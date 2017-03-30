@@ -1,6 +1,19 @@
 systemd (215-17+deb8u6pexip1) pexip; urgency=low
 
   * Prepare Pexip packaging
+  * Retain the following changes from Ubuntu:
+    - debian/rules: Drop doc dir symlinking. It creates havoc with dpkg
+      upgrades, and we already have the automatic per-file symlinking.
+    - Keep our much simpler udev maintainer scripts (all platforms must
+      support udev, no debconf).
+    - Don't install 80-networking.rules and the Debian *.agent scripts, we
+      never supported them in Ubuntu.
+    - Mark graphics devices as PRIMARY_DEVICE_FOR_DISPLAY so that we can wait
+      for those in plymouth.
+    - Clean up obsolete /etc/udev/rules.d/README on upgrades.
+    - Add Get-RTC-is-in-local-time-setting-from-etc-default-rc.patch: In Ubuntu
+      we currently keep the setting whether the RTC is in local or UTC time
+      in /etc/default/rcS "UTC=yes|no", instead of /etc/adjtime.
 
  -- John-Mark Bell <jmb@pexip.com>  Wed, 29 Mar 2017 23:54:02 +0000
 
