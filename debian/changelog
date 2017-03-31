@@ -14,6 +14,7 @@ systemd (215-17+deb8u6pexip1) pexip; urgency=low
     - Add Get-RTC-is-in-local-time-setting-from-etc-default-rc.patch: In Ubuntu
       we currently keep the setting whether the RTC is in local or UTC time
       in /etc/default/rcS "UTC=yes|no", instead of /etc/adjtime.
+    - debian/rules: Add an epoch to libgudev
 
  -- John-Mark Bell <jmb@pexip.com>  Wed, 29 Mar 2017 23:54:02 +0000
 
