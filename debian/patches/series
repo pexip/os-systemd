@@ -230,3 +230,4 @@ Revert-core-one-step-back-again-for-nspawn-we-actual.patch
 udev-increase-udev-event-timeout-to-180s.patch
 
 Get-RTC-is-in-local-time-setting-from-etc-default-rc.patch
+mtd_probe-include-order.patch
