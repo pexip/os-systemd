@@ -17,11 +17,18 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
-#include "architecture.h"
-#include "path-util.h"
-#include "strv.h"
 #include "sd-path.h"
+
+#include "alloc-util.h"
+#include "architecture.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "missing.h"
+#include "path-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "user-util.h"
+#include "util.h"
 
 static int from_environment(const char *envname, const char *fallback, const char **ret) {
         assert(ret);
@@ -82,7 +89,8 @@ static int from_home_dir(const char *envname, const char *suffix, char **buffer,
 static int from_user_dir(const char *field, char **buffer, const char **ret) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *b = NULL;
-        const char *fn = NULL;
+        _cleanup_free_ const char *fn = NULL;
+        const char *c = NULL;
         char line[LINE_MAX];
         size_t n;
         int r;
@@ -91,9 +99,13 @@ static int from_user_dir(const char *field, char **buffer, const char **ret) {
         assert(buffer);
         assert(ret);
 
-        r = from_home_dir(NULL, ".config/user-dirs.dirs", &b, &fn);
+        r = from_home_dir("XDG_CONFIG_HOME", ".config", &b, &c);
         if (r < 0)
                 return r;
+
+        fn = strappend(c, "/user-dirs.dirs");
+        if (!fn)
+                return -ENOMEM;
 
         f = fopen(fn, "re");
         if (!f) {
@@ -322,10 +334,10 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
                 return from_user_dir("XDG_DESKTOP_DIR", buffer, ret);
         }
 
-        return -ENOTSUP;
+        return -EOPNOTSUPP;
 }
 
-int sd_path_home(uint64_t type, const char *suffix, char **path) {
+_public_ int sd_path_home(uint64_t type, const char *suffix, char **path) {
         char *buffer = NULL, *cc;
         const char *ret;
         int r;
@@ -551,10 +563,10 @@ static int get_search(uint64_t type, char ***list) {
                                                NULL);
         }
 
-        return -ENOTSUP;
+        return -EOPNOTSUPP;
 }
 
-int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
+_public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
         char **l, **i, **j, **n;
         int r;
 

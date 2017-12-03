@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,33 +17,65 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "formats-util.h"
+#include "fs-util.h"
+#include "log.h"
+#include "string-util.h"
 #include "util.h"
 
 int main(int argc, char** argv) {
+        _cleanup_free_ char *cmd = NULL, *cmd2 = NULL, *ans = NULL, *ans2 = NULL, *d = NULL, *tmp = NULL, *line = NULL;
+        _cleanup_close_ int fd = -1, fd2 = -1;
         const char *p = argv[1] ?: "/tmp";
-        char *pattern = strappenda(p, "/systemd-test-XXXXXX");
-        _cleanup_close_ int fd, fd2;
-        _cleanup_free_ char *cmd, *cmd2;
+        char *pattern;
 
-        fd = open_tmpfile(p, O_RDWR|O_CLOEXEC);
-        assert(fd >= 0);
+        log_set_max_level(LOG_DEBUG);
+        log_parse_environment();
+
+        pattern = strjoina(p, "/systemd-test-XXXXXX");
+
+        fd = open_tmpfile_unlinkable(p, O_RDWR|O_CLOEXEC);
+        assert_se(fd >= 0);
 
         assert_se(asprintf(&cmd, "ls -l /proc/"PID_FMT"/fd/%d", getpid(), fd) > 0);
-        system(cmd);
+        (void) system(cmd);
+        assert_se(readlink_malloc(cmd + 6, &ans) >= 0);
+        log_debug("link1: %s", ans);
+        assert_se(endswith(ans, " (deleted)"));
 
-        fd2 = mkostemp_safe(pattern, O_RDWR|O_CLOEXEC);
-        assert(fd >= 0);
+        fd2 = mkostemp_safe(pattern);
+        assert_se(fd >= 0);
         assert_se(unlink(pattern) == 0);
 
         assert_se(asprintf(&cmd2, "ls -l /proc/"PID_FMT"/fd/%d", getpid(), fd2) > 0);
-        system(cmd2);
+        (void) system(cmd2);
+        assert_se(readlink_malloc(cmd2 + 6, &ans2) >= 0);
+        log_debug("link2: %s", ans2);
+        assert_se(endswith(ans2, " (deleted)"));
+
+        pattern = strjoina(p, "/tmpfiles-test");
+        assert_se(tempfn_random(pattern, NULL, &d) >= 0);
+
+        fd = open_tmpfile_linkable(d, O_RDWR|O_CLOEXEC, &tmp);
+        assert_se(fd >= 0);
+        assert_se(write(fd, "foobar\n", 7) == 7);
+
+        assert_se(touch(d) >= 0);
+        assert_se(link_tmpfile(fd, tmp, d) == -EEXIST);
+        assert_se(unlink(d) >= 0);
+        assert_se(link_tmpfile(fd, tmp, d) >= 0);
+
+        assert_se(read_one_line_file(d, &line) >= 0);
+        assert_se(streq(line, "foobar"));
+        assert_se(unlink(d) >= 0);
 
         return 0;
 }

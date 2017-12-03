@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,10 +17,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <libgen.h>
 #include <sys/socket.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "namespace.h"
+#include "process-util.h"
+#include "string-util.h"
 #include "util.h"
 
 static void test_tmpdir(const char *id, const char *A, const char *B) {
@@ -43,8 +44,8 @@ static void test_tmpdir(const char *id, const char *A, const char *B) {
         assert_se((x.st_mode & 01777) == 0700);
         assert_se((y.st_mode & 01777) == 0700);
 
-        c = strappenda(a, "/tmp");
-        d = strappenda(b, "/tmp");
+        c = strjoina(a, "/tmp");
+        d = strjoina(b, "/tmp");
 
         assert_se(stat(c, &x) >= 0);
         assert_se(stat(d, &y) >= 0);
@@ -68,8 +69,10 @@ static void test_netns(void) {
         int r, n = 0;
         siginfo_t si;
 
-        if (geteuid() > 0)
-                return;
+        if (geteuid() > 0) {
+                log_info("Skipping test: not root");
+                exit(EXIT_TEST_SKIP);
+        }
 
         assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, s) >= 0);
 
@@ -122,6 +125,9 @@ int main(int argc, char *argv[]) {
         sd_id128_t bid;
         char boot_id[SD_ID128_STRING_MAX];
         _cleanup_free_ char *x = NULL, *y = NULL, *z = NULL, *zz = NULL;
+
+        log_parse_environment();
+        log_open();
 
         assert_se(sd_id128_get_boot(&bid) >= 0);
         sd_id128_to_string(bid, boot_id);

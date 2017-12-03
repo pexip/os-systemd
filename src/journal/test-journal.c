@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -22,12 +20,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <systemd/sd-journal.h>
-
-#include "log.h"
-#include "journal-file.h"
 #include "journal-authenticate.h"
+#include "journal-file.h"
 #include "journal-vacuum.h"
+#include "log.h"
+#include "rm-rf.h"
 
 static bool arg_keep = false;
 
@@ -45,7 +42,7 @@ static void test_non_empty(void) {
         assert_se(mkdtemp(t));
         assert_se(chdir(t) >= 0);
 
-        assert_se(journal_file_open("test.journal", O_RDWR|O_CREAT, 0666, true, true, NULL, NULL, NULL, &f) == 0);
+        assert_se(journal_file_open(-1, "test.journal", O_RDWR|O_CREAT, 0666, true, true, NULL, NULL, NULL, NULL, &f) == 0);
 
         dual_timestamp_get(&ts);
 
@@ -66,69 +63,60 @@ static void test_non_empty(void) {
 #endif
         journal_file_dump(f);
 
-        assert(journal_file_next_entry(f, NULL, 0, DIRECTION_DOWN, &o, &p) == 1);
-        assert(le64toh(o->entry.seqnum) == 1);
+        assert_se(journal_file_next_entry(f, 0, DIRECTION_DOWN, &o, &p) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 1);
 
-        assert(journal_file_next_entry(f, o, p, DIRECTION_DOWN, &o, &p) == 1);
-        assert(le64toh(o->entry.seqnum) == 2);
+        assert_se(journal_file_next_entry(f, p, DIRECTION_DOWN, &o, &p) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 2);
 
-        assert(journal_file_next_entry(f, o, p, DIRECTION_DOWN, &o, &p) == 1);
-        assert(le64toh(o->entry.seqnum) == 3);
+        assert_se(journal_file_next_entry(f, p, DIRECTION_DOWN, &o, &p) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 3);
 
-        assert(journal_file_next_entry(f, o, p, DIRECTION_DOWN, &o, &p) == 0);
+        assert_se(journal_file_next_entry(f, p, DIRECTION_DOWN, &o, &p) == 0);
 
-        assert(journal_file_next_entry(f, NULL, 0, DIRECTION_DOWN, &o, &p) == 1);
-        assert(le64toh(o->entry.seqnum) == 1);
+        assert_se(journal_file_next_entry(f, 0, DIRECTION_DOWN, &o, &p) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 1);
 
-        assert(journal_file_skip_entry(f, o, p, 2, &o, &p) == 1);
-        assert(le64toh(o->entry.seqnum) == 3);
+        assert_se(journal_file_find_data_object(f, test, strlen(test), NULL, &p) == 1);
+        assert_se(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_DOWN, &o, NULL) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 1);
 
-        assert(journal_file_skip_entry(f, o, p, -2, &o, &p) == 1);
-        assert(le64toh(o->entry.seqnum) == 1);
+        assert_se(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_UP, &o, NULL) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 3);
 
-        assert(journal_file_skip_entry(f, o, p, -2, &o, &p) == 1);
-        assert(le64toh(o->entry.seqnum) == 1);
+        assert_se(journal_file_find_data_object(f, test2, strlen(test2), NULL, &p) == 1);
+        assert_se(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_UP, &o, NULL) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 2);
 
-        assert(journal_file_find_data_object(f, test, strlen(test), NULL, &p) == 1);
-        assert(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_DOWN, &o, NULL) == 1);
-        assert(le64toh(o->entry.seqnum) == 1);
+        assert_se(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_DOWN, &o, NULL) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 2);
 
-        assert(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_UP, &o, NULL) == 1);
-        assert(le64toh(o->entry.seqnum) == 3);
+        assert_se(journal_file_find_data_object(f, "quux", 4, NULL, &p) == 0);
 
-        assert(journal_file_find_data_object(f, test2, strlen(test2), NULL, &p) == 1);
-        assert(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_UP, &o, NULL) == 1);
-        assert(le64toh(o->entry.seqnum) == 2);
+        assert_se(journal_file_move_to_entry_by_seqnum(f, 1, DIRECTION_DOWN, &o, NULL) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 1);
 
-        assert(journal_file_next_entry_for_data(f, NULL, 0, p, DIRECTION_DOWN, &o, NULL) == 1);
-        assert(le64toh(o->entry.seqnum) == 2);
+        assert_se(journal_file_move_to_entry_by_seqnum(f, 3, DIRECTION_DOWN, &o, NULL) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 3);
 
-        assert(journal_file_find_data_object(f, "quux", 4, NULL, &p) == 0);
+        assert_se(journal_file_move_to_entry_by_seqnum(f, 2, DIRECTION_DOWN, &o, NULL) == 1);
+        assert_se(le64toh(o->entry.seqnum) == 2);
 
-        assert(journal_file_move_to_entry_by_seqnum(f, 1, DIRECTION_DOWN, &o, NULL) == 1);
-        assert(le64toh(o->entry.seqnum) == 1);
+        assert_se(journal_file_move_to_entry_by_seqnum(f, 10, DIRECTION_DOWN, &o, NULL) == 0);
 
-        assert(journal_file_move_to_entry_by_seqnum(f, 3, DIRECTION_DOWN, &o, NULL) == 1);
-        assert(le64toh(o->entry.seqnum) == 3);
+        journal_file_rotate(&f, true, true, NULL);
+        journal_file_rotate(&f, true, true, NULL);
 
-        assert(journal_file_move_to_entry_by_seqnum(f, 2, DIRECTION_DOWN, &o, NULL) == 1);
-        assert(le64toh(o->entry.seqnum) == 2);
-
-        assert(journal_file_move_to_entry_by_seqnum(f, 10, DIRECTION_DOWN, &o, NULL) == 0);
-
-        journal_file_rotate(&f, true, true);
-        journal_file_rotate(&f, true, true);
-
-        journal_file_close(f);
+        (void) journal_file_close(f);
 
         log_info("Done...");
 
         if (arg_keep)
                 log_info("Not removing %s", t);
         else {
-                journal_directory_vacuum(".", 3000000, 0, NULL);
+                journal_directory_vacuum(".", 3000000, 0, 0, NULL, true);
 
-                assert_se(rm_rf_dangerous(t, false, true, false) >= 0);
+                assert_se(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL) >= 0);
         }
 
         puts("------------------------------------------------------------");
@@ -143,13 +131,13 @@ static void test_empty(void) {
         assert_se(mkdtemp(t));
         assert_se(chdir(t) >= 0);
 
-        assert_se(journal_file_open("test.journal", O_RDWR|O_CREAT, 0666, false, false, NULL, NULL, NULL, &f1) == 0);
+        assert_se(journal_file_open(-1, "test.journal", O_RDWR|O_CREAT, 0666, false, false, NULL, NULL, NULL, NULL, &f1) == 0);
 
-        assert_se(journal_file_open("test-compress.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, &f2) == 0);
+        assert_se(journal_file_open(-1, "test-compress.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, NULL, &f2) == 0);
 
-        assert_se(journal_file_open("test-seal.journal", O_RDWR|O_CREAT, 0666, false, true, NULL, NULL, NULL, &f3) == 0);
+        assert_se(journal_file_open(-1, "test-seal.journal", O_RDWR|O_CREAT, 0666, false, true, NULL, NULL, NULL, NULL, &f3) == 0);
 
-        assert_se(journal_file_open("test-seal-compress.journal", O_RDWR|O_CREAT, 0666, true, true, NULL, NULL, NULL, &f4) == 0);
+        assert_se(journal_file_open(-1, "test-seal-compress.journal", O_RDWR|O_CREAT, 0666, true, true, NULL, NULL, NULL, NULL, &f4) == 0);
 
         journal_file_print_header(f1);
         puts("");
@@ -165,15 +153,15 @@ static void test_empty(void) {
         if (arg_keep)
                 log_info("Not removing %s", t);
         else {
-                journal_directory_vacuum(".", 3000000, 0, NULL);
+                journal_directory_vacuum(".", 3000000, 0, 0, NULL, true);
 
-                assert_se(rm_rf_dangerous(t, false, true, false) >= 0);
+                assert_se(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL) >= 0);
         }
 
-        journal_file_close(f1);
-        journal_file_close(f2);
-        journal_file_close(f3);
-        journal_file_close(f4);
+        (void) journal_file_close(f1);
+        (void) journal_file_close(f2);
+        (void) journal_file_close(f3);
+        (void) journal_file_close(f4);
 }
 
 int main(int argc, char *argv[]) {

@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,14 +17,21 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <time.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/socket.h>
+#include <time.h>
 
+#include "alloc-util.h"
+#include "fd-util.h"
 #include "fileio.h"
-#include "journald-server.h"
+#include "formats-util.h"
+#include "io-util.h"
 #include "journald-console.h"
+#include "journald-server.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "stdio-util.h"
+#include "terminal-util.h"
 
 static bool prefix_timestamp(void) {
 
@@ -48,12 +53,12 @@ void server_forward_console(
                 int priority,
                 const char *identifier,
                 const char *message,
-                struct ucred *ucred) {
+                const struct ucred *ucred) {
 
         struct iovec iovec[5];
-        char header_pid[16];
         struct timespec ts;
-        char tbuf[4 + DECIMAL_STR_MAX(ts.tv_sec) + DECIMAL_STR_MAX(ts.tv_nsec)-3 + 1];
+        char tbuf[sizeof("[] ")-1 + DECIMAL_STR_MAX(ts.tv_sec) + DECIMAL_STR_MAX(ts.tv_nsec)-3 + 1];
+        char header_pid[sizeof("[]: ")-1 + DECIMAL_STR_MAX(pid_t)];
         int n = 0, fd;
         _cleanup_free_ char *ident_buf = NULL;
         const char *tty;
@@ -67,7 +72,7 @@ void server_forward_console(
         /* First: timestamp */
         if (prefix_timestamp()) {
                 assert_se(clock_gettime(CLOCK_MONOTONIC, &ts) == 0);
-                snprintf(tbuf, sizeof(tbuf), "[%5"PRI_TIME".%06ld] ",
+                xsprintf(tbuf, "[%5"PRI_TIME".%06ld] ",
                          ts.tv_sec,
                          ts.tv_nsec / 1000);
                 IOVEC_SET_STRING(iovec[n++], tbuf);
@@ -80,8 +85,7 @@ void server_forward_console(
                         identifier = ident_buf;
                 }
 
-                snprintf(header_pid, sizeof(header_pid), "["PID_FMT"]: ", ucred->pid);
-                char_array_0(header_pid);
+                xsprintf(header_pid, "["PID_FMT"]: ", ucred->pid);
 
                 if (identifier)
                         IOVEC_SET_STRING(iovec[n++], identifier);
@@ -98,14 +102,19 @@ void server_forward_console(
 
         tty = s->tty_path ? s->tty_path : "/dev/console";
 
+        /* Before you ask: yes, on purpose we open/close the console for each log line we write individually. This is a
+         * good strategy to avoid journald getting killed by the kernel's SAK concept (it doesn't fix this entirely,
+         * but minimizes the time window the kernel might end up killing journald due to SAK). It also makes things
+         * easier for us so that we don't have to recover from hangups and suchlike triggered on the console. */
+
         fd = open_terminal(tty, O_WRONLY|O_NOCTTY|O_CLOEXEC);
         if (fd < 0) {
-                log_debug("Failed to open %s for logging: %m", tty);
+                log_debug_errno(fd, "Failed to open %s for logging: %m", tty);
                 return;
         }
 
         if (writev(fd, iovec, n) < 0)
-                log_debug("Failed to write to %s for logging: %m", tty);
+                log_debug_errno(errno, "Failed to write to %s for logging: %m", tty);
 
         safe_close(fd);
 }

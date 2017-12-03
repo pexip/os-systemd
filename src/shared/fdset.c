@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,29 +17,54 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <errno.h>
+#include <alloca.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <unistd.h>
+#include <stddef.h>
 
-#include "set.h"
-#include "util.h"
-#include "macro.h"
-#include "fdset.h"
 #include "sd-daemon.h"
+
+#include "fd-util.h"
+#include "fdset.h"
+#include "log.h"
+#include "macro.h"
+#include "parse-util.h"
+#include "path-util.h"
+#include "set.h"
 
 #define MAKE_SET(s) ((Set*) s)
 #define MAKE_FDSET(s) ((FDSet*) s)
 
-/* Make sure we can distuingish fd 0 and NULL */
-#define FD_TO_PTR(fd) INT_TO_PTR((fd)+1)
-#define PTR_TO_FD(p) (PTR_TO_INT(p)-1)
-
 FDSet *fdset_new(void) {
-        return MAKE_FDSET(set_new(trivial_hash_func, trivial_compare_func));
+        return MAKE_FDSET(set_new(NULL));
 }
 
-void fdset_free(FDSet *s) {
+int fdset_new_array(FDSet **ret, const int *fds, unsigned n_fds) {
+        unsigned i;
+        FDSet *s;
+        int r;
+
+        assert(ret);
+
+        s = fdset_new();
+        if (!s)
+                return -ENOMEM;
+
+        for (i = 0; i < n_fds; i++) {
+
+                r = fdset_put(s, fds[i]);
+                if (r < 0) {
+                        set_free(MAKE_SET(s));
+                        return r;
+                }
+        }
+
+        *ret = s;
+        return 0;
+}
+
+FDSet* fdset_free(FDSet *s) {
         void *p;
 
         while ((p = set_steal_first(MAKE_SET(s)))) {
@@ -61,6 +84,7 @@ void fdset_free(FDSet *s) {
         }
 
         set_free(MAKE_SET(s));
+        return NULL;
 }
 
 int fdset_put(FDSet *s, int fd) {
@@ -127,7 +151,7 @@ int fdset_new_fill(FDSet **_s) {
         while ((de = readdir(d))) {
                 int fd = -1;
 
-                if (ignore_file(de->d_name))
+                if (hidden_or_backup_file(de->d_name))
                         continue;
 
                 r = safe_atoi(de->d_name, &fd);
@@ -164,9 +188,11 @@ int fdset_cloexec(FDSet *fds, bool b) {
 
         assert(fds);
 
-        SET_FOREACH(p, MAKE_SET(fds), i)
-                if ((r = fd_cloexec(PTR_TO_FD(p), b)) < 0)
+        SET_FOREACH(p, MAKE_SET(fds), i) {
+                r = fd_cloexec(PTR_TO_FD(p), b);
+                if (r < 0)
                         return r;
+        }
 
         return 0;
 }
@@ -223,10 +249,23 @@ unsigned fdset_size(FDSet *fds) {
         return set_size(MAKE_SET(fds));
 }
 
+bool fdset_isempty(FDSet *fds) {
+        return set_isempty(MAKE_SET(fds));
+}
+
 int fdset_iterate(FDSet *s, Iterator *i) {
         void *p;
 
-        p = set_iterate(MAKE_SET(s), i);
+        if (!set_iterate(MAKE_SET(s), i, &p))
+                return -ENOENT;
+
+        return PTR_TO_FD(p);
+}
+
+int fdset_steal_first(FDSet *fds) {
+        void *p;
+
+        p = set_steal_first(MAKE_SET(fds));
         if (!p)
                 return -ENOENT;
 

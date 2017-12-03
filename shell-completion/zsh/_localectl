@@ -22,8 +22,8 @@ _localectl_set-locale() {
 
 _localectl_set-keymap() {
     local -a _keymaps
-    _keymaps=( ${(f)"$(_call_program locales "$service" list-keymaps)"} )
     if (( CURRENT <= 3 )); then
+        _keymaps=( ${(f)"$(_call_program locales "$service" list-keymaps)"} )
         _describe keymaps _keymaps
     else
         _message "no more options"
@@ -36,8 +36,8 @@ _localectl_set-x11-keymap() {
         local _xorg_lst
         _xorg_lst=${"$($commands[pkg-config] xkeyboard-config --variable=xkb_base)"}
         _file=( ${(ps:\n\!:)"$(<$_xorg_lst/rules/xorg.lst)"} )
-        _layout=( ${${${(M)${(f)_file[1]}:#  *}#  }%% *} )
-        _model=( ${${${(M)${(f)_file[2]}:#  *}#  }%% *} )
+        _layout=( ${${${(M)${(f)_file[2]}:#  *}#  }%% *} )
+        _model=( ${${${(M)${(f)_file[1]}:#  *}#  }%% *} )
         _variant=( ${${${(M)${(f)_file[3]}:#  *}#  }%% *} )
         _options=( ${${${(M)${(f)_file[4]}:#  *}#  }%% *} )
         #_layout=( ${(f)"$( echo $_file[1] | awk '/^  / {print $1}' )"} )
@@ -77,7 +77,7 @@ _localectl_command() {
         if (( $+functions[_localectl_$cmd] )); then
             _localectl_$cmd
         else
-            _message "no more options"
+            _message "unknown localectl command: $words[1]"
         fi
     fi
 }

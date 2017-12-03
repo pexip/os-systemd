@@ -1,297 +1,376 @@
 #! /usr/bin/make -f
 
-#export DH_VERBOSE=1
-#export DEB_BUILD_OPTIONS="nostrip"
+#export DH_VERBOSE = 1
+#export DEB_BUILD_OPTIONS = nostrip
 
-DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+include /usr/share/dpkg/default.mk
 
-ifneq (,$(findstring stage1,$(DEB_BUILD_PROFILES)))
-BOOTSTRAP_DH_FLAGS := -Ngir1.2-gudev-1.0 -Nlibgudev-1.0-0 -Nlibgudev-1.0-dev
+ifeq ($(DEB_VENDOR),Ubuntu)
+    DEFAULT_NTP_SERVERS = ntp.ubuntu.com
+    BREAKS_USB_MODESWITCH =
+    SUPPORT_URL = http://www.ubuntu.com/support
+else
+    DEFAULT_NTP_SERVERS = 0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
+    BREAKS_USB_MODESWITCH = usb-modeswitch (<< 2.3.0+repack0-1~)
+    SUPPORT_URL = https://www.debian.org/support
 endif
 
+# Drop these after stretch
+BREAKS_RCS_COMPAT = \
+	ifupdown (<< 0.8), \
+	keyboard-configuration (<< 1.141), \
+	kbd (<< 2.0.3-2), \
+	nfs-common (<< 1:1.2.8-9.1), \
+	rpcbind (<< 0.2.3-0.1), \
+	hdparm (<< 9.48+ds-1), \
+	screen (<< 4.3.1-2), \
+	mdadm (<< 3.4-2), \
+	console-common (<< 0.7.89), \
+	ebtables (<< 2.0.10.4-3.5), \
+	ufw (<< 0.34-1), \
+	virtualbox-guest-x11 (<< 5.0.12-dfsg-2), \
+	rdnssd (<< 1.0.1-5), \
+	pidentd (<< 3.0.19.ds1-7.1), \
+	shorewall (<< 5.0.3.1-1), \
+	setserial (<< 2.17-49), \
+	apparmor (<< 2.10.95-1), \
+	ipsec-tools (<< 1:0.8.2+20140711-6), \
+	ferm (<< 2.2-3.1), \
+	mt-st (<< 1.3-1), \
+	scsitools (<< 0.12-2.3), \
+	clvm (<< 2.02.156-1), \
+	zfs-fuse (<< 0.7.0-13.1), \
+	multipath-tools (<< 0.5.0+git1.656f8865-3), \
+	shorewall6 (<< 5.0.3.1-1), \
+	arno-iptables-firewall (<< 2.0.1.f-1), \
+	ifrename (<< 30~pre9-9), \
+	live-tools (<< 1:20151214+nmu1), \
+	selinux-basics (<< 0.5.3), \
+	adjtimex (<< 1.29-6), \
+	nbd-client (<< 1:3.14-1), \
+	ifupdown-extra (<< 0.27), \
+	eeepc-acpi-scripts (<< 1.1.12+nmu1), \
+	aoetools (<< 36-1.1), \
+	ocfs2-tools (<< 1.8.4-2), \
+	shorewall-init (<< 5.0.3.1-1), \
+	espeakup (<< 1:0.71-27.1), \
+	cman (<< 3.1.8-1.3+rm), \
+	gfs2-utils (<< 3.1.8-1), \
+	gfs2-cluster (<< 3.1.8-1), \
+	srptools (<< 1.0.3-1), \
+	ifscheme (<< 1.7-4), \
+	gom (<< 0.30.2-7), \
+	atm-tools (<< 1:2.5.1-1.6), \
+	switchconf (<< 0.0.15-1), \
+	shorewall-lite (<< 5.0.3.1-1), \
+	rgmanager (<< 3.1.8-1.3+rm), \
+	zvbi (<< 0.2.35-10), \
+	fiaif (<< 1.23.1-4+rm), \
+	netenv (<< 0.94.3-30+rm), \
+	shorewall6-lite (<< 5.0.3.1-1), \
+	natlog (<< 1.02.00-4),
+
+# fail on missing files and symbols changes on distro builds, but not if we
+# build/test upstream master
+ifeq ($(TEST_UPSTREAM),)
+    DH_INSTALL_MISSING = --fail-missing
+    GENSYMBOLS_LEVEL = 4
+else
+    DH_INSTALL_MISSING = --list-missing
+    GENSYMBOLS_LEVEL = 1
+    BREAKS_RCS_COMPAT =
+endif
+
+ifneq (, $(filter noudeb, $(DEB_BUILD_OPTIONS)))
+export DEB_BUILD_PROFILES += noudeb
+endif
+
+# The gold linker is currently broken on mips*. See #851736.
+# Switch to bfd as a temporary workaround.
+ifneq ($(filter $(DEB_BUILD_ARCH), mips mipsel mips64el),)
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-fuse-ld=bfd
+endif
+
+SPLIT_USR_PATHS = \
+	QUOTAON=/sbin/quotaon \
+	QUOTACHECK=/sbin/quotacheck \
+	SETCAP=/sbin/setcap \
+	KILL=/bin/kill \
+	KMOD=/bin/kmod \
+	KEXEC=/sbin/kexec \
+	SULOGIN=/sbin/sulogin \
+	MOUNT_PATH=/bin/mount \
+	UMOUNT_PATH=/bin/umount \
+	$(NULL)
+
 CONFFLAGS = \
+	$(SPLIT_USR_PATHS) \
 	--with-rootprefix= \
 	--with-rootlibdir=/lib/$(DEB_HOST_MULTIARCH) \
 	--with-zshcompletiondir=/usr/share/zsh/vendor-completions \
 	--with-sysvinit-path=/etc/init.d \
 	--with-sysvrcnd-path=/etc \
-	--with-firmware-path=/lib/firmware \
 	--with-debug-shell=/bin/bash \
+	--with-kbd-loadkeys=/bin/loadkeys \
+	--with-kbd-setfont=/bin/setfont \
 	--with-telinit=/lib/sysvinit/telinit \
-	--disable-coredump \
-	--disable-efi \
-	--disable-myhostname \
+	--with-dbuspolicydir=/etc/dbus-1/system.d/ \
+	--with-support-url=$(SUPPORT_URL) \
+	--without-kill-user-processes \
+	--with-pamconfdir=no \
+	--enable-split-usr \
+	--disable-qrencode \
 	--disable-vconsole \
-	--disable-microhttpd \
-	--disable-sysusers \
-	--disable-silent-rules \
-	--with-ntp-servers="0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org"  \
-	--with-dns-servers="" \
+	--disable-firstboot \
+	--disable-xkbcommon \
+	--disable-wheel-group \
+	--with-ntp-servers="$(DEFAULT_NTP_SERVERS)"  \
 	--with-system-uid-max=999 \
-	--with-system-gid-max=999
+	--with-system-gid-max=999 \
+	--with-nobody-user=nobody \
+	--with-nobody-group=nogroup
 
-ifeq (,$(findstring stage1,$(DEB_BUILD_PROFILES)))
-CONFFLAGS += --enable-libcryptsetup
-endif
+# resolved's DNSSEC support is still not mature enough, don't enable it by
+# default on stable Debian/Ubuntu releases
+CONFFLAGS += $(shell grep -qE 'stretch|yakkety|zesty' /etc/os-release && echo --with-default-dnssec=no)
 
 CONFFLAGS_deb = \
 	--enable-selinux \
-	--enable-introspection \
-	--enable-gtk-doc \
-	--enable-compat-libs \
-	PYTHON=python3 \
-	$(NULL)
+	--enable-hwdb \
+	--enable-sysusers \
+	--enable-efi \
+	PYTHON=python3
+
+ifeq (, $(filter stage1, $(DEB_BUILD_PROFILES)))
+CONFFLAGS_deb += \
+	--enable-audit \
+	--enable-libcryptsetup \
+	--enable-coredump \
+	--enable-elfutils \
+	--enable-apparmor \
+	--enable-libidn \
+	--enable-libiptc \
+	--enable-libcurl \
+	--enable-importd \
+	--enable-microhttpd \
+	--enable-gnutls
+else
+CONFFLAGS_deb += \
+	--disable-audit \
+	--disable-libcryptsetup \
+	--disable-coredump \
+	--disable-elfutils \
+	--disable-apparmor \
+	--disable-libidn \
+	--disable-libiptc \
+	--disable-libcurl \
+	--disable-importd \
+	--disable-microhttpd \
+	--disable-gnutls
+endif
 
 CONFFLAGS_udeb = \
 	--disable-libcryptsetup \
+	--disable-coredump \
+	--disable-elfutils \
 	--disable-pam \
 	--disable-audit \
 	--disable-selinux \
+	--disable-apparmor \
+	--disable-libidn \
+	--disable-libiptc \
 	--disable-smack \
 	--disable-ima \
-	--disable-introspection \
-	--disable-gtk-doc \
 	--disable-binfmt \
-	--disable-readahead \
-	--disable-bootchart \
 	--disable-quotacheck \
 	--disable-tmpfiles \
 	--disable-randomseed \
 	--disable-backlight \
 	--disable-logind \
 	--disable-machined \
+	--disable-libcurl \
+	--disable-importd \
+	--disable-microhttpd \
+	--disable-gnutls \
 	--disable-hostnamed \
 	--disable-timedated \
 	--disable-networkd \
 	--disable-timesyncd \
 	--disable-localed \
+	--disable-myhostname \
 	--disable-resolved \
 	--disable-polkit \
 	--disable-acl \
 	--disable-gcrypt \
-	--disable-gudev \
 	--disable-rfkill \
-	--disable-multi-seat-x \
+	--disable-hwdb \
 	--disable-manpages \
+	--disable-efi \
+	--disable-gnuefi \
+	--disable-seccomp \
+	--disable-sysusers \
 	--without-python
 
 override_dh_auto_configure:
 	dh_auto_configure --builddirectory=build-deb \
 		-- $(CONFFLAGS) $(CONFFLAGS_deb)
+ifeq (, $(filter noudeb, $(DEB_BUILD_PROFILES)))
 	dh_auto_configure --builddirectory=build-udeb \
 		-- $(CONFFLAGS) $(CONFFLAGS_udeb)
+endif
 
 override_dh_auto_build:
 	dh_auto_build --builddirectory=build-deb
+ifeq (, $(filter noudeb, $(DEB_BUILD_PROFILES)))
 	dh_auto_build --builddirectory=build-udeb
+endif
+	# generate POT file for translators
+	cd build-deb/po; srcdir=../../po intltool-update --pot --verbose
 
 override_dh_auto_install:
 	dh_auto_install --builddirectory=build-deb \
 		--destdir=debian/install/deb
+ifeq (, $(filter noudeb, $(DEB_BUILD_PROFILES)))
 	dh_auto_install --builddirectory=build-udeb \
 		--destdir=debian/install/udeb
+endif
+	# fix paths in manpages; manually check the remaining /usr occurrences
+	# occasionally, with filtering out paths which are known to be in /usr:
+	# grep -r /usr debian/install/deb/usr/share/man/|egrep -v '/usr/local|os.*release|factory|zoneinfo|tmpfiles|kernel|foo|machines|sysctl|dbus|include|binfmt'
+	find debian/install/deb/usr/share/man/ -type f | xargs sed -ri 's_/usr(/lib/systemd/system|/lib/systemd/network|/lib/udev|/lib[^/]|/lib/[^a-z])_\1_g'
 
 override_dh_auto_clean:
+ifneq (, $(TEST_UPSTREAM))
+	debian/extra/checkout-upstream
+endif
 	dh_auto_clean --builddirectory=build-deb
+ifeq (, $(filter noudeb, $(DEB_BUILD_PROFILES)))
 	dh_auto_clean --builddirectory=build-udeb
-	rm -rf debian/install/
-	# remove pre-generated man pages so they are rebuilt
-	rm -f man/*.[13578]
-	# remove pre-generated rules and unit files so they are rebuilt
-	rm -f rules/99-systemd.rules \
-		units/emergency.service \
-		units/systemd-udevd.service \
-		units/systemd-udev-settle.service \
-		units/systemd-udev-trigger.service
+endif
+	rm -rf debian/install/ debian/shlibs.local
 	# remove Python byte code files
-	rm -f *.pyc
+	rm -rf tools/__pycache__/
 
 override_dh_install:
 	# remove unnecessary / unused files
 	rm -f debian/install/*/usr/share/doc/systemd/LICENSE.*
 	rm -f debian/install/*/var/log/README
 	rm -f debian/install/*/etc/init.d/README
-	rm -f debian/install/*/usr/share/man/man8/kernel-install.8
-	rm -f debian/install/*/usr/bin/kernel-install
-	rm -f debian/install/*/usr/share/zsh/vendor-completions/_kernel-install
-	rm -f debian/install/*/usr/share/bash-completion/completions/kernel-install
-	rm -rf debian/install/*/usr/lib/kernel/install.d
 	rm -rf debian/install/*/etc/rpm/
 	rm -rf debian/install/*/usr/lib/rpm/
-	rm -rf debian/install/*/etc/kernel/
 	rm -f debian/install/*/usr/lib/sysctl.d/50-default.conf
+	rm -f debian/install/*/etc/X11/xinit/xinitrc.d/50-systemd-user.sh
+	rmdir -p --ignore-fail-on-non-empty debian/install/*/etc/X11/xinit/xinitrc.d/
+	rm -f debian/install/*/lib/systemd/system/halt-local.service
 	find debian/install/ -name '*.la' -delete
+	rm -f debian/install/*/lib/systemd/libsystemd-shared.so
+	find debian/install/ -name '*.busname' -delete
 	# remove files related to factory-reset feature
 	find debian/install/ \( -name 'systemd-update-done*' -o \
 		-name systemd-journal-catalog-update.service -o \
 		-name systemd-udev-hwdb-update.service -o \
 		-name ldconfig.service -o \
 		-name etc.conf \) -delete
-	# remove .so for deprecated compatibility libraries
-	rm -f debian/install/*/usr/lib/*/libsystemd-daemon.so
-	rm -f debian/install/*/usr/lib/*/libsystemd-login.so
-	rm -f debian/install/*/usr/lib/*/libsystemd-id128.so
-	rm -f debian/install/*/usr/lib/*/libsystemd-journal.so
+	rm -rf debian/install/*/usr/share/factory/
 	# remove symlinks enabling default-on services
 	rm -rf debian/install/*/etc/systemd/system/*.target.wants/
+	# FIXME: generate proper sysusers.d/basic.conf for Debian, and add autopkgtest
+	rm -rf debian/install/*/usr/lib/sysusers.d/*
+	rm -f debian/install/*/lib/systemd/system/*sysusers*.service debian/install/*/lib/systemd/system/*/*sysusers*.service
+ifeq (, $(filter noudeb, $(DEB_BUILD_PROFILES)))
 	dh_install -pudev-udeb -plibudev1-udeb --sourcedir=debian/install/udeb
-	dh_install $(BOOTSTRAP_DH_FLAGS) -Nudev-udeb -Nlibudev1-udeb --sourcedir=debian/install/deb --fail-missing
-	# install some files manually, --sourcedir makes that necessary
-	# udev-udeb
-	install -D --mode=755 debian/extra/udev.startup \
-		debian/udev-udeb/lib/debian-installer/start-udev
-	install -D --mode=755 debian/extra/udev.base-installer \
-		debian/udev-udeb/usr/lib/base-installer.d/05udev
-	mkdir -p debian/udev-udeb/lib/udev/rules.d/
-	install -D --mode=644 \
-		debian/extra/rules/73-idrac.rules \
-		debian/extra/rules/75-persistent-net-generator.rules \
-		debian/udev-udeb/lib/udev/rules.d/
-	mkdir -p debian/udev-udeb/lib/udev
-	install -D --mode=644 \
-		debian/extra/hotplug.functions \
-		debian/extra/rule_generator.functions \
-		debian/udev-udeb/lib/udev/
-	install -D --mode=755 \
-		debian/extra/write_net_rules \
-		debian/udev-udeb/lib/udev/
-	# udev: initramfs-tools support
-	install -D --mode=755 debian/extra/initramfs.hook \
-		debian/udev/usr/share/initramfs-tools/hooks/udev
-	install -D --mode=755 debian/extra/initramfs.top \
-		debian/udev/usr/share/initramfs-tools/scripts/init-top/udev
-	install -D --mode=755 debian/extra/initramfs.bottom \
-		debian/udev/usr/share/initramfs-tools/scripts/init-bottom/udev
-	# udev: debian specific rules and helpers
-	install -D --mode=644 debian/extra/rules/* \
-		debian/udev/lib/udev/rules.d/
-	install -D --mode=644 debian/extra/fbdev-blacklist.conf \
-		debian/udev/etc/modprobe.d/fbdev-blacklist.conf
-	install -D --mode=644 \
-		debian/extra/hotplug.functions \
-		debian/extra/rule_generator.functions \
-		debian/udev/lib/udev/
-	install -D --mode=755 \
-		debian/extra/dsl-modem.agent \
-		debian/extra/logger.agent \
-		debian/extra/net.agent \
-		debian/extra/udev-finish \
-		debian/extra/write_net_rules \
-		debian/udev/lib/udev/
-	# systemd
-	cp -a debian/pam-configs debian/libpam-systemd/usr/share/
-	install -D --mode=644 debian/init-functions.d/40-systemd \
-		debian/systemd/lib/lsb/init-functions.d/40-systemd
-	install --mode=644 debian/tmpfiles.d/debian.conf \
-		debian/systemd/usr/lib/tmpfiles.d/
-	install --mode=644 debian/debian-fixup.service \
-		debian/ifup@.service \
-		debian/extra/getty-static.service \
-		debian/extra/hwclock-save.service \
-		debian/extra/systemd-setup-dgram-qlen.service \
-		debian/systemd/lib/systemd/system/
-	install -D --mode=644 debian/extra/network-pre.conf \
-		debian/systemd/lib/systemd/system/networking.service.d/network-pre.conf
-	install --mode=644 debian/extra/udev-finish.service \
-		debian/udev/lib/systemd/system/
-	ln -s ../udev-finish.service debian/udev/lib/systemd/system/sysinit.target.wants/
-	install --mode=755 debian/debian-fixup \
-		debian/systemd/lib/systemd/
-	# Make sure the runlevel services are known by systemd so their targets
-	# get launches. See https://bugzilla.redhat.com/show_bug.cgi?id=1002806
-	for t in poweroff rescue multi-user graphical reboot; do \
-		mkdir -p debian/systemd/lib/systemd/system/$${t}.target.wants;\
-		ln -s ../systemd-update-utmp-runlevel.service \
-			debian/systemd/lib/systemd/system/$${t}.target.wants ;\
-	done
-	# man files for example code in /usr/share/doc
-	mkdir -p debian/systemd/usr/share/man/man3/
-	mv debian/libsystemd-dev/usr/share/man/man3/sd-readahead.3 \
-		debian/libsystemd-dev/usr/share/man/man3/sd_readahead.3 \
-		debian/systemd/usr/share/man/man3/
-	install --mode=755 debian/systemd-logind-launch \
-		debian/systemd/lib/systemd/
-	# remove duplicates
-	# files shipped by systemd-sysv / sysvinit
-	rm debian/systemd/usr/share/man/man1/init.1
-	rm debian/systemd/usr/share/man/man8/halt.8
-	rm debian/systemd/usr/share/man/man8/poweroff.8
-	rm debian/systemd/usr/share/man/man8/reboot.8
-	rm debian/systemd/usr/share/man/man8/shutdown.8
-	rm debian/systemd/usr/share/man/man8/telinit.8
-	rm debian/systemd/usr/share/man/man8/runlevel.8
-	# files shipped by libpam-systemd
-	rm debian/systemd/usr/share/man/man8/pam_systemd.8
-	# files shipped by udev
-	rm -r debian/systemd/etc/udev/
-	rm debian/systemd/lib/systemd/system/systemd-udev*
-	rm debian/systemd/lib/systemd/system/*.target.wants/systemd-udev*
-	rm debian/systemd/lib/systemd/systemd-udevd
-	rm debian/systemd/usr/share/man/man7/udev.7
-	rm debian/systemd/usr/share/man/man8/*udev*.8
-	# files shipped by udev / bash-completion
-	rm debian/systemd/usr/share/bash-completion/completions/udevadm
-	# files systemd by cryptsetup
-ifeq (,$(findstring stage1,$(DEB_BUILD_PROFILES)))
+endif
+
+	dh_install --remaining-packages --sourcedir=debian/install/deb $(DH_INSTALL_MISSING)
+
+	# we don't want /tmp to be a tmpfs by default
+	mv debian/systemd/lib/systemd/system/tmp.mount debian/systemd/usr/share/systemd/
+	printf '\n[Install]\nWantedBy=local-fs.target\n' >> debian/systemd/usr/share/systemd/tmp.mount
+	rm debian/systemd/lib/systemd/system/local-fs.target.wants/tmp.mount
+
+	# files shipped by cryptsetup
+ifeq (, $(filter stage1, $(DEB_BUILD_PROFILES)))
 	rm debian/systemd/usr/share/man/man5/crypttab.5
 endif
+
 	# files shipped by systemd
 	rm debian/udev/lib/udev/rules.d/70-uaccess.rules
 	rm debian/udev/lib/udev/rules.d/73-seat-late.rules
 	rm debian/udev/lib/udev/rules.d/71-seat.rules
 	rm debian/udev/lib/udev/rules.d/99-systemd.rules
 
-# use symlinked doc directories as the old udev package did
-override_dh_installdocs:
-	dh_installdocs -pudev -plibudev-dev --link-doc=libudev1
-	# we have to manually install udev's README for the above
-	install -D --mode 644 debian/udev.README.Debian debian/libudev1/usr/share/doc/libudev1/README.Debian
-	dh_installdocs -pgir1.2-gudev-1.0 -plibgudev-1.0-dev --link-doc=libgudev-1.0-0
-	dh_installdocs --remaining-packages
+	# remove duplicate files shipped by systemd-*/udev
+	echo "Removing duplicate files in systemd package:"
+	set -e; for pkg in $(shell dh_listpackages -Nudev-udeb -Nlibudev1-udeb -Nsystemd); do \
+		echo "... from $$pkg..."; \
+		(cd debian/$$pkg; find -type f -o -type l) | (cd debian/systemd; xargs rm -f --verbose); \
+		(cd debian/$$pkg; find -mindepth 1 -type d) | (cd debian/systemd; xargs rmdir --ignore-fail-on-non-empty --verbose || true); \
+	done
+
+	# ship unit tests for autopkgtests and manual tests
+	install -d debian/libsystemd-dev/usr/lib/$(DEB_HOST_MULTIARCH)/systemd-tests
+	install build-deb/.libs/test-* build-deb/test-copy build-deb/test-bus-error debian/libsystemd-dev/usr/lib/$(DEB_HOST_MULTIARCH)/systemd-tests/
+	# put a list of automatic tests into our package for the autopkgtest
+	printf 'print-tests:\n\t@echo $$(TESTS)\n' | make -f build-deb/Makefile -f - print-tests | xargs -n1 | grep ^test- > debian/libsystemd-dev/usr/lib/$(DEB_HOST_MULTIARCH)/systemd-tests/unittests.txt
+
+
+	# Ubuntu specific files
+ifeq ($(DEB_VENDOR),Ubuntu)
+	install -D --mode=644 debian/extra/udev.py debian/udev/usr/share/apport/package-hooks/udev.py
+	install -D --mode=644 debian/extra/systemd.py debian/systemd/usr/share/apport/package-hooks/systemd.py
+	install --mode=644 debian/extra/rules-ubuntu/*.rules debian/udev/lib/udev/rules.d/
+	cp -a debian/extra/units-ubuntu/* debian/systemd/lib/systemd/system/
+	install --mode=755 debian/extra/set-cpufreq debian/systemd/lib/systemd/
+endif
 
 override_dh_installinit:
 	dh_installinit --no-start
-	dh_installinit --name=udev-finish --no-start
-	dh_installinit --name=udevtrigger --no-start
-	dh_installinit --name=udevmonitor --no-start
-	dh_installinit --name=udev-fallback-graphics --no-start
+	# the following are only upstart jobs
+	dh_installinit --name=udevtrigger --noscripts
+	dh_installinit --name=udevmonitor --noscripts
+	dh_installinit --name=udev-fallback-graphics --noscripts
 
 # The SysV compat tools (which are symlinks to systemctl) are
-# quasi-essential, so add its dependencies to Pre-Depends
+# quasi-essential, so add their dependencies to Pre-Depends
 # https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=753589
 override_dh_shlibdeps:
 	dh_shlibdeps -psystemd -- -dPre-Depends -edebian/systemd/bin/systemctl -dDepends
-	dh_shlibdeps --remaining-packages
+	dh_shlibdeps -plibsystemd-dev -Xtests
+	dh_shlibdeps --remaining-packages -Lsystemd
 
 override_dh_makeshlibs:
-	dh_makeshlibs -plibudev1 --add-udeb=libudev1-udeb
-	dh_makeshlibs --remaining-packages
+	sed 's/SHARED_LIB_VERSION/$(shell sed -n '/^PACKAGE_VERSION/ {s/^.*= *//; p}' build-deb/Makefile)/' debian/shlibs.local.in > debian/shlibs.local
+	dh_makeshlibs -plibudev1 --add-udeb=libudev1-udeb -- -c$(GENSYMBOLS_LEVEL)
+	dh_makeshlibs -psystemd -Xlibsystemd-shared -- -c$(GENSYMBOLS_LEVEL)
+	dh_makeshlibs --remaining-packages -- -c$(GENSYMBOLS_LEVEL)
 
 autoreconf:
-	gtkdocize --copy --docdir docs/
 	intltoolize -f -c
 	autoreconf -f -i
 
 override_dh_autoreconf:
-	dh_autoreconf debian/rules -- autoreconf
+	dh_autoreconf --as-needed debian/rules -- autoreconf
 
 override_dh_strip:
-	dh_strip --dbg-package=systemd-dbg
+	dh_strip --dbgsym-migration='systemd-dbg (<< 229-6~)'
+
+override_dh_gencontrol:
+	dh_gencontrol -- -VBreaks:usb-modeswitch="$(BREAKS_USB_MODESWITCH)" -VBreaks:rcs-compat="$(BREAKS_RCS_COMPAT)"
 
 override_dh_auto_test:
-ifeq (, $(findstring nocheck, $(DEB_BUILD_OPTIONS)))
-	# some tests hang under fakeroot, so disable fakeroot
+ifeq (, $(filter nocheck, $(DEB_BUILD_OPTIONS)))
 	echo "01234567890123456789012345678901" > build-deb/machine-id
-	env -u LD_PRELOAD SYSTEMD_MACHINE_ID_PATH=$(CURDIR)/build-deb/machine-id \
-		make -C build-deb check || ( \
+	# some tests hang under fakeroot, so disable fakeroot
+	# some tests are known to fail under ancient kernels
+	env -u LD_PRELOAD SYSTEMD_MACHINE_ID_PATH=$(CURDIR)/build-deb/machine-id make -C build-deb check || ( \
 		cd build-deb; \
 		for f in test-*.log; do echo "==== $$f ===="; cat $$f; done; \
-		exit 0; )  # replace with 1 to make failures fatal
+		if linux-version compare "$$(uname -r)" ge 3.13; then \
+		    exit 1; \
+		else \
+		    echo "Ignoring test failure under too old kernel $$(uname -r)"; \
+		fi)
 endif
 
 %:
-ifeq (,$(findstring stage1,$(DEB_BUILD_PROFILES)))
-	dh $@ --with autoreconf,gir,python3 --parallel
-else
-	dh $@ --with autoreconf,python3 $(BOOTSTRAP_DH_FLAGS)
-endif
+	dh $@ --with autoreconf --parallel

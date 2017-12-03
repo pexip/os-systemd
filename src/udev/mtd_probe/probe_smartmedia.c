@@ -17,15 +17,16 @@
  * Boston, MA  02110-1301  USA
  */
 
+#include <fcntl.h>
+#include <mtd/mtd-user.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <mtd/mtd-user.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/types.h>
 #include <unistd.h>
-#include <stdint.h>
+
 #include "mtd_probe.h"
 
 static const uint8_t cis_signature[] = {
@@ -72,7 +73,7 @@ void probe_smart_media(int mtd_fd, mtd_info_t* info)
         for (offset = 0 ; offset < block_size * spare_count ;
                                                 offset += sector_size) {
                 lseek(mtd_fd, SEEK_SET, offset);
-                if (read(mtd_fd, cis_buffer, SM_SECTOR_SIZE) == SM_SECTOR_SIZE){
+                if (read(mtd_fd, cis_buffer, SM_SECTOR_SIZE) == SM_SECTOR_SIZE) {
                         cis_found = 1;
                         break;
                 }
