@@ -1,0 +1,140 @@
+From ae3251851aa64138f415567b0a0d0df143182803 Mon Sep 17 00:00:00 2001
+From: Ruslan Bilovol <ruslan.bilovol@gmail.com>
+Date: Mon, 13 Feb 2017 21:50:22 +0200
+Subject: [PATCH] fstab-generator: add x-systemd.before and x-systemd.after
+ fstab options (#5330)
+
+Currently fstab entries with 'nofail' option are mounted
+asynchronously and there is no way how to specify dependencies
+between such fstab entry and another units. It means that
+users are forced to write additional dependency units manually.
+
+The patch introduces new systemd fstab options:
+
+x-systemd.before=<PATH>
+x-systemd.after=<PATH>
+
+ - to specify another mount dependency (PATH is translated to unit name)
+
+x-systemd.before=<UNIT>
+x-systemd.after=<UNIT>
+
+ - to specify arbitrary UNIT dependency
+
+For example mount where A should be mounted before local-fs.target unit:
+
+ /dev/sdb1    /mnt/test/A     none    nofail,x-systemd.before=local-fs.target
+---
+ man/systemd.mount.xml                 | 19 +++++++++++++++++++
+ src/fstab-generator/fstab-generator.c | 33 ++++++++++++++++++++++++++++++---
+ 2 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/man/systemd.mount.xml b/man/systemd.mount.xml
+index bb372d788a3..598b5772fd5 100644
+--- a/man/systemd.mount.xml
++++ b/man/systemd.mount.xml
+@@ -193,6 +193,25 @@
+         for details.</para></listitem>
+       </varlistentry>
+ 
++      <varlistentry>
++        <term><option>x-systemd.before=</option></term>
++        <term><option>x-systemd.after=</option></term>
++
++        <listitem><para>Configures a <varname>Before=</varname>
++        dependency or <varname>After=</varname> between the created
++        mount unit and another systemd unit, such as a mount unit.
++        The argument should be a unit name or an absolute path
++        to a mount point. This option may be specified more than once.
++        This option is particularly useful for mount point declarations
++        with <option>nofail</option> option that are mounted
++        asynchronously but need to be mounted before or after some unit
++        start, for example, before <filename>local-fs.target</filename>
++        unit.
++        See <varname>Before=</varname> and <varname>After=</varname> in
++        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>
++        for details.</para></listitem>
++      </varlistentry>
++
+       <varlistentry>
+         <term><option>x-systemd.requires-mounts-for=</option></term>
+ 
+diff --git a/src/fstab-generator/fstab-generator.c b/src/fstab-generator/fstab-generator.c
+index d97bafd1fb2..c38a5aa2572 100644
+--- a/src/fstab-generator/fstab-generator.c
++++ b/src/fstab-generator/fstab-generator.c
+@@ -209,7 +209,8 @@ static int write_mount_timeout(FILE *f, const char *where, const char *opts) {
+         return !!*values;
+ }
+ 
+-static int write_requires_after(FILE *f, const char *opts) {
++static int write_dependency(FILE *f, const char *opts,
++                const char *filter, const char *format) {
+         _cleanup_strv_free_ char **names = NULL, **units = NULL;
+         _cleanup_free_ char *res = NULL;
+         char **s;
+@@ -218,7 +219,7 @@ static int write_requires_after(FILE *f, const char *opts) {
+         assert(f);
+         assert(opts);
+ 
+-        r = fstab_extract_values(opts, "x-systemd.requires", &names);
++        r = fstab_extract_values(opts, filter, &names);
+         if (r < 0) {
+                 log_warning("Failed to parse options: %s", strerror(-r));
+                 return r;
+@@ -239,12 +240,26 @@ static int write_requires_after(FILE *f, const char *opts) {
+                 res = strv_join(units, " ");
+                 if (!res)
+                         return log_oom();
+-                fprintf(f, "After=%1$s\nRequires=%1$s\n", res);
++                fprintf(f, format, res);
+         }
+ 
+         return 0;
+ }
+ 
++static int write_after(FILE *f, const char *opts) {
++        return write_dependency(f, opts, "x-systemd.after", "After=%1$s\n");
++}
++
++static int write_requires_after(FILE *f, const char *opts) {
++        return write_dependency(f, opts,
++                                "x-systemd.requires", "After=%1$s\nRequires=%1$s\n");
++}
++
++static int write_before(FILE *f, const char *opts) {
++        return write_dependency(f, opts,
++                                "x-systemd.before", "Before=%1$s\n");
++}
++
+ static int write_requires_mounts_for(FILE *f, const char *opts) {
+         _cleanup_strv_free_ char **paths = NULL;
+         _cleanup_free_ char *res = NULL;
+@@ -344,7 +359,13 @@ static int add_mount(
+                 fprintf(f, "Before=%s\n", post);
+ 
+         if (!automount && opts) {
++                 r = write_after(f, opts);
++                 if (r < 0)
++                         return r;
+                  r = write_requires_after(f, opts);
++                 if (r < 0)
++                         return r;
++                 r = write_before(f, opts);
+                  if (r < 0)
+                          return r;
+                  r = write_requires_mounts_for(f, opts);
+@@ -421,7 +442,13 @@ static int add_mount(
+                                 post);
+ 
+                 if (opts) {
++                        r = write_after(f, opts);
++                        if (r < 0)
++                                return r;
+                         r = write_requires_after(f, opts);
++                        if (r < 0)
++                                return r;
++                        r = write_before(f, opts);
+                         if (r < 0)
+                                 return r;
+                         r = write_requires_mounts_for(f, opts);
