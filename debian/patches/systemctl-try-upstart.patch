@@ -1,0 +1,94 @@
+diff --git a/src/systemctl/systemctl.c b/src/systemctl/systemctl.c
+index 03720f4..95b4945 100644
+--- a/src/systemctl/systemctl.c
++++ b/src/systemctl/systemctl.c
+@@ -6523,6 +6523,78 @@ static int talk_initctl(void) {
+         return 1;
+ }
+ 
++static int bus_open_upstart(sd_bus **_bus) {
++        _cleanup_bus_unref_ sd_bus *bus = NULL;
++        int r;
++
++        assert(_bus);
++
++        if (geteuid() != 0)
++                return -EPERM;
++
++        r = sd_bus_new(&bus);
++        if (r < 0)
++                return r;
++
++        r = sd_bus_set_address(bus, "unix:abstract=/com/ubuntu/upstart");
++        if (r < 0)
++                return r;
++
++        r = sd_bus_start(bus);
++        if (r < 0)
++                return r;
++
++        r = bus_check_peercred(bus);
++        if (r < 0)
++                return r;
++
++        *_bus = bus;
++        bus = NULL;
++
++        return 0;
++}
++
++static int talk_upstart(void) {
++        _cleanup_bus_unref_ sd_bus *bus = NULL;
++        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
++        char arg1[] = "RUNLEVEL=N";
++        char arg2[] = "PREVLEVEL=N";
++        char *args[] = { arg1, arg2 };
++        int rl, pl;
++        int r;
++
++        rl = action_to_runlevel();
++        if (!rl)
++                return 0;
++
++        r = utmp_get_runlevel(&pl, NULL);
++        if (r < 0)
++                return r;
++
++        arg1[strlen(arg1)-1] = rl;
++        arg2[strlen(arg2)-1] = pl < 0 ? 'N' : pl;
++
++        r = bus_open_upstart(&bus);
++        if (r < 0)
++                return r;
++
++        r = sd_bus_call_method(
++                        bus,
++                        "com.ubuntu.Upstart",
++                        "/com/ubuntu/Upstart",
++                        "com.ubuntu.Upstart0_6",
++                        "EmitEvent",
++                        &error,
++                        NULL,
++                        "sasb", "runlevel", 2, args[0], args[1], false);
++        if (r < 0) {
++                log_error("Failed to call upstart: %s", bus_error_message(&error, r));
++                return r;
++        }
++
++        return 1;
++}
++
+ static int systemctl_main(sd_bus *bus, int argc, char *argv[], int bus_error) {
+ 
+         static const struct {
+@@ -6754,6 +6826,10 @@ static int start_with_fallback(sd_bus *bus) {
+                         goto done;
+         }
+ 
++        /* Try talking to upstart via D-Bus. */
++        if (talk_upstart() > 0)
++                goto done;
++
+         /* Nothing else worked, so let's try
+          * /dev/initctl */
+         if (talk_initctl() > 0)

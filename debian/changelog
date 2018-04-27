@@ -1,6 +1,7 @@
 systemd (215-17+deb8u7pexip2) pexip; urgency=low
 
   * Backport support for x-systemd.{before,after,requires} in fstab
+  * Make systemctl try to fallback to upstart if possible
 
  -- John-Mark Bell <jmb@pexip.com>  Thu, 25 Apr 2018 01:52:34 +0100
 
