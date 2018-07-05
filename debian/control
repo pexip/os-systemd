@@ -39,7 +39,7 @@ Build-Depends: debhelper (>= 9),
                python3-all-dev,
                python3-lxml,
                libglib2.0-doc
-XS-Pexip-Upstream: http://ftp.debian.org/debian/ jessie
+XS-Pexip-Upstream: http://ftp.debian.org/debian/ stretch
 
 Package: systemd
 Architecture: linux-any
