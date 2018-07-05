@@ -12,38 +12,35 @@
  * GNU General Public License for more details.
  */
 
-#include <time.h>
 #include <errno.h>
+#include <getopt.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stddef.h>
 #include <string.h>
 #include <unistd.h>
-#include <getopt.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <sys/un.h>
 
-#include "udev.h"
+#include "time-util.h"
 #include "udev-util.h"
+#include "udev.h"
 
-static void print_help(void)
-{
-        printf("Usage: udevadm control COMMAND\n"
-                "  -e,--exit                 instruct the daemon to cleanup and exit\n"
-                "  -l,--log-priority=LEVEL   set the udev log level for the daemon\n"
-                "  -s,--stop-exec-queue      do not execute events, queue only\n"
-                "  -S,--start-exec-queue     execute events, flush queue\n"
-                "  -R,--reload               reload rules and databases\n"
-                "  -p,--property=KEY=VALUE   set a global property for all events\n"
-                "  -m,--children-max=N       maximum number of children\n"
-                "     --timeout=SECONDS      maximum time to block for a reply\n"
-                "  -h,--help                 print this help text\n\n");
+static void print_help(void) {
+        printf("%s control COMMAND\n\n"
+               "Control the udev daemon.\n\n"
+               "  -h --help                Show this help\n"
+               "     --version             Show package version\n"
+               "  -e --exit                Instruct the daemon to cleanup and exit\n"
+               "  -l --log-priority=LEVEL  Set the udev log level for the daemon\n"
+               "  -s --stop-exec-queue     Do not execute events, queue only\n"
+               "  -S --start-exec-queue    Execute events, flush queue\n"
+               "  -R --reload              Reload rules and databases\n"
+               "  -p --property=KEY=VALUE  Set a global property for all events\n"
+               "  -m --children-max=N      Maximum number of children\n"
+               "     --timeout=SECONDS     Maximum time to block for a reply\n"
+               , program_invocation_short_name);
 }
 
-static int adm_control(struct udev *udev, int argc, char *argv[])
-{
+static int adm_control(struct udev *udev, int argc, char *argv[]) {
         _cleanup_udev_ctrl_unref_ struct udev_ctrl *uctrl = NULL;
         int timeout = 60;
         int rc = 1, c;
@@ -64,7 +61,7 @@ static int adm_control(struct udev *udev, int argc, char *argv[])
         };
 
         if (getuid() != 0) {
-                fprintf(stderr, "root privileges required\n");
+                log_error("root privileges required");
                 return 1;
         }
 
@@ -85,7 +82,7 @@ static int adm_control(struct udev *udev, int argc, char *argv[])
 
                         i = util_log_priority(optarg);
                         if (i < 0) {
-                                fprintf(stderr, "invalid number '%s'\n", optarg);
+                                log_error("invalid number '%s'", optarg);
                                 return rc;
                         }
                         if (udev_ctrl_send_set_log_level(uctrl, util_log_priority(optarg), timeout) < 0)
@@ -114,7 +111,7 @@ static int adm_control(struct udev *udev, int argc, char *argv[])
                         break;
                 case 'p':
                         if (strchr(optarg, '=') == NULL) {
-                                fprintf(stderr, "expect <KEY>=<value> instead of '%s'\n", optarg);
+                                log_error("expect <KEY>=<value> instead of '%s'", optarg);
                                 return rc;
                         }
                         if (udev_ctrl_send_set_env(uctrl, optarg, timeout) < 0)
@@ -128,7 +125,7 @@ static int adm_control(struct udev *udev, int argc, char *argv[])
 
                         i = strtoul(optarg, &endp, 0);
                         if (endp[0] != '\0' || i < 1) {
-                                fprintf(stderr, "invalid number '%s'\n", optarg);
+                                log_error("invalid number '%s'", optarg);
                                 return rc;
                         }
                         if (udev_ctrl_send_set_children_max(uctrl, i, timeout) < 0)
@@ -138,13 +135,21 @@ static int adm_control(struct udev *udev, int argc, char *argv[])
                         break;
                 }
                 case 't': {
+                        usec_t s;
                         int seconds;
+                        int r;
 
-                        seconds = atoi(optarg);
-                        if (seconds >= 0)
+                        r = parse_sec(optarg, &s);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse timeout value '%s'.", optarg);
+
+                        if (((s + USEC_PER_SEC - 1) / USEC_PER_SEC) > INT_MAX)
+                                log_error("Timeout value is out of range.");
+                        else {
+                                seconds = s != USEC_INFINITY ? (int) ((s + USEC_PER_SEC - 1) / USEC_PER_SEC) : INT_MAX;
                                 timeout = seconds;
-                        else
-                                fprintf(stderr, "invalid timeout value\n");
+                                rc = 0;
+                        }
                         break;
                 }
                 case 'h':
@@ -154,14 +159,14 @@ static int adm_control(struct udev *udev, int argc, char *argv[])
                 }
 
         if (optind < argc)
-                fprintf(stderr, "Extraneous argument: %s\n", argv[optind]);
+                log_error("Extraneous argument: %s", argv[optind]);
         else if (optind == 1)
-                fprintf(stderr, "Option missing\n");
+                log_error("Option missing");
         return rc;
 }
 
 const struct udevadm_cmd udevadm_control = {
         .name = "control",
         .cmd = adm_control,
-        .help = "control the udev daemon",
+        .help = "Control the udev daemon",
 };

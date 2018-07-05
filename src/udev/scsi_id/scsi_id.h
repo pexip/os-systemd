@@ -1,3 +1,5 @@
+#pragma once
+
 /*
  * Copyright (C) IBM Corp. 2003
  *

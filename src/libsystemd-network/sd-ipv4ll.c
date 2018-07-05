@@ -2,6 +2,7 @@
   This file is part of systemd.
 
   Copyright (C) 2014 Axis Communications AB. All rights reserved.
+  Copyright (C) 2015 Tom Gundersen
 
   systemd is free software; you can redistribute it and/or modify it
   under the terms of the GNU Lesser General Public License as published by
@@ -17,607 +18,84 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdlib.h>
-#include <errno.h>
-#include <string.h>
-#include <stdio.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include "util.h"
-#include "siphash24.h"
-#include "list.h"
-#include "refcnt.h"
-
-#include "ipv4ll-internal.h"
+#include "sd-ipv4acd.h"
 #include "sd-ipv4ll.h"
 
-/* Constants from the RFC */
-#define PROBE_WAIT 1
-#define PROBE_NUM 3
-#define PROBE_MIN 1
-#define PROBE_MAX 2
-#define ANNOUNCE_WAIT 2
-#define ANNOUNCE_NUM 2
-#define ANNOUNCE_INTERVAL 2
-#define MAX_CONFLICTS 10
-#define RATE_LIMIT_INTERVAL 60
-#define DEFEND_INTERVAL 10
+#include "alloc-util.h"
+#include "ether-addr-util.h"
+#include "in-addr-util.h"
+#include "list.h"
+#include "random-util.h"
+#include "siphash24.h"
+#include "sparse-endian.h"
+#include "string-util.h"
+#include "util.h"
 
-#define IPV4LL_NETWORK 0xA9FE0000L
-#define IPV4LL_NETMASK 0xFFFF0000L
+#define IPV4LL_NETWORK UINT32_C(0xA9FE0000)
+#define IPV4LL_NETMASK UINT32_C(0xFFFF0000)
 
-typedef enum IPv4LLTrigger{
-        IPV4LL_TRIGGER_NULL,
-        IPV4LL_TRIGGER_PACKET,
-        IPV4LL_TRIGGER_TIMEOUT,
-        _IPV4LL_TRIGGER_MAX,
-        _IPV4LL_TRIGGER_INVALID = -1
-} IPv4LLTrigger;
-
-typedef enum IPv4LLState {
-        IPV4LL_STATE_INIT,
-        IPV4LL_STATE_WAITING_PROBE,
-        IPV4LL_STATE_PROBING,
-        IPV4LL_STATE_WAITING_ANNOUNCE,
-        IPV4LL_STATE_ANNOUNCING,
-        IPV4LL_STATE_RUNNING,
-        IPV4LL_STATE_STOPPED,
-        _IPV4LL_STATE_MAX,
-        _IPV4LL_STATE_INVALID = -1
-} IPv4LLState;
+#define IPV4LL_DONT_DESTROY(ll) \
+        _cleanup_(sd_ipv4ll_unrefp) _unused_ sd_ipv4ll *_dont_destroy_##ll = sd_ipv4ll_ref(ll)
 
 struct sd_ipv4ll {
-        RefCount n_ref;
+        unsigned n_ref;
 
-        IPv4LLState state;
-        int index;
-        int fd;
-        union sockaddr_union link;
-        int iteration;
-        int conflict;
-        sd_event_source *receive_message;
-        sd_event_source *timer;
-        usec_t next_wakeup;
-        usec_t defend_window;
-        int next_wakeup_valid;
-        be32_t address;
-        struct random_data *random_data;
-        char *random_data_state;
+        sd_ipv4acd *acd;
+
+        be32_t address; /* the address pushed to ACD */
+        struct ether_addr mac;
+
+        struct {
+                le64_t value;
+                le64_t generation;
+        } seed;
+        bool seed_set;
+
         /* External */
         be32_t claimed_address;
-        struct ether_addr mac_addr;
-        sd_event *event;
-        int event_priority;
-        sd_ipv4ll_cb_t cb;
+
+        sd_ipv4ll_callback_t callback;
         void* userdata;
 };
 
-static void ipv4ll_run_state_machine(sd_ipv4ll *ll, IPv4LLTrigger trigger, void *trigger_data);
+#define log_ipv4ll_errno(ll, error, fmt, ...) log_internal(LOG_DEBUG, error, __FILE__, __LINE__, __func__, "IPV4LL: " fmt, ##__VA_ARGS__)
+#define log_ipv4ll(ll, fmt, ...) log_ipv4ll_errno(ll, 0, fmt, ##__VA_ARGS__)
 
-static void ipv4ll_set_state(sd_ipv4ll *ll, IPv4LLState st, int reset_counter) {
-
-        assert(ll);
-        assert(st < _IPV4LL_STATE_MAX);
-
-        if (st == ll->state && !reset_counter) {
-                ll->iteration++;
-        } else {
-                ll->state = st;
-                ll->iteration = 0;
-        }
-}
-
-static sd_ipv4ll *ipv4ll_client_notify(sd_ipv4ll *ll, int event) {
-        assert(ll);
-
-        if (ll->cb) {
-                ll = sd_ipv4ll_ref(ll);
-                ll->cb(ll, event, ll->userdata);
-                ll = sd_ipv4ll_unref(ll);
-        }
-
-        return ll;
-}
-
-static sd_ipv4ll *ipv4ll_stop(sd_ipv4ll *ll, int event) {
-        assert(ll);
-
-        ll->receive_message = sd_event_source_unref(ll->receive_message);
-        ll->fd = safe_close(ll->fd);
-
-        ll->timer = sd_event_source_unref(ll->timer);
-
-        log_ipv4ll(ll, "STOPPED");
-
-        ll = ipv4ll_client_notify(ll, event);
-
-        if (ll) {
-                ll->claimed_address = 0;
-                ipv4ll_set_state (ll, IPV4LL_STATE_INIT, 1);
-        }
-
-        return ll;
-}
-
-static int ipv4ll_pick_address(sd_ipv4ll *ll, be32_t *address) {
-        be32_t addr;
-        int r;
-        int32_t random;
-
-        assert(ll);
-        assert(address);
-        assert(ll->random_data);
-
-        do {
-                r = random_r(ll->random_data, &random);
-                if (r < 0)
-                        return r;
-                addr = htonl((random & 0x0000FFFF) | IPV4LL_NETWORK);
-        } while (addr == ll->address ||
-                (ntohl(addr) & IPV4LL_NETMASK) != IPV4LL_NETWORK ||
-                (ntohl(addr) & 0x0000FF00) == 0x0000 ||
-                (ntohl(addr) & 0x0000FF00) == 0xFF00);
-
-        *address = addr;
-        return 0;
-}
-
-static int ipv4ll_timer(sd_event_source *s, uint64_t usec, void *userdata) {
-        sd_ipv4ll *ll = (sd_ipv4ll*)userdata;
-
-        assert(ll);
-
-        ll->next_wakeup_valid = 0;
-        ipv4ll_run_state_machine(ll, IPV4LL_TRIGGER_TIMEOUT, NULL);
-
-        return 0;
-}
-
-static void ipv4ll_set_next_wakeup(sd_ipv4ll *ll, int sec, int random_sec) {
-        usec_t next_timeout = 0;
-        usec_t time_now = 0;
-
-        assert(sec >= 0);
-        assert(random_sec >= 0);
-        assert(ll);
-
-        next_timeout = sec * USEC_PER_SEC;
-
-        if (random_sec)
-                next_timeout += random_u32() % (random_sec * USEC_PER_SEC);
-
-        if (sd_event_now(ll->event, CLOCK_MONOTONIC, &time_now) < 0)
-                time_now = now(CLOCK_MONOTONIC);
-
-        ll->next_wakeup = time_now + next_timeout;
-        ll->next_wakeup_valid = 1;
-}
-
-static bool ipv4ll_arp_conflict (sd_ipv4ll *ll, struct ether_arp *arp) {
-        assert(ll);
-        assert(arp);
-
-        if (memcmp(arp->arp_spa, &ll->address, sizeof(ll->address)) == 0 &&
-            memcmp(arp->arp_sha, &ll->mac_addr, ETH_ALEN) != 0)
-                return true;
-
-        return false;
-}
-
-static bool ipv4ll_arp_probe_conflict (sd_ipv4ll *ll, struct ether_arp *arp) {
-        assert(ll);
-        assert(arp);
-
-        if (ipv4ll_arp_conflict(ll, arp))
-                return true;
-
-        if (memcmp(arp->arp_tpa, &ll->address, sizeof(ll->address)) == 0 &&
-            memcmp(arp->arp_sha, &ll->mac_addr, ETH_ALEN))
-                return true;
-
-        return false;
-}
-
-static void ipv4ll_run_state_machine(sd_ipv4ll *ll, IPv4LLTrigger trigger, void *trigger_data) {
-        struct ether_arp out_packet;
-        int out_packet_ready = 0;
-        int r = 0;
-
-        assert(ll);
-        assert(trigger < _IPV4LL_TRIGGER_MAX);
-
-        if (ll->state == IPV4LL_STATE_INIT) {
-
-                log_ipv4ll(ll, "PROBE");
-                ipv4ll_set_state(ll, IPV4LL_STATE_WAITING_PROBE, 1);
-                ipv4ll_set_next_wakeup(ll, 0, PROBE_WAIT);
-
-        } else if ((ll->state == IPV4LL_STATE_WAITING_PROBE && trigger == IPV4LL_TRIGGER_TIMEOUT) ||
-                (ll->state == IPV4LL_STATE_PROBING && trigger == IPV4LL_TRIGGER_TIMEOUT && ll->iteration < PROBE_NUM-2)) {
-
-                /* Send a probe */
-                arp_packet_probe(&out_packet, ll->address, &ll->mac_addr);
-                out_packet_ready = 1;
-                ipv4ll_set_state(ll, IPV4LL_STATE_PROBING, 0);
-
-                ipv4ll_set_next_wakeup(ll, PROBE_MIN, (PROBE_MAX-PROBE_MIN));
-
-        } else if (ll->state == IPV4LL_STATE_PROBING && trigger == IPV4LL_TRIGGER_TIMEOUT && ll->iteration >= PROBE_NUM-2) {
-
-                /* Send the last probe */
-                arp_packet_probe(&out_packet, ll->address, &ll->mac_addr);
-                out_packet_ready = 1;
-                ipv4ll_set_state(ll, IPV4LL_STATE_WAITING_ANNOUNCE, 1);
-
-                ipv4ll_set_next_wakeup(ll, ANNOUNCE_WAIT, 0);
-
-        } else if ((ll->state == IPV4LL_STATE_WAITING_ANNOUNCE && trigger == IPV4LL_TRIGGER_TIMEOUT) ||
-                (ll->state == IPV4LL_STATE_ANNOUNCING && trigger == IPV4LL_TRIGGER_TIMEOUT && ll->iteration < ANNOUNCE_NUM-1)) {
-
-                /* Send announcement packet */
-                arp_packet_announcement(&out_packet, ll->address, &ll->mac_addr);
-                out_packet_ready = 1;
-                ipv4ll_set_state(ll, IPV4LL_STATE_ANNOUNCING, 0);
-
-                ipv4ll_set_next_wakeup(ll, ANNOUNCE_INTERVAL, 0);
-
-                if (ll->iteration == 0) {
-                        log_ipv4ll(ll, "ANNOUNCE");
-                        ll->claimed_address = ll->address;
-                        ll = ipv4ll_client_notify(ll, IPV4LL_EVENT_BIND);
-                        if (!ll || ll->state == IPV4LL_STATE_STOPPED)
-                                goto out;
-
-                        ll->conflict = 0;
-                }
-
-        } else if ((ll->state == IPV4LL_STATE_ANNOUNCING && trigger == IPV4LL_TRIGGER_TIMEOUT &&
-                    ll->iteration >= ANNOUNCE_NUM-1)) {
-
-                ipv4ll_set_state(ll, IPV4LL_STATE_RUNNING, 0);
-                ll->next_wakeup_valid = 0;
-
-        } else if (trigger == IPV4LL_TRIGGER_PACKET) {
-
-                int conflicted = 0;
-                usec_t time_now;
-                struct ether_arp* in_packet = (struct ether_arp*)trigger_data;
-
-                assert(in_packet);
-
-                if (IN_SET(ll->state, IPV4LL_STATE_ANNOUNCING, IPV4LL_STATE_RUNNING)) {
-
-                        if (ipv4ll_arp_conflict(ll, in_packet)) {
-
-                                r = sd_event_now(ll->event, CLOCK_MONOTONIC, &time_now);
-                                if (r < 0)
-                                        goto out;
-
-                                /* Defend address */
-                                if (time_now > ll->defend_window) {
-                                        ll->defend_window = time_now + DEFEND_INTERVAL * USEC_PER_SEC;
-                                        arp_packet_announcement(&out_packet, ll->address, &ll->mac_addr);
-                                        out_packet_ready = 1;
-                                } else
-                                        conflicted = 1;
-                        }
-
-                } else if (IN_SET(ll->state, IPV4LL_STATE_WAITING_PROBE,
-                                             IPV4LL_STATE_PROBING,
-                                             IPV4LL_STATE_WAITING_ANNOUNCE)) {
-
-                        conflicted = ipv4ll_arp_probe_conflict(ll, in_packet);
-                }
-
-                if (conflicted) {
-                        log_ipv4ll(ll, "CONFLICT");
-                        ll = ipv4ll_client_notify(ll, IPV4LL_EVENT_CONFLICT);
-                        if (!ll || ll->state == IPV4LL_STATE_STOPPED)
-                                goto out;
-
-                        ll->claimed_address = 0;
-
-                        /* Pick a new address */
-                        r = ipv4ll_pick_address(ll, &ll->address);
-                        if (r < 0)
-                                goto out;
-                        ll->conflict++;
-                        ll->defend_window = 0;
-                        ipv4ll_set_state(ll, IPV4LL_STATE_WAITING_PROBE, 1);
-
-                        if (ll->conflict >= MAX_CONFLICTS) {
-                                log_ipv4ll(ll, "MAX_CONFLICTS");
-                                ipv4ll_set_next_wakeup(ll, RATE_LIMIT_INTERVAL, PROBE_WAIT);
-                        } else
-                                ipv4ll_set_next_wakeup(ll, 0, PROBE_WAIT);
-
-                }
-        }
-
-        if (out_packet_ready) {
-                r = arp_network_send_raw_socket(ll->fd, &ll->link, &out_packet);
-                if (r < 0) {
-                        log_ipv4ll(ll, "failed to send arp packet out");
-                        goto out;
-                }
-        }
-
-        if (ll->next_wakeup_valid) {
-                ll->timer = sd_event_source_unref(ll->timer);
-                r = sd_event_add_time(ll->event, &ll->timer, CLOCK_MONOTONIC,
-                                      ll->next_wakeup, 0, ipv4ll_timer, ll);
-                if (r < 0)
-                        goto out;
-
-                r = sd_event_source_set_priority(ll->timer, ll->event_priority);
-                if (r < 0)
-                        goto out;
-        }
-
-out:
-        if (r < 0 && ll)
-                ipv4ll_stop(ll, r);
-}
-
-static int ipv4ll_receive_message(sd_event_source *s, int fd,
-                                  uint32_t revents, void *userdata) {
-        int r;
-        struct ether_arp arp;
-        sd_ipv4ll *ll = (sd_ipv4ll*)userdata;
-
-        assert(ll);
-
-        r = read(fd, &arp, sizeof(struct ether_arp));
-        if (r < (int) sizeof(struct ether_arp))
-                return 0;
-
-        r = arp_packet_verify_headers(&arp);
-        if (r < 0)
-                return 0;
-
-        ipv4ll_run_state_machine(ll, IPV4LL_TRIGGER_PACKET, &arp);
-
-        return 0;
-}
-
-int sd_ipv4ll_set_index(sd_ipv4ll *ll, int interface_index) {
-        assert_return(ll, -EINVAL);
-        assert_return(interface_index > 0, -EINVAL);
-        assert_return(IN_SET(ll->state, IPV4LL_STATE_INIT,
-                             IPV4LL_STATE_STOPPED), -EBUSY);
-
-        ll->index = interface_index;
-
-        return 0;
-}
-
-int sd_ipv4ll_set_mac(sd_ipv4ll *ll, const struct ether_addr *addr) {
-        bool need_restart = false;
-
-        assert_return(ll, -EINVAL);
-        assert_return(addr, -EINVAL);
-
-        if (memcmp(&ll->mac_addr, addr, ETH_ALEN) == 0)
-                return 0;
-
-        if (!IN_SET(ll->state, IPV4LL_STATE_INIT, IPV4LL_STATE_STOPPED)) {
-                log_ipv4ll(ll, "Changing MAC address on running IPv4LL "
-                           "client, restarting");
-                ll = ipv4ll_stop(ll, IPV4LL_EVENT_STOP);
-                need_restart = true;
-        }
-
-        if (!ll)
-                return 0;
-
-        memcpy(&ll->mac_addr, addr, ETH_ALEN);
-
-        if (need_restart)
-                sd_ipv4ll_start(ll);
-
-        return 0;
-}
-
-int sd_ipv4ll_detach_event(sd_ipv4ll *ll) {
-        assert_return(ll, -EINVAL);
-
-        ll->event = sd_event_unref(ll->event);
-
-        return 0;
-}
-
-int sd_ipv4ll_attach_event(sd_ipv4ll *ll, sd_event *event, int priority) {
-        int r;
-
-        assert_return(ll, -EINVAL);
-        assert_return(!ll->event, -EBUSY);
-
-        if (event)
-                ll->event = sd_event_ref(event);
-        else {
-                r = sd_event_default(&ll->event);
-                if (r < 0) {
-                        ipv4ll_stop(ll, IPV4LL_EVENT_STOP);
-                        return r;
-                }
-        }
-
-        ll->event_priority = priority;
-
-        return 0;
-}
-
-int sd_ipv4ll_set_callback(sd_ipv4ll *ll, sd_ipv4ll_cb_t cb, void *userdata) {
-        assert_return(ll, -EINVAL);
-
-        ll->cb = cb;
-        ll->userdata = userdata;
-
-        return 0;
-}
-
-int sd_ipv4ll_get_address(sd_ipv4ll *ll, struct in_addr *address){
-        assert_return(ll, -EINVAL);
-        assert_return(address, -EINVAL);
-
-        if (ll->claimed_address == 0) {
-                return -ENOENT;
-        }
-
-        address->s_addr = ll->claimed_address;
-        return 0;
-}
-
-int sd_ipv4ll_set_address_seed (sd_ipv4ll *ll, uint8_t seed[8]) {
-        unsigned int entropy;
-        int r;
-
-        assert_return(ll, -EINVAL);
-        assert_return(seed, -EINVAL);
-
-        entropy = *seed;
-
-        free(ll->random_data);
-        free(ll->random_data_state);
-
-        ll->random_data = new0(struct random_data, 1);
-        ll->random_data_state = new0(char, 128);
-
-        if (!ll->random_data || !ll->random_data_state) {
-                r = -ENOMEM;
-                goto error;
-        }
-
-        r = initstate_r((unsigned int)entropy, ll->random_data_state, 128, ll->random_data);
-        if (r < 0)
-                goto error;
-
-error:
-        if (r < 0){
-                free(ll->random_data);
-                free(ll->random_data_state);
-                ll->random_data = NULL;
-                ll->random_data_state = NULL;
-        }
-        return r;
-}
-
-bool sd_ipv4ll_is_running(sd_ipv4ll *ll) {
-        assert_return(ll, -EINVAL);
-
-        return !IN_SET(ll->state, IPV4LL_STATE_INIT, IPV4LL_STATE_STOPPED);
-}
-
-#define HASH_KEY SD_ID128_MAKE(df,04,22,98,3f,ad,14,52,f9,87,2e,d1,9c,70,e2,f2)
-
-int sd_ipv4ll_start (sd_ipv4ll *ll) {
-        int r;
-
-        assert_return(ll, -EINVAL);
-        assert_return(ll->event, -EINVAL);
-        assert_return(ll->index > 0, -EINVAL);
-        assert_return(IN_SET(ll->state, IPV4LL_STATE_INIT,
-                             IPV4LL_STATE_STOPPED), -EBUSY);
-
-        ll->state = IPV4LL_STATE_INIT;
-
-        r = arp_network_bind_raw_socket(ll->index, &ll->link);
-
-        if (r < 0)
-                goto out;
-
-        ll->fd = r;
-        ll->conflict = 0;
-        ll->defend_window = 0;
-        ll->claimed_address = 0;
-
-        if (!ll->random_data) {
-                uint8_t seed[8];
-
-                /* Fallback to mac */
-                siphash24(seed, &ll->mac_addr.ether_addr_octet,
-                          ETH_ALEN, HASH_KEY.bytes);
-
-                r = sd_ipv4ll_set_address_seed(ll, seed);
-                if (r < 0)
-                        goto out;
-        }
-
-        if (ll->address == 0) {
-                r = ipv4ll_pick_address(ll, &ll->address);
-                if (r < 0)
-                        goto out;
-        }
-
-        ipv4ll_set_state (ll, IPV4LL_STATE_INIT, 1);
-
-        r = sd_event_add_io(ll->event, &ll->receive_message, ll->fd,
-                            EPOLLIN, ipv4ll_receive_message, ll);
-        if (r < 0)
-                goto out;
-
-        r = sd_event_source_set_priority(ll->receive_message, ll->event_priority);
-        if (r < 0)
-                goto out;
-
-        r = sd_event_add_time(ll->event,
-                              &ll->timer,
-                              CLOCK_MONOTONIC,
-                              now(CLOCK_MONOTONIC), 0,
-                              ipv4ll_timer, ll);
-
-        if (r < 0)
-                goto out;
-
-        r = sd_event_source_set_priority(ll->timer, ll->event_priority);
-
-out:
-        if (r < 0)
-                ipv4ll_stop(ll, IPV4LL_EVENT_STOP);
-
-        return 0;
-}
-
-int sd_ipv4ll_stop(sd_ipv4ll *ll) {
-        ipv4ll_stop(ll, IPV4LL_EVENT_STOP);
-        if (ll)
-                ipv4ll_set_state(ll, IPV4LL_STATE_STOPPED, 1);
-
-        return 0;
-}
+static void ipv4ll_on_acd(sd_ipv4acd *ll, int event, void *userdata);
 
 sd_ipv4ll *sd_ipv4ll_ref(sd_ipv4ll *ll) {
-        if (ll)
-                assert_se(REFCNT_INC(ll->n_ref) >= 2);
+        if (!ll)
+                return NULL;
+
+        assert(ll->n_ref >= 1);
+        ll->n_ref++;
 
         return ll;
 }
 
 sd_ipv4ll *sd_ipv4ll_unref(sd_ipv4ll *ll) {
-        if (ll && REFCNT_DEC(ll->n_ref) <= 0) {
-                ll->receive_message =
-                        sd_event_source_unref(ll->receive_message);
-                ll->fd = safe_close(ll->fd);
-
-                ll->timer = sd_event_source_unref(ll->timer);
-
-                sd_ipv4ll_detach_event(ll);
-
-                free(ll->random_data);
-                free(ll->random_data_state);
-                free(ll);
-
+        if (!ll)
                 return NULL;
-        }
 
-        return ll;
+        assert(ll->n_ref >= 1);
+        ll->n_ref--;
+
+        if (ll->n_ref > 0)
+                return NULL;
+
+        sd_ipv4acd_unref(ll->acd);
+        return mfree(ll);
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(sd_ipv4ll*, sd_ipv4ll_unref);
-#define _cleanup_ipv4ll_free_ _cleanup_(sd_ipv4ll_unrefp)
-
 int sd_ipv4ll_new(sd_ipv4ll **ret) {
-        _cleanup_ipv4ll_free_ sd_ipv4ll *ll = NULL;
+        _cleanup_(sd_ipv4ll_unrefp) sd_ipv4ll *ll = NULL;
+        int r;
 
         assert_return(ret, -EINVAL);
 
@@ -625,13 +103,242 @@ int sd_ipv4ll_new(sd_ipv4ll **ret) {
         if (!ll)
                 return -ENOMEM;
 
-        ll->n_ref = REFCNT_INIT;
-        ll->state = IPV4LL_STATE_INIT;
-        ll->index = -1;
-        ll->fd = -1;
+        ll->n_ref = 1;
+
+        r = sd_ipv4acd_new(&ll->acd);
+        if (r < 0)
+                return r;
+
+        r = sd_ipv4acd_set_callback(ll->acd, ipv4ll_on_acd, ll);
+        if (r < 0)
+                return r;
 
         *ret = ll;
         ll = NULL;
 
         return 0;
+}
+
+int sd_ipv4ll_stop(sd_ipv4ll *ll) {
+        assert_return(ll, -EINVAL);
+
+        return sd_ipv4acd_stop(ll->acd);
+}
+
+int sd_ipv4ll_set_ifindex(sd_ipv4ll *ll, int ifindex) {
+        assert_return(ll, -EINVAL);
+        assert_return(ifindex > 0, -EINVAL);
+        assert_return(sd_ipv4ll_is_running(ll) == 0, -EBUSY);
+
+        return sd_ipv4acd_set_ifindex(ll->acd, ifindex);
+}
+
+int sd_ipv4ll_set_mac(sd_ipv4ll *ll, const struct ether_addr *addr) {
+        int r;
+
+        assert_return(ll, -EINVAL);
+        assert_return(addr, -EINVAL);
+        assert_return(sd_ipv4ll_is_running(ll) == 0, -EBUSY);
+
+        r = sd_ipv4acd_set_mac(ll->acd, addr);
+        if (r < 0)
+                return r;
+
+        ll->mac = *addr;
+        return 0;
+}
+
+int sd_ipv4ll_detach_event(sd_ipv4ll *ll) {
+        assert_return(ll, -EINVAL);
+
+        return sd_ipv4acd_detach_event(ll->acd);
+}
+
+int sd_ipv4ll_attach_event(sd_ipv4ll *ll, sd_event *event, int64_t priority) {
+        assert_return(ll, -EINVAL);
+
+        return sd_ipv4acd_attach_event(ll->acd, event, priority);
+}
+
+int sd_ipv4ll_set_callback(sd_ipv4ll *ll, sd_ipv4ll_callback_t cb, void *userdata) {
+        assert_return(ll, -EINVAL);
+
+        ll->callback = cb;
+        ll->userdata = userdata;
+
+        return 0;
+}
+
+int sd_ipv4ll_get_address(sd_ipv4ll *ll, struct in_addr *address) {
+        assert_return(ll, -EINVAL);
+        assert_return(address, -EINVAL);
+
+        if (ll->claimed_address == 0)
+                return -ENOENT;
+
+        address->s_addr = ll->claimed_address;
+
+        return 0;
+}
+
+int sd_ipv4ll_set_address_seed(sd_ipv4ll *ll, uint64_t seed) {
+        assert_return(ll, -EINVAL);
+        assert_return(sd_ipv4ll_is_running(ll) == 0, -EBUSY);
+
+        ll->seed.value = htole64(seed);
+        ll->seed_set = true;
+
+        return 0;
+}
+
+int sd_ipv4ll_is_running(sd_ipv4ll *ll) {
+        assert_return(ll, false);
+
+        return sd_ipv4acd_is_running(ll->acd);
+}
+
+static bool ipv4ll_address_is_valid(const struct in_addr *address) {
+        assert(address);
+
+        if (!in_addr_is_link_local(AF_INET, (const union in_addr_union *) address))
+                return false;
+
+        return !IN_SET(be32toh(address->s_addr) & 0x0000FF00U, 0x0000U, 0xFF00U);
+}
+
+int sd_ipv4ll_set_address(sd_ipv4ll *ll, const struct in_addr *address) {
+        int r;
+
+        assert_return(ll, -EINVAL);
+        assert_return(address, -EINVAL);
+        assert_return(ipv4ll_address_is_valid(address), -EINVAL);
+
+        r = sd_ipv4acd_set_address(ll->acd, address);
+        if (r < 0)
+                return r;
+
+        ll->address = address->s_addr;
+
+        return 0;
+}
+
+#define PICK_HASH_KEY SD_ID128_MAKE(15,ac,82,a6,d6,3f,49,78,98,77,5d,0c,69,02,94,0b)
+
+static int ipv4ll_pick_address(sd_ipv4ll *ll) {
+        _cleanup_free_ char *address = NULL;
+        be32_t addr;
+
+        assert(ll);
+
+        do {
+                uint64_t h;
+
+                h = siphash24(&ll->seed, sizeof(ll->seed), PICK_HASH_KEY.bytes);
+
+                /* Increase the generation counter by one */
+                ll->seed.generation = htole64(le64toh(ll->seed.generation) + 1);
+
+                addr = htobe32((h & UINT32_C(0x0000FFFF)) | IPV4LL_NETWORK);
+        } while (addr == ll->address ||
+                 IN_SET(be32toh(addr) & 0x0000FF00U, 0x0000U, 0xFF00U));
+
+        (void) in_addr_to_string(AF_INET, &(union in_addr_union) { .in.s_addr = addr }, &address);
+        log_ipv4ll(ll, "Picked new IP address %s.", strna(address));
+
+        return sd_ipv4ll_set_address(ll, &(struct in_addr) { addr });
+}
+
+#define MAC_HASH_KEY SD_ID128_MAKE(df,04,22,98,3f,ad,14,52,f9,87,2e,d1,9c,70,e2,f2)
+
+int sd_ipv4ll_start(sd_ipv4ll *ll) {
+        int r;
+        bool picked_address = false;
+
+        assert_return(ll, -EINVAL);
+        assert_return(!ether_addr_is_null(&ll->mac), -EINVAL);
+        assert_return(sd_ipv4ll_is_running(ll) == 0, -EBUSY);
+
+        /* If no random seed is set, generate some from the MAC address */
+        if (!ll->seed_set)
+                ll->seed.value = htole64(siphash24(ll->mac.ether_addr_octet, ETH_ALEN, MAC_HASH_KEY.bytes));
+
+        /* Restart the generation counter. */
+        ll->seed.generation = 0;
+
+        if (ll->address == 0) {
+                r = ipv4ll_pick_address(ll);
+                if (r < 0)
+                        return r;
+
+                picked_address = true;
+        }
+
+        r = sd_ipv4acd_start(ll->acd);
+        if (r < 0) {
+
+                /* We couldn't start? If so, let's forget the picked address again, the user might make a change and
+                 * retry, and we want the new data to take effect when picking an address. */
+                if (picked_address)
+                        ll->address = 0;
+
+                return r;
+        }
+
+        return 0;
+}
+
+static void ipv4ll_client_notify(sd_ipv4ll *ll, int event) {
+        assert(ll);
+
+        if (ll->callback)
+                ll->callback(ll, event, ll->userdata);
+}
+
+void ipv4ll_on_acd(sd_ipv4acd *acd, int event, void *userdata) {
+        sd_ipv4ll *ll = userdata;
+        IPV4LL_DONT_DESTROY(ll);
+        int r;
+
+        assert(acd);
+        assert(ll);
+
+        switch (event) {
+
+        case SD_IPV4ACD_EVENT_STOP:
+                ipv4ll_client_notify(ll, SD_IPV4LL_EVENT_STOP);
+                ll->claimed_address = 0;
+                break;
+
+        case SD_IPV4ACD_EVENT_BIND:
+                ll->claimed_address = ll->address;
+                ipv4ll_client_notify(ll, SD_IPV4LL_EVENT_BIND);
+                break;
+
+        case SD_IPV4ACD_EVENT_CONFLICT:
+                /* if an address was already bound we must call up to the
+                   user to handle this, otherwise we just try again */
+                if (ll->claimed_address != 0) {
+                        ipv4ll_client_notify(ll, SD_IPV4LL_EVENT_CONFLICT);
+
+                        ll->claimed_address = 0;
+                } else {
+                        r = ipv4ll_pick_address(ll);
+                        if (r < 0)
+                                goto error;
+
+                        r = sd_ipv4acd_start(ll->acd);
+                        if (r < 0)
+                                goto error;
+                }
+
+                break;
+
+        default:
+                assert_not_reached("Invalid IPv4ACD event.");
+        }
+
+        return;
+
+error:
+        ipv4ll_client_notify(ll, SD_IPV4LL_EVENT_STOP);
 }

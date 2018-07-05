@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,24 +17,43 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <time.h>
-#include <assert.h>
 #include <errno.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
-#include <string.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <syslog.h>
+#include <time.h>
+#include <unistd.h>
 
-#include "logs-show.h"
-#include "log.h"
-#include "util.h"
-#include "utf8.h"
+#include "sd-id128.h"
+#include "sd-journal.h"
+
+#include "alloc-util.h"
+#include "fd-util.h"
+#include "formats-util.h"
 #include "hashmap.h"
-#include "fileio.h"
+#include "hostname-util.h"
+#include "io-util.h"
 #include "journal-internal.h"
+#include "log.h"
+#include "logs-show.h"
+#include "macro.h"
+#include "output-mode.h"
+#include "parse-util.h"
+#include "process-util.h"
+#include "sparse-endian.h"
+#include "stdio-util.h"
+#include "string-table.h"
+#include "string-util.h"
+#include "terminal-util.h"
+#include "time-util.h"
+#include "utf8.h"
+#include "util.h"
 
-/* up to three lines (each up to 100 characters),
-   or 300 characters, whichever is less */
+/* up to three lines (each up to 100 characters) or 300 characters, whichever is less */
 #define PRINT_LINE_THRESHOLD 3
 #define PRINT_CHAR_THRESHOLD 300
 
@@ -64,12 +81,11 @@ static int print_catalog(FILE *f, sd_journal *j) {
 
 static int parse_field(const void *data, size_t length, const char *field, char **target, size_t *target_size) {
         size_t fl, nl;
-        void *buf;
+        char *buf;
 
         assert(data);
         assert(field);
         assert(target);
-        assert(target_size);
 
         fl = strlen(field);
         if (length < fl)
@@ -79,16 +95,18 @@ static int parse_field(const void *data, size_t length, const char *field, char 
                 return 0;
 
         nl = length - fl;
-        buf = malloc(nl+1);
+        buf = new(char, nl+1);
         if (!buf)
                 return log_oom();
 
         memcpy(buf, (const char*) data + fl, nl);
-        ((char*)buf)[nl] = 0;
+        buf[nl] = 0;
 
         free(*target);
         *target = buf;
-        *target_size = nl;
+
+        if (target_size)
+                *target_size = nl;
 
         return 1;
 }
@@ -116,11 +134,11 @@ static bool print_multiline(FILE *f, unsigned prefix, unsigned n_columns, Output
 
         if (flags & OUTPUT_COLOR) {
                 if (priority <= LOG_ERR) {
-                        color_on = ANSI_HIGHLIGHT_RED_ON;
-                        color_off = ANSI_HIGHLIGHT_OFF;
+                        color_on = ANSI_HIGHLIGHT_RED;
+                        color_off = ANSI_NORMAL;
                 } else if (priority <= LOG_NOTICE) {
-                        color_on = ANSI_HIGHLIGHT_ON;
-                        color_off = ANSI_HIGHLIGHT_OFF;
+                        color_on = ANSI_HIGHLIGHT;
+                        color_off = ANSI_NORMAL;
                 }
         }
 
@@ -187,6 +205,108 @@ static bool print_multiline(FILE *f, unsigned prefix, unsigned n_columns, Output
         }
 
         return ellipsized;
+}
+
+static int output_timestamp_monotonic(FILE *f, sd_journal *j, const char *monotonic) {
+        sd_id128_t boot_id;
+        uint64_t t;
+        int r;
+
+        assert(f);
+        assert(j);
+
+        r = -ENXIO;
+        if (monotonic)
+                r = safe_atou64(monotonic, &t);
+        if (r < 0)
+                r = sd_journal_get_monotonic_usec(j, &t, &boot_id);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get monotonic timestamp: %m");
+
+        fprintf(f, "[%5llu.%06llu]",
+                (unsigned long long) (t / USEC_PER_SEC),
+                (unsigned long long) (t % USEC_PER_SEC));
+
+        return 1 + 5 + 1 + 6 + 1;
+}
+
+static int output_timestamp_realtime(FILE *f, sd_journal *j, OutputMode mode, OutputFlags flags, const char *realtime) {
+        char buf[MAX(FORMAT_TIMESTAMP_MAX, 64)];
+        struct tm *(*gettime_r)(const time_t *, struct tm *);
+        struct tm tm;
+        uint64_t x;
+        time_t t;
+        int r;
+
+        assert(f);
+        assert(j);
+
+        r = -ENXIO;
+        if (realtime)
+                r = safe_atou64(realtime, &x);
+        if (r < 0)
+                r = sd_journal_get_realtime_usec(j, &x);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get realtime timestamp: %m");
+
+        if (mode == OUTPUT_SHORT_FULL) {
+                const char *k;
+
+                if (flags & OUTPUT_UTC)
+                        k = format_timestamp_utc(buf, sizeof(buf), x);
+                else
+                        k = format_timestamp(buf, sizeof(buf), x);
+                if (!k) {
+                        log_error("Failed to format timestamp.");
+                        return -EINVAL;
+                }
+
+        } else {
+                gettime_r = (flags & OUTPUT_UTC) ? gmtime_r : localtime_r;
+                t = (time_t) (x / USEC_PER_SEC);
+
+                switch (mode) {
+
+                case OUTPUT_SHORT_UNIX:
+                        xsprintf(buf, "%10llu.%06llu", (unsigned long long) t, (unsigned long long) (x % USEC_PER_SEC));
+                        break;
+
+                case OUTPUT_SHORT_ISO:
+                        if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", gettime_r(&t, &tm)) <= 0) {
+                                log_error("Failed for format ISO time");
+                                return -EINVAL;
+                        }
+                        break;
+
+                case OUTPUT_SHORT:
+                case OUTPUT_SHORT_PRECISE:
+
+                        if (strftime(buf, sizeof(buf), "%b %d %H:%M:%S", gettime_r(&t, &tm)) <= 0) {
+                                log_error("Failed to format syslog time");
+                                return -EINVAL;
+                        }
+
+                        if (mode == OUTPUT_SHORT_PRECISE) {
+                                size_t k;
+
+                                assert(sizeof(buf) > strlen(buf));
+                                k = sizeof(buf) - strlen(buf);
+
+                                r = snprintf(buf + strlen(buf), k, ".%06llu", (unsigned long long) (x % USEC_PER_SEC));
+                                if (r <= 0 || (size_t) r >= k) { /* too long? */
+                                        log_error("Failed to format precise time");
+                                        return -EINVAL;
+                                }
+                        }
+                        break;
+
+                default:
+                        assert_not_reached("Unknown time format");
+                }
+        }
+
+        fputs(buf, f);
+        return (int) strlen(buf);
 }
 
 static int output_short(
@@ -270,12 +390,17 @@ static int output_short(
                 if (r < 0)
                         return r;
         }
-
-        if (r < 0)
-                return r;
-
-        if (!message)
+        if (r == -EBADMSG) {
+                log_debug_errno(r, "Skipping message we can't read: %m");
                 return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get journal fields: %m");
+
+        if (!message) {
+                log_debug("Skipping message without MESSAGE= field.");
+                return 0;
+        }
 
         if (!(flags & OUTPUT_SHOW_ALL))
                 strip_tab_ansi(&message, &message_len);
@@ -283,72 +408,18 @@ static int output_short(
         if (priority_len == 1 && *priority >= '0' && *priority <= '7')
                 p = *priority - '0';
 
-        if (mode == OUTPUT_SHORT_MONOTONIC) {
-                uint64_t t;
-                sd_id128_t boot_id;
+        if (mode == OUTPUT_SHORT_MONOTONIC)
+                r = output_timestamp_monotonic(f, j, monotonic);
+        else
+                r = output_timestamp_realtime(f, j, mode, flags, realtime);
+        if (r < 0)
+                return r;
+        n += r;
 
-                r = -ENOENT;
-
-                if (monotonic)
-                        r = safe_atou64(monotonic, &t);
-
-                if (r < 0)
-                        r = sd_journal_get_monotonic_usec(j, &t, &boot_id);
-
-                if (r < 0) {
-                        log_error("Failed to get monotonic timestamp: %s", strerror(-r));
-                        return r;
-                }
-
-                fprintf(f, "[%5llu.%06llu]",
-                        (unsigned long long) (t / USEC_PER_SEC),
-                        (unsigned long long) (t % USEC_PER_SEC));
-
-                n += 1 + 5 + 1 + 6 + 1;
-
-        } else {
-                char buf[64];
-                uint64_t x;
-                time_t t;
-                struct tm tm;
-
-                r = -ENOENT;
-
-                if (realtime)
-                        r = safe_atou64(realtime, &x);
-
-                if (r < 0)
-                        r = sd_journal_get_realtime_usec(j, &x);
-
-                if (r < 0) {
-                        log_error("Failed to get realtime timestamp: %s", strerror(-r));
-                        return r;
-                }
-
-                t = (time_t) (x / USEC_PER_SEC);
-
-                switch(mode) {
-                case OUTPUT_SHORT_ISO:
-                        r = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", localtime_r(&t, &tm));
-                        break;
-                case OUTPUT_SHORT_PRECISE:
-                        r = strftime(buf, sizeof(buf), "%b %d %H:%M:%S", localtime_r(&t, &tm));
-                        if (r > 0) {
-                                snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf),
-                                         ".%06llu", (unsigned long long) (x % USEC_PER_SEC));
-                        }
-                        break;
-                default:
-                        r = strftime(buf, sizeof(buf), "%b %d %H:%M:%S", localtime_r(&t, &tm));
-                }
-
-                if (r <= 0) {
-                        log_error("Failed to format time.");
-                        return -EINVAL;
-                }
-
-                fputs(buf, f);
-                n += strlen(buf);
+        if (flags & OUTPUT_NO_HOSTNAME) {
+                /* Suppress display of the hostname if this is requested. */
+                hostname = NULL;
+                hostname_len = 0;
         }
 
         if (hostname && shall_print(hostname, hostname_len, flags)) {
@@ -363,7 +434,7 @@ static int output_short(
                 fprintf(f, " %.*s", (int) comm_len, comm);
                 n += comm_len + 1;
         } else
-                fputc(' ', f);
+                fputs(" unknown", f);
 
         if (pid && shall_print(pid, pid_len, flags)) {
                 fprintf(f, "[%.*s]", (int) pid_len, pid);
@@ -398,7 +469,7 @@ static int output_verbose(
         const void *data;
         size_t length;
         _cleanup_free_ char *cursor = NULL;
-        uint64_t realtime;
+        uint64_t realtime = 0;
         char ts[FORMAT_TIMESTAMP_MAX + 7];
         int r;
 
@@ -410,41 +481,34 @@ static int output_verbose(
         r = sd_journal_get_data(j, "_SOURCE_REALTIME_TIMESTAMP", &data, &length);
         if (r == -ENOENT)
                 log_debug("Source realtime timestamp not found");
-        else if (r < 0) {
-                log_full(r == -EADDRNOTAVAIL ? LOG_DEBUG : LOG_ERR,
-                         "Failed to get source realtime timestamp: %s", strerror(-r));
-                return r;
-        } else {
+        else if (r < 0)
+                return log_full_errno(r == -EADDRNOTAVAIL ? LOG_DEBUG : LOG_ERR, r, "Failed to get source realtime timestamp: %m");
+        else {
                 _cleanup_free_ char *value = NULL;
-                size_t size;
 
-                r = parse_field(data, length, "_SOURCE_REALTIME_TIMESTAMP=", &value, &size);
+                r = parse_field(data, length, "_SOURCE_REALTIME_TIMESTAMP=", &value, NULL);
                 if (r < 0)
-                        log_debug("_SOURCE_REALTIME_TIMESTAMP invalid: %s", strerror(-r));
-                else {
-                        r = safe_atou64(value, &realtime);
-                        if (r < 0)
-                                log_debug("Failed to parse realtime timestamp: %s",
-                                          strerror(-r));
-                }
+                        return r;
+                assert(r > 0);
+
+                r = safe_atou64(value, &realtime);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to parse realtime timestamp: %m");
         }
 
         if (r < 0) {
                 r = sd_journal_get_realtime_usec(j, &realtime);
-                if (r < 0) {
-                        log_full(r == -EADDRNOTAVAIL ? LOG_DEBUG : LOG_ERR,
-                                 "Failed to get realtime timestamp: %s", strerror(-r));
-                        return r;
-                }
+                if (r < 0)
+                        return log_full_errno(r == -EADDRNOTAVAIL ? LOG_DEBUG : LOG_ERR, r, "Failed to get realtime timestamp: %m");
         }
 
         r = sd_journal_get_cursor(j, &cursor);
-        if (r < 0) {
-                log_error("Failed to get cursor: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get cursor: %m");
 
         fprintf(f, "%s [%s]\n",
+                flags & OUTPUT_UTC ?
+                format_timestamp_us_utc(ts, sizeof(ts), realtime) :
                 format_timestamp_us(ts, sizeof(ts), realtime),
                 cursor);
 
@@ -461,11 +525,11 @@ static int output_verbose(
                 fieldlen = c - (const char*) data;
 
                 if (flags & OUTPUT_COLOR && startswith(data, "MESSAGE=")) {
-                        on = ANSI_HIGHLIGHT_ON;
-                        off = ANSI_HIGHLIGHT_OFF;
+                        on = ANSI_HIGHLIGHT;
+                        off = ANSI_NORMAL;
                 }
 
-                if (flags & OUTPUT_SHOW_ALL ||
+                if ((flags & OUTPUT_SHOW_ALL) ||
                     (((length < PRINT_CHAR_THRESHOLD) || flags & OUTPUT_FULL_WIDTH)
                      && utf8_is_printable(data, length))) {
                         fprintf(f, "    %s%.*s=", on, fieldlen, (const char*)data);
@@ -512,22 +576,16 @@ static int output_export(
         sd_journal_set_data_threshold(j, 0);
 
         r = sd_journal_get_realtime_usec(j, &realtime);
-        if (r < 0) {
-                log_error("Failed to get realtime timestamp: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get realtime timestamp: %m");
 
         r = sd_journal_get_monotonic_usec(j, &monotonic, &boot_id);
-        if (r < 0) {
-                log_error("Failed to get monotonic timestamp: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get monotonic timestamp: %m");
 
         r = sd_journal_get_cursor(j, &cursor);
-        if (r < 0) {
-                log_error("Failed to get cursor: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get cursor: %m");
 
         fprintf(f,
                 "__CURSOR=%s\n"
@@ -587,10 +645,9 @@ void json_escape(
         assert(p);
 
         if (!(flags & OUTPUT_SHOW_ALL) && l >= JSON_THRESHOLD)
-
                 fputs("null", f);
 
-        else if (!utf8_is_printable(p, l)) {
+        else if (!(flags & OUTPUT_SHOW_ALL) && !utf8_is_printable(p, l)) {
                 bool not_first = false;
 
                 fputs("[ ", f);
@@ -617,8 +674,8 @@ void json_escape(
                                 fputc(*p, f);
                         } else if (*p == '\n')
                                 fputs("\\n", f);
-                        else if (*p < ' ')
-                                fprintf(f, "\\u%04x", *p);
+                        else if ((uint8_t) *p < ' ')
+                                fprintf(f, "\\u%04x", (uint8_t) *p);
                         else
                                 fputc(*p, f);
 
@@ -652,22 +709,16 @@ static int output_json(
         sd_journal_set_data_threshold(j, flags & OUTPUT_SHOW_ALL ? 0 : JSON_THRESHOLD);
 
         r = sd_journal_get_realtime_usec(j, &realtime);
-        if (r < 0) {
-                log_error("Failed to get realtime timestamp: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get realtime timestamp: %m");
 
         r = sd_journal_get_monotonic_usec(j, &monotonic, &boot_id);
-        if (r < 0) {
-                log_error("Failed to get monotonic timestamp: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get monotonic timestamp: %m");
 
         r = sd_journal_get_cursor(j, &cursor);
-        if (r < 0) {
-                log_error("Failed to get cursor: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get cursor: %m");
 
         if (mode == OUTPUT_JSON_PRETTY)
                 fprintf(f,
@@ -695,9 +746,9 @@ static int output_json(
                         sd_id128_to_string(boot_id, sid));
         }
 
-        h = hashmap_new(string_hash_func, string_compare_func);
+        h = hashmap_new(&string_hash_ops);
         if (!h)
-                return -ENOMEM;
+                return log_oom();
 
         /* First round, iterate through the entry and count how often each field appears */
         JOURNAL_FOREACH_DATA_RETVAL(j, data, length, r) {
@@ -715,7 +766,7 @@ static int output_json(
 
                 n = strndup(data, eq - (const char*) data);
                 if (!n) {
-                        r = -ENOMEM;
+                        r = log_oom();
                         goto finish;
                 }
 
@@ -724,13 +775,16 @@ static int output_json(
                         r = hashmap_put(h, n, UINT_TO_PTR(1));
                         if (r < 0) {
                                 free(n);
+                                log_oom();
                                 goto finish;
                         }
                 } else {
                         r = hashmap_update(h, n, UINT_TO_PTR(u + 1));
                         free(n);
-                        if (r < 0)
+                        if (r < 0) {
+                                log_oom();
                                 goto finish;
+                        }
                 }
         }
 
@@ -768,7 +822,7 @@ static int output_json(
 
                         n = strndup(data, m);
                         if (!n) {
-                                r = -ENOMEM;
+                                r = log_oom();
                                 goto finish;
                         }
 
@@ -873,8 +927,7 @@ static int output_cat(
                 if (r == -ENOENT)
                         return 0;
 
-                log_error("Failed to get data: %s", strerror(-r));
-                return r;
+                return log_error_errno(r, "Failed to get data: %m");
         }
 
         assert(l >= 8);
@@ -896,6 +949,8 @@ static int (*output_funcs[_OUTPUT_MODE_MAX])(
         [OUTPUT_SHORT_ISO] = output_short,
         [OUTPUT_SHORT_PRECISE] = output_short,
         [OUTPUT_SHORT_MONOTONIC] = output_short,
+        [OUTPUT_SHORT_UNIX] = output_short,
+        [OUTPUT_SHORT_FULL] = output_short,
         [OUTPUT_VERBOSE] = output_verbose,
         [OUTPUT_EXPORT] = output_export,
         [OUTPUT_JSON] = output_json,
@@ -964,11 +1019,11 @@ static int show_journal(FILE *f,
         /* Seek to end */
         r = sd_journal_seek_tail(j);
         if (r < 0)
-                goto finish;
+                return log_error_errno(r, "Failed to seek to tail: %m");
 
         r = sd_journal_previous_skip(j, how_many);
         if (r < 0)
-                goto finish;
+                return log_error_errno(r, "Failed to skip previous: %m");
 
         for (;;) {
                 for (;;) {
@@ -977,7 +1032,7 @@ static int show_journal(FILE *f,
                         if (need_seek) {
                                 r = sd_journal_next(j);
                                 if (r < 0)
-                                        goto finish;
+                                        return log_error_errno(r, "Failed to iterate through journal: %m");
                         }
 
                         if (r == 0)
@@ -993,33 +1048,33 @@ static int show_journal(FILE *f,
                                 if (r == -ESTALE)
                                         continue;
                                 else if (r < 0)
-                                        goto finish;
+                                        return log_error_errno(r, "Failed to get journal time: %m");
 
                                 if (usec < not_before)
                                         continue;
                         }
 
-                        line ++;
+                        line++;
                         maybe_print_begin_newline(f, &flags);
 
                         r = output_journal(f, j, mode, n_columns, flags, ellipsized);
                         if (r < 0)
-                                goto finish;
+                                return r;
                 }
 
                 if (warn_cutoff && line < how_many && not_before > 0) {
                         sd_id128_t boot_id;
-                        usec_t cutoff;
+                        usec_t cutoff = 0;
 
                         /* Check whether the cutoff line is too early */
 
                         r = sd_id128_get_boot(&boot_id);
                         if (r < 0)
-                                goto finish;
+                                return log_error_errno(r, "Failed to get boot id: %m");
 
                         r = sd_journal_get_cutoff_monotonic_usec(j, boot_id, &cutoff, NULL);
                         if (r < 0)
-                                goto finish;
+                                return log_error_errno(r, "Failed to get journal cutoff time: %m");
 
                         if (r > 0 && not_before < cutoff) {
                                 maybe_print_begin_newline(f, &flags);
@@ -1032,27 +1087,26 @@ static int show_journal(FILE *f,
                 if (!(flags & OUTPUT_FOLLOW))
                         break;
 
-                r = sd_journal_wait(j, (usec_t) -1);
+                r = sd_journal_wait(j, USEC_INFINITY);
                 if (r < 0)
-                        goto finish;
+                        return log_error_errno(r, "Failed to wait for journal: %m");
 
         }
 
-finish:
-        return r;
+        return 0;
 }
 
 int add_matches_for_unit(sd_journal *j, const char *unit) {
+        const char *m1, *m2, *m3, *m4;
         int r;
-        char *m1, *m2, *m3, *m4;
 
         assert(j);
         assert(unit);
 
-        m1 = strappenda("_SYSTEMD_UNIT=", unit);
-        m2 = strappenda("COREDUMP_UNIT=", unit);
-        m3 = strappenda("UNIT=", unit);
-        m4 = strappenda("OBJECT_SYSTEMD_UNIT=", unit);
+        m1 = strjoina("_SYSTEMD_UNIT=", unit);
+        m2 = strjoina("COREDUMP_UNIT=", unit);
+        m3 = strjoina("UNIT=", unit);
+        m4 = strjoina("OBJECT_SYSTEMD_UNIT=", unit);
 
         (void)(
             /* Look for messages from the service itself */
@@ -1076,7 +1130,9 @@ int add_matches_for_unit(sd_journal *j, const char *unit) {
         );
 
         if (r == 0 && endswith(unit, ".slice")) {
-                char *m5 = strappend("_SYSTEMD_SLICE=", unit);
+                const char *m5;
+
+                m5 = strjoina("_SYSTEMD_SLICE=", unit);
 
                 /* Show all messages belonging to a slice */
                 (void)(
@@ -1096,10 +1152,10 @@ int add_matches_for_user_unit(sd_journal *j, const char *unit, uid_t uid) {
         assert(j);
         assert(unit);
 
-        m1 = strappenda("_SYSTEMD_USER_UNIT=", unit);
-        m2 = strappenda("USER_UNIT=", unit);
-        m3 = strappenda("COREDUMP_USER_UNIT=", unit);
-        m4 = strappenda("OBJECT_SYSTEMD_USER_UNIT=", unit);
+        m1 = strjoina("_SYSTEMD_USER_UNIT=", unit);
+        m2 = strjoina("USER_UNIT=", unit);
+        m3 = strjoina("COREDUMP_USER_UNIT=", unit);
+        m4 = strjoina("OBJECT_SYSTEMD_USER_UNIT=", unit);
         sprintf(muid, "_UID="UID_FMT, uid);
 
         (void) (
@@ -1126,7 +1182,9 @@ int add_matches_for_user_unit(sd_journal *j, const char *unit, uid_t uid) {
         );
 
         if (r == 0 && endswith(unit, ".slice")) {
-                char *m5 = strappend("_SYSTEMD_SLICE=", unit);
+                const char *m5;
+
+                m5 = strjoina("_SYSTEMD_SLICE=", unit);
 
                 /* Show all messages belonging to a slice */
                 (void)(
@@ -1151,14 +1209,14 @@ static int get_boot_id_for_machine(const char *machine, sd_id128_t *boot_id) {
         assert(machine);
         assert(boot_id);
 
-        if (!filename_is_safe(machine))
+        if (!machine_name_is_valid(machine))
                 return -EINVAL;
 
         r = container_get_leader(machine, &pid);
         if (r < 0)
                 return r;
 
-        r = namespace_open(pid, &pidnsfd, &mntnsfd, NULL, &rootfd);
+        r = namespace_open(pid, &pidnsfd, &mntnsfd, NULL, NULL, &rootfd);
         if (r < 0)
                 return r;
 
@@ -1174,7 +1232,7 @@ static int get_boot_id_for_machine(const char *machine, sd_id128_t *boot_id) {
 
                 pair[0] = safe_close(pair[0]);
 
-                r = namespace_enter(pidnsfd, mntnsfd, -1, rootfd);
+                r = namespace_enter(pidnsfd, mntnsfd, -1, -1, rootfd);
                 if (r < 0)
                         _exit(EXIT_FAILURE);
 
@@ -1182,9 +1240,9 @@ static int get_boot_id_for_machine(const char *machine, sd_id128_t *boot_id) {
                 if (fd < 0)
                         _exit(EXIT_FAILURE);
 
-                k = loop_read(fd, buf, 36, false);
+                r = loop_read_exact(fd, buf, 36, false);
                 safe_close(fd);
-                if (k != 36)
+                if (r < 0)
                         _exit(EXIT_FAILURE);
 
                 k = send(pair[1], buf, 36, MSG_NOSIGNAL);
@@ -1221,28 +1279,22 @@ int add_match_this_boot(sd_journal *j, const char *machine) {
 
         if (machine) {
                 r = get_boot_id_for_machine(machine, &boot_id);
-                if (r < 0) {
-                        log_error("Failed to get boot id of container %s: %s", machine, strerror(-r));
-                        return r;
-                }
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get boot id of container %s: %m", machine);
         } else {
                 r = sd_id128_get_boot(&boot_id);
-                if (r < 0) {
-                        log_error("Failed to get boot id: %s", strerror(-r));
-                        return r;
-                }
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get boot id: %m");
         }
 
         sd_id128_to_string(boot_id, match + 9);
         r = sd_journal_add_match(j, match, strlen(match));
-        if (r < 0) {
-                log_error("Failed to add match: %s", strerror(-r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to add match: %m");
 
         r = sd_journal_add_conjunction(j);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to add conjunction: %m");
 
         return 0;
 }
@@ -1256,12 +1308,12 @@ int show_journal_by_unit(
                 unsigned how_many,
                 uid_t uid,
                 OutputFlags flags,
-                bool system,
+                int journal_open_flags,
+                bool system_unit,
                 bool *ellipsized) {
 
-        _cleanup_journal_close_ sd_journal*j = NULL;
+        _cleanup_(sd_journal_closep) sd_journal *j = NULL;
         int r;
-        int jflags = SD_JOURNAL_LOCAL_ONLY | system * SD_JOURNAL_SYSTEM;
 
         assert(mode >= 0);
         assert(mode < _OUTPUT_MODE_MAX);
@@ -1270,42 +1322,30 @@ int show_journal_by_unit(
         if (how_many <= 0)
                 return 0;
 
-        r = sd_journal_open(&j, jflags);
+        r = sd_journal_open(&j, journal_open_flags);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to open journal: %m");
 
         r = add_match_this_boot(j, NULL);
         if (r < 0)
                 return r;
 
-        if (system)
+        if (system_unit)
                 r = add_matches_for_unit(j, unit);
         else
                 r = add_matches_for_user_unit(j, unit, uid);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to add unit matches: %m");
 
-        if (_unlikely_(log_get_max_level() >= LOG_PRI(LOG_DEBUG))) {
+        if (_unlikely_(log_get_max_level() >= LOG_DEBUG)) {
                 _cleanup_free_ char *filter;
 
                 filter = journal_make_match_string(j);
+                if (!filter)
+                        return log_oom();
+
                 log_debug("Journal filter: %s", filter);
         }
 
         return show_journal(f, j, mode, n_columns, not_before, how_many, flags, ellipsized);
 }
-
-static const char *const output_mode_table[_OUTPUT_MODE_MAX] = {
-        [OUTPUT_SHORT] = "short",
-        [OUTPUT_SHORT_ISO] = "short-iso",
-        [OUTPUT_SHORT_PRECISE] = "short-precise",
-        [OUTPUT_SHORT_MONOTONIC] = "short-monotonic",
-        [OUTPUT_VERBOSE] = "verbose",
-        [OUTPUT_EXPORT] = "export",
-        [OUTPUT_JSON] = "json",
-        [OUTPUT_JSON_PRETTY] = "json-pretty",
-        [OUTPUT_JSON_SSE] = "json-sse",
-        [OUTPUT_CAT] = "cat"
-};
-
-DEFINE_STRING_TABLE_LOOKUP(output_mode, OutputMode);

@@ -17,14 +17,12 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stddef.h>
-#include <unistd.h>
 #include <errno.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include "libudev.h"
+#include "alloc-util.h"
 #include "libudev-private.h"
 
 /**
@@ -168,17 +166,16 @@ struct udev_list_entry *udev_list_entry_add(struct udev_list *list, const char *
         entry = new0(struct udev_list_entry, 1);
         if (entry == NULL)
                 return NULL;
+
         entry->name = strdup(name);
-        if (entry->name == NULL) {
-                free(entry);
-                return NULL;
-        }
+        if (entry->name == NULL)
+                return mfree(entry);
+
         if (value != NULL) {
                 entry->value = strdup(value);
                 if (entry->value == NULL) {
                         free(entry->name);
-                        free(entry);
-                        return NULL;
+                        return mfree(entry);
                 }
         }
 
@@ -195,8 +192,7 @@ struct udev_list_entry *udev_list_entry_add(struct udev_list *list, const char *
                         if (entries == NULL) {
                                 free(entry->name);
                                 free(entry->value);
-                                free(entry);
-                                return NULL;
+                                return mfree(entry);
                         }
                         list->entries = entries;
                         list->entries_max += add;
@@ -249,8 +245,7 @@ void udev_list_cleanup(struct udev_list *list)
         struct udev_list_entry *entry_loop;
         struct udev_list_entry *entry_tmp;
 
-        free(list->entries);
-        list->entries = NULL;
+        list->entries = mfree(list->entries);
         list->entries_cur = 0;
         list->entries_max = 0;
         udev_list_entry_foreach_safe(entry_loop, entry_tmp, udev_list_get_entry(list))

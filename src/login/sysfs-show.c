@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -21,12 +19,17 @@
 
 #include <errno.h>
 #include <string.h>
-#include <libudev.h>
 
-#include "util.h"
-#include "sysfs-show.h"
+#include "libudev.h"
+
+#include "alloc-util.h"
+#include "locale-util.h"
 #include "path-util.h"
+#include "string-util.h"
+#include "sysfs-show.h"
+#include "terminal-util.h"
 #include "udev-util.h"
+#include "util.h"
 
 static int show_sysfs_one(
                 struct udev *udev,
@@ -107,13 +110,13 @@ static int show_sysfs_one(
                 if (!k)
                         return -ENOMEM;
 
-                printf("%s%s%s\n", prefix, draw_special_char(lookahead ? DRAW_TREE_BRANCH : DRAW_TREE_RIGHT), k);
+                printf("%s%s%s\n", prefix, special_glyph(lookahead ? TREE_BRANCH : TREE_RIGHT), k);
 
                 if (asprintf(&l,
                              "%s%s:%s%s%s%s",
                              is_master ? "[MASTER] " : "",
                              subsystem, sysname,
-                             name ? " \"" : "", name ? name : "", name ? "\"" : "") < 0)
+                             name ? " \"" : "", strempty(name), name ? "\"" : "") < 0)
                         return -ENOMEM;
 
                 free(k);
@@ -121,13 +124,13 @@ static int show_sysfs_one(
                 if (!k)
                         return -ENOMEM;
 
-                printf("%s%s%s\n", prefix, lookahead ? draw_special_char(DRAW_TREE_VERTICAL) : "  ", k);
+                printf("%s%s%s\n", prefix, lookahead ? special_glyph(TREE_VERTICAL) : "  ", k);
 
                 *item = next;
                 if (*item) {
                         _cleanup_free_ char *p = NULL;
 
-                        p = strappend(prefix, lookahead ? draw_special_char(DRAW_TREE_VERTICAL) : "  ");
+                        p = strappend(prefix, lookahead ? special_glyph(TREE_VERTICAL) : "  ");
                         if (!p)
                                 return -ENOMEM;
 
@@ -180,7 +183,7 @@ int show_sysfs(const char *seat, const char *prefix, unsigned n_columns) {
         if (first)
                 show_sysfs_one(udev, seat, &first, "/", prefix, n_columns);
         else
-                printf("%s%s%s\n", prefix, draw_special_char(DRAW_TREE_RIGHT), "(none)");
+                printf("%s%s%s\n", prefix, special_glyph(TREE_RIGHT), "(none)");
 
         return r;
 }

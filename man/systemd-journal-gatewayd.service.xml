@@ -1,24 +1,24 @@
-<?xml version='1.0'?> <!--*-nxml-*-->
+<?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
 "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-This file is part of systemd.
+  This file is part of systemd.
 
-Copyright 2012 Zbigniew Jędrzejewski-Szmek
+  Copyright 2012 Zbigniew Jędrzejewski-Szmek
 
-systemd is free software; you can redistribute it and/or modify it
-under the terms of the GNU Lesser General Public License as published by
-the Free Software Foundation; either version 2.1 of the License, or
-(at your option) any later version.
+  systemd is free software; you can redistribute it and/or modify it
+  under the terms of the GNU Lesser General Public License as published by
+  the Free Software Foundation; either version 2.1 of the License, or
+  (at your option) any later version.
 
-systemd is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-Lesser General Public License for more details.
+  systemd is distributed in the hope that it will be useful, but
+  WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+  Lesser General Public License for more details.
 
-You should have received a copy of the GNU Lesser General Public License
-along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  You should have received a copy of the GNU Lesser General Public License
+  along with systemd; If not, see <http://www.gnu.org/licenses/>.
 -->
 
 <refentry id="systemd-journal-gatewayd.service" conditional='HAVE_MICROHTTPD'
@@ -98,6 +98,16 @@ along with systemd; If not, see <http://www.gnu.org/licenses/>.
         <listitem><para>Specify the path to a file containing a server
         key in PEM format corresponding to the certificate specified
         with <option>--cert=</option>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-D <replaceable>DIR</replaceable></option></term>
+        <term><option>--directory=<replaceable>DIR</replaceable></option></term>
+
+        <listitem><para>Takes a directory path as argument. If
+        specified, <command>systemd-journal-gatewayd</command> will serve the
+        specified journal directory <replaceable>DIR</replaceable> instead of
+        the default runtime and system journal paths.</para></listitem>
       </varlistentry>
 
       <xi:include href="standard-options.xml" xpointer="help" />
@@ -193,7 +203,7 @@ along with systemd; If not, see <http://www.gnu.org/licenses/>.
       </varlistentry>
 
       <varlistentry>
-        <term><constant>application/event-stream</constant></term>
+        <term><constant>text/event-stream</constant></term>
 
         <listitem><para>Entries are formatted as JSON data structures,
         wrapped in a format suitable for <ulink
@@ -262,7 +272,7 @@ along with systemd; If not, see <http://www.gnu.org/licenses/>.
         <term><uri>boot</uri></term>
 
         <listitem><para>Limit events to the current boot of the system
-        (like <command>journalctl --this--boot</command>).</para></listitem>
+        (like <command>journalctl --this-boot</command>).</para></listitem>
       </varlistentry>
 
       <varlistentry>

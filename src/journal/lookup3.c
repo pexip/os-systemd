@@ -40,10 +40,10 @@ on 1 byte), but shoehorning those bytes into integers efficiently is messy.
 */
 /* #define SELF_TEST 1 */
 
-#include <stdio.h>      /* defines printf for tests */
-#include <time.h>       /* defines time_t for timings in the test */
 #include <stdint.h>     /* defines uint32_t etc */
+#include <stdio.h>      /* defines printf for tests */
 #include <sys/param.h>  /* attempt to define endianness */
+#include <time.h>       /* defines time_t for timings in the test */
 #ifdef linux
 # include <endian.h>    /* attempt to define endianness */
 #endif
@@ -317,7 +317,7 @@ uint32_t jenkins_hashlittle( const void *key, size_t length, uint32_t initval)
      * still catch it and complain.  The masking trick does make the hash
      * noticeably faster for short strings (like English words).
      */
-#ifndef VALGRIND
+#if !defined(VALGRIND) && !defined(__SANITIZE_ADDRESS__)
 
     switch(length)
     {
@@ -503,7 +503,7 @@ void jenkins_hashlittle2(
      * still catch it and complain.  The masking trick does make the hash
      * noticeably faster for short strings (like English words).
      */
-#ifndef VALGRIND
+#if !defined(VALGRIND) && !defined(__SANITIZE_ADDRESS__)
 
     switch(length)
     {
@@ -681,7 +681,7 @@ uint32_t jenkins_hashbig( const void *key, size_t length, uint32_t initval)
      * still catch it and complain.  The masking trick does make the hash
      * noticeably faster for short strings (like English words).
      */
-#ifndef VALGRIND
+#if !defined(VALGRIND) && !defined(__SANITIZE_ADDRESS__)
 
     switch(length)
     {
