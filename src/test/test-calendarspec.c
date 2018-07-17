@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -21,7 +19,9 @@
 
 #include <string.h>
 
+#include "alloc-util.h"
 #include "calendarspec.h"
+#include "string-util.h"
 #include "util.h"
 
 static void test_one(const char *input, const char *output) {
@@ -50,15 +50,101 @@ static void test_one(const char *input, const char *output) {
         assert_se(streq(q, p));
 }
 
+static void test_next(const char *input, const char *new_tz, usec_t after, usec_t expect) {
+        CalendarSpec *c;
+        usec_t u;
+        char *old_tz;
+        char buf[FORMAT_TIMESTAMP_MAX];
+        int r;
+
+        old_tz = getenv("TZ");
+        if (old_tz)
+                old_tz = strdupa(old_tz);
+
+        if (new_tz)
+                assert_se(setenv("TZ", new_tz, 1) >= 0);
+        else
+                assert_se(unsetenv("TZ") >= 0);
+        tzset();
+
+        assert_se(calendar_spec_from_string(input, &c) >= 0);
+
+        printf("\"%s\"\n", input);
+
+        u = after;
+        r = calendar_spec_next_usec(c, after, &u);
+        printf("At: %s\n", r < 0 ? strerror(-r) : format_timestamp_us(buf, sizeof buf, u));
+        if (expect != (usec_t)-1)
+                assert_se(r >= 0 && u == expect);
+        else
+                assert(r == -ENOENT);
+
+        calendar_spec_free(c);
+
+        if (old_tz)
+                assert_se(setenv("TZ", old_tz, 1) >= 0);
+        else
+                assert_se(unsetenv("TZ") >= 0);
+        tzset();
+}
+
+static void test_timestamp(void) {
+        char buf[FORMAT_TIMESTAMP_MAX];
+        _cleanup_free_ char *t = NULL;
+        CalendarSpec *c;
+        usec_t x, y;
+
+        /* Ensure that a timestamp is also a valid calendar specification. Convert forth and back */
+
+        x = now(CLOCK_REALTIME);
+
+        assert_se(format_timestamp_us(buf, sizeof(buf), x));
+        printf("%s\n", buf);
+        assert_se(calendar_spec_from_string(buf, &c) >= 0);
+        assert_se(calendar_spec_to_string(c, &t) >= 0);
+        calendar_spec_free(c);
+        printf("%s\n", t);
+
+        assert_se(parse_timestamp(t, &y) >= 0);
+        assert_se(y == x);
+}
+
+static void test_hourly_bug_4031(void) {
+        CalendarSpec *c;
+        usec_t n, u, w;
+        char buf[FORMAT_TIMESTAMP_MAX], zaf[FORMAT_TIMESTAMP_MAX];
+        int r;
+
+        assert_se(calendar_spec_from_string("hourly", &c) >= 0);
+        n = now(CLOCK_REALTIME);
+        assert_se((r = calendar_spec_next_usec(c, n, &u)) >= 0);
+
+        printf("Now: %s (%"PRIu64")\n", format_timestamp_us(buf, sizeof buf, n), n);
+        printf("Next hourly: %s (%"PRIu64")\n", r < 0 ? strerror(-r) : format_timestamp_us(buf, sizeof buf, u), u);
+
+        assert_se((r = calendar_spec_next_usec(c, u, &w)) >= 0);
+        printf("Next hourly: %s (%"PRIu64")\n", r < 0 ? strerror(-r) : format_timestamp_us(zaf, sizeof zaf, w), w);
+
+        assert_se(n < u);
+        assert_se(u <= n + USEC_PER_HOUR);
+        assert_se(u < w);
+        assert_se(w <= u + USEC_PER_HOUR);
+
+        calendar_spec_free(c);
+}
+
 int main(int argc, char* argv[]) {
         CalendarSpec *c;
 
-        test_one("Sat,Thu,Mon-Wed,Sat-Sun", "Mon-Thu,Sat,Sun *-*-* 00:00:00");
+        test_one("Sat,Thu,Mon-Wed,Sat-Sun", "Mon..Thu,Sat,Sun *-*-* 00:00:00");
+        test_one("Sat,Thu,Mon..Wed,Sat..Sun", "Mon..Thu,Sat,Sun *-*-* 00:00:00");
         test_one("Mon,Sun 12-*-* 2,1:23", "Mon,Sun 2012-*-* 01,02:23:00");
         test_one("Wed *-1", "Wed *-*-01 00:00:00");
         test_one("Wed-Wed,Wed *-1", "Wed *-*-01 00:00:00");
+        test_one("Wed..Wed,Wed *-1", "Wed *-*-01 00:00:00");
         test_one("Wed, 17:48", "Wed *-*-* 17:48:00");
-        test_one("Wed-Sat,Tue 12-10-15 1:2:3", "Tue-Sat 2012-10-15 01:02:03");
+        test_one("Wed-Sat,Tue 12-10-15 1:2:3", "Tue..Sat 2012-10-15 01:02:03");
+        test_one("Wed..Sat,Tue 12-10-15 1:2:3", "Tue..Sat 2012-10-15 01:02:03");
         test_one("*-*-7 0:0:0", "*-*-07 00:00:00");
         test_one("10-15", "*-10-15 00:00:00");
         test_one("monday *-12-* 17:00", "Mon *-12-* 17:00:00");
@@ -77,12 +163,45 @@ int main(int argc, char* argv[]) {
         test_one("daily", "*-*-* 00:00:00");
         test_one("monthly", "*-*-01 00:00:00");
         test_one("weekly", "Mon *-*-* 00:00:00");
+        test_one("minutely", "*-*-* *:*:00");
+        test_one("quarterly", "*-01,04,07,10-01 00:00:00");
+        test_one("semi-annually", "*-01,07-01 00:00:00");
+        test_one("annually", "*-01-01 00:00:00");
         test_one("*:2/3", "*-*-* *:02/3:00");
+        test_one("2015-10-25 01:00:00 uTc", "2015-10-25 01:00:00 UTC");
+        test_one("2016-03-27 03:17:00.4200005", "2016-03-27 03:17:00.420001");
+        test_one("2016-03-27 03:17:00/0.42", "2016-03-27 03:17:00/0.420000");
+        test_one("2016-03-27 03:17:00/0.42", "2016-03-27 03:17:00/0.420000");
+        test_one("9..11,13:00,30", "*-*-* 09,10,11,13:00,30:00");
+        test_one("1..3-1..3 1..3:1..3", "*-01,02,03-01,02,03 01,02,03:01,02,03:00");
+        test_one("00:00:1.125..2.125", "*-*-* 00:00:01.125000,02.125000");
+        test_one("00:00:1.0..3.8", "*-*-* 00:00:01,02,03");
+
+        test_next("2016-03-27 03:17:00", "", 12345, 1459048620000000);
+        test_next("2016-03-27 03:17:00", "CET", 12345, 1459041420000000);
+        test_next("2016-03-27 03:17:00", "EET", 12345, -1);
+        test_next("2016-03-27 03:17:00 UTC", NULL, 12345, 1459048620000000);
+        test_next("2016-03-27 03:17:00 UTC", "", 12345, 1459048620000000);
+        test_next("2016-03-27 03:17:00 UTC", "CET", 12345, 1459048620000000);
+        test_next("2016-03-27 03:17:00 UTC", "EET", 12345, 1459048620000000);
+        test_next("2016-03-27 03:17:00.420000001 UTC", "EET", 12345, 1459048620420000);
+        test_next("2016-03-27 03:17:00.4200005 UTC", "EET", 12345, 1459048620420001);
+        test_next("2015-11-13 09:11:23.42", "EET", 12345, 1447398683420000);
+        test_next("2015-11-13 09:11:23.42/1.77", "EET", 1447398683420000, 1447398685190000);
+        test_next("2015-11-13 09:11:23.42/1.77", "EET", 1447398683419999, 1447398683420000);
+        test_next("Sun 16:00:00", "CET", 1456041600123456, 1456066800000000);
 
         assert_se(calendar_spec_from_string("test", &c) < 0);
         assert_se(calendar_spec_from_string("", &c) < 0);
         assert_se(calendar_spec_from_string("7", &c) < 0);
         assert_se(calendar_spec_from_string("121212:1:2", &c) < 0);
+        assert_se(calendar_spec_from_string("2000-03-05.23 00:00:00", &c) < 0);
+        assert_se(calendar_spec_from_string("2000-03-05 00:00.1:00", &c) < 0);
+        assert_se(calendar_spec_from_string("00:00:00/0.00000001", &c) < 0);
+        assert_se(calendar_spec_from_string("00:00:00.0..00.9", &c) < 0);
+
+        test_timestamp();
+        test_hourly_bug_4031();
 
         return 0;
 }

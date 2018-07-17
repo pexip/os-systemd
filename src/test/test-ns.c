@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -20,56 +18,86 @@
 ***/
 
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-#include <sys/mount.h>
-#include <linux/fs.h>
 
-#include "namespace.h"
-#include "execute.h"
 #include "log.h"
+#include "namespace.h"
 
 int main(int argc, char *argv[]) {
         const char * const writable[] = {
                 "/home",
+                "-/home/lennart/projects/foobar", /* this should be masked automatically */
                 NULL
         };
 
         const char * const readonly[] = {
-                "/",
-                "/usr",
+                /* "/", */
+                /* "/usr", */
                 "/boot",
+                "/lib",
+                "/usr/lib",
+                "-/lib64",
+                "-/usr/lib64",
                 NULL
         };
 
-        const char * const inaccessible[] = {
+        const char *inaccessible[] = {
                 "/home/lennart/projects",
                 NULL
         };
 
+        static const NameSpaceInfo ns_info = {
+                .private_dev = true,
+                .protect_control_groups = true,
+                .protect_kernel_tunables = true,
+                .protect_kernel_modules = true,
+        };
+
+        char *root_directory;
+        char *projects_directory;
         int r;
         char tmp_dir[] = "/tmp/systemd-private-XXXXXX",
              var_tmp_dir[] = "/var/tmp/systemd-private-XXXXXX";
 
+        log_set_max_level(LOG_DEBUG);
+
         assert_se(mkdtemp(tmp_dir));
         assert_se(mkdtemp(var_tmp_dir));
 
-        r = setup_namespace((char **) writable,
+        root_directory = getenv("TEST_NS_CHROOT");
+        projects_directory = getenv("TEST_NS_PROJECTS");
+
+        if (projects_directory)
+                inaccessible[0] = projects_directory;
+
+        log_info("Inaccessible directory: '%s'", inaccessible[0]);
+        if (root_directory)
+                log_info("Chroot: '%s'", root_directory);
+        else
+                log_info("Not chrooted");
+
+        r = setup_namespace(root_directory,
+                            &ns_info,
+                            (char **) writable,
                             (char **) readonly,
                             (char **) inaccessible,
                             tmp_dir,
                             var_tmp_dir,
-                            true,
                             PROTECT_HOME_NO,
                             PROTECT_SYSTEM_NO,
                             0);
         if (r < 0) {
-                log_error("Failed to setup namespace: %s", strerror(-r));
+                log_error_errno(r, "Failed to setup namespace: %m");
+
+                log_info("Usage:\n"
+                         "  sudo TEST_NS_PROJECTS=/home/lennart/projects ./test-ns\n"
+                         "  sudo TEST_NS_CHROOT=/home/alban/debian-tree TEST_NS_PROJECTS=/home/alban/debian-tree/home/alban/Documents ./test-ns");
+
                 return 1;
         }
 
         execl("/bin/sh", "/bin/sh", NULL);
-        log_error("execl(): %m");
+        log_error_errno(errno, "execl(): %m");
 
         return 1;
 }

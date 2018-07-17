@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,13 +17,82 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "alloc-util.h"
 #include "bus-util.h"
-#include "path-util.h"
 #include "cgroup-util.h"
 #include "cgroup.h"
 #include "dbus-cgroup.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "path-util.h"
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_cgroup_device_policy, cgroup_device_policy, CGroupDevicePolicy);
+
+static int property_get_io_device_weight(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        CGroupContext *c = userdata;
+        CGroupIODeviceWeight *w;
+        int r;
+
+        assert(bus);
+        assert(reply);
+        assert(c);
+
+        r = sd_bus_message_open_container(reply, 'a', "(st)");
+        if (r < 0)
+                return r;
+
+        LIST_FOREACH(device_weights, w, c->io_device_weights) {
+                r = sd_bus_message_append(reply, "(st)", w->path, w->weight);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_bus_message_close_container(reply);
+}
+
+static int property_get_io_device_limits(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        CGroupContext *c = userdata;
+        CGroupIODeviceLimit *l;
+        int r;
+
+        assert(bus);
+        assert(reply);
+        assert(c);
+
+        r = sd_bus_message_open_container(reply, 'a', "(st)");
+        if (r < 0)
+                return r;
+
+        LIST_FOREACH(device_limits, l, c->io_device_limits) {
+                CGroupIOLimitType type;
+
+                type = cgroup_io_limit_type_from_string(property);
+                if (type < 0 || l->limits[type] == cgroup_io_limit_defaults[type])
+                        continue;
+
+                r = sd_bus_message_append(reply, "(st)", l->path, l->limits[type]);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_bus_message_close_container(reply);
+}
 
 static int property_get_blockio_device_weight(
                 sd_bus *bus,
@@ -79,11 +146,17 @@ static int property_get_blockio_device_bandwidths(
                 return r;
 
         LIST_FOREACH(device_bandwidths, b, c->blockio_device_bandwidths) {
+                uint64_t v;
 
-                if (streq(property, "BlockIOReadBandwidth") != b->read)
+                if (streq(property, "BlockIOReadBandwidth"))
+                        v = b->rbps;
+                else
+                        v = b->wbps;
+
+                if (v == CGROUP_LIMIT_MAX)
                         continue;
 
-                r = sd_bus_message_append(reply, "(st)", b->path, b->bandwidth);
+                r = sd_bus_message_append(reply, "(st)", b->path, v);
                 if (r < 0)
                         return r;
         }
@@ -133,60 +206,74 @@ static int property_get_device_allow(
         return sd_bus_message_close_container(reply);
 }
 
-static int property_get_cpu_quota_per_sec_usec(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        CGroupContext *c = userdata;
-
-        assert(bus);
-        assert(reply);
-        assert(c);
-
-        return sd_bus_message_append(reply, "t", c->cpu_quota_per_sec_usec);
-}
-
-static int property_get_ulong_as_u64(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        unsigned long *ul = userdata;
-
-        assert(bus);
-        assert(reply);
-        assert(ul);
-
-        return sd_bus_message_append(reply, "t", *ul == (unsigned long) -1 ? (uint64_t) -1 : (uint64_t) *ul);
-}
-
 const sd_bus_vtable bus_cgroup_vtable[] = {
         SD_BUS_VTABLE_START(0),
+        SD_BUS_PROPERTY("Delegate", "b", bus_property_get_bool, offsetof(CGroupContext, delegate), 0),
         SD_BUS_PROPERTY("CPUAccounting", "b", bus_property_get_bool, offsetof(CGroupContext, cpu_accounting), 0),
-        SD_BUS_PROPERTY("CPUShares", "t", property_get_ulong_as_u64, offsetof(CGroupContext, cpu_shares), 0),
-        SD_BUS_PROPERTY("StartupCPUShares", "t", property_get_ulong_as_u64, offsetof(CGroupContext, startup_cpu_shares), 0),
-        SD_BUS_PROPERTY("CPUQuotaPerSecUSec", "t", property_get_cpu_quota_per_sec_usec, 0, 0),
+        SD_BUS_PROPERTY("CPUWeight", "t", NULL, offsetof(CGroupContext, cpu_weight), 0),
+        SD_BUS_PROPERTY("StartupCPUWeight", "t", NULL, offsetof(CGroupContext, startup_cpu_weight), 0),
+        SD_BUS_PROPERTY("CPUShares", "t", NULL, offsetof(CGroupContext, cpu_shares), 0),
+        SD_BUS_PROPERTY("StartupCPUShares", "t", NULL, offsetof(CGroupContext, startup_cpu_shares), 0),
+        SD_BUS_PROPERTY("CPUQuotaPerSecUSec", "t", bus_property_get_usec, offsetof(CGroupContext, cpu_quota_per_sec_usec), 0),
+        SD_BUS_PROPERTY("IOAccounting", "b", bus_property_get_bool, offsetof(CGroupContext, io_accounting), 0),
+        SD_BUS_PROPERTY("IOWeight", "t", NULL, offsetof(CGroupContext, io_weight), 0),
+        SD_BUS_PROPERTY("StartupIOWeight", "t", NULL, offsetof(CGroupContext, startup_io_weight), 0),
+        SD_BUS_PROPERTY("IODeviceWeight", "a(st)", property_get_io_device_weight, 0, 0),
+        SD_BUS_PROPERTY("IOReadBandwidthMax", "a(st)", property_get_io_device_limits, 0, 0),
+        SD_BUS_PROPERTY("IOWriteBandwidthMax", "a(st)", property_get_io_device_limits, 0, 0),
+        SD_BUS_PROPERTY("IOReadIOPSMax", "a(st)", property_get_io_device_limits, 0, 0),
+        SD_BUS_PROPERTY("IOWriteIOPSMax", "a(st)", property_get_io_device_limits, 0, 0),
         SD_BUS_PROPERTY("BlockIOAccounting", "b", bus_property_get_bool, offsetof(CGroupContext, blockio_accounting), 0),
-        SD_BUS_PROPERTY("BlockIOWeight", "t", property_get_ulong_as_u64, offsetof(CGroupContext, blockio_weight), 0),
-        SD_BUS_PROPERTY("StartupBlockIOWeight", "t", property_get_ulong_as_u64, offsetof(CGroupContext, startup_blockio_weight), 0),
+        SD_BUS_PROPERTY("BlockIOWeight", "t", NULL, offsetof(CGroupContext, blockio_weight), 0),
+        SD_BUS_PROPERTY("StartupBlockIOWeight", "t", NULL, offsetof(CGroupContext, startup_blockio_weight), 0),
         SD_BUS_PROPERTY("BlockIODeviceWeight", "a(st)", property_get_blockio_device_weight, 0, 0),
         SD_BUS_PROPERTY("BlockIOReadBandwidth", "a(st)", property_get_blockio_device_bandwidths, 0, 0),
         SD_BUS_PROPERTY("BlockIOWriteBandwidth", "a(st)", property_get_blockio_device_bandwidths, 0, 0),
         SD_BUS_PROPERTY("MemoryAccounting", "b", bus_property_get_bool, offsetof(CGroupContext, memory_accounting), 0),
+        SD_BUS_PROPERTY("MemoryLow", "t", NULL, offsetof(CGroupContext, memory_low), 0),
+        SD_BUS_PROPERTY("MemoryHigh", "t", NULL, offsetof(CGroupContext, memory_high), 0),
+        SD_BUS_PROPERTY("MemoryMax", "t", NULL, offsetof(CGroupContext, memory_max), 0),
+        SD_BUS_PROPERTY("MemorySwapMax", "t", NULL, offsetof(CGroupContext, memory_swap_max), 0),
         SD_BUS_PROPERTY("MemoryLimit", "t", NULL, offsetof(CGroupContext, memory_limit), 0),
         SD_BUS_PROPERTY("DevicePolicy", "s", property_get_cgroup_device_policy, offsetof(CGroupContext, device_policy), 0),
         SD_BUS_PROPERTY("DeviceAllow", "a(ss)", property_get_device_allow, 0, 0),
+        SD_BUS_PROPERTY("TasksAccounting", "b", bus_property_get_bool, offsetof(CGroupContext, tasks_accounting), 0),
+        SD_BUS_PROPERTY("TasksMax", "t", NULL, offsetof(CGroupContext, tasks_max), 0),
         SD_BUS_VTABLE_END
 };
+
+static int bus_cgroup_set_transient_property(
+                Unit *u,
+                CGroupContext *c,
+                const char *name,
+                sd_bus_message *message,
+                UnitSetPropertiesMode mode,
+                sd_bus_error *error) {
+
+        int r;
+
+        assert(u);
+        assert(c);
+        assert(name);
+        assert(message);
+
+        if (streq(name, "Delegate")) {
+                int b;
+
+                r = sd_bus_message_read(message, "b", &b);
+                if (r < 0)
+                        return r;
+
+                if (mode != UNIT_CHECK) {
+                        c->delegate = b;
+                        unit_write_drop_in_private(u, mode, name, b ? "Delegate=yes" : "Delegate=no");
+                }
+
+                return 1;
+        }
+
+        return 0;
+}
 
 int bus_cgroup_set_property(
                 Unit *u,
@@ -196,6 +283,7 @@ int bus_cgroup_set_property(
                 UnitSetPropertiesMode mode,
                 sd_bus_error *error) {
 
+        CGroupIOLimitType iol_type;
         int r;
 
         assert(u);
@@ -212,56 +300,96 @@ int bus_cgroup_set_property(
 
                 if (mode != UNIT_CHECK) {
                         c->cpu_accounting = b;
-                        u->cgroup_realized_mask &= ~CGROUP_CPUACCT;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPUACCT|CGROUP_MASK_CPU);
                         unit_write_drop_in_private(u, mode, name, b ? "CPUAccounting=yes" : "CPUAccounting=no");
                 }
 
                 return 1;
 
-        } else if (streq(name, "CPUShares")) {
-                uint64_t u64;
-                unsigned long ul;
+        } else if (streq(name, "CPUWeight")) {
+                uint64_t weight;
 
-                r = sd_bus_message_read(message, "t", &u64);
+                r = sd_bus_message_read(message, "t", &weight);
                 if (r < 0)
                         return r;
 
-                if (u64 == (uint64_t) -1)
-                        ul = (unsigned long) -1;
-                else {
-                        ul = (unsigned long) u64;
-                        if (ul <= 0 || (uint64_t) ul != u64)
-                                return sd_bus_error_set_errnof(error, EINVAL, "CPUShares value out of range");
-                }
+                if (!CGROUP_WEIGHT_IS_OK(weight))
+                        return sd_bus_error_set_errnof(error, EINVAL, "CPUWeight value out of range");
 
                 if (mode != UNIT_CHECK) {
-                        c->cpu_shares = ul;
-                        u->cgroup_realized_mask &= ~CGROUP_CPU;
-                        unit_write_drop_in_private_format(u, mode, name, "CPUShares=%lu", ul);
+                        c->cpu_weight = weight;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPU);
+
+                        if (weight == CGROUP_WEIGHT_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "CPUWeight=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "CPUWeight=%" PRIu64, weight);
+                }
+
+                return 1;
+
+        } else if (streq(name, "StartupCPUWeight")) {
+                uint64_t weight;
+
+                r = sd_bus_message_read(message, "t", &weight);
+                if (r < 0)
+                        return r;
+
+                if (!CGROUP_WEIGHT_IS_OK(weight))
+                        return sd_bus_error_set_errnof(error, EINVAL, "StartupCPUWeight value out of range");
+
+                if (mode != UNIT_CHECK) {
+                        c->startup_cpu_weight = weight;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPU);
+
+                        if (weight == CGROUP_CPU_SHARES_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "StartupCPUWeight=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "StartupCPUWeight=%" PRIu64, weight);
+                }
+
+                return 1;
+
+        } else if (streq(name, "CPUShares")) {
+                uint64_t shares;
+
+                r = sd_bus_message_read(message, "t", &shares);
+                if (r < 0)
+                        return r;
+
+                if (!CGROUP_CPU_SHARES_IS_OK(shares))
+                        return sd_bus_error_set_errnof(error, EINVAL, "CPUShares value out of range");
+
+                if (mode != UNIT_CHECK) {
+                        c->cpu_shares = shares;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPU);
+
+                        if (shares == CGROUP_CPU_SHARES_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "CPUShares=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "CPUShares=%" PRIu64, shares);
                 }
 
                 return 1;
 
         } else if (streq(name, "StartupCPUShares")) {
-                uint64_t u64;
-                unsigned long ul;
+                uint64_t shares;
 
-                r = sd_bus_message_read(message, "t", &u64);
+                r = sd_bus_message_read(message, "t", &shares);
                 if (r < 0)
                         return r;
 
-                if (u64 == (uint64_t) -1)
-                        ul = (unsigned long) -1;
-                else {
-                        ul = (unsigned long) u64;
-                        if (ul <= 0 || (uint64_t) ul != u64)
-                                return sd_bus_error_set_errnof(error, EINVAL, "StartupCPUShares value out of range");
-                }
+                if (!CGROUP_CPU_SHARES_IS_OK(shares))
+                        return sd_bus_error_set_errnof(error, EINVAL, "StartupCPUShares value out of range");
 
                 if (mode != UNIT_CHECK) {
-                        c->startup_cpu_shares = ul;
-                        u->cgroup_realized_mask &= ~CGROUP_CPU;
-                        unit_write_drop_in_private_format(u, mode, name, "StartupCPUShares=%lu", ul);
+                        c->startup_cpu_shares = shares;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPU);
+
+                        if (shares == CGROUP_CPU_SHARES_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "StartupCPUShares=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "StartupCPUShares=%" PRIu64, shares);
                 }
 
                 return 1;
@@ -278,8 +406,225 @@ int bus_cgroup_set_property(
 
                 if (mode != UNIT_CHECK) {
                         c->cpu_quota_per_sec_usec = u64;
-                        u->cgroup_realized_mask &= ~CGROUP_CPU;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPU);
                         unit_write_drop_in_private_format(u, mode, "CPUQuota", "CPUQuota=%0.f%%", (double) (c->cpu_quota_per_sec_usec / 10000));
+                }
+
+                return 1;
+
+        } else if (streq(name, "IOAccounting")) {
+                int b;
+
+                r = sd_bus_message_read(message, "b", &b);
+                if (r < 0)
+                        return r;
+
+                if (mode != UNIT_CHECK) {
+                        c->io_accounting = b;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_IO);
+                        unit_write_drop_in_private(u, mode, name, b ? "IOAccounting=yes" : "IOAccounting=no");
+                }
+
+                return 1;
+
+        } else if (streq(name, "IOWeight")) {
+                uint64_t weight;
+
+                r = sd_bus_message_read(message, "t", &weight);
+                if (r < 0)
+                        return r;
+
+                if (!CGROUP_WEIGHT_IS_OK(weight))
+                        return sd_bus_error_set_errnof(error, EINVAL, "IOWeight value out of range");
+
+                if (mode != UNIT_CHECK) {
+                        c->io_weight = weight;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_IO);
+
+                        if (weight == CGROUP_WEIGHT_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "IOWeight=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "IOWeight=%" PRIu64, weight);
+                }
+
+                return 1;
+
+        } else if (streq(name, "StartupIOWeight")) {
+                uint64_t weight;
+
+                r = sd_bus_message_read(message, "t", &weight);
+                if (r < 0)
+                        return r;
+
+                if (CGROUP_WEIGHT_IS_OK(weight))
+                        return sd_bus_error_set_errnof(error, EINVAL, "StartupIOWeight value out of range");
+
+                if (mode != UNIT_CHECK) {
+                        c->startup_io_weight = weight;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_IO);
+
+                        if (weight == CGROUP_WEIGHT_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "StartupIOWeight=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "StartupIOWeight=%" PRIu64, weight);
+                }
+
+                return 1;
+
+        } else if ((iol_type = cgroup_io_limit_type_from_string(name)) >= 0) {
+                const char *path;
+                unsigned n = 0;
+                uint64_t u64;
+
+                r = sd_bus_message_enter_container(message, 'a', "(st)");
+                if (r < 0)
+                        return r;
+
+                while ((r = sd_bus_message_read(message, "(st)", &path, &u64)) > 0) {
+
+                        if (mode != UNIT_CHECK) {
+                                CGroupIODeviceLimit *a = NULL, *b;
+
+                                LIST_FOREACH(device_limits, b, c->io_device_limits) {
+                                        if (path_equal(path, b->path)) {
+                                                a = b;
+                                                break;
+                                        }
+                                }
+
+                                if (!a) {
+                                        CGroupIOLimitType type;
+
+                                        a = new0(CGroupIODeviceLimit, 1);
+                                        if (!a)
+                                                return -ENOMEM;
+
+                                        a->path = strdup(path);
+                                        if (!a->path) {
+                                                free(a);
+                                                return -ENOMEM;
+                                        }
+
+                                        for (type = 0; type < _CGROUP_IO_LIMIT_TYPE_MAX; type++)
+                                                a->limits[type] = cgroup_io_limit_defaults[type];
+
+                                        LIST_PREPEND(device_limits, c->io_device_limits, a);
+                                }
+
+                                a->limits[iol_type] = u64;
+                        }
+
+                        n++;
+                }
+                if (r < 0)
+                        return r;
+
+                r = sd_bus_message_exit_container(message);
+                if (r < 0)
+                        return r;
+
+                if (mode != UNIT_CHECK) {
+                        CGroupIODeviceLimit *a;
+                        _cleanup_free_ char *buf = NULL;
+                        _cleanup_fclose_ FILE *f = NULL;
+                        size_t size = 0;
+
+                        if (n == 0) {
+                                LIST_FOREACH(device_limits, a, c->io_device_limits)
+                                        a->limits[iol_type] = cgroup_io_limit_defaults[iol_type];
+                        }
+
+                        unit_invalidate_cgroup(u, CGROUP_MASK_IO);
+
+                        f = open_memstream(&buf, &size);
+                        if (!f)
+                                return -ENOMEM;
+
+                        fprintf(f, "%s=\n", name);
+                        LIST_FOREACH(device_limits, a, c->io_device_limits)
+                                        if (a->limits[iol_type] != cgroup_io_limit_defaults[iol_type])
+                                                fprintf(f, "%s=%s %" PRIu64 "\n", name, a->path, a->limits[iol_type]);
+
+                        r = fflush_and_check(f);
+                        if (r < 0)
+                                return r;
+                        unit_write_drop_in_private(u, mode, name, buf);
+                }
+
+                return 1;
+
+        } else if (streq(name, "IODeviceWeight")) {
+                const char *path;
+                uint64_t weight;
+                unsigned n = 0;
+
+                r = sd_bus_message_enter_container(message, 'a', "(st)");
+                if (r < 0)
+                        return r;
+
+                while ((r = sd_bus_message_read(message, "(st)", &path, &weight)) > 0) {
+
+                        if (!CGROUP_WEIGHT_IS_OK(weight) || weight == CGROUP_WEIGHT_INVALID)
+                                return sd_bus_error_set_errnof(error, EINVAL, "IODeviceWeight out of range");
+
+                        if (mode != UNIT_CHECK) {
+                                CGroupIODeviceWeight *a = NULL, *b;
+
+                                LIST_FOREACH(device_weights, b, c->io_device_weights) {
+                                        if (path_equal(b->path, path)) {
+                                                a = b;
+                                                break;
+                                        }
+                                }
+
+                                if (!a) {
+                                        a = new0(CGroupIODeviceWeight, 1);
+                                        if (!a)
+                                                return -ENOMEM;
+
+                                        a->path = strdup(path);
+                                        if (!a->path) {
+                                                free(a);
+                                                return -ENOMEM;
+                                        }
+                                        LIST_PREPEND(device_weights,c->io_device_weights, a);
+                                }
+
+                                a->weight = weight;
+                        }
+
+                        n++;
+                }
+
+                r = sd_bus_message_exit_container(message);
+                if (r < 0)
+                        return r;
+
+                if (mode != UNIT_CHECK) {
+                        _cleanup_free_ char *buf = NULL;
+                        _cleanup_fclose_ FILE *f = NULL;
+                        CGroupIODeviceWeight *a;
+                        size_t size = 0;
+
+                        if (n == 0) {
+                                while (c->io_device_weights)
+                                        cgroup_context_free_io_device_weight(c, c->io_device_weights);
+                        }
+
+                        unit_invalidate_cgroup(u, CGROUP_MASK_IO);
+
+                        f = open_memstream(&buf, &size);
+                        if (!f)
+                                return -ENOMEM;
+
+                        fputs("IODeviceWeight=\n", f);
+                        LIST_FOREACH(device_weights, a, c->io_device_weights)
+                                fprintf(f, "IODeviceWeight=%s %" PRIu64 "\n", a->path, a->weight);
+
+                        r = fflush_and_check(f);
+                        if (r < 0)
+                                return r;
+                        unit_write_drop_in_private(u, mode, name, buf);
                 }
 
                 return 1;
@@ -293,61 +638,57 @@ int bus_cgroup_set_property(
 
                 if (mode != UNIT_CHECK) {
                         c->blockio_accounting = b;
-                        u->cgroup_realized_mask &= ~CGROUP_BLKIO;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_BLKIO);
                         unit_write_drop_in_private(u, mode, name, b ? "BlockIOAccounting=yes" : "BlockIOAccounting=no");
                 }
 
                 return 1;
 
         } else if (streq(name, "BlockIOWeight")) {
-                uint64_t u64;
-                unsigned long ul;
+                uint64_t weight;
 
-                r = sd_bus_message_read(message, "t", &u64);
+                r = sd_bus_message_read(message, "t", &weight);
                 if (r < 0)
                         return r;
 
-                if (u64 == (uint64_t) -1)
-                        ul = (unsigned long) -1;
-                else  {
-                        ul = (unsigned long) u64;
-                        if (ul < 10 || ul > 1000)
-                                return sd_bus_error_set_errnof(error, EINVAL, "BlockIOWeight value out of range");
-                }
+                if (!CGROUP_BLKIO_WEIGHT_IS_OK(weight))
+                        return sd_bus_error_set_errnof(error, EINVAL, "BlockIOWeight value out of range");
 
                 if (mode != UNIT_CHECK) {
-                        c->blockio_weight = ul;
-                        u->cgroup_realized_mask &= ~CGROUP_BLKIO;
-                        unit_write_drop_in_private_format(u, mode, name, "BlockIOWeight=%lu", ul);
+                        c->blockio_weight = weight;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_BLKIO);
+
+                        if (weight == CGROUP_BLKIO_WEIGHT_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "BlockIOWeight=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "BlockIOWeight=%" PRIu64, weight);
                 }
 
                 return 1;
 
         } else if (streq(name, "StartupBlockIOWeight")) {
-                uint64_t u64;
-                unsigned long ul;
+                uint64_t weight;
 
-                r = sd_bus_message_read(message, "t", &u64);
+                r = sd_bus_message_read(message, "t", &weight);
                 if (r < 0)
                         return r;
 
-                if (u64 == (uint64_t) -1)
-                        ul = (unsigned long) -1;
-                else  {
-                        ul = (unsigned long) u64;
-                        if (ul < 10 || ul > 1000)
-                                return sd_bus_error_set_errnof(error, EINVAL, "StartupBlockIOWeight value out of range");
-                }
+                if (!CGROUP_BLKIO_WEIGHT_IS_OK(weight))
+                        return sd_bus_error_set_errnof(error, EINVAL, "StartupBlockIOWeight value out of range");
 
                 if (mode != UNIT_CHECK) {
-                        c->startup_blockio_weight = ul;
-                        u->cgroup_realized_mask &= ~CGROUP_BLKIO;
-                        unit_write_drop_in_private_format(u, mode, name, "StartupBlockIOWeight=%lu", ul);
+                        c->startup_blockio_weight = weight;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_BLKIO);
+
+                        if (weight == CGROUP_BLKIO_WEIGHT_INVALID)
+                                unit_write_drop_in_private(u, mode, name, "StartupBlockIOWeight=");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "StartupBlockIOWeight=%" PRIu64, weight);
                 }
 
                 return 1;
 
-        } else if (streq(name, "BlockIOReadBandwidth") || streq(name, "BlockIOWriteBandwidth")) {
+        } else if (STR_IN_SET(name, "BlockIOReadBandwidth", "BlockIOWriteBandwidth")) {
                 const char *path;
                 bool read = true;
                 unsigned n = 0;
@@ -366,7 +707,7 @@ int bus_cgroup_set_property(
                                 CGroupBlockIODeviceBandwidth *a = NULL, *b;
 
                                 LIST_FOREACH(device_bandwidths, b, c->blockio_device_bandwidths) {
-                                        if (path_equal(path, b->path) && read == b->read) {
+                                        if (path_equal(path, b->path)) {
                                                 a = b;
                                                 break;
                                         }
@@ -377,7 +718,8 @@ int bus_cgroup_set_property(
                                         if (!a)
                                                 return -ENOMEM;
 
-                                        a->read = read;
+                                        a->rbps = CGROUP_LIMIT_MAX;
+                                        a->wbps = CGROUP_LIMIT_MAX;
                                         a->path = strdup(path);
                                         if (!a->path) {
                                                 free(a);
@@ -387,7 +729,10 @@ int bus_cgroup_set_property(
                                         LIST_PREPEND(device_bandwidths, c->blockio_device_bandwidths, a);
                                 }
 
-                                a->bandwidth = u64;
+                                if (read)
+                                        a->rbps = u64;
+                                else
+                                        a->wbps = u64;
                         }
 
                         n++;
@@ -400,36 +745,41 @@ int bus_cgroup_set_property(
                         return r;
 
                 if (mode != UNIT_CHECK) {
-                        CGroupBlockIODeviceBandwidth *a, *next;
+                        CGroupBlockIODeviceBandwidth *a;
                         _cleanup_free_ char *buf = NULL;
                         _cleanup_fclose_ FILE *f = NULL;
                         size_t size = 0;
 
                         if (n == 0) {
-                                LIST_FOREACH_SAFE(device_bandwidths, a, next, c->blockio_device_bandwidths)
-                                        if (a->read == read)
-                                                cgroup_context_free_blockio_device_bandwidth(c, a);
+                                LIST_FOREACH(device_bandwidths, a, c->blockio_device_bandwidths) {
+                                        if (read)
+                                                a->rbps = CGROUP_LIMIT_MAX;
+                                        else
+                                                a->wbps = CGROUP_LIMIT_MAX;
+                                }
                         }
 
-                        u->cgroup_realized_mask &= ~CGROUP_BLKIO;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_BLKIO);
 
                         f = open_memstream(&buf, &size);
                         if (!f)
                                 return -ENOMEM;
 
-                         if (read) {
+                        if (read) {
                                 fputs("BlockIOReadBandwidth=\n", f);
-                                 LIST_FOREACH(device_bandwidths, a, c->blockio_device_bandwidths)
-                                        if (a->read)
-                                                fprintf(f, "BlockIOReadBandwidth=%s %" PRIu64 "\n", a->path, a->bandwidth);
+                                LIST_FOREACH(device_bandwidths, a, c->blockio_device_bandwidths)
+                                        if (a->rbps != CGROUP_LIMIT_MAX)
+                                                fprintf(f, "BlockIOReadBandwidth=%s %" PRIu64 "\n", a->path, a->rbps);
                         } else {
                                 fputs("BlockIOWriteBandwidth=\n", f);
                                 LIST_FOREACH(device_bandwidths, a, c->blockio_device_bandwidths)
-                                        if (!a->read)
-                                                fprintf(f, "BlockIOWriteBandwidth=%s %" PRIu64 "\n", a->path, a->bandwidth);
+                                        if (a->wbps != CGROUP_LIMIT_MAX)
+                                                fprintf(f, "BlockIOWriteBandwidth=%s %" PRIu64 "\n", a->path, a->wbps);
                         }
 
-                        fflush(f);
+                        r = fflush_and_check(f);
+                        if (r < 0)
+                                return r;
                         unit_write_drop_in_private(u, mode, name, buf);
                 }
 
@@ -437,17 +787,16 @@ int bus_cgroup_set_property(
 
         } else if (streq(name, "BlockIODeviceWeight")) {
                 const char *path;
-                uint64_t u64;
+                uint64_t weight;
                 unsigned n = 0;
 
                 r = sd_bus_message_enter_container(message, 'a', "(st)");
                 if (r < 0)
                         return r;
 
-                while ((r = sd_bus_message_read(message, "(st)", &path, &u64)) > 0) {
-                        unsigned long ul = u64;
+                while ((r = sd_bus_message_read(message, "(st)", &path, &weight)) > 0) {
 
-                        if (ul < 10 || ul > 1000)
+                        if (!CGROUP_BLKIO_WEIGHT_IS_OK(weight) || weight == CGROUP_BLKIO_WEIGHT_INVALID)
                                 return sd_bus_error_set_errnof(error, EINVAL, "BlockIODeviceWeight out of range");
 
                         if (mode != UNIT_CHECK) {
@@ -473,7 +822,7 @@ int bus_cgroup_set_property(
                                         LIST_PREPEND(device_weights,c->blockio_device_weights, a);
                                 }
 
-                                a->weight = ul;
+                                a->weight = weight;
                         }
 
                         n++;
@@ -494,7 +843,7 @@ int bus_cgroup_set_property(
                                         cgroup_context_free_blockio_device_weight(c, c->blockio_device_weights);
                         }
 
-                        u->cgroup_realized_mask &= ~CGROUP_BLKIO;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_BLKIO);
 
                         f = open_memstream(&buf, &size);
                         if (!f)
@@ -502,9 +851,11 @@ int bus_cgroup_set_property(
 
                         fputs("BlockIODeviceWeight=\n", f);
                         LIST_FOREACH(device_weights, a, c->blockio_device_weights)
-                                fprintf(f, "BlockIODeviceWeight=%s %lu\n", a->path, a->weight);
+                                fprintf(f, "BlockIODeviceWeight=%s %" PRIu64 "\n", a->path, a->weight);
 
-                        fflush(f);
+                        r = fflush_and_check(f);
+                        if (r < 0)
+                                return r;
                         unit_write_drop_in_private(u, mode, name, buf);
                 }
 
@@ -519,8 +870,70 @@ int bus_cgroup_set_property(
 
                 if (mode != UNIT_CHECK) {
                         c->memory_accounting = b;
-                        u->cgroup_realized_mask &= ~CGROUP_MEMORY;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_MEMORY);
                         unit_write_drop_in_private(u, mode, name, b ? "MemoryAccounting=yes" : "MemoryAccounting=no");
+                }
+
+                return 1;
+
+        } else if (STR_IN_SET(name, "MemoryLow", "MemoryHigh", "MemoryMax", "MemorySwapMax")) {
+                uint64_t v;
+
+                r = sd_bus_message_read(message, "t", &v);
+                if (r < 0)
+                        return r;
+                if (v <= 0)
+                        return sd_bus_error_set_errnof(error, EINVAL, "%s= is too small", name);
+
+                if (mode != UNIT_CHECK) {
+                        if (streq(name, "MemoryLow"))
+                                c->memory_low = v;
+                        else if (streq(name, "MemoryHigh"))
+                                c->memory_high = v;
+                        else if (streq(name, "MemorySwapMax"))
+                                c->memory_swap_max = v;
+                        else
+                                c->memory_max = v;
+
+                        unit_invalidate_cgroup(u, CGROUP_MASK_MEMORY);
+
+                        if (v == CGROUP_LIMIT_MAX)
+                                unit_write_drop_in_private_format(u, mode, name, "%s=infinity", name);
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "%s=%" PRIu64, name, v);
+                }
+
+                return 1;
+
+        } else if (STR_IN_SET(name, "MemoryLowScale", "MemoryHighScale", "MemoryMaxScale")) {
+                uint32_t raw;
+                uint64_t v;
+
+                r = sd_bus_message_read(message, "u", &raw);
+                if (r < 0)
+                        return r;
+
+                v = physical_memory_scale(raw, UINT32_MAX);
+                if (v <= 0 || v == UINT64_MAX)
+                        return sd_bus_error_set_errnof(error, EINVAL, "%s= is out of range", name);
+
+                if (mode != UNIT_CHECK) {
+                        const char *e;
+
+                        /* Chop off suffix */
+                        assert_se(e = endswith(name, "Scale"));
+                        name = strndupa(name, e - name);
+
+                        if (streq(name, "MemoryLow"))
+                                c->memory_low = v;
+                        else if (streq(name, "MemoryHigh"))
+                                c->memory_high = v;
+                        else
+                                c->memory_max = v;
+
+                        unit_invalidate_cgroup(u, CGROUP_MASK_MEMORY);
+                        unit_write_drop_in_private_format(u, mode, name, "%s=%" PRIu32 "%%", name,
+                                                          (uint32_t) (DIV_ROUND_UP((uint64_t) raw * 100U, (uint64_t) UINT32_MAX)));
                 }
 
                 return 1;
@@ -531,11 +944,38 @@ int bus_cgroup_set_property(
                 r = sd_bus_message_read(message, "t", &limit);
                 if (r < 0)
                         return r;
+                if (limit <= 0)
+                        return sd_bus_error_set_errnof(error, EINVAL, "%s= is too small", name);
 
                 if (mode != UNIT_CHECK) {
                         c->memory_limit = limit;
-                        u->cgroup_realized_mask &= ~CGROUP_MEMORY;
-                        unit_write_drop_in_private_format(u, mode, name, "%s=%" PRIu64, name, limit);
+                        unit_invalidate_cgroup(u, CGROUP_MASK_MEMORY);
+
+                        if (limit == (uint64_t) -1)
+                                unit_write_drop_in_private(u, mode, name, "MemoryLimit=infinity");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "MemoryLimit=%" PRIu64, limit);
+                }
+
+                return 1;
+
+        } else if (streq(name, "MemoryLimitScale")) {
+                uint64_t limit;
+                uint32_t raw;
+
+                r = sd_bus_message_read(message, "u", &raw);
+                if (r < 0)
+                        return r;
+
+                limit = physical_memory_scale(raw, UINT32_MAX);
+                if (limit <= 0 || limit == UINT64_MAX)
+                        return sd_bus_error_set_errnof(error, EINVAL, "%s= is out of range", name);
+
+                if (mode != UNIT_CHECK) {
+                        c->memory_limit = limit;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_MEMORY);
+                        unit_write_drop_in_private_format(u, mode, "MemoryLimit", "MemoryLimit=%" PRIu32 "%%",
+                                                          (uint32_t) (DIV_ROUND_UP((uint64_t) raw * 100U, (uint64_t) UINT32_MAX)));
                 }
 
                 return 1;
@@ -553,13 +993,9 @@ int bus_cgroup_set_property(
                         return -EINVAL;
 
                 if (mode != UNIT_CHECK) {
-                        char *buf;
-
                         c->device_policy = p;
-                        u->cgroup_realized_mask &= ~CGROUP_DEVICE;
-
-                        buf = strappenda("DevicePolicy=", policy);
-                        unit_write_drop_in_private(u, mode, name, buf);
+                        unit_invalidate_cgroup(u, CGROUP_MASK_DEVICES);
+                        unit_write_drop_in_private_format(u, mode, name, "DevicePolicy=%s", policy);
                 }
 
                 return 1;
@@ -575,6 +1011,7 @@ int bus_cgroup_set_property(
                 while ((r = sd_bus_message_read(message, "(ss)", &path, &rwm)) > 0) {
 
                         if ((!startswith(path, "/dev/") &&
+                             !startswith(path, "/run/systemd/inaccessible/") &&
                              !startswith(path, "block-") &&
                              !startswith(path, "char-")) ||
                             strpbrk(path, WHITESPACE))
@@ -635,7 +1072,7 @@ int bus_cgroup_set_property(
                                         cgroup_context_free_device_allow(c, c->device_allow);
                         }
 
-                        u->cgroup_realized_mask &= ~CGROUP_DEVICE;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_DEVICES);
 
                         f = open_memstream(&buf, &size);
                         if (!f)
@@ -645,11 +1082,76 @@ int bus_cgroup_set_property(
                         LIST_FOREACH(device_allow, a, c->device_allow)
                                 fprintf(f, "DeviceAllow=%s %s%s%s\n", a->path, a->r ? "r" : "", a->w ? "w" : "", a->m ? "m" : "");
 
-                        fflush(f);
+                        r = fflush_and_check(f);
+                        if (r < 0)
+                                return r;
                         unit_write_drop_in_private(u, mode, name, buf);
                 }
 
                 return 1;
+
+        } else if (streq(name, "TasksAccounting")) {
+                int b;
+
+                r = sd_bus_message_read(message, "b", &b);
+                if (r < 0)
+                        return r;
+
+                if (mode != UNIT_CHECK) {
+                        c->tasks_accounting = b;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_PIDS);
+                        unit_write_drop_in_private(u, mode, name, b ? "TasksAccounting=yes" : "TasksAccounting=no");
+                }
+
+                return 1;
+
+        } else if (streq(name, "TasksMax")) {
+                uint64_t limit;
+
+                r = sd_bus_message_read(message, "t", &limit);
+                if (r < 0)
+                        return r;
+                if (limit <= 0)
+                        return sd_bus_error_set_errnof(error, EINVAL, "%s= is too small", name);
+
+                if (mode != UNIT_CHECK) {
+                        c->tasks_max = limit;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_PIDS);
+
+                        if (limit == (uint64_t) -1)
+                                unit_write_drop_in_private(u, mode, name, "TasksMax=infinity");
+                        else
+                                unit_write_drop_in_private_format(u, mode, name, "TasksMax=%" PRIu64, limit);
+                }
+
+                return 1;
+        } else if (streq(name, "TasksMaxScale")) {
+                uint64_t limit;
+                uint32_t raw;
+
+                r = sd_bus_message_read(message, "u", &raw);
+                if (r < 0)
+                        return r;
+
+                limit = system_tasks_max_scale(raw, UINT32_MAX);
+                if (limit <= 0 || limit >= UINT64_MAX)
+                        return sd_bus_error_set_errnof(error, EINVAL, "%s= is out of range", name);
+
+                if (mode != UNIT_CHECK) {
+                        c->tasks_max = limit;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_PIDS);
+                        unit_write_drop_in_private_format(u, mode, name, "TasksMax=%" PRIu32 "%%",
+                                                          (uint32_t) (DIV_ROUND_UP((uint64_t) raw * 100U, (uint64_t) UINT32_MAX)));
+                }
+
+                return 1;
+        }
+
+        if (u->transient && u->load_state == UNIT_STUB) {
+                r = bus_cgroup_set_transient_property(u, c, name, message, mode, error);
+                if (r != 0)
+                        return r;
+
         }
 
         return 0;

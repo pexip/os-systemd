@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,29 +17,33 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <unistd.h>
 #include <fcntl.h>
+#include <unistd.h>
 
-#include <systemd/sd-journal.h>
+#include "sd-journal.h"
 
+#include "alloc-util.h"
 #include "journal-file.h"
 #include "journal-internal.h"
-#include "util.h"
 #include "log.h"
+#include "macro.h"
+#include "parse-util.h"
+#include "rm-rf.h"
+#include "util.h"
 
 #define N_ENTRIES 200
 
 static void verify_contents(sd_journal *j, unsigned skip) {
         unsigned i;
 
-        assert(j);
+        assert_se(j);
 
         i = 0;
         SD_JOURNAL_FOREACH(j) {
                 const void *d;
                 char *k, *c;
                 size_t l;
-                unsigned u;
+                unsigned u = 0;
 
                 assert_se(sd_journal_get_cursor(j, &k) >= 0);
                 printf("cursor: %s\n", k);
@@ -75,10 +77,11 @@ int main(int argc, char *argv[]) {
         JournalFile *one, *two, *three;
         char t[] = "/tmp/journal-stream-XXXXXX";
         unsigned i;
-        _cleanup_journal_close_ sd_journal *j = NULL;
+        _cleanup_(sd_journal_closep) sd_journal *j = NULL;
         char *z;
         const void *data;
         size_t l;
+        dual_timestamp previous_ts = DUAL_TIMESTAMP_NULL;
 
         /* journal_file_open requires a valid machine id */
         if (access("/etc/machine-id", F_OK) != 0)
@@ -89,9 +92,9 @@ int main(int argc, char *argv[]) {
         assert_se(mkdtemp(t));
         assert_se(chdir(t) >= 0);
 
-        assert_se(journal_file_open("one.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, &one) == 0);
-        assert_se(journal_file_open("two.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, &two) == 0);
-        assert_se(journal_file_open("three.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, &three) == 0);
+        assert_se(journal_file_open(-1, "one.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, NULL, &one) == 0);
+        assert_se(journal_file_open(-1, "two.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, NULL, &two) == 0);
+        assert_se(journal_file_open(-1, "three.journal", O_RDWR|O_CREAT, 0666, true, false, NULL, NULL, NULL, NULL, &three) == 0);
 
         for (i = 0; i < N_ENTRIES; i++) {
                 char *p, *q;
@@ -99,6 +102,14 @@ int main(int argc, char *argv[]) {
                 struct iovec iovec[2];
 
                 dual_timestamp_get(&ts);
+
+                if (ts.monotonic <= previous_ts.monotonic)
+                        ts.monotonic = previous_ts.monotonic + 1;
+
+                if (ts.realtime <= previous_ts.realtime)
+                        ts.realtime = previous_ts.realtime + 1;
+
+                previous_ts = ts;
 
                 assert_se(asprintf(&p, "NUMBER=%u", i) >= 0);
                 iovec[0].iov_base = p;
@@ -122,9 +133,9 @@ int main(int argc, char *argv[]) {
                 free(q);
         }
 
-        journal_file_close(one);
-        journal_file_close(two);
-        journal_file_close(three);
+        (void) journal_file_close(one);
+        (void) journal_file_close(two);
+        (void) journal_file_close(three);
 
         assert_se(sd_journal_open_directory(&j, t, 0) >= 0);
 
@@ -179,7 +190,7 @@ int main(int argc, char *argv[]) {
         SD_JOURNAL_FOREACH_UNIQUE(j, data, l)
                 printf("%.*s\n", (int) l, (const char*) data);
 
-        assert_se(rm_rf_dangerous(t, false, true, false) >= 0);
+        assert_se(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL) >= 0);
 
         return 0;
 }

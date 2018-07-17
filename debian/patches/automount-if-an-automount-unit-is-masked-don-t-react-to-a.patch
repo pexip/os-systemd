@@ -10,21 +10,16 @@ mode, as otherwise we don't know how to operate on the automount and
 detach it.
 
 Fixes: #5441
-(backported from commit e350ca3f1ecb6672b74cd25d09ef23c7b309aa5a)
+(cherry picked from commit e350ca3f1ecb6672b74cd25d09ef23c7b309aa5a)
 ---
- src/core/automount.c | 67 +++++++++++++++++++++++++++++++++++-----------------
- 1 file changed, 45 insertions(+), 22 deletions(-)
+ src/core/automount.c | 78 +++++++++++++++++++++++++++++++++-------------------
+ 1 file changed, 50 insertions(+), 28 deletions(-)
 
 diff --git a/src/core/automount.c b/src/core/automount.c
-index 73a8ce1..4392635 100644
+index 7d7a0a6..f091a9a 100644
 --- a/src/core/automount.c
 +++ b/src/core/automount.c
-@@ -87,17 +87,19 @@ static void unmount_autofs(Automount *a) {
-         if (a->pipe_fd < 0)
-                 return;
- 
--        automount_send_ready(a, -EHOSTDOWN);
- 
+@@ -101,17 +101,17 @@ static void unmount_autofs(Automount *a) {
          a->pipe_event_source = sd_event_source_unref(a->pipe_event_source);
          a->pipe_fd = safe_close(a->pipe_fd);
  
@@ -32,34 +27,39 @@ index 73a8ce1..4392635 100644
 -         * around */
 -        if (a->where &&
 -            (UNIT(a)->manager->exit_code != MANAGER_RELOAD &&
--             UNIT(a)->manager->exit_code != MANAGER_REEXECUTE))
--                repeat_unmount(a->where);
+-             UNIT(a)->manager->exit_code != MANAGER_REEXECUTE)) {
 +        /* If we reload/reexecute things we keep the mount point around */
 +        if (!IN_SET(UNIT(a)->manager->exit_code, MANAGER_RELOAD, MANAGER_REEXECUTE)) {
 +
-+                automount_send_ready(a, -EHOSTDOWN);
-+
+                 automount_send_ready(a, a->tokens, -EHOSTDOWN);
+                 automount_send_ready(a, a->expire_tokens, -EHOSTDOWN);
+ 
+-                r = repeat_unmount(a->where, MNT_DETACH);
+-                if (r < 0)
+-                        log_error_errno(r, "Failed to unmount: %m");
 +                if (a->where) {
-+                        repeat_unmount(a->where);
++                        r = repeat_unmount(a->where, MNT_DETACH);
++                        if (r < 0)
++                                log_error_errno(r, "Failed to unmount: %m");
 +                }
-+        }
+         }
  }
  
- static void automount_done(Unit *u) {
-@@ -169,6 +171,21 @@ static int automount_verify(Automount *a) {
+@@ -186,6 +186,22 @@ static int automount_verify(Automount *a) {
          return 0;
  }
  
 +static int automount_set_where(Automount *a) {
++        int r;
 +
 +        assert(a);
 +
 +        if (a->where)
 +                return 0;
 +
-+        a->where = unit_name_to_path(UNIT(a)->id);
-+        if (!a->where)
-+                return -ENOMEM;
++        r = unit_name_to_path(UNIT(a)->id, &a->where);
++        if (r < 0)
++                return r;
 +
 +        path_kill_slashes(a->where);
 +        return 1;
@@ -68,14 +68,14 @@ index 73a8ce1..4392635 100644
  static int automount_load(Unit *u) {
          Automount *a = AUTOMOUNT(u);
          int r;
-@@ -184,13 +201,9 @@ static int automount_load(Unit *u) {
+@@ -201,13 +217,9 @@ static int automount_load(Unit *u) {
          if (u->load_state == UNIT_LOADED) {
                  Unit *x;
  
 -                if (!a->where) {
--                        a->where = unit_name_to_path(u->id);
--                        if (!a->where)
--                                return -ENOMEM;
+-                        r = unit_name_to_path(u->id, &a->where);
+-                        if (r < 0)
+-                                return r;
 -                }
 -
 -                path_kill_slashes(a->where);
@@ -85,7 +85,7 @@ index 73a8ce1..4392635 100644
  
                  r = unit_load_related_unit(u, ".mount", &x);
                  if (r < 0)
-@@ -242,21 +255,25 @@ static int automount_coldplug(Unit *u) {
+@@ -256,26 +268,30 @@ static int automount_coldplug(Unit *u) {
          assert(a);
          assert(a->state == AUTOMOUNT_DEAD);
  
@@ -105,27 +105,37 @@ index 73a8ce1..4392635 100644
  
 -                if (a->deserialized_state == AUTOMOUNT_WAITING ||
 -                    a->deserialized_state == AUTOMOUNT_RUNNING) {
-+                assert(a->pipe_fd >= 0);
- 
 -                        assert(a->pipe_fd >= 0);
-+                r = sd_event_add_io(u->manager->event, &a->pipe_event_source, a->pipe_fd, EPOLLIN, automount_dispatch_io, u);
-+                if (r < 0)
-+                        return r;
++                assert(a->pipe_fd >= 0);
  
 -                        r = sd_event_add_io(u->manager->event, &a->pipe_event_source, a->pipe_fd, EPOLLIN, automount_dispatch_io, u);
 -                        if (r < 0)
 -                                return r;
--                }
++                r = sd_event_add_io(u->manager->event, &a->pipe_event_source, a->pipe_fd, EPOLLIN, automount_dispatch_io, u);
++                if (r < 0)
++                        return r;
+ 
+-                        (void) sd_event_source_set_description(a->pipe_event_source, "automount-io");
+-                        if (a->deserialized_state == AUTOMOUNT_RUNNING) {
+-                                r = automount_start_expire(a);
+-                                if (r < 0)
+-                                        log_unit_warning_errno(UNIT(a), r, "Failed to start expiration timer, ignoring: %m");
+-                        }
++                (void) sd_event_source_set_description(a->pipe_event_source, "automount-io");
++                if (a->deserialized_state == AUTOMOUNT_RUNNING) {
++                        r = automount_start_expire(a);
++                        if (r < 0)
++                                log_unit_warning_errno(UNIT(a), r, "Failed to start expiration timer, ignoring: %m");
+                 }
  
                  automount_set_state(a, a->deserialized_state);
-         }
-@@ -548,6 +565,12 @@ static void automount_enter_runnning(Automount *a) {
+@@ -733,6 +749,12 @@ static void automount_enter_runnning(Automount *a) {
  
          assert(a);
  
 +        /* If the user masked our unit in the meantime, fail */
 +        if (UNIT(a)->load_state != UNIT_LOADED) {
-+                log_error_unit(UNIT(a)->id, "Suppressing automount event since unit is no longer loaded.");
++                log_unit_error(UNIT(a), "Suppressing automount event since unit is no longer loaded.");
 +                goto fail;
 +        }
 +

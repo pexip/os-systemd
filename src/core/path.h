@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 #pragma once
 
 /***
@@ -22,18 +20,9 @@
 ***/
 
 typedef struct Path Path;
+typedef struct PathSpec PathSpec;
 
 #include "unit.h"
-#include "mount.h"
-
-typedef enum PathState {
-        PATH_DEAD,
-        PATH_WAITING,
-        PATH_RUNNING,
-        PATH_FAILED,
-        _PATH_STATE_MAX,
-        _PATH_STATE_INVALID = -1
-} PathState;
 
 typedef enum PathType {
         PATH_EXISTS,
@@ -73,6 +62,7 @@ static inline bool path_spec_owns_inotify_fd(PathSpec *s, int fd) {
 typedef enum PathResult {
         PATH_SUCCESS,
         PATH_FAILURE_RESOURCES,
+        PATH_FAILURE_START_LIMIT_HIT,
         _PATH_RESULT_MAX,
         _PATH_RESULT_INVALID = -1
 } PathResult;
@@ -95,9 +85,6 @@ struct Path {
 void path_free_specs(Path *p);
 
 extern const UnitVTable path_vtable;
-
-const char* path_state_to_string(PathState i) _const_;
-PathState path_state_from_string(const char *s) _pure_;
 
 const char* path_type_to_string(PathType i) _const_;
 PathType path_type_from_string(const char *s) _pure_;

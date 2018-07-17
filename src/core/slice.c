@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -20,21 +18,28 @@
 ***/
 
 #include <errno.h>
-#include <signal.h>
-#include <unistd.h>
 
-#include "unit.h"
-#include "slice.h"
-#include "load-fragment.h"
-#include "log.h"
+#include "alloc-util.h"
 #include "dbus-slice.h"
+#include "log.h"
+#include "slice.h"
 #include "special.h"
+#include "string-util.h"
+#include "strv.h"
 #include "unit-name.h"
+#include "unit.h"
 
 static const UnitActiveState state_translation_table[_SLICE_STATE_MAX] = {
         [SLICE_DEAD] = UNIT_INACTIVE,
         [SLICE_ACTIVE] = UNIT_ACTIVE
 };
+
+static void slice_init(Unit *u) {
+        assert(u);
+        assert(u->load_state == UNIT_STUB);
+
+        u->ignore_on_isolate = true;
+}
 
 static void slice_set_state(Slice *t, SliceState state) {
         SliceState old_state;
@@ -85,6 +90,9 @@ static int slice_add_default_dependencies(Slice *s) {
 
         assert(s);
 
+        if (!UNIT(s)->default_dependencies)
+                return 0;
+
         /* Make sure slices are unloaded on shutdown */
         r = unit_add_two_dependencies_by_name(
                         UNIT(s),
@@ -97,29 +105,51 @@ static int slice_add_default_dependencies(Slice *s) {
 }
 
 static int slice_verify(Slice *s) {
+        _cleanup_free_ char *parent = NULL;
+        int r;
+
         assert(s);
 
         if (UNIT(s)->load_state != UNIT_LOADED)
                 return 0;
 
-        if (UNIT_DEREF(UNIT(s)->slice)) {
-                char *a, *dash;
+        if (!slice_name_is_valid(UNIT(s)->id)) {
+                log_unit_error(UNIT(s), "Slice name %s is not valid. Refusing.", UNIT(s)->id);
+                return -EINVAL;
+        }
 
-                a = strdupa(UNIT(s)->id);
-                dash = strrchr(a, '-');
-                if (dash)
-                        strcpy(dash, ".slice");
-                else
-                        a = (char*) SPECIAL_ROOT_SLICE;
+        r = slice_build_parent_slice(UNIT(s)->id, &parent);
+        if (r < 0)
+                return log_unit_error_errno(UNIT(s), r, "Failed to determine parent slice: %m");
 
-                if (!unit_has_name(UNIT_DEREF(UNIT(s)->slice), a)) {
-                        log_error_unit(UNIT(s)->id,
-                                       "%s located outside its parent slice. Refusing.", UNIT(s)->id);
-                        return -EINVAL;
-                }
+        if (parent ? !unit_has_name(UNIT_DEREF(UNIT(s)->slice), parent) : UNIT_ISSET(UNIT(s)->slice)) {
+                log_unit_error(UNIT(s), "Located outside of parent slice. Refusing.");
+                return -EINVAL;
         }
 
         return 0;
+}
+
+static int slice_load_root_slice(Unit *u) {
+        assert(u);
+
+        if (!unit_has_name(u, SPECIAL_ROOT_SLICE))
+                return 0;
+
+        u->perpetual = true;
+
+        /* The root slice is a bit special. For example it is always running and cannot be terminated. Because of its
+         * special semantics we synthesize it here, instead of relying on the unit file on disk. */
+
+        u->default_dependencies = false;
+        u->ignore_on_isolate = true;
+
+        if (!u->description)
+                u->description = strdup("Root Slice");
+        if (!u->documentation)
+                u->documentation = strv_new("man:systemd.special(7)", NULL);
+
+        return 1;
 }
 
 static int slice_load(Unit *u) {
@@ -127,7 +157,11 @@ static int slice_load(Unit *u) {
         int r;
 
         assert(s);
+        assert(u->load_state == UNIT_STUB);
 
+        r = slice_load_root_slice(u);
+        if (r < 0)
+                return r;
         r = unit_load_fragment_and_dropin_optional(u);
         if (r < 0)
                 return r;
@@ -143,11 +177,9 @@ static int slice_load(Unit *u) {
                 if (r < 0)
                         return r;
 
-                if (u->default_dependencies) {
-                        r = slice_add_default_dependencies(s);
-                        if (r < 0)
-                                return r;
-                }
+                r = slice_add_default_dependencies(s);
+                if (r < 0)
+                        return r;
         }
 
         return slice_verify(s);
@@ -180,14 +212,20 @@ static void slice_dump(Unit *u, FILE *f, const char *prefix) {
 
 static int slice_start(Unit *u) {
         Slice *t = SLICE(u);
+        int r;
 
         assert(t);
         assert(t->state == SLICE_DEAD);
 
-        unit_realize_cgroup(u);
+        r = unit_acquire_invocation_id(u);
+        if (r < 0)
+                return r;
+
+        (void) unit_realize_cgroup(u);
+        (void) unit_reset_cpu_usage(u);
 
         slice_set_state(t, SLICE_ACTIVE);
-        return 0;
+        return 1;
 }
 
 static int slice_stop(Unit *u) {
@@ -200,7 +238,7 @@ static int slice_stop(Unit *u) {
          * unit_notify() will do that for us anyway. */
 
         slice_set_state(t, SLICE_DEAD);
-        return 0;
+        return 1;
 }
 
 static int slice_kill(Unit *u, KillWho who, int signo, sd_bus_error *error) {
@@ -253,12 +291,27 @@ _pure_ static const char *slice_sub_state_to_string(Unit *u) {
         return slice_state_to_string(SLICE(u)->state);
 }
 
-static const char* const slice_state_table[_SLICE_STATE_MAX] = {
-        [SLICE_DEAD] = "dead",
-        [SLICE_ACTIVE] = "active"
-};
+static void slice_enumerate(Manager *m) {
+        Unit *u;
+        int r;
 
-DEFINE_STRING_TABLE_LOOKUP(slice_state, SliceState);
+        assert(m);
+
+        u = manager_get_unit(m, SPECIAL_ROOT_SLICE);
+        if (!u) {
+                r = unit_new_for_name(m, sizeof(Slice), SPECIAL_ROOT_SLICE, &u);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to allocate the special " SPECIAL_ROOT_SLICE " unit: %m");
+                        return;
+                }
+        }
+
+        u->perpetual = true;
+        SLICE(u)->deserialized_state = SLICE_ACTIVE;
+
+        unit_add_to_load_queue(u);
+        unit_add_to_dbus_queue(u);
+}
 
 const UnitVTable slice_vtable = {
         .object_size = sizeof(Slice),
@@ -270,9 +323,9 @@ const UnitVTable slice_vtable = {
                 "Install\0",
         .private_section = "Slice",
 
-        .no_alias = true,
-        .no_instances = true,
+        .can_transient = true,
 
+        .init = slice_init,
         .load = slice_load,
 
         .coldplug = slice_coldplug,
@@ -290,15 +343,15 @@ const UnitVTable slice_vtable = {
         .active_state = slice_active_state,
         .sub_state_to_string = slice_sub_state_to_string,
 
-        .bus_interface = "org.freedesktop.systemd1.Slice",
         .bus_vtable = bus_slice_vtable,
         .bus_set_property = bus_slice_set_property,
         .bus_commit_properties = bus_slice_commit_properties,
 
+        .enumerate = slice_enumerate,
+
         .status_message_formats = {
                 .finished_start_job = {
                         [JOB_DONE]       = "Created slice %s.",
-                        [JOB_DEPENDENCY] = "Dependency failed for %s.",
                 },
                 .finished_stop_job = {
                         [JOB_DONE]       = "Removed slice %s.",

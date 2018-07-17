@@ -22,11 +22,23 @@ use strict;
 
 my $udev_bin            = "./test-udev";
 my $valgrind            = 0;
-my $udev_bin_valgrind   = "valgrind --tool=memcheck --leak-check=yes --quiet $udev_bin";
-my $udev_dev            = "test/dev";
+my $gdb                 = 0;
+my $strace              = 0;
+my $udev_bin_valgrind   = "valgrind --tool=memcheck --leak-check=yes --track-origins=yes --quiet $udev_bin";
+my $udev_bin_gdb        = "gdb --args $udev_bin";
+my $udev_bin_strace     = "strace -efile $udev_bin";
 my $udev_run            = "test/run";
+my $udev_tmpfs          = "test/tmpfs";
+my $udev_sys            = "${udev_tmpfs}/sys";
+my $udev_dev            = "${udev_tmpfs}/dev";
 my $udev_rules_dir      = "$udev_run/udev/rules.d";
 my $udev_rules          = "$udev_rules_dir/udev-test.rules";
+my $EXIT_TEST_SKIP      = 77;
+
+my $rules_10k_tags      = "";
+for (my $i = 1; $i <= 10000; ++$i) {
+        $rules_10k_tags .= 'KERNEL=="sda", TAG+="test' . $i . "\"\n";
+}
 
 my @tests = (
         {
@@ -549,21 +561,21 @@ KERNEL=="tty33", OWNER="bad", GROUP="name"
 EOF
         },
         {
-                desc            => "permissions OWNER=5000",
+                desc            => "permissions OWNER=1",
                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
                 exp_name        => "node",
-                exp_perms       => "5000::0600",
+                exp_perms       => "1::0600",
                 rules           => <<EOF
-SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", OWNER="5000"
+SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", OWNER="1"
 EOF
         },
         {
-                desc            => "permissions GROUP=100",
+                desc            => "permissions GROUP=1",
                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
                 exp_name        => "node",
-                exp_perms       => ":100:0660",
+                exp_perms       => ":1:0660",
                 rules           => <<EOF
-SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", GROUP="100"
+SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", GROUP="1"
 EOF
         },
         {
@@ -603,30 +615,30 @@ SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", MODE="0777"
 EOF
         },
         {
-                desc            => "permissions OWNER=5000 GROUP=100 MODE=0777",
+                desc            => "permissions OWNER=1 GROUP=1 MODE=0777",
                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
                 exp_name        => "node",
-                exp_perms       => "5000:100:0777",
+                exp_perms       => "1:1:0777",
                 rules           => <<EOF
-SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", OWNER="5000", GROUP="100", MODE="0777"
+SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", OWNER="1", GROUP="1", MODE="0777"
 EOF
         },
         {
-                desc            => "permissions OWNER to 5000",
+                desc            => "permissions OWNER to 1",
                 devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
                 exp_name        => "ttyACM0",
-                exp_perms       => "5000::",
+                exp_perms       => "1::",
                 rules           => <<EOF
-KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", OWNER="5000"
+KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", OWNER="1"
 EOF
         },
         {
-                desc            => "permissions GROUP to 100",
+                desc            => "permissions GROUP to 1",
                 devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
                 exp_name        => "ttyACM0",
-                exp_perms       => ":100:0660",
+                exp_perms       => ":1:0660",
                 rules           => <<EOF
-KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", GROUP="100"
+KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", GROUP="1"
 EOF
         },
         {
@@ -642,19 +654,19 @@ EOF
                 desc            => "permissions OWNER, GROUP, MODE",
                 devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
                 exp_name        => "ttyACM0",
-                exp_perms       => "5000:100:0777",
+                exp_perms       => "1:1:0777",
                 rules           => <<EOF
-KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", OWNER="5000", GROUP="100", MODE="0777"
+KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", OWNER="1", GROUP="1", MODE="0777"
 EOF
         },
         {
                 desc            => "permissions only rule",
                 devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
                 exp_name        => "ttyACM0",
-                exp_perms       => "5000:100:0777",
+                exp_perms       => "1:1:0777",
                 rules           => <<EOF
-KERNEL=="ttyACM[0-9]*", OWNER="5000", GROUP="100", MODE="0777"
-KERNEL=="ttyUSX[0-9]*", OWNER="5001", GROUP="101", MODE="0444"
+KERNEL=="ttyACM[0-9]*", OWNER="1", GROUP="1", MODE="0777"
+KERNEL=="ttyUSX[0-9]*", OWNER="2", GROUP="2", MODE="0444"
 KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n"
 EOF
         },
@@ -662,12 +674,12 @@ EOF
                 desc            => "multiple permissions only rule",
                 devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
                 exp_name        => "ttyACM0",
-                exp_perms       => "3000:4000:0777",
+                exp_perms       => "1:1:0777",
                 rules           => <<EOF
-SUBSYSTEM=="tty", OWNER="3000"
-SUBSYSTEM=="tty", GROUP="4000"
+SUBSYSTEM=="tty", OWNER="1"
+SUBSYSTEM=="tty", GROUP="1"
 SUBSYSTEM=="tty", MODE="0777"
-KERNEL=="ttyUSX[0-9]*", OWNER="5001", GROUP="101", MODE="0444"
+KERNEL=="ttyUSX[0-9]*", OWNER="2", GROUP="2", MODE="0444"
 KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n"
 EOF
         },
@@ -675,13 +687,13 @@ EOF
                 desc            => "permissions only rule with override at SYMLINK+ rule",
                 devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
                 exp_name        => "ttyACM0",
-                exp_perms       => "3000:8000:0777",
+                exp_perms       => "1:2:0777",
                 rules           => <<EOF
-SUBSYSTEM=="tty", OWNER="3000"
-SUBSYSTEM=="tty", GROUP="4000"
+SUBSYSTEM=="tty", OWNER="1"
+SUBSYSTEM=="tty", GROUP="1"
 SUBSYSTEM=="tty", MODE="0777"
-KERNEL=="ttyUSX[0-9]*", OWNER="5001", GROUP="101", MODE="0444"
-KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", GROUP="8000"
+KERNEL=="ttyUSX[0-9]*", OWNER="2", GROUP="2", MODE="0444"
+KERNEL=="ttyACM[0-9]*", SYMLINK+="ttyACM%n", GROUP="2"
 EOF
         },
         {
@@ -1232,8 +1244,8 @@ EOF
                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
                 exp_name        => "there",
                 rules           => <<EOF
-TEST=="/etc/hosts", SYMLINK+="there"
-TEST!="/etc/hosts", SYMLINK+="notthere"
+TEST=="/etc/machine-id", SYMLINK+="there"
+TEST!="/etc/machine-id", SYMLINK+="notthere"
 EOF
         },
         {
@@ -1274,11 +1286,11 @@ EOF
                 desc            => "TEST PROGRAM feeds OWNER, GROUP, MODE",
                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
                 exp_name        => "sda",
-                exp_perms       => "5000:100:0400",
+                exp_perms       => "1:1:0400",
                 exp_rem_error   => "yes",
                 rules           => <<EOF
 KERNEL=="sda", MODE="666"
-KERNEL=="sda", PROGRAM=="/bin/echo 5000 100 0400", OWNER="%c{1}", GROUP="%c{2}", MODE="%c{3}"
+KERNEL=="sda", PROGRAM=="/bin/echo 1 1 0400", OWNER="%c{1}", GROUP="%c{2}", MODE="%c{3}"
 EOF
         },
         {
@@ -1312,6 +1324,25 @@ KERNEL=="sda", IMPORT{builtin}="path_id"
 KERNEL=="sda", ENV{ID_PATH}=="?*", SYMLINK+="disk/by-path/\$env{ID_PATH}"
 EOF
         },
+        {
+                desc            => "add and match tag",
+                devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
+                exp_name        => "found",
+                not_exp_name    => "bad" ,
+                rules           => <<EOF
+SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", TAG+="green"
+TAGS=="green", SYMLINK+="found"
+TAGS=="blue", SYMLINK+="bad"
+EOF
+        },
+        {
+                desc            => "don't crash with lots of tags",
+                devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
+                exp_name        => "found",
+                rules           => $rules_10k_tags . <<EOF
+TAGS=="test1", TAGS=="test500", TAGS=="test1234", TAGS=="test9999", TAGS=="test10000", SYMLINK+="found"
+EOF
+        },
 );
 
 sub udev {
@@ -1324,9 +1355,13 @@ sub udev {
         close CONF;
 
         if ($valgrind > 0) {
-                system("$udev_bin_valgrind $action $devpath");
+                return system("$udev_bin_valgrind $action $devpath");
+        } elsif ($gdb > 0) {
+                return system("$udev_bin_gdb $action $devpath");
+        } elsif ($strace > 0) {
+                return system("$udev_bin_strace $action $devpath");
         } else {
-                system("$udev_bin", "$action", "$devpath");
+                return system("$udev_bin", "$action", "$devpath");
         }
 }
 
@@ -1396,23 +1431,34 @@ sub major_minor_test {
 }
 
 sub udev_setup {
-        system("rm", "-rf", "$udev_dev");
+        system("umount", $udev_tmpfs);
+        rmdir($udev_tmpfs);
+        mkdir($udev_tmpfs) || die "unable to create udev_tmpfs: $udev_tmpfs\n";
+        system("mount", "-o", "rw,mode=755,nosuid,noexec,nodev", "-t", "tmpfs", "tmpfs", $udev_tmpfs) && die "unable to mount tmpfs";
+
         mkdir($udev_dev) || die "unable to create udev_dev: $udev_dev\n";
         # setting group and mode of udev_dev ensures the tests work
         # even if the parent directory has setgid bit enabled.
         chown (0, 0, $udev_dev) || die "unable to chown $udev_dev\n";
         chmod (0755, $udev_dev) || die "unable to chmod $udev_dev\n";
 
+        system("cp", "-r", "test/sys/", $udev_sys) && die "unable to copy test/sys";
+
         system("rm", "-rf", "$udev_run");
 }
 
 sub run_test {
         my ($rules, $number) = @_;
+        my $rc;
 
         print "TEST $number: $rules->{desc}\n";
         print "device \'$rules->{devpath}\' expecting node/link \'$rules->{exp_name}\'\n";
 
-        udev("add", $rules->{devpath}, \$rules->{rules});
+        $rc = udev("add", $rules->{devpath}, \$rules->{rules});
+        if ($rc != 0) {
+                print "$udev_bin add failed with code $rc\n";
+                $error++;
+        }
         if (defined($rules->{not_exp_name})) {
                 if ((-e "$udev_dev/$rules->{not_exp_name}") ||
                     (-l "$udev_dev/$rules->{not_exp_name}")) {
@@ -1453,7 +1499,11 @@ sub run_test {
                 return;
         }
 
-        udev("remove", $rules->{devpath}, \$rules->{rules});
+        $rc = udev("remove", $rules->{devpath}, \$rules->{rules});
+        if ($rc != 0) {
+                print "$udev_bin remove failed with code $rc\n";
+                $error++;
+        }
         if ((-e "$udev_dev/$rules->{exp_name}") ||
             (-l "$udev_dev/$rules->{exp_name}")) {
                 print "remove:      error";
@@ -1482,7 +1532,21 @@ sub run_test {
 # due to mknod restrictions
 if (!($<==0)) {
         print "Must have root permissions to run properly.\n";
-        exit;
+        exit($EXIT_TEST_SKIP);
+}
+
+# skip the test when running in a chroot
+system("systemd-detect-virt", "-r", "-q");
+if ($? >> 8 == 0) {
+        print "Running in a chroot, skipping the test.\n";
+        exit($EXIT_TEST_SKIP);
+}
+
+# skip the test when running in a container
+system("systemd-detect-virt", "-c", "-q");
+if ($? >> 8 == 0) {
+        print "Running in a container, skipping the test.\n";
+        exit($EXIT_TEST_SKIP);
 }
 
 udev_setup();
@@ -1494,6 +1558,12 @@ foreach my $arg (@ARGV) {
         if ($arg =~ m/--valgrind/) {
                 $valgrind = 1;
                 printf("using valgrind\n");
+        } elsif ($arg =~ m/--gdb/) {
+                $gdb = 1;
+                printf("using gdb\n");
+        } elsif ($arg =~ m/--strace/) {
+                $strace = 1;
+                printf("using strace\n");
         } else {
                 push(@list, $arg);
         }
@@ -1521,10 +1591,11 @@ if ($list[0]) {
 print "$error errors occurred\n\n";
 
 # cleanup
-system("rm", "-rf", "$udev_dev");
 system("rm", "-rf", "$udev_run");
+system("umount", "$udev_tmpfs");
+rmdir($udev_tmpfs);
 
 if ($error > 0) {
-    exit(1);
+        exit(1);
 }
 exit(0);

@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,44 +17,72 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include <assert.h>
-#include <stdlib.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "specifier.h"
-#include "unit-name.h"
-#include "util.h"
+#include "formats-util.h"
 #include "install-printf.h"
+#include "install.h"
+#include "macro.h"
+#include "specifier.h"
+#include "string-util.h"
+#include "unit-name.h"
+#include "user-util.h"
 
 static int specifier_prefix_and_instance(char specifier, void *data, void *userdata, char **ret) {
-        InstallInfo *i = userdata;
-        char *n;
+        const UnitFileInstallInfo *i = userdata;
+        _cleanup_free_ char *prefix = NULL;
+        int r;
 
         assert(i);
 
-        n = unit_name_to_prefix_and_instance(i->name);
-        if (!n)
-                return -ENOMEM;
+        r = unit_name_to_prefix_and_instance(i->name, &prefix);
+        if (r < 0)
+                return r;
 
-        *ret = n;
+        if (endswith(prefix, "@") && i->default_instance) {
+                char *ans;
+
+                ans = strjoin(prefix, i->default_instance, NULL);
+                if (!ans)
+                        return -ENOMEM;
+                *ret = ans;
+        } else {
+                *ret = prefix;
+                prefix = NULL;
+        }
+
+        return 0;
+}
+
+static int specifier_name(char specifier, void *data, void *userdata, char **ret) {
+        const UnitFileInstallInfo *i = userdata;
+        char *ans;
+
+        assert(i);
+
+        if (unit_name_is_valid(i->name, UNIT_NAME_TEMPLATE) && i->default_instance)
+                return unit_name_replace_instance(i->name, i->default_instance, ret);
+
+        ans = strdup(i->name);
+        if (!ans)
+                return -ENOMEM;
+        *ret = ans;
         return 0;
 }
 
 static int specifier_prefix(char specifier, void *data, void *userdata, char **ret) {
-        InstallInfo *i = userdata;
-        char *n;
+        const UnitFileInstallInfo *i = userdata;
 
         assert(i);
 
-        n = unit_name_to_prefix(i->name);
-        if (!n)
-                return -ENOMEM;
-
-        *ret = n;
-        return 0;
+        return unit_name_to_prefix(i->name, ret);
 }
 
 static int specifier_instance(char specifier, void *data, void *userdata, char **ret) {
-        InstallInfo *i = userdata;
+        const UnitFileInstallInfo *i = userdata;
         char *instance;
         int r;
 
@@ -66,8 +92,8 @@ static int specifier_instance(char specifier, void *data, void *userdata, char *
         if (r < 0)
                 return r;
 
-        if (!instance) {
-                instance = strdup("");
+        if (isempty(instance)) {
+                instance = strdup(i->default_instance ?: "");
                 if (!instance)
                         return -ENOMEM;
         }
@@ -77,44 +103,34 @@ static int specifier_instance(char specifier, void *data, void *userdata, char *
 }
 
 static int specifier_user_name(char specifier, void *data, void *userdata, char **ret) {
-        InstallInfo *i = userdata;
-        const char *username;
-        _cleanup_free_ char *tmp = NULL;
-        char *printed = NULL;
+        char *t;
 
-        assert(i);
+        /* If we are UID 0 (root), this will not result in NSS,
+         * otherwise it might. This is good, as we want to be able to
+         * run this in PID 1, where our user ID is 0, but where NSS
+         * lookups are not allowed.
 
-        if (i->user)
-                username = i->user;
-        else
-                /* get USER env from env or our own uid */
-                username = tmp = getusername_malloc();
+         * We don't user getusername_malloc() here, because we don't want to look
+         * at $USER, to remain consistent with specifer_user_id() below.
+         */
 
-        switch (specifier) {
-        case 'u':
-                printed = strdup(username);
-                break;
-        case 'U': {
-                /* fish username from passwd */
-                uid_t uid;
-                int r;
+        t = uid_to_name(getuid());
+        if (!t)
+                return -ENOMEM;
 
-                r = get_user_creds(&username, &uid, NULL, NULL, NULL);
-                if (r < 0)
-                        return r;
-
-                if (asprintf(&printed, "%d", uid) < 0)
-                        return -ENOMEM;
-                break;
-        }}
-
-
-        *ret = printed;
+        *ret = t;
         return 0;
 }
 
+static int specifier_user_id(char specifier, void *data, void *userdata, char **ret) {
 
-int install_full_printf(InstallInfo *i, const char *format, char **ret) {
+        if (asprintf(ret, UID_FMT, getuid()) < 0)
+                return -ENOMEM;
+
+        return 0;
+}
+
+int install_full_printf(UnitFileInstallInfo *i, const char *format, char **ret) {
 
         /* This is similar to unit_full_printf() but does not support
          * anything path-related.
@@ -124,8 +140,8 @@ int install_full_printf(InstallInfo *i, const char *format, char **ret) {
          * %p: the prefix                              (foo)
          * %i: the instance                            (bar)
 
-         * %U the UID of the configured user or running user
-         * %u the username of the configured user or running user
+         * %U the UID of the running user
+         * %u the username of running user
          * %m the machine ID of the running system
          * %H the host name of the running system
          * %b the boot ID of the running system
@@ -133,12 +149,12 @@ int install_full_printf(InstallInfo *i, const char *format, char **ret) {
          */
 
         const Specifier table[] = {
-                { 'n', specifier_string,              i->name },
+                { 'n', specifier_name,                NULL },
                 { 'N', specifier_prefix_and_instance, NULL },
                 { 'p', specifier_prefix,              NULL },
                 { 'i', specifier_instance,            NULL },
 
-                { 'U', specifier_user_name,           NULL },
+                { 'U', specifier_user_id,             NULL },
                 { 'u', specifier_user_name,           NULL },
 
                 { 'm', specifier_machine_id,          NULL },

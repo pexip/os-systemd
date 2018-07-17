@@ -1,5 +1,3 @@
-/*-*- Mode: C; c-basic-offset: 8; indent-tabs-mode: nil -*-*/
-
 /***
   This file is part of systemd.
 
@@ -19,14 +17,20 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
-#include "util.h"
 #include "clean-ipc.h"
+#include "user-util.h"
+#include "util.h"
 
 int main(int argc, char *argv[]) {
         uid_t uid;
+        int r;
+        const char* name = argv[1] ?: "nfsnobody";
 
-        assert_se(argc == 2);
-        assert_se(parse_uid(argv[1], &uid) >= 0);
+        r = get_user_creds(&name, &uid, NULL, NULL, NULL);
+        if (r < 0) {
+                log_error_errno(r, "Failed to resolve \"%s\": %m", name);
+                return EXIT_FAILURE;
+        }
 
-        return clean_ipc(uid) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return clean_ipc_by_uid(uid) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
