@@ -5,6 +5,8 @@ systemd (232-25+deb9u2pexip1) pexip; urgency=medium
   * debian/patches/Get-RTC-is-in-local-time-setting-from-etc-default-rc.patch:
     drop; not needed
   * debian/patches/fstab-generator-add-x-systemd.before.patch: refresh
+  * debian/patches/fstab-generator-add-x-systemd.requires.patch: drop; merged
+    upstream
 
  -- John-Mark Bell <jmb@pexip.com>  Tue, 17 Jul 2018 15:15:29 +0100
 
