@@ -63,8 +63,8 @@ diff --git a/src/fstab-generator/fstab-generator.c b/src/fstab-generator/fstab-g
 index d97bafd1fb2..c38a5aa2572 100644
 --- a/src/fstab-generator/fstab-generator.c
 +++ b/src/fstab-generator/fstab-generator.c
-@@ -209,7 +209,8 @@ static int write_mount_timeout(FILE *f, const char *where, const char *opts) {
-         return !!*values;
+@@ -164,7 +164,8 @@ static int write_mount_timeout(FILE *f, const char *where, const char *opts) {
+                              "x-systemd.mount-timeout\0", "TimeoutSec");
  }
  
 -static int write_requires_after(FILE *f, const char *opts) {
@@ -73,16 +73,16 @@ index d97bafd1fb2..c38a5aa2572 100644
          _cleanup_strv_free_ char **names = NULL, **units = NULL;
          _cleanup_free_ char *res = NULL;
          char **s;
-@@ -218,7 +219,7 @@ static int write_requires_after(FILE *f, const char *opts) {
+@@ -173,7 +174,7 @@ static int write_requires_after(FILE *f, const char *opts) {
          assert(f);
          assert(opts);
  
 -        r = fstab_extract_values(opts, "x-systemd.requires", &names);
 +        r = fstab_extract_values(opts, filter, &names);
-         if (r < 0) {
-                 log_warning("Failed to parse options: %s", strerror(-r));
-                 return r;
-@@ -239,12 +240,26 @@ static int write_requires_after(FILE *f, const char *opts) {
+         if (r < 0)
+                 return log_warning_errno(r, "Failed to parse options: %m");
+         if (r == 0)
+@@ -194,12 +194,26 @@ static int write_requires_after(FILE *f, const char *opts) {
                  res = strv_join(units, " ");
                  if (!res)
                          return log_oom();
@@ -110,7 +110,7 @@ index d97bafd1fb2..c38a5aa2572 100644
  static int write_requires_mounts_for(FILE *f, const char *opts) {
          _cleanup_strv_free_ char **paths = NULL;
          _cleanup_free_ char *res = NULL;
-@@ -344,7 +359,13 @@ static int add_mount(
+@@ -298,7 +313,13 @@ static int add_mount(
                  fprintf(f, "Before=%s\n", post);
  
          if (!automount && opts) {
@@ -124,8 +124,8 @@ index d97bafd1fb2..c38a5aa2572 100644
                   if (r < 0)
                           return r;
                   r = write_requires_mounts_for(f, opts);
-@@ -421,7 +442,13 @@ static int add_mount(
-                                 post);
+@@ -368,7 +389,13 @@ static int add_mount(
+                 fprintf(f, "Before=%s\n", post);
  
                  if (opts) {
 +                        r = write_after(f, opts);
