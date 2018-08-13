@@ -109,3 +109,4 @@ debian/Add-env-variable-for-machine-ID-path.patch
 
 fstab-generator-add-x-systemd.before.patch
 systemctl-try-upstart.patch
+disable-journald-audit.patch
