@@ -240,3 +240,4 @@ mtd_probe-include-order.patch
 fstab-generator-add-x-systemd.requires.patch
 fstab-generator-add-x-systemd.before.patch
 systemctl-try-upstart.patch
+systemctl-Don-t-forward-telinit-u-to-upstart.patch
