@@ -3,6 +3,7 @@ systemd (232-25+deb9u4pexip1) pexip; urgency=medium
   * New upstream release
   * Disable systemd-journald-audit.socket: not wanted
   * Backport fix from Ubuntu to ignore telinit u
+  * Avoid emitting UTF-8 during installation of symlinks
 
  -- John-Mark Bell <jmb@pexip.com>  Sun, 29 Jul 2018 00:18:44 +0100
 

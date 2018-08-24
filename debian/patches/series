@@ -111,3 +111,4 @@ fstab-generator-add-x-systemd.before.patch
 systemctl-try-upstart.patch
 systemctl-Don-t-forward-telinit-u-to-upstart.patch
 disable-journald-audit.patch
+install-avoid-utf8.patch
