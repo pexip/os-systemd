@@ -1,0 +1,24 @@
+From 264212289821f357cc3a1df32c5bf0fbb8fcc277 Mon Sep 17 00:00:00 2001
+From: Lennart Poettering <lennart@poettering.net>
+Date: Thu, 16 Nov 2017 12:30:33 +0100
+Subject: [PATCH] install: when we encounter a transient/generated unit while
+ presetting all, skip over it silently
+
+Fixes: #7100
+---
+ src/shared/install.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/shared/install.c b/src/shared/install.c
+index 5516799e6ba..99761f99da7 100644
+--- a/src/shared/install.c
++++ b/src/shared/install.c
+@@ -3121,6 +3121,8 @@ int unit_file_preset_all(
+                         else if (r == -ENOLINK)
+                                 r = unit_file_changes_add(changes, n_changes,
+                                                           UNIT_FILE_IS_DANGLING, de->d_name, NULL);
++                        else if (r == -EADDRNOTAVAIL) /* Ignore generated/transient units when applying preset */
++                                continue;
+                         if (r < 0)
+                                 return r;
+                 }

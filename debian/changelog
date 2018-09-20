@@ -1,3 +1,9 @@
+systemd (232-25+deb9u4pexip2) pexip; urgency=medium
+
+  * Backport fix to ignore transient/generated units during preset
+
+ -- John-Mark Bell <jmb@pexip.com>  Thu, 20 Sep 2018 18:54:43 +0100
+
 systemd (232-25+deb9u4pexip1) pexip; urgency=medium
 
   * New upstream release
