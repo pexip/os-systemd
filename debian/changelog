@@ -1,3 +1,10 @@
+systemd (232-25+deb9u4pexip3) pexip; urgency=medium
+
+  * Add patch to have random-seed credit entropy to pool
+  * Ensure seed is resaved on upgrade
+
+ -- John-Mark Bell <jmb@pexip.com>  Thu, 25 Oct 2018 21:28:33 +0100
+
 systemd (232-25+deb9u4pexip2) pexip; urgency=medium
 
   * Backport fix to ignore transient/generated units during preset
