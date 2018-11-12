@@ -1,3 +1,25 @@
+systemd (232-25+deb9u6pexip1) pexip; urgency=medium
+
+  * New upstream release
+
+ -- John-Mark Bell <jmb@pexip.com>  Mon, 12 Nov 2018 20:15:24 +0000
+
+systemd (232-25+deb9u6) stretch; urgency=medium
+
+  * dhcp6: Make sure we have enough space for the DHCP6 option header.
+    Fixes out-of-bounds heap write in systemd-networkd dhcpv6 option
+    handling.
+    (CVE-2018-15688, LP: #1795921, Closes: #912008)
+
+ -- Michael Biebl <biebl@debian.org>  Sun, 28 Oct 2018 18:02:10 +0100
+
+systemd (232-25+deb9u5) stretch; urgency=medium
+
+  * networkd: Do not fail manager_connect_bus() if dbus is not active yet
+    (Closes: #901834)
+
+ -- Michael Biebl <biebl@debian.org>  Sat, 15 Sep 2018 21:40:38 +0200
+
 systemd (232-25+deb9u4pexip3) pexip; urgency=medium
 
   * Add patch to have random-seed credit entropy to pool
