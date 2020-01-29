@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include "extract-word.h"
 #include "hashmap.h"
@@ -27,13 +9,11 @@ Set *internal_set_new(const struct hash_ops *hash_ops HASHMAP_DEBUG_PARAMS);
 #define set_new(ops) internal_set_new(ops HASHMAP_DEBUG_SRC_ARGS)
 
 static inline Set *set_free(Set *s) {
-        internal_hashmap_free(HASHMAP_BASE(s));
-        return NULL;
+        return (Set*) internal_hashmap_free(HASHMAP_BASE(s), NULL, NULL);
 }
 
 static inline Set *set_free_free(Set *s) {
-        internal_hashmap_free_free(HASHMAP_BASE(s));
-        return NULL;
+        return (Set*) internal_hashmap_free(HASHMAP_BASE(s), free, NULL);
 }
 
 /* no set_free_free_free */
@@ -94,24 +74,36 @@ static inline unsigned set_buckets(Set *s) {
 bool set_iterate(Set *s, Iterator *i, void **value);
 
 static inline void set_clear(Set *s) {
-        internal_hashmap_clear(HASHMAP_BASE(s));
+        internal_hashmap_clear(HASHMAP_BASE(s), NULL, NULL);
 }
 
 static inline void set_clear_free(Set *s) {
-        internal_hashmap_clear_free(HASHMAP_BASE(s));
+        internal_hashmap_clear(HASHMAP_BASE(s), free, NULL);
 }
 
 /* no set_clear_free_free */
 
 static inline void *set_steal_first(Set *s) {
-        return internal_hashmap_steal_first(HASHMAP_BASE(s));
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(s), true, NULL);
 }
+
+#define set_clear_with_destructor(_s, _f)               \
+        ({                                              \
+                void *_item;                            \
+                while ((_item = set_steal_first(_s)))   \
+                        _f(_item);                      \
+        })
+#define set_free_with_destructor(_s, _f)                \
+        ({                                              \
+                set_clear_with_destructor(_s, _f);      \
+                set_free(_s);                           \
+        })
 
 /* no set_steal_first_key */
 /* no set_first_key */
 
 static inline void *set_first(Set *s) {
-        return internal_hashmap_first(HASHMAP_BASE(s));
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(s), false, NULL);
 }
 
 /* no set_next */

@@ -1,24 +1,8 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2012 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "bus-util.h"
 #include "dbus-kill.h"
+#include "dbus-util.h"
 #include "kill.h"
 #include "signal-util.h"
 
@@ -28,95 +12,50 @@ const sd_bus_vtable bus_kill_vtable[] = {
         SD_BUS_VTABLE_START(0),
         SD_BUS_PROPERTY("KillMode", "s", property_get_kill_mode, offsetof(KillContext, kill_mode), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("KillSignal", "i", bus_property_get_int, offsetof(KillContext, kill_signal), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("FinalKillSignal", "i", bus_property_get_int, offsetof(KillContext, final_kill_signal), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("SendSIGKILL", "b", bus_property_get_bool, offsetof(KillContext, send_sigkill), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("SendSIGHUP", "b", bus_property_get_bool,  offsetof(KillContext, send_sighup), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("WatchdogSignal", "i", bus_property_get_int, offsetof(KillContext, watchdog_signal), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_VTABLE_END
 };
+
+static BUS_DEFINE_SET_TRANSIENT_PARSE(kill_mode, KillMode, kill_mode_from_string);
+static BUS_DEFINE_SET_TRANSIENT_TO_STRING(kill_signal, "i", int32_t, int, "%" PRIi32, signal_to_string_with_check);
+static BUS_DEFINE_SET_TRANSIENT_TO_STRING(final_kill_signal, "i", int32_t, int, "%" PRIi32, signal_to_string_with_check);
+static BUS_DEFINE_SET_TRANSIENT_TO_STRING(watchdog_signal, "i", int32_t, int, "%" PRIi32, signal_to_string_with_check);
 
 int bus_kill_context_set_transient_property(
                 Unit *u,
                 KillContext *c,
                 const char *name,
                 sd_bus_message *message,
-                UnitSetPropertiesMode mode,
+                UnitWriteFlags flags,
                 sd_bus_error *error) {
-
-        int r;
 
         assert(u);
         assert(c);
         assert(name);
         assert(message);
 
-        if (streq(name, "KillMode")) {
-                const char *m;
-                KillMode k;
+        flags |= UNIT_PRIVATE;
 
-                r = sd_bus_message_read(message, "s", &m);
-                if (r < 0)
-                        return r;
+        if (streq(name, "KillMode"))
+                return bus_set_transient_kill_mode(u, name, &c->kill_mode, message, flags, error);
 
-                k = kill_mode_from_string(m);
-                if (k < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Kill mode '%s' not known.", m);
+        if (streq(name, "SendSIGHUP"))
+                return bus_set_transient_bool(u, name, &c->send_sighup, message, flags, error);
 
-                if (mode != UNIT_CHECK) {
-                        c->kill_mode = k;
+        if (streq(name, "SendSIGKILL"))
+                return bus_set_transient_bool(u, name, &c->send_sigkill, message, flags, error);
 
-                        unit_write_drop_in_private_format(u, mode, name, "KillMode=%s", kill_mode_to_string(k));
-                }
+        if (streq(name, "KillSignal"))
+                return bus_set_transient_kill_signal(u, name, &c->kill_signal, message, flags, error);
 
-                return 1;
+        if (streq(name, "FinalKillSignal"))
+                return bus_set_transient_final_kill_signal(u, name, &c->final_kill_signal, message, flags, error);
 
-        } else if (streq(name, "KillSignal")) {
-                int sig;
-
-                r = sd_bus_message_read(message, "i", &sig);
-                if (r < 0)
-                        return r;
-
-                if (!SIGNAL_VALID(sig))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Signal %i out of range", sig);
-
-                if (mode != UNIT_CHECK) {
-                        c->kill_signal = sig;
-
-                        unit_write_drop_in_private_format(u, mode, name, "KillSignal=%s", signal_to_string(sig));
-                }
-
-                return 1;
-
-        } else if (streq(name, "SendSIGHUP")) {
-                int b;
-
-                r = sd_bus_message_read(message, "b", &b);
-                if (r < 0)
-                        return r;
-
-                if (mode != UNIT_CHECK) {
-                        c->send_sighup = b;
-
-                        unit_write_drop_in_private_format(u, mode, name, "SendSIGHUP=%s", yes_no(b));
-                }
-
-                return 1;
-
-        } else if (streq(name, "SendSIGKILL")) {
-                int b;
-
-                r = sd_bus_message_read(message, "b", &b);
-                if (r < 0)
-                        return r;
-
-                if (mode != UNIT_CHECK) {
-                        c->send_sigkill = b;
-
-                        unit_write_drop_in_private_format(u, mode, name, "SendSIGKILL=%s", yes_no(b));
-                }
-
-                return 1;
-
-        }
+        if (streq(name, "WatchdogSignal"))
+                return bus_set_transient_watchdog_signal(u, name, &c->watchdog_signal, message, flags, error);
 
         return 0;
 }

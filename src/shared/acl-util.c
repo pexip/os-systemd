@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2011,2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <stdbool.h>
@@ -162,7 +145,7 @@ int add_base_acls_if_needed(acl_t *acl_p, const char *path) {
 
 int acl_search_groups(const char *path, char ***ret_groups) {
         _cleanup_strv_free_ char **g = NULL;
-        _cleanup_(acl_free) acl_t acl = NULL;
+        _cleanup_(acl_freep) acl_t acl = NULL;
         bool ret = false;
         acl_entry_t entry;
         int r;
@@ -216,16 +199,14 @@ int acl_search_groups(const char *path, char ***ret_groups) {
                 r = acl_get_entry(acl, ACL_NEXT_ENTRY, &entry);
         }
 
-        if (ret_groups) {
-                *ret_groups = g;
-                g = NULL;
-        }
+        if (ret_groups)
+                *ret_groups = TAKE_PTR(g);
 
         return ret;
 }
 
 int parse_acl(const char *text, acl_t *acl_access, acl_t *acl_default, bool want_mask) {
-        _cleanup_free_ char **a = NULL, **d = NULL; /* strings are not be freed */
+        _cleanup_free_ char **a = NULL, **d = NULL; /* strings are not freed */
         _cleanup_strv_free_ char **split;
         char **entry;
         int r = -EINVAL;
@@ -238,10 +219,7 @@ int parse_acl(const char *text, acl_t *acl_access, acl_t *acl_default, bool want
         STRV_FOREACH(entry, split) {
                 char *p;
 
-                p = startswith(*entry, "default:");
-                if (!p)
-                        p = startswith(*entry, "d:");
-
+                p = STARTSWITH_SET(*entry, "default:", "d:");
                 if (p)
                         r = strv_push(&d, p);
                 else
@@ -286,9 +264,8 @@ int parse_acl(const char *text, acl_t *acl_access, acl_t *acl_default, bool want
                 }
         }
 
-        *acl_access = a_acl;
-        *acl_default = d_acl;
-        a_acl = d_acl = NULL;
+        *acl_access = TAKE_PTR(a_acl);
+        *acl_default = TAKE_PTR(d_acl);
 
         return 0;
 }
@@ -392,8 +369,8 @@ int acls_for_file(const char *path, acl_type_t type, acl_t new, acl_t *acl) {
         if (r < 0)
                 return -errno;
 
-        *acl = old;
-        old = NULL;
+        *acl = TAKE_PTR(old);
+
         return 0;
 }
 

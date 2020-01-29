@@ -1,35 +1,36 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2016 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <sys/reboot.h>
-#include <sys/unistd.h>
 #include <sys/wait.h>
+#include <sys/prctl.h>
+#include <unistd.h>
 
+#include "def.h"
+#include "exit-status.h"
 #include "fd-util.h"
 #include "log.h"
+#include "missing.h"
 #include "nspawn-stub-pid1.h"
 #include "process-util.h"
 #include "signal-util.h"
 #include "time-util.h"
-#include "def.h"
 
-int stub_pid1(void) {
+static int reset_environ(const char *new_environment, size_t length) {
+        unsigned long start, end;
+
+        start = (unsigned long) new_environment;
+        end = start + length;
+
+        if (prctl(PR_SET_MM, PR_SET_MM_ENV_START, start, 0, 0) < 0)
+                return -errno;
+
+        if (prctl(PR_SET_MM, PR_SET_MM_ENV_END, end, 0, 0) < 0)
+                return -errno;
+
+        return 0;
+}
+
+int stub_pid1(sd_id128_t uuid) {
         enum {
                 STATE_RUNNING,
                 STATE_REBOOT,
@@ -40,6 +41,11 @@ int stub_pid1(void) {
         usec_t quit_usec = USEC_INFINITY;
         pid_t pid;
         int r;
+
+        /* The new environment we set up, on the stack. */
+        char new_environment[] =
+                "container=systemd-nspawn\0"
+                "container_uuid=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
 
         /* Implements a stub PID 1, that reaps all processes and processes a couple of standard signals. This is useful
          * for allowing arbitrary processes run in a container, and still have all zombies reaped. */
@@ -64,7 +70,13 @@ int stub_pid1(void) {
         close_all_fds(NULL, 0);
         log_open();
 
-        rename_process("STUBINIT");
+        /* Flush out /proc/self/environ, so that we don't leak the environment from the host into the container. Also,
+         * set $container= and $container_uuid= so that clients in the container that query it from /proc/1/environ
+         * find them set. */
+        sd_id128_to_string(uuid, new_environment + sizeof(new_environment) - SD_ID128_STRING_MAX);
+        reset_environ(new_environment, sizeof(new_environment));
+
+        (void) rename_process("(sd-stubinit)");
 
         assert_se(sigemptyset(&waitmask) >= 0);
         assert_se(sigset_add_many(&waitmask,
@@ -111,7 +123,7 @@ int stub_pid1(void) {
                         if (si.si_pid == pid && si.si_code == CLD_EXITED)
                                 r = si.si_status; /* pass on exit code */
                         else
-                                r = 255; /* signal, coredump, timeout, … */
+                                r = EXIT_EXCEPTION; /* signal, coredump, timeout, … */
 
                         goto finish;
                 }
@@ -161,7 +173,16 @@ int stub_pid1(void) {
                 else
                         assert_not_reached("Got unexpected signal");
 
-                /* (void) kill_and_sigcont(pid, SIGTERM); */
+                r = kill_and_sigcont(pid, SIGTERM);
+
+                /* Let's send a SIGHUP after the SIGTERM, as shells tend to ignore SIGTERM but do react to SIGHUP. We
+                 * do it strictly in this order, so that the SIGTERM is dispatched first, and SIGHUP second for those
+                 * processes which handle both. That's because services tend to bind configuration reload or something
+                 * else to SIGHUP. */
+
+                if (r != -ESRCH)
+                        (void) kill(pid, SIGHUP);
+
                 quit_usec = now(CLOCK_MONOTONIC) + DEFAULT_TIMEOUT_USEC;
         }
 

@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <fnmatch.h>
 #include <stdarg.h>
@@ -27,6 +9,7 @@
 #include "alloc-util.h"
 #include "extract-word.h"
 #include "macro.h"
+#include "string-util.h"
 #include "util.h"
 
 char *strv_find(char **l, const char *name) _pure_;
@@ -44,7 +27,7 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(char**, strv_free_erase);
 void strv_clear(char **l);
 
 char **strv_copy(char * const *l);
-unsigned strv_length(char * const *l) _pure_;
+size_t strv_length(char * const *l) _pure_;
 
 int strv_extend_strv(char ***a, char **b, bool filter_duplicates);
 int strv_extend_strv_concat(char ***a, char **b, const char *suffix);
@@ -53,7 +36,12 @@ int strv_extendf(char ***l, const char *format, ...) _printf_(2,0);
 int strv_extend_front(char ***l, const char *value);
 int strv_push(char ***l, char *value);
 int strv_push_pair(char ***l, char *a, char *b);
-int strv_push_prepend(char ***l, char *value);
+int strv_insert(char ***l, size_t position, char *value);
+
+static inline int strv_push_prepend(char ***l, char *value) {
+        return strv_insert(l, 0, value);
+}
+
 int strv_consume(char ***l, char *value);
 int strv_consume_pair(char ***l, char *a, char *b);
 int strv_consume_prepend(char ***l, char *value);
@@ -66,8 +54,9 @@ bool strv_equal(char **a, char **b);
 
 #define strv_contains(l, s) (!!strv_find((l), (s)))
 
-char **strv_new(const char *x, ...) _sentinel_;
+char **strv_new_internal(const char *x, ...) _sentinel_;
 char **strv_new_ap(const char *x, va_list ap);
+#define strv_new(...) strv_new_internal(__VA_ARGS__, NULL)
 
 #define STRV_IGNORE ((const char *) -1)
 
@@ -79,13 +68,18 @@ static inline bool strv_isempty(char * const *l) {
         return !l || !*l;
 }
 
-char **strv_split(const char *s, const char *separator);
+char **strv_split_full(const char *s, const char *separator, SplitFlags flags);
+static inline char **strv_split(const char *s, const char *separator) {
+        return strv_split_full(s, separator, 0);
+}
 char **strv_split_newlines(const char *s);
 
 int strv_split_extract(char ***t, const char *s, const char *separators, ExtractFlags flags);
 
-char *strv_join(char **l, const char *separator);
-char *strv_join_quoted(char **l);
+char *strv_join_prefix(char **l, const char *separator, const char *prefix);
+static inline char *strv_join(char **l, const char *separator) {
+        return strv_join_prefix(l, separator, NULL);
+}
 
 char **strv_parse_nulstr(const char *s, size_t l);
 char **strv_split_nulstr(const char *s);
@@ -121,7 +115,7 @@ void strv_print(char **l);
                 if (!first)                                     \
                         _l = (char**) &first;                   \
                 else {                                          \
-                        unsigned _n;                            \
+                        size_t _n;                              \
                         va_list _ap;                            \
                                                                 \
                         _n = 1;                                 \
@@ -150,17 +144,22 @@ void strv_print(char **l);
                 _x && strv_contains(STRV_MAKE(__VA_ARGS__), _x); \
         })
 
-#define FOREACH_STRING(x, ...)                               \
-        for (char **_l = ({                                  \
-                char **_ll = STRV_MAKE(__VA_ARGS__);         \
-                x = _ll ? _ll[0] : NULL;                     \
-                _ll;                                         \
-        });                                                  \
-        _l && *_l;                                           \
-        x = ({                                               \
-                _l ++;                                       \
-                _l[0];                                       \
-        }))
+#define STARTSWITH_SET(p, ...)                                  \
+        ({                                                      \
+                const char *_p = (p);                           \
+                char  *_found = NULL, **_i;                     \
+                STRV_FOREACH(_i, STRV_MAKE(__VA_ARGS__)) {      \
+                        _found = startswith(_p, *_i);           \
+                        if (_found)                             \
+                                break;                          \
+                }                                               \
+                _found;                                         \
+        })
+
+#define FOREACH_STRING(x, y, ...)                                       \
+        for (char **_l = STRV_MAKE(({ x = y; }), ##__VA_ARGS__);        \
+             x;                                                         \
+             x = *(++_l))
 
 char **strv_reverse(char **l);
 char **strv_shell_escape(char **l, const char *bad);
@@ -174,9 +173,18 @@ static inline bool strv_fnmatch_or_empty(char* const* patterns, const char *s, i
 }
 
 char ***strv_free_free(char ***l);
+DEFINE_TRIVIAL_CLEANUP_FUNC(char***, strv_free_free);
 
 char **strv_skip(char **l, size_t n);
 
 int strv_extend_n(char ***l, const char *value, size_t n);
 
 int fputstrv(FILE *f, char **l, const char *separator, bool *space);
+
+#define strv_free_and_replace(a, b)             \
+        ({                                      \
+                strv_free(a);                   \
+                (a) = (b);                      \
+                (b) = NULL;                     \
+                0;                              \
+        })

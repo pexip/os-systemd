@@ -1,19 +1,7 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
- * Copyright (C) IBM Corp. 2003
- * Copyright (C) SUSE Linux Products GmbH, 2006
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Copyright © IBM Corp. 2003
+ * Copyright © SUSE Linux Products GmbH, 2006
  */
 
 #include <ctype.h>
@@ -29,12 +17,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "libudev.h"
-
+#include "alloc-util.h"
+#include "build.h"
 #include "fd-util.h"
-#include "libudev-private.h"
+#include "libudev-util.h"
 #include "scsi_id.h"
 #include "string-util.h"
+#include "strxcpyx.h"
 #include "udev-util.h"
 
 static const struct option options[] = {
@@ -66,8 +55,7 @@ static char model_enc_str[256];
 static char revision_str[16];
 static char type_str[16];
 
-static void set_type(const char *from, char *to, size_t len)
-{
+static void set_type(const char *from, char *to, size_t len) {
         int type_num;
         char *eptr;
         const char *type = "generic";
@@ -112,8 +100,7 @@ static void set_type(const char *from, char *to, size_t len)
  * Return a pointer to the NUL terminated string, returns NULL if no
  * matches.
  */
-static char *get_value(char **buffer)
-{
+static char *get_value(char **buffer) {
         static const char *quote_string = "\"\n";
         static const char *comma_string = ",\n";
         char *val;
@@ -141,8 +128,7 @@ static char *get_value(char **buffer)
         return val;
 }
 
-static int argc_count(char *opts)
-{
+static int argc_count(char *opts) {
         int i = 0;
         while (*opts != '\0')
                 if (*opts++ == ' ')
@@ -159,11 +145,9 @@ static int argc_count(char *opts)
  *
  * vendor and model can end in '\n'.
  */
-static int get_file_options(struct udev *udev,
-                            const char *vendor, const char *model,
-                            int *argc, char ***newargv)
-{
-        char *buffer;
+static int get_file_options(const char *vendor, const char *model,
+                            int *argc, char ***newargv) {
+        _cleanup_free_ char *buffer = NULL;
         _cleanup_fclose_ FILE *f;
         char *buf;
         char *str1;
@@ -258,9 +242,8 @@ static int get_file_options(struct udev *udev,
                         if (vendor_in == NULL)
                                 break;
                 } else if (vendor_in &&
-                           strneq(vendor, vendor_in, strlen(vendor_in)) &&
-                           (!model_in ||
-                            (strneq(model, model_in, strlen(model_in))))) {
+                           startswith(vendor, vendor_in) &&
+                           (!model_in || startswith(model, model_in))) {
                                 /*
                                  * Matched vendor and optionally model.
                                  *
@@ -295,14 +278,13 @@ static int get_file_options(struct udev *udev,
                                 (*newargv)[c] = buffer;
                                 for (c = 1; c < *argc; c++)
                                         (*newargv)[c] = strsep(&buffer, " \t");
+                                buffer = NULL;
                         }
                 } else {
                         /* No matches  */
                         retval = 1;
                 }
         }
-        if (retval != 0)
-                free(buffer);
         return retval;
 }
 
@@ -324,10 +306,8 @@ static void help(void) {
 
 }
 
-static int set_options(struct udev *udev,
-                       int argc, char **argv,
-                       char *maj_min_dev)
-{
+static int set_options(int argc, char **argv,
+                       char *maj_min_dev) {
         int option;
 
         /*
@@ -336,7 +316,7 @@ static int set_options(struct udev *udev,
          * file) we have to reset this back to 1.
          */
         optind = 1;
-        while ((option = getopt_long(argc, argv, "d:f:gp:uvVxh", options, NULL)) >= 0)
+        while ((option = getopt_long(argc, argv, "d:f:gp:uvVxhbs:", options, NULL)) >= 0)
                 switch (option) {
                 case 'b':
                         all_good = false;
@@ -357,7 +337,7 @@ static int set_options(struct udev *udev,
 
                 case 'h':
                         help();
-                        exit(0);
+                        exit(EXIT_SUCCESS);
 
                 case 'p':
                         if (streq(optarg, "0x80"))
@@ -391,8 +371,8 @@ static int set_options(struct udev *udev,
                         break;
 
                 case 'V':
-                        printf("%s\n", VERSION);
-                        exit(0);
+                        printf("%s\n", GIT_VERSION);
+                        exit(EXIT_SUCCESS);
 
                 case 'x':
                         export = true;
@@ -413,9 +393,7 @@ static int set_options(struct udev *udev,
         return 0;
 }
 
-static int per_dev_options(struct udev *udev,
-                           struct scsi_id_device *dev_scsi, int *good_bad, int *page_code)
-{
+static int per_dev_options(struct scsi_id_device *dev_scsi, int *good_bad, int *page_code) {
         int retval;
         int newargc;
         char **newargv = NULL;
@@ -424,7 +402,7 @@ static int per_dev_options(struct udev *udev,
         *good_bad = all_good;
         *page_code = default_page_code;
 
-        retval = get_file_options(udev, vendor_str, model_str, &newargc, &newargv);
+        retval = get_file_options(vendor_str, model_str, &newargc, &newargv);
 
         optind = 1; /* reset this global extern */
         while (retval == 0) {
@@ -468,25 +446,24 @@ static int per_dev_options(struct udev *udev,
         return retval;
 }
 
-static int set_inq_values(struct udev *udev, struct scsi_id_device *dev_scsi, const char *path)
-{
+static int set_inq_values(struct scsi_id_device *dev_scsi, const char *path) {
         int retval;
 
         dev_scsi->use_sg = sg_version;
 
-        retval = scsi_std_inquiry(udev, dev_scsi, path);
+        retval = scsi_std_inquiry(dev_scsi, path);
         if (retval)
                 return retval;
 
         udev_util_encode_string(dev_scsi->vendor, vendor_enc_str, sizeof(vendor_enc_str));
         udev_util_encode_string(dev_scsi->model, model_enc_str, sizeof(model_enc_str));
 
-        util_replace_whitespace(dev_scsi->vendor, vendor_str, sizeof(vendor_str));
+        util_replace_whitespace(dev_scsi->vendor, vendor_str, sizeof(vendor_str)-1);
         util_replace_chars(vendor_str, NULL);
-        util_replace_whitespace(dev_scsi->model, model_str, sizeof(model_str));
+        util_replace_whitespace(dev_scsi->model, model_str, sizeof(model_str)-1);
         util_replace_chars(model_str, NULL);
         set_type(dev_scsi->type, type_str, sizeof(type_str));
-        util_replace_whitespace(dev_scsi->revision, revision_str, sizeof(revision_str));
+        util_replace_whitespace(dev_scsi->revision, revision_str, sizeof(revision_str)-1);
         util_replace_chars(revision_str, NULL);
         return 0;
 }
@@ -495,27 +472,26 @@ static int set_inq_values(struct udev *udev, struct scsi_id_device *dev_scsi, co
  * scsi_id: try to get an id, if one is found, printf it to stdout.
  * returns a value passed to exit() - 0 if printed an id, else 1.
  */
-static int scsi_id(struct udev *udev, char *maj_min_dev)
-{
+static int scsi_id(char *maj_min_dev) {
         struct scsi_id_device dev_scsi = {};
         int good_dev;
         int page_code;
         int retval = 0;
 
-        if (set_inq_values(udev, &dev_scsi, maj_min_dev) < 0) {
+        if (set_inq_values(&dev_scsi, maj_min_dev) < 0) {
                 retval = 1;
                 goto out;
         }
 
         /* get per device (vendor + model) options from the config file */
-        per_dev_options(udev, &dev_scsi, &good_dev, &page_code);
+        per_dev_options(&dev_scsi, &good_dev, &page_code);
         if (!good_dev) {
                 retval = 1;
                 goto out;
         }
 
         /* read serial number from mode pages (no values for optical drives) */
-        scsi_get_serial(udev, &dev_scsi, maj_min_dev, page_code, MAX_SERIAL_LEN);
+        scsi_get_serial(&dev_scsi, maj_min_dev, page_code, MAX_SERIAL_LEN);
 
         if (export) {
                 char serial_str[MAX_SERIAL_LEN];
@@ -528,10 +504,10 @@ static int scsi_id(struct udev *udev, char *maj_min_dev)
                 printf("ID_REVISION=%s\n", revision_str);
                 printf("ID_TYPE=%s\n", type_str);
                 if (dev_scsi.serial[0] != '\0') {
-                        util_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str));
+                        util_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str)-1);
                         util_replace_chars(serial_str, NULL);
                         printf("ID_SERIAL=%s\n", serial_str);
-                        util_replace_whitespace(dev_scsi.serial_short, serial_str, sizeof(serial_str));
+                        util_replace_whitespace(dev_scsi.serial_short, serial_str, sizeof(serial_str)-1);
                         util_replace_chars(serial_str, NULL);
                         printf("ID_SERIAL_SHORT=%s\n", serial_str);
                 }
@@ -558,7 +534,7 @@ static int scsi_id(struct udev *udev, char *maj_min_dev)
         if (reformat_serial) {
                 char serial_str[MAX_SERIAL_LEN];
 
-                util_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str));
+                util_replace_whitespace(dev_scsi.serial, serial_str, sizeof(serial_str)-1);
                 util_replace_chars(serial_str, NULL);
                 printf("%s\n", serial_str);
                 goto out;
@@ -569,25 +545,21 @@ out:
         return retval;
 }
 
-int main(int argc, char **argv)
-{
-        _cleanup_udev_unref_ struct udev *udev;
+int main(int argc, char **argv) {
         int retval = 0;
         char maj_min_dev[MAX_PATH_LEN];
         int newargc;
         char **newargv = NULL;
 
+        log_set_target(LOG_TARGET_AUTO);
+        udev_parse_config();
         log_parse_environment();
         log_open();
-
-        udev = udev_new();
-        if (udev == NULL)
-                goto exit;
 
         /*
          * Get config file options.
          */
-        retval = get_file_options(udev, NULL, NULL, &newargc, &newargv);
+        retval = get_file_options(NULL, NULL, &newargc, &newargv);
         if (retval < 0) {
                 retval = 1;
                 goto exit;
@@ -595,7 +567,7 @@ int main(int argc, char **argv)
         if (retval == 0) {
                 assert(newargv);
 
-                if (set_options(udev, newargc, newargv, maj_min_dev) < 0) {
+                if (set_options(newargc, newargv, maj_min_dev) < 0) {
                         retval = 2;
                         goto exit;
                 }
@@ -604,8 +576,8 @@ int main(int argc, char **argv)
         /*
          * Get command line options (overriding any config file settings).
          */
-        if (set_options(udev, argc, argv, maj_min_dev) < 0)
-                exit(1);
+        if (set_options(argc, argv, maj_min_dev) < 0)
+                exit(EXIT_FAILURE);
 
         if (!dev_specified) {
                 log_error("No device specified.");
@@ -613,7 +585,7 @@ int main(int argc, char **argv)
                 goto exit;
         }
 
-        retval = scsi_id(udev, maj_min_dev);
+        retval = scsi_id(maj_min_dev);
 
 exit:
         if (newargv) {

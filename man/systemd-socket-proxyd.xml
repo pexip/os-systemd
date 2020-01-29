@@ -3,22 +3,7 @@
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
      "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
-  This file is part of systemd.
-
-  Copyright 2013 David Strauss
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 <refentry id="systemd-socket-proxyd"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -26,14 +11,6 @@
   <refentryinfo>
     <title>systemd-socket-proxyd</title>
     <productname>systemd</productname>
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>David</firstname>
-        <surname>Strauss</surname>
-        <email>david@davidstrauss.net</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
   <refmeta>
     <refentrytitle>systemd-socket-proxyd</refentrytitle>
@@ -75,7 +52,7 @@
     <citerefentry project='die-net'><refentrytitle>socat</refentrytitle><manvolnum>1</manvolnum></citerefentry>.
     The main differences for <command>systemd-socket-proxyd</command>
     are support for socket activation with
-    <literal>Accept=false</literal> and an event-driven
+    <literal>Accept=no</literal> and an event-driven
     design that scales better with the number of
     connections.</para>
   </refsect1>
@@ -85,6 +62,13 @@
     <variablelist>
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
+      <varlistentry>
+        <term><option>--connections-max=</option></term>
+        <term><option>-c</option></term>
+
+        <listitem><para>Sets the maximum number of simultaneous connections, defaults to 256.
+        If the limit of concurrent connections is reached further connections will be refused.</para></listitem>
+      </varlistentry>
     </variablelist>
   </refsect1>
   <refsect1>
@@ -111,25 +95,26 @@ WantedBy=sockets.target]]></programlisting>
         <programlisting><![CDATA[[Unit]
 Requires=nginx.service
 After=nginx.service
+Requires=proxy-to-nginx.socket
+After=proxy-to-nginx.socket
 
 [Service]
-ExecStart=/usr/lib/systemd/systemd-socket-proxyd /tmp/nginx.sock
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd /run/nginx/socket
 PrivateTmp=yes
 PrivateNetwork=yes]]></programlisting>
       </example>
       <example>
         <title>nginx.conf</title>
         <programlisting>
-<![CDATA[[...]
+<![CDATA[[…]
 server {
-    listen       unix:/tmp/nginx.sock;
-    [...]]]>
+    listen       unix:/run/nginx/socket;
+    […]]]>
 </programlisting>
       </example>
       <example>
         <title>Enabling the proxy</title>
-        <programlisting><![CDATA[# systemctl enable proxy-to-nginx.socket
-# systemctl start proxy-to-nginx.socket
+        <programlisting><![CDATA[# systemctl enable --now proxy-to-nginx.socket
 $ curl http://localhost:80/]]></programlisting>
       </example>
     </refsect2>
@@ -153,6 +138,8 @@ WantedBy=sockets.target]]></programlisting>
         <programlisting><![CDATA[[Unit]
 Requires=nginx.service
 After=nginx.service
+Requires=proxy-to-nginx.socket
+After=proxy-to-nginx.socket
 JoinsNamespaceOf=nginx.service
 
 [Service]
@@ -162,15 +149,14 @@ PrivateNetwork=yes]]></programlisting>
       </example>
       <example>
         <title>nginx.conf</title>
-        <programlisting><![CDATA[[...]
+        <programlisting><![CDATA[[…]
 server {
     listen       8080;
-    [...]]]></programlisting>
+    […]]]></programlisting>
       </example>
       <example>
         <title>Enabling the proxy</title>
-        <programlisting><![CDATA[# systemctl enable proxy-to-nginx.socket
-# systemctl start proxy-to-nginx.socket
+        <programlisting><![CDATA[# systemctl enable --now proxy-to-nginx.socket
 $ curl http://localhost:80/]]></programlisting>
       </example>
     </refsect2>

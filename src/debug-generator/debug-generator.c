@@ -1,23 +1,7 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
+#include "generator.h"
 #include "mkdir.h"
 #include "parse-util.h"
 #include "proc-cmdline.h"
@@ -27,11 +11,15 @@
 #include "unit-name.h"
 #include "util.h"
 
+static const char *arg_dest = NULL;
 static char *arg_default_unit = NULL;
-static const char *arg_dest = "/tmp";
 static char **arg_mask = NULL;
 static char **arg_wants = NULL;
 static bool arg_debug_shell = false;
+
+STATIC_DESTRUCTOR_REGISTER(arg_default_unit, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_mask, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_wants, strv_freep);
 
 static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
         int r;
@@ -39,56 +27,53 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
         assert(key);
 
         if (streq(key, "systemd.mask")) {
+                char *n;
 
-                if (!value)
-                        log_error("Missing argument for systemd.mask= kernel command line parameter.");
-                else {
-                        char *n;
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
-                        r = unit_name_mangle(value, UNIT_NAME_NOGLOB, &n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to glob unit name: %m");
+                r = unit_name_mangle(value, UNIT_NAME_MANGLE_WARN, &n);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to glob unit name: %m");
 
-                        r = strv_consume(&arg_mask, n);
-                        if (r < 0)
-                                return log_oom();
-                }
+                r = strv_consume(&arg_mask, n);
+                if (r < 0)
+                        return log_oom();
 
         } else if (streq(key, "systemd.wants")) {
+                char *n;
 
-                if (!value)
-                        log_error("Missing argument for systemd.want= kernel command line parameter.");
-                else {
-                        char *n;
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
 
-                        r = unit_name_mangle(value, UNIT_NAME_NOGLOB, &n);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to glob unit name: %m");
+                r = unit_name_mangle(value, UNIT_NAME_MANGLE_WARN, &n);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to glob unit name: %m");
 
-                        r = strv_consume(&arg_wants, n);
-                        if (r < 0)
-                                return log_oom();
-                }
+                r = strv_consume(&arg_wants, n);
+                if (r < 0)
+                        return log_oom();
 
-        } else if (streq(key, "systemd.debug-shell")) {
+        } else if (proc_cmdline_key_streq(key, "systemd.debug_shell")) {
 
                 if (value) {
                         r = parse_boolean(value);
                         if (r < 0)
-                                log_error("Failed to parse systemd.debug-shell= argument '%s', ignoring.", value);
+                                log_error("Failed to parse systemd.debug_shell= argument '%s', ignoring.", value);
                         else
                                 arg_debug_shell = r;
                 } else
                         arg_debug_shell = true;
+
         } else if (streq(key, "systemd.unit")) {
 
-                if (!value)
-                        log_error("Missing argument for systemd.unit= kernel command line parameter.");
-                else {
-                        r = free_and_strdup(&arg_default_unit, value);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set default unit %s: %m", value);
-                }
+                if (proc_cmdline_value_missing(key, value))
+                        return 0;
+
+                r = free_and_strdup(&arg_default_unit, value);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set default unit %s: %m", value);
+
         } else if (!value) {
                 const char *target;
 
@@ -113,7 +98,7 @@ static int generate_mask_symlinks(void) {
         STRV_FOREACH(u, arg_mask) {
                 _cleanup_free_ char *p = NULL;
 
-                p = strjoin(arg_dest, "/", *u, NULL);
+                p = strjoin(arg_dest, "/", *u);
                 if (!p)
                         return log_oom();
 
@@ -135,8 +120,9 @@ static int generate_wants_symlinks(void) {
 
         STRV_FOREACH(u, arg_wants) {
                 _cleanup_free_ char *p = NULL, *f = NULL;
+                const char *target = arg_default_unit ?: SPECIAL_DEFAULT_TARGET;
 
-                p = strjoin(arg_dest, "/", arg_default_unit, ".wants/", *u, NULL);
+                p = strjoin(arg_dest, "/", target, ".wants/", *u);
                 if (!p)
                         return log_oom();
 
@@ -155,48 +141,25 @@ static int generate_wants_symlinks(void) {
         return r;
 }
 
-int main(int argc, char *argv[]) {
+static int run(const char *dest, const char *dest_early, const char *dest_late) {
         int r, q;
 
-        if (argc > 1 && argc != 4) {
-                log_error("This program takes three or no arguments.");
-                return EXIT_FAILURE;
-        }
+        assert_se(arg_dest = dest_early);
 
-        if (argc > 1)
-                arg_dest = argv[2];
-
-        log_set_target(LOG_TARGET_SAFE);
-        log_parse_environment();
-        log_open();
-
-        umask(0022);
-
-        r = free_and_strdup(&arg_default_unit, SPECIAL_DEFAULT_TARGET);
-        if (r < 0) {
-                log_error_errno(r, "Failed to set default unit %s: %m", SPECIAL_DEFAULT_TARGET);
-                goto finish;
-        }
-
-        r = parse_proc_cmdline(parse_proc_cmdline_item, NULL, false);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, PROC_CMDLINE_RD_STRICT | PROC_CMDLINE_STRIP_RD_PREFIX);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
         if (arg_debug_shell) {
                 r = strv_extend(&arg_wants, "debug-shell.service");
-                if (r < 0) {
-                        r = log_oom();
-                        goto finish;
-                }
+                if (r < 0)
+                        return log_oom();
         }
 
         r = generate_mask_symlinks();
-
         q = generate_wants_symlinks();
-        if (q < 0)
-                r = q;
 
-finish:
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
-
+        return r < 0 ? r : q;
 }
+
+DEFINE_MAIN_GENERATOR_FUNCTION(run);

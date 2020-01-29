@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010-2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <limits.h>
@@ -37,6 +20,7 @@
 #include "log.h"
 #include "macro.h"
 #include "ptyfwd.h"
+#include "terminal-util.h"
 #include "time-util.h"
 
 struct PTYForward {
@@ -69,6 +53,7 @@ struct PTYForward {
         bool read_from_master:1;
 
         bool done:1;
+        bool drain:1;
 
         bool last_char_set:1;
         char last_char;
@@ -104,8 +89,8 @@ static void pty_forward_disconnect(PTYForward *f) {
         }
 
         /* STDIN/STDOUT should not be nonblocking normally, so let's unconditionally reset it */
-        fd_nonblock(STDIN_FILENO, false);
-        fd_nonblock(STDOUT_FILENO, false);
+        (void) fd_nonblock(STDIN_FILENO, false);
+        (void) fd_nonblock(STDOUT_FILENO, false);
 }
 
 static int pty_forward_done(PTYForward *f, int rcode) {
@@ -169,6 +154,30 @@ static bool ignore_vhangup(PTYForward *f) {
         return false;
 }
 
+static bool drained(PTYForward *f) {
+        int q = 0;
+
+        assert(f);
+
+        if (f->out_buffer_full > 0)
+                return false;
+
+        if (f->master_readable)
+                return false;
+
+        if (ioctl(f->master, TIOCINQ, &q) < 0)
+                log_debug_errno(errno, "TIOCINQ failed on master: %m");
+        else if (q > 0)
+                return false;
+
+        if (ioctl(f->master, TIOCOUTQ, &q) < 0)
+                log_debug_errno(errno, "TIOCOUTQ failed on master: %m");
+        else if (q > 0)
+                return false;
+
+        return true;
+}
+
 static int shovel(PTYForward *f) {
         ssize_t k;
 
@@ -186,7 +195,7 @@ static int shovel(PTYForward *f) {
 
                                 if (errno == EAGAIN)
                                         f->stdin_readable = false;
-                                else if (errno == EIO || errno == EPIPE || errno == ECONNRESET) {
+                                else if (IN_SET(errno, EIO, EPIPE, ECONNRESET)) {
                                         f->stdin_readable = false;
                                         f->stdin_hangup = true;
 
@@ -216,9 +225,9 @@ static int shovel(PTYForward *f) {
                         k = write(f->master, f->in_buffer, f->in_buffer_full);
                         if (k < 0) {
 
-                                if (errno == EAGAIN || errno == EIO)
+                                if (IN_SET(errno, EAGAIN, EIO))
                                         f->master_writable = false;
-                                else if (errno == EPIPE || errno == ECONNRESET) {
+                                else if (IN_SET(errno, EPIPE, ECONNRESET)) {
                                         f->master_writable = f->master_readable = false;
                                         f->master_hangup = true;
 
@@ -248,7 +257,7 @@ static int shovel(PTYForward *f) {
 
                                 if (errno == EAGAIN || (errno == EIO && ignore_vhangup(f)))
                                         f->master_readable = false;
-                                else if (errno == EPIPE || errno == ECONNRESET || errno == EIO) {
+                                else if (IN_SET(errno, EPIPE, ECONNRESET, EIO)) {
                                         f->master_readable = f->master_writable = false;
                                         f->master_hangup = true;
 
@@ -270,7 +279,7 @@ static int shovel(PTYForward *f) {
 
                                 if (errno == EAGAIN)
                                         f->stdout_writable = false;
-                                else if (errno == EIO || errno == EPIPE || errno == ECONNRESET) {
+                                else if (IN_SET(errno, EIO, EPIPE, ECONNRESET)) {
                                         f->stdout_writable = false;
                                         f->stdout_hangup = true;
                                         f->stdout_event_source = sd_event_source_unref(f->stdout_event_source);
@@ -301,6 +310,11 @@ static int shovel(PTYForward *f) {
                     (f->in_buffer_full <= 0 || f->master_hangup))
                         return pty_forward_done(f, 0);
         }
+
+        /* If we were asked to drain, and there's nothing more to handle from the master, then call the callback
+         * too. */
+        if (f->drain && drained(f))
+                return pty_forward_done(f, 0);
 
         return 0;
 }
@@ -378,11 +392,14 @@ int pty_forward_new(
         struct winsize ws;
         int r;
 
-        f = new0(PTYForward, 1);
+        f = new(PTYForward, 1);
         if (!f)
                 return -ENOMEM;
 
-        f->flags = flags;
+        *f = (struct PTYForward) {
+                .flags = flags,
+                .master = -1,
+        };
 
         if (event)
                 f->event = sd_event_ref(event);
@@ -408,8 +425,17 @@ int pty_forward_new(
 
         f->master = master;
 
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) >= 0)
-                (void) ioctl(master, TIOCSWINSZ, &ws);
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) < 0) {
+                /* If we can't get the resolution from the output fd, then use our internal, regular width/height,
+                 * i.e. something derived from $COLUMNS and $LINES if set. */
+
+                ws = (struct winsize) {
+                        .ws_row = lines(),
+                        .ws_col = columns(),
+                };
+        }
+
+        (void) ioctl(master, TIOCSWINSZ, &ws);
 
         if (!(flags & PTY_FORWARD_READ_ONLY)) {
                 if (tcgetattr(STDIN_FILENO, &f->saved_stdin_attr) >= 0) {
@@ -438,6 +464,9 @@ int pty_forward_new(
                 r = sd_event_add_io(f->event, &f->stdin_event_source, STDIN_FILENO, EPOLLIN|EPOLLET, on_stdin_event, f);
                 if (r < 0 && r != -EPERM)
                         return r;
+
+                if (r >= 0)
+                        (void) sd_event_source_set_description(f->stdin_event_source, "ptyfwd-stdin");
         }
 
         r = sd_event_add_io(f->event, &f->stdout_event_source, STDOUT_FILENO, EPOLLOUT|EPOLLET, on_stdout_event, f);
@@ -446,17 +475,22 @@ int pty_forward_new(
                 f->stdout_writable = true;
         else if (r < 0)
                 return r;
+        else
+                (void) sd_event_source_set_description(f->stdout_event_source, "ptyfwd-stdout");
 
         r = sd_event_add_io(f->event, &f->master_event_source, master, EPOLLIN|EPOLLOUT|EPOLLET, on_master_event, f);
         if (r < 0)
                 return r;
 
+        (void) sd_event_source_set_description(f->master_event_source, "ptyfwd-master");
+
         r = sd_event_add_signal(f->event, &f->sigwinch_event_source, SIGWINCH, on_sigwinch_event, f);
         if (r < 0)
                 return r;
 
-        *ret = f;
-        f = NULL;
+        (void) sd_event_source_set_description(f->sigwinch_event_source, "ptyfwd-sigwinch");
+
+        *ret = TAKE_PTR(f);
 
         return 0;
 }
@@ -518,4 +552,80 @@ void pty_forward_set_handler(PTYForward *f, PTYForwardHandler cb, void *userdata
 
         f->handler = cb;
         f->userdata = userdata;
+}
+
+bool pty_forward_drain(PTYForward *f) {
+        assert(f);
+
+        /* Starts draining the forwarder. Specifically:
+         *
+         * - Returns true if there are no unprocessed bytes from the pty, false otherwise
+         *
+         * - Makes sure the handler function is called the next time the number of unprocessed bytes hits zero
+         */
+
+        f->drain = true;
+        return drained(f);
+}
+
+int pty_forward_set_priority(PTYForward *f, int64_t priority) {
+        int r;
+        assert(f);
+
+        r = sd_event_source_set_priority(f->stdin_event_source, priority);
+        if (r < 0)
+                return r;
+
+        r = sd_event_source_set_priority(f->stdout_event_source, priority);
+        if (r < 0)
+                return r;
+
+        r = sd_event_source_set_priority(f->master_event_source, priority);
+        if (r < 0)
+                return r;
+
+        r = sd_event_source_set_priority(f->sigwinch_event_source, priority);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+int pty_forward_set_width_height(PTYForward *f, unsigned width, unsigned height) {
+        struct winsize ws;
+
+        assert(f);
+
+        if (width == (unsigned) -1 && height == (unsigned) -1)
+                return 0; /* noop */
+
+        if (width != (unsigned) -1 &&
+            (width == 0 || width > USHRT_MAX))
+                return -ERANGE;
+
+        if (height != (unsigned) -1 &&
+            (height == 0 || height > USHRT_MAX))
+                return -ERANGE;
+
+        if (width == (unsigned) -1 || height == (unsigned) -1) {
+                if (ioctl(f->master, TIOCGWINSZ, &ws) < 0)
+                        return -errno;
+
+                if (width != (unsigned) -1)
+                        ws.ws_col = width;
+                if (height != (unsigned) -1)
+                        ws.ws_row = height;
+        } else
+                ws = (struct winsize) {
+                        .ws_row = height,
+                        .ws_col = width,
+                };
+
+        if (ioctl(f->master, TIOCSWINSZ, &ws) < 0)
+                return -errno;
+
+        /* Make sure we ignore SIGWINCH window size events from now on */
+        f->sigwinch_event_source = sd_event_source_unref(f->sigwinch_event_source);
+
+        return 0;
 }

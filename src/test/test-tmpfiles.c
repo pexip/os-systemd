@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -25,10 +8,13 @@
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "formats-util.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "log.h"
+#include "process-util.h"
 #include "string-util.h"
+#include "tests.h"
+#include "tmpfile-util.h"
 #include "util.h"
 
 int main(int argc, char** argv) {
@@ -37,15 +23,14 @@ int main(int argc, char** argv) {
         const char *p = argv[1] ?: "/tmp";
         char *pattern;
 
-        log_set_max_level(LOG_DEBUG);
-        log_parse_environment();
+        test_setup_logging(LOG_DEBUG);
 
         pattern = strjoina(p, "/systemd-test-XXXXXX");
 
         fd = open_tmpfile_unlinkable(p, O_RDWR|O_CLOEXEC);
         assert_se(fd >= 0);
 
-        assert_se(asprintf(&cmd, "ls -l /proc/"PID_FMT"/fd/%d", getpid(), fd) > 0);
+        assert_se(asprintf(&cmd, "ls -l /proc/"PID_FMT"/fd/%d", getpid_cached(), fd) > 0);
         (void) system(cmd);
         assert_se(readlink_malloc(cmd + 6, &ans) >= 0);
         log_debug("link1: %s", ans);
@@ -55,7 +40,7 @@ int main(int argc, char** argv) {
         assert_se(fd >= 0);
         assert_se(unlink(pattern) == 0);
 
-        assert_se(asprintf(&cmd2, "ls -l /proc/"PID_FMT"/fd/%d", getpid(), fd2) > 0);
+        assert_se(asprintf(&cmd2, "ls -l /proc/"PID_FMT"/fd/%d", getpid_cached(), fd2) > 0);
         (void) system(cmd2);
         assert_se(readlink_malloc(cmd2 + 6, &ans2) >= 0);
         log_debug("link2: %s", ans2);

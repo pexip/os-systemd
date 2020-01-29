@@ -1,26 +1,9 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 typedef struct User User;
 
+#include "conf-parser.h"
 #include "list.h"
 #include "logind.h"
 
@@ -40,32 +23,39 @@ struct User {
         uid_t uid;
         gid_t gid;
         char *name;
+        char *home;
         char *state_file;
         char *runtime_path;
-        char *slice;
-        char *service;
+
+        char *slice;                     /* user-UID.slice */
+        char *service;                   /* user@UID.service */
+        char *runtime_dir_service;       /* user-runtime-dir@UID.service */
 
         char *service_job;
-        char *slice_job;
 
         Session *display;
 
-        dual_timestamp timestamp;
+        dual_timestamp timestamp;      /* When this User object was 'started' the first time */
+        usec_t last_session_timestamp; /* When the number of sessions of this user went from 1 to 0 the last time */
+
+        /* Set up when the last session of the user logs out */
+        sd_event_source *timer_event_source;
 
         bool in_gc_queue:1;
-        bool started:1;
-        bool stopping:1;
+
+        bool started:1;       /* Whenever the user being started, has been started or is being stopped again. */
+        bool stopping:1;      /* Whenever the user is being stopped or has been stopped. */
 
         LIST_HEAD(Session, sessions);
         LIST_FIELDS(User, gc_queue);
 };
 
-int user_new(User **out, Manager *m, uid_t uid, gid_t gid, const char *name);
+int user_new(User **out, Manager *m, uid_t uid, gid_t gid, const char *name, const char *home);
 User *user_free(User *u);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(User *, user_free);
 
-bool user_check_gc(User *u, bool drop_not_started);
+bool user_may_gc(User *u, bool drop_not_started);
 void user_add_to_gc_queue(User *u);
 int user_start(User *u);
 int user_stop(User *u, bool force);
@@ -77,6 +67,7 @@ int user_load(User *u);
 int user_kill(User *u, int signo);
 int user_check_linger_file(User *u);
 void user_elect_display(User *u);
+void user_update_last_session_timer(User *u);
 
 extern const sd_bus_vtable user_vtable[];
 int user_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error);
@@ -91,3 +82,5 @@ UserState user_state_from_string(const char *s) _pure_;
 
 int bus_user_method_terminate(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_user_method_kill(sd_bus_message *message, void *userdata, sd_bus_error *error);
+
+CONFIG_PARSER_PROTOTYPE(config_parse_compat_user_tasks_max);

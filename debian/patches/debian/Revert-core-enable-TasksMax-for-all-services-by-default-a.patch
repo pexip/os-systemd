@@ -24,14 +24,14 @@ Bug-Debian: https://bugs.debian.org/823530
 Bug-Ubuntu: https://launchpad.net/bugs/1578080
 ---
  man/systemd-system.conf.xml | 3 +--
- src/core/system.conf        | 2 +-
+ src/core/system.conf.in     | 2 +-
  2 files changed, 2 insertions(+), 3 deletions(-)
 
 diff --git a/man/systemd-system.conf.xml b/man/systemd-system.conf.xml
-index e4e81f7..9a27b8e 100644
+index 27242b3..9ff7cc5 100644
 --- a/man/systemd-system.conf.xml
 +++ b/man/systemd-system.conf.xml
-@@ -340,8 +340,7 @@
+@@ -320,8 +320,7 @@
          <listitem><para>Configure the default value for the per-unit <varname>TasksMax=</varname> setting. See
          <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>
          for details. This setting applies to all unit types that support resource control settings, with the exception
@@ -41,13 +41,13 @@ index e4e81f7..9a27b8e 100644
        </varlistentry>
  
        <varlistentry>
-diff --git a/src/core/system.conf b/src/core/system.conf
-index 746572b..9662487 100644
---- a/src/core/system.conf
-+++ b/src/core/system.conf
-@@ -43,7 +43,7 @@
+diff --git a/src/core/system.conf.in b/src/core/system.conf.in
+index 0a58737..97ecd75 100644
+--- a/src/core/system.conf.in
++++ b/src/core/system.conf.in
+@@ -45,7 +45,7 @@
  #DefaultBlockIOAccounting=no
- #DefaultMemoryAccounting=no
+ #DefaultMemoryAccounting=@MEMORY_ACCOUNTING_DEFAULT@
  #DefaultTasksAccounting=yes
 -#DefaultTasksMax=15%
 +#DefaultTasksMax=

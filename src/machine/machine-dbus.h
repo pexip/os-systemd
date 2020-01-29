@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include "sd-bus.h"
 
@@ -39,6 +21,7 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
 int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_machine_method_open_root_directory(sd_bus_message *message, void *userdata, sd_bus_error *error);
+int bus_machine_method_get_uid_shift(sd_bus_message *message, void *userdata, sd_bus_error *error);
 
 int machine_send_signal(Machine *m, bool new_machine);
 int machine_send_create_reply(Machine *m, sd_bus_error *error);

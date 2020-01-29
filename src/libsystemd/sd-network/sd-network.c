@@ -1,22 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-  Copyright 2014 Tom Gundersen
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <poll.h>
@@ -26,8 +8,8 @@
 #include "sd-network.h"
 
 #include "alloc-util.h"
+#include "env-file.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "fs-util.h"
 #include "macro.h"
 #include "parse-util.h"
@@ -42,7 +24,7 @@ _public_ int sd_network_get_operational_state(char **state) {
 
         assert_return(state, -EINVAL);
 
-        r = parse_env_file("/run/systemd/netif/state", NEWLINE, "OPER_STATE", &s, NULL);
+        r = parse_env_file(NULL, "/run/systemd/netif/state", "OPER_STATE", &s);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
@@ -50,8 +32,7 @@ _public_ int sd_network_get_operational_state(char **state) {
         if (isempty(s))
                 return -ENODATA;
 
-        *state = s;
-        s = NULL;
+        *state = TAKE_PTR(s);
 
         return 0;
 }
@@ -63,7 +44,7 @@ static int network_get_strv(const char *key, char ***ret) {
 
         assert_return(ret, -EINVAL);
 
-        r = parse_env_file("/run/systemd/netif/state", NEWLINE, key, &s, NULL);
+        r = parse_env_file(NULL, "/run/systemd/netif/state", key, &s);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
@@ -78,10 +59,9 @@ static int network_get_strv(const char *key, char ***ret) {
                 return -ENOMEM;
 
         strv_uniq(a);
-        r = strv_length(a);
+        r = (int) strv_length(a);
 
-        *ret = a;
-        a = NULL;
+        *ret = TAKE_PTR(a);
 
         return r;
 }
@@ -103,7 +83,7 @@ _public_ int sd_network_get_route_domains(char ***ret) {
 }
 
 static int network_link_get_string(int ifindex, const char *field, char **ret) {
-        char path[strlen("/run/systemd/netif/links/") + DECIMAL_STR_MAX(ifindex) + 1];
+        char path[STRLEN("/run/systemd/netif/links/") + DECIMAL_STR_MAX(ifindex) + 1];
         _cleanup_free_ char *s = NULL;
         int r;
 
@@ -112,7 +92,7 @@ static int network_link_get_string(int ifindex, const char *field, char **ret) {
 
         xsprintf(path, "/run/systemd/netif/links/%i", ifindex);
 
-        r = parse_env_file(path, NEWLINE, field, &s, NULL);
+        r = parse_env_file(NULL, path, field, &s);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
@@ -120,14 +100,13 @@ static int network_link_get_string(int ifindex, const char *field, char **ret) {
         if (isempty(s))
                 return -ENODATA;
 
-        *ret = s;
-        s = NULL;
+        *ret = TAKE_PTR(s);
 
         return 0;
 }
 
 static int network_link_get_strv(int ifindex, const char *key, char ***ret) {
-        char path[strlen("/run/systemd/netif/links/") + DECIMAL_STR_MAX(ifindex) + 1];
+        char path[STRLEN("/run/systemd/netif/links/") + DECIMAL_STR_MAX(ifindex) + 1];
         _cleanup_strv_free_ char **a = NULL;
         _cleanup_free_ char *s = NULL;
         int r;
@@ -136,7 +115,7 @@ static int network_link_get_strv(int ifindex, const char *key, char ***ret) {
         assert_return(ret, -EINVAL);
 
         xsprintf(path, "/run/systemd/netif/links/%i", ifindex);
-        r = parse_env_file(path, NEWLINE, key, &s, NULL);
+        r = parse_env_file(NULL, path, key, &s);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
@@ -151,10 +130,9 @@ static int network_link_get_strv(int ifindex, const char *key, char ***ret) {
                 return -ENOMEM;
 
         strv_uniq(a);
-        r = strv_length(a);
+        r = (int) strv_length(a);
 
-        *ret = a;
-        a = NULL;
+        *ret = TAKE_PTR(a);
 
         return r;
 }
@@ -171,12 +149,31 @@ _public_ int sd_network_link_get_operational_state(int ifindex, char **state) {
         return network_link_get_string(ifindex, "OPER_STATE", state);
 }
 
+_public_ int sd_network_link_get_required_for_online(int ifindex) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        r = network_link_get_string(ifindex, "REQUIRED_FOR_ONLINE", &s);
+        if (r < 0) {
+                /* Handle -ENODATA as RequiredForOnline=yes, for compatibility */
+                if (r == -ENODATA)
+                        return true;
+                return r;
+        }
+
+        return parse_boolean(s);
+}
+
 _public_ int sd_network_link_get_llmnr(int ifindex, char **llmnr) {
         return network_link_get_string(ifindex, "LLMNR", llmnr);
 }
 
 _public_ int sd_network_link_get_mdns(int ifindex, char **mdns) {
         return network_link_get_string(ifindex, "MDNS", mdns);
+}
+
+_public_ int sd_network_link_get_dns_over_tls(int ifindex, char **dns_over_tls) {
+        return network_link_get_string(ifindex, "DNS_OVER_TLS", dns_over_tls);
 }
 
 _public_ int sd_network_link_get_dnssec(int ifindex, char **dnssec) {
@@ -207,8 +204,27 @@ _public_ int sd_network_link_get_route_domains(int ifindex, char ***ret) {
         return network_link_get_strv(ifindex, "ROUTE_DOMAINS", ret);
 }
 
+_public_ int sd_network_link_get_dns_default_route(int ifindex) {
+        char path[STRLEN("/run/systemd/netif/links/") + DECIMAL_STR_MAX(ifindex) + 1];
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert_return(ifindex > 0, -EINVAL);
+
+        xsprintf(path, "/run/systemd/netif/links/%i", ifindex);
+
+        r = parse_env_file(NULL, path, "DNS_DEFAULT_ROUTE", &s);
+        if (r == -ENOENT)
+                return -ENODATA;
+        if (r < 0)
+                return r;
+        if (isempty(s))
+                return -ENODATA;
+        return parse_boolean(s);
+}
+
 static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
-        char path[strlen("/run/systemd/netif/links/") + DECIMAL_STR_MAX(ifindex) + 1];
+        char path[STRLEN("/run/systemd/netif/links/") + DECIMAL_STR_MAX(ifindex) + 1];
         _cleanup_free_ int *ifis = NULL;
         _cleanup_free_ char *s = NULL;
         size_t allocated = 0, c = 0;
@@ -219,18 +235,13 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
         assert_return(ret, -EINVAL);
 
         xsprintf(path, "/run/systemd/netif/links/%i", ifindex);
-        r = parse_env_file(path, NEWLINE, key, &s, NULL);
+        r = parse_env_file(NULL, path, key, &s);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
                 return r;
-        if (isempty(s)) {
-                *ret = NULL;
-                return 0;
-        }
 
-        x = s;
-        for (;;) {
+        for (x = s;;) {
                 _cleanup_free_ char *word = NULL;
 
                 r = extract_first_word(&x, &word, NULL, 0);
@@ -243,18 +254,16 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
                 if (r < 0)
                         return r;
 
-                if (!GREEDY_REALLOC(ifis, allocated, c + 1))
+                if (!GREEDY_REALLOC(ifis, allocated, c + 2))
                         return -ENOMEM;
 
                 ifis[c++] = ifindex;
         }
 
-        if (!GREEDY_REALLOC(ifis, allocated, c + 1))
-                return -ENOMEM;
-        ifis[c] = 0; /* Let's add a 0 ifindex to the end, to be nice*/
+        if (ifis)
+                ifis[c] = 0; /* Let's add a 0 ifindex to the end, to be nice */
 
-        *ret = ifis;
-        ifis = NULL;
+        *ret = TAKE_PTR(ifis);
 
         return c;
 }
@@ -267,11 +276,11 @@ _public_ int sd_network_link_get_carrier_bound_by(int ifindex, int **ret) {
         return network_link_get_ifindexes(ifindex, "CARRIER_BOUND_BY", ret);
 }
 
-static inline int MONITOR_TO_FD(sd_network_monitor *m) {
+static int MONITOR_TO_FD(sd_network_monitor *m) {
         return (int) (unsigned long) m - 1;
 }
 
-static inline sd_network_monitor* FD_TO_MONITOR(int fd) {
+static sd_network_monitor* FD_TO_MONITOR(int fd) {
         return (sd_network_monitor*) (unsigned long) (fd + 1);
 }
 
@@ -348,7 +357,7 @@ _public_ int sd_network_monitor_flush(sd_network_monitor *m) {
 
         l = read(fd, &buffer, sizeof(buffer));
         if (l < 0) {
-                if (errno == EAGAIN || errno == EINTR)
+                if (IN_SET(errno, EAGAIN, EINTR))
                         return 0;
 
                 return -errno;

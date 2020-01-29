@@ -1,31 +1,16 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <curl/curl.h>
 #include <stdbool.h>
 
+#include "sd-daemon.h"
+
 #include "alloc-util.h"
 #include "journal-upload.h"
 #include "log.h"
+#include "string-util.h"
 #include "utf8.h"
 #include "util.h"
-#include "sd-daemon.h"
 
 /**
  * Write up to size bytes to buf. Return negative on error, and number of
@@ -49,7 +34,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
                         r = snprintf(buf + pos, size - pos,
                                      "__CURSOR=%s\n", u->current_cursor);
-                        if (pos + r > size)
+                        assert(r >= 0);
+                        if ((size_t) r > size - pos)
                                 /* not enough space */
                                 return pos;
 
@@ -62,8 +48,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         }
 
                         pos += r;
-                }       /* fall through */
-
+                }
+                        _fallthrough_;
                 case ENTRY_REALTIME: {
                         usec_t realtime;
 
@@ -73,7 +59,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
                         r = snprintf(buf + pos, size - pos,
                                      "__REALTIME_TIMESTAMP="USEC_FMT"\n", realtime);
-                        if (r + pos > size)
+                        assert(r >= 0);
+                        if ((size_t) r > size - pos)
                                 /* not enough space */
                                 return pos;
 
@@ -86,8 +73,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         }
 
                         pos += r;
-                }       /* fall through */
-
+                }
+                        _fallthrough_;
                 case ENTRY_MONOTONIC: {
                         usec_t monotonic;
                         sd_id128_t boot_id;
@@ -98,7 +85,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
                         r = snprintf(buf + pos, size - pos,
                                      "__MONOTONIC_TIMESTAMP="USEC_FMT"\n", monotonic);
-                        if (r + pos > size)
+                        assert(r >= 0);
+                        if ((size_t) r > size - pos)
                                 /* not enough space */
                                 return pos;
 
@@ -111,8 +99,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         }
 
                         pos += r;
-                }       /* fall through */
-
+                }
+                        _fallthrough_;
                 case ENTRY_BOOT_ID: {
                         sd_id128_t boot_id;
                         char sid[33];
@@ -123,7 +111,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
                         r = snprintf(buf + pos, size - pos,
                                      "_BOOT_ID=%s\n", sd_id128_to_string(boot_id, sid));
-                        if (r + pos > size)
+                        assert(r >= 0);
+                        if ((size_t) r > size - pos)
                                 /* not enough space */
                                 return pos;
 
@@ -136,8 +125,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         }
 
                         pos += r;
-                }       /* fall through */
-
+                }
+                        _fallthrough_;
                 case ENTRY_NEW_FIELD: {
                         u->field_pos = 0;
 
@@ -151,15 +140,19 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                                 continue;
                         }
 
-                        if (!utf8_is_printable_newline(u->field_data,
-                                                       u->field_length, false)) {
+                        /* We already printed the boot id from the data in
+                         * the header, hence let's suppress it here */
+                        if (memory_startswith(u->field_data, u->field_length, "_BOOT_ID="))
+                                continue;
+
+                        if (!utf8_is_printable_newline(u->field_data, u->field_length, false)) {
                                 u->entry_state = ENTRY_BINARY_FIELD_START;
                                 continue;
                         }
 
                         u->entry_state++;
-                }       /* fall through */
-
+                }
+                        _fallthrough_;
                 case ENTRY_TEXT_FIELD:
                 case ENTRY_BINARY_FIELD: {
                         bool done;
@@ -191,10 +184,9 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         size_t len;
 
                         c = memchr(u->field_data, '=', u->field_length);
-                        if (!c || c == u->field_data) {
-                                log_error("Invalid field.");
-                                return -EINVAL;
-                        }
+                        if (!c || c == u->field_data)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Invalid field.");
 
                         len = c - (const char*)u->field_data;
 
@@ -208,8 +200,8 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
 
                         u->field_pos = len + 1;
                         u->entry_state++;
-                }       /* fall through */
-
+                }
+                        _fallthrough_;
                 case ENTRY_BINARY_FIELD_SIZE: {
                         uint64_t le64;
 
@@ -243,7 +235,7 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
         assert_not_reached("WTF?");
 }
 
-static inline void check_update_watchdog(Uploader *u) {
+static void check_update_watchdog(Uploader *u) {
         usec_t after;
         usec_t elapsed_time;
 
@@ -251,7 +243,7 @@ static inline void check_update_watchdog(Uploader *u) {
                 return;
 
         after = now(CLOCK_MONOTONIC);
-        elapsed_time = usec_sub(after, u->watchdog_timestamp);
+        elapsed_time = usec_sub_unsigned(after, u->watchdog_timestamp);
         if (elapsed_time > u->watchdog_usec / 2) {
                 log_debug("Update watchdog timer");
                 sd_notify(false, "WATCHDOG=1");

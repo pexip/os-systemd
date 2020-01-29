@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <dirent.h>
 #include <stdbool.h>
@@ -28,27 +10,39 @@
 #include "macro.h"
 #include "time-util.h"
 
+#define LONG_LINE_MAX (1U*1024U*1024U)
+
 typedef enum {
-        WRITE_STRING_FILE_CREATE = 1,
-        WRITE_STRING_FILE_ATOMIC = 2,
-        WRITE_STRING_FILE_AVOID_NEWLINE = 4,
-        WRITE_STRING_FILE_VERIFY_ON_FAILURE = 8,
+        WRITE_STRING_FILE_CREATE            = 1 << 0,
+        WRITE_STRING_FILE_ATOMIC            = 1 << 1,
+        WRITE_STRING_FILE_AVOID_NEWLINE     = 1 << 2,
+        WRITE_STRING_FILE_VERIFY_ON_FAILURE = 1 << 3,
+        WRITE_STRING_FILE_SYNC              = 1 << 4,
+        WRITE_STRING_FILE_DISABLE_BUFFER    = 1 << 5,
+        WRITE_STRING_FILE_NOFOLLOW          = 1 << 6,
+
+        /* And before you wonder, why write_string_file_atomic_label_ts() is a separate function instead of just one
+           more flag here: it's about linking: we don't want to pull -lselinux into all users of write_string_file()
+           and friends. */
+
 } WriteStringFileFlags;
 
-int write_string_stream(FILE *f, const char *line, bool enforce_newline);
-int write_string_file(const char *fn, const char *line, WriteStringFileFlags flags);
+int write_string_stream_ts(FILE *f, const char *line, WriteStringFileFlags flags, struct timespec *ts);
+static inline int write_string_stream(FILE *f, const char *line, WriteStringFileFlags flags) {
+        return write_string_stream_ts(f, line, flags, NULL);
+}
+int write_string_file_ts(const char *fn, const char *line, WriteStringFileFlags flags, struct timespec *ts);
+static inline int write_string_file(const char *fn, const char *line, WriteStringFileFlags flags) {
+        return write_string_file_ts(fn, line, flags, NULL);
+}
+
+int write_string_filef(const char *fn, WriteStringFileFlags flags, const char *format, ...) _printf_(3, 4);
 
 int read_one_line_file(const char *fn, char **line);
 int read_full_file(const char *fn, char **contents, size_t *size);
 int read_full_stream(FILE *f, char **contents, size_t *size);
 
 int verify_file(const char *fn, const char *blob, bool accept_extra_nl);
-
-int parse_env_file(const char *fname, const char *separator, ...) _sentinel_;
-int load_env_file(FILE *f, const char *fname, const char *separator, char ***l);
-int load_env_file_pairs(FILE *f, const char *fname, const char *separator, char ***l);
-
-int write_env_file(const char *fname, char **l);
 
 int executable_is_script(const char *path, char **interpreter);
 
@@ -59,32 +53,26 @@ DIR *xopendirat(int dirfd, const char *name, int flags);
 int search_and_fopen(const char *path, const char *mode, const char *root, const char **search, FILE **_f);
 int search_and_fopen_nulstr(const char *path, const char *mode, const char *root, const char *search, FILE **_f);
 
-#define FOREACH_LINE(line, f, on_error)                         \
-        for (;;)                                                \
-                if (!fgets(line, sizeof(line), f)) {            \
-                        if (ferror(f)) {                        \
-                                on_error;                       \
-                        }                                       \
-                        break;                                  \
-                } else
-
 int fflush_and_check(FILE *f);
-
-int fopen_temporary(const char *path, FILE **_f, char **_temp_path);
-int mkostemp_safe(char *pattern);
-
-int tempfn_xxxxxx(const char *p, const char *extra, char **ret);
-int tempfn_random(const char *p, const char *extra, char **ret);
-int tempfn_random_child(const char *p, const char *extra, char **ret);
+int fflush_sync_and_check(FILE *f);
 
 int write_timestamp_file_atomic(const char *fn, usec_t n);
 int read_timestamp_file(const char *fn, usec_t *ret);
 
 int fputs_with_space(FILE *f, const char *s, const char *separator, bool *space);
 
-int open_tmpfile_unlinkable(const char *directory, int flags);
-int open_tmpfile_linkable(const char *target, int flags, char **ret_path);
+typedef enum ReadLineFlags {
+        READ_LINE_ONLY_NUL = 1 << 0,
+} ReadLineFlags;
 
-int link_tmpfile(int fd, const char *path, const char *target);
+int read_line_full(FILE *f, size_t limit, ReadLineFlags flags, char **ret);
 
-int read_nul_string(FILE *f, char **ret);
+static inline int read_line(FILE *f, size_t limit, char **ret) {
+        return read_line_full(f, limit, 0, ret);
+}
+
+static inline int read_nul_string(FILE *f, size_t limit, char **ret) {
+        return read_line_full(f, limit, READ_LINE_ONLY_NUL, ret);
+}
+
+int safe_fgetc(FILE *f, char *ret);

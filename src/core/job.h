@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <stdbool.h>
 
@@ -98,7 +80,7 @@ enum JobMode {
 };
 
 enum JobResult {
-        JOB_DONE,                /* Job completed successfully */
+        JOB_DONE,                /* Job completed successfully (or skipped due to a failed ConditionXYZ=) */
         JOB_CANCELED,            /* Job canceled by a conflicting job installation or by explicit cancel request */
         JOB_TIMEOUT,             /* Job timeout elapsed */
         JOB_FAILED,              /* Job failed */
@@ -107,6 +89,8 @@ enum JobResult {
         JOB_INVALID,             /* JOB_RELOAD of inactive unit */
         JOB_ASSERT,              /* Couldn't start a unit, because an assert didn't hold */
         JOB_UNSUPPORTED,         /* Couldn't start a unit, because the unit type is not supported on the system */
+        JOB_COLLECTED,           /* Job was garbage collected, since nothing needed it anymore */
+        JOB_ONCE,                /* Unit was started before, and hence can't be started again */
         _JOB_RESULT_MAX,
         _JOB_RESULT_INVALID = -1
 };
@@ -122,8 +106,8 @@ struct JobDependency {
         LIST_FIELDS(JobDependency, subject);
         LIST_FIELDS(JobDependency, object);
 
-        bool matters;
-        bool conflicts;
+        bool matters:1;
+        bool conflicts:1;
 };
 
 struct Job {
@@ -133,6 +117,7 @@ struct Job {
         LIST_FIELDS(Job, transaction);
         LIST_FIELDS(Job, run_queue);
         LIST_FIELDS(Job, dbus_queue);
+        LIST_FIELDS(Job, gc_queue);
 
         LIST_HEAD(JobDependency, subject_list);
         LIST_HEAD(JobDependency, object_list);
@@ -148,6 +133,7 @@ struct Job {
 
         sd_event_source *timer_event_source;
         usec_t begin_usec;
+        usec_t begin_running_usec;
 
         /*
          * This tracks where to send signals, and also which clients
@@ -156,7 +142,7 @@ struct Job {
          *
          * There can be more than one client, because of job merging.
          */
-        sd_bus_track *clients;
+        sd_bus_track *bus_track;
         char **deserialized_clients;
 
         JobResult result;
@@ -168,15 +154,18 @@ struct Job {
         bool sent_dbus_new_signal:1;
         bool ignore_order:1;
         bool irreversible:1;
+        bool in_gc_queue:1;
+        bool ref_by_private_bus:1;
 };
 
 Job* job_new(Unit *unit, JobType type);
 Job* job_new_raw(Unit *unit);
-void job_free(Job *job);
+void job_unlink(Job *job);
+Job* job_free(Job *job);
 Job* job_install(Job *j);
 int job_install_deserialized(Job *j);
 void job_uninstall(Job *j);
-void job_dump(Job *j, FILE*f, const char *prefix);
+void job_dump(Job *j, FILE *f, const char *prefix);
 int job_serialize(Job *j, FILE *f);
 int job_deserialize(Job *j, FILE *f);
 int job_coldplug(Job *j);
@@ -216,7 +205,7 @@ int job_type_merge_and_collapse(JobType *a, JobType b, Unit *u);
 void job_add_to_run_queue(Job *j);
 void job_add_to_dbus_queue(Job *j);
 
-int job_start_timer(Job *j);
+int job_start_timer(Job *j, bool job_running);
 
 int job_run_and_invalidate(Job *j);
 int job_finish_and_invalidate(Job *j, JobResult result, bool recursive, bool already);
@@ -226,6 +215,14 @@ char *job_dbus_path(Job *j);
 void job_shutdown_magic(Job *j);
 
 int job_get_timeout(Job *j, usec_t *timeout) _pure_;
+
+bool job_may_gc(Job *j);
+void job_add_to_gc_queue(Job *j);
+
+int job_get_before(Job *j, Job*** ret);
+int job_get_after(Job *j, Job*** ret);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(Job*, job_free);
 
 const char* job_type_to_string(JobType t) _const_;
 JobType job_type_from_string(const char *s) _pure_;

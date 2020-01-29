@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <limits.h>
@@ -36,8 +19,10 @@
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
+#include "io-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "socket-util.h"
 #include "strv.h"
 #include "util.h"
@@ -70,7 +55,7 @@ _public_ int sd_listen_fds(int unset_environment) {
                 goto finish;
 
         /* Is this for us? */
-        if (getpid() != pid) {
+        if (getpid_cached() != pid) {
                 r = 0;
                 goto finish;
         }
@@ -139,8 +124,7 @@ _public_ int sd_listen_fds_with_names(int unset_environment, char ***names) {
                         return r;
         }
 
-        *names = l;
-        l = NULL;
+        *names = TAKE_PTR(l);
 
         return n_fds;
 }
@@ -161,7 +145,7 @@ _public_ int sd_is_fifo(int fd, const char *path) {
 
                 if (stat(path, &st_path) < 0) {
 
-                        if (errno == ENOENT || errno == ENOTDIR)
+                        if (IN_SET(errno, ENOENT, ENOTDIR))
                                 return 0;
 
                         return -errno;
@@ -191,7 +175,7 @@ _public_ int sd_is_special(int fd, const char *path) {
 
                 if (stat(path, &st_path) < 0) {
 
-                        if (errno == ENOENT || errno == ENOTDIR)
+                        if (IN_SET(errno, ENOENT, ENOTDIR))
                                 return 0;
 
                         return -errno;
@@ -297,8 +281,7 @@ _public_ int sd_is_socket_inet(int fd, int family, int type, int listening, uint
         if (l < sizeof(sa_family_t))
                 return -EINVAL;
 
-        if (sockaddr.sa.sa_family != AF_INET &&
-            sockaddr.sa.sa_family != AF_INET6)
+        if (!IN_SET(sockaddr.sa.sa_family, AF_INET, AF_INET6))
                 return 0;
 
         if (family != 0)
@@ -306,20 +289,74 @@ _public_ int sd_is_socket_inet(int fd, int family, int type, int listening, uint
                         return 0;
 
         if (port > 0) {
-                if (sockaddr.sa.sa_family == AF_INET) {
-                        if (l < sizeof(struct sockaddr_in))
-                                return -EINVAL;
+                unsigned sa_port;
 
-                        return htobe16(port) == sockaddr.in.sin_port;
-                } else {
-                        if (l < sizeof(struct sockaddr_in6))
-                                return -EINVAL;
+                r = sockaddr_port(&sockaddr.sa, &sa_port);
+                if (r < 0)
+                        return r;
 
-                        return htobe16(port) == sockaddr.in6.sin6_port;
-                }
+                return port == sa_port;
         }
 
         return 1;
+}
+
+_public_ int sd_is_socket_sockaddr(int fd, int type, const struct sockaddr* addr, unsigned addr_len, int listening) {
+        union sockaddr_union sockaddr = {};
+        socklen_t l = sizeof(sockaddr);
+        int r;
+
+        assert_return(fd >= 0, -EBADF);
+        assert_return(addr, -EINVAL);
+        assert_return(addr_len >= sizeof(sa_family_t), -ENOBUFS);
+        assert_return(IN_SET(addr->sa_family, AF_INET, AF_INET6), -EPFNOSUPPORT);
+
+        r = sd_is_socket_internal(fd, type, listening);
+        if (r <= 0)
+                return r;
+
+        if (getsockname(fd, &sockaddr.sa, &l) < 0)
+                return -errno;
+
+        if (l < sizeof(sa_family_t))
+                return -EINVAL;
+
+        if (sockaddr.sa.sa_family != addr->sa_family)
+                return 0;
+
+        if (sockaddr.sa.sa_family == AF_INET) {
+                const struct sockaddr_in *in = (const struct sockaddr_in *) addr;
+
+                if (l < sizeof(struct sockaddr_in) || addr_len < sizeof(struct sockaddr_in))
+                        return -EINVAL;
+
+                if (in->sin_port != 0 &&
+                    sockaddr.in.sin_port != in->sin_port)
+                        return false;
+
+                return sockaddr.in.sin_addr.s_addr == in->sin_addr.s_addr;
+
+        } else {
+                const struct sockaddr_in6 *in = (const struct sockaddr_in6 *) addr;
+
+                if (l < sizeof(struct sockaddr_in6) || addr_len < sizeof(struct sockaddr_in6))
+                        return -EINVAL;
+
+                if (in->sin6_port != 0 &&
+                    sockaddr.in6.sin6_port != in->sin6_port)
+                        return false;
+
+                if (in->sin6_flowinfo != 0 &&
+                    sockaddr.in6.sin6_flowinfo != in->sin6_flowinfo)
+                        return false;
+
+                if (in->sin6_scope_id != 0 &&
+                    sockaddr.in6.sin6_scope_id != in->sin6_scope_id)
+                        return false;
+
+                return memcmp(sockaddr.in6.sin6_addr.s6_addr, in->sin6_addr.s6_addr,
+                              sizeof(in->sin6_addr.s6_addr)) == 0;
+        }
 }
 
 _public_ int sd_is_socket_unix(int fd, int type, int listening, const char *path, size_t length) {
@@ -401,13 +438,15 @@ _public_ int sd_is_mq(int fd, const char *path) {
         return 1;
 }
 
-_public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char *state, const int *fds, unsigned n_fds) {
-        union sockaddr_union sockaddr = {
-                .sa.sa_family = AF_UNIX,
-        };
-        struct iovec iovec = {
-                .iov_base = (char*) state,
-        };
+_public_ int sd_pid_notify_with_fds(
+                pid_t pid,
+                int unset_environment,
+                const char *state,
+                const int *fds,
+                unsigned n_fds) {
+
+        union sockaddr_union sockaddr = {};
+        struct iovec iovec;
         struct msghdr msghdr = {
                 .msg_iov = &iovec,
                 .msg_iovlen = 1,
@@ -416,8 +455,8 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
         _cleanup_close_ int fd = -1;
         struct cmsghdr *cmsg = NULL;
         const char *e;
-        bool have_pid;
-        int r;
+        bool send_ucred;
+        int r, salen;
 
         if (!state) {
                 r = -EINVAL;
@@ -433,14 +472,9 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
         if (!e)
                 return 0;
 
-        /* Must be an abstract socket, or an absolute path */
-        if ((e[0] != '@' && e[0] != '/') || e[1] == 0) {
-                r = -EINVAL;
-                goto finish;
-        }
-
-        if (strlen(e) > sizeof(sockaddr.un.sun_path)) {
-                r = -EINVAL;
+        salen = sockaddr_un_set_path(&sockaddr.un, e);
+        if (salen < 0) {
+                r = salen;
                 goto finish;
         }
 
@@ -450,23 +484,21 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
                 goto finish;
         }
 
-        fd_inc_sndbuf(fd, SNDBUF_SIZE);
+        (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
-        iovec.iov_len = strlen(state);
+        iovec = IOVEC_MAKE_STRING(state);
+        msghdr.msg_namelen = salen;
 
-        strncpy(sockaddr.un.sun_path, e, sizeof(sockaddr.un.sun_path));
-        if (sockaddr.un.sun_path[0] == '@')
-                sockaddr.un.sun_path[0] = 0;
+        send_ucred =
+                (pid != 0 && pid != getpid_cached()) ||
+                getuid() != geteuid() ||
+                getgid() != getegid();
 
-        msghdr.msg_namelen = SOCKADDR_UN_LEN(sockaddr.un);
-
-        have_pid = pid != 0 && pid != getpid();
-
-        if (n_fds > 0 || have_pid) {
+        if (n_fds > 0 || send_ucred) {
                 /* CMSG_SPACE(0) may return value different than zero, which results in miscalculated controllen. */
                 msghdr.msg_controllen =
                         (n_fds > 0 ? CMSG_SPACE(sizeof(int) * n_fds) : 0) +
-                        (have_pid ? CMSG_SPACE(sizeof(struct ucred)) : 0);
+                        (send_ucred ? CMSG_SPACE(sizeof(struct ucred)) : 0);
 
                 msghdr.msg_control = alloca0(msghdr.msg_controllen);
 
@@ -478,11 +510,11 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
 
                         memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * n_fds);
 
-                        if (have_pid)
+                        if (send_ucred)
                                 assert_se(cmsg = CMSG_NXTHDR(&msghdr, cmsg));
                 }
 
-                if (have_pid) {
+                if (send_ucred) {
                         struct ucred *ucred;
 
                         cmsg->cmsg_level = SOL_SOCKET;
@@ -490,7 +522,7 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
                         cmsg->cmsg_len = CMSG_LEN(sizeof(struct ucred));
 
                         ucred = (struct ucred*) CMSG_DATA(cmsg);
-                        ucred->pid = pid;
+                        ucred->pid = pid != 0 ? pid : getpid_cached();
                         ucred->uid = getuid();
                         ucred->gid = getgid();
                 }
@@ -503,7 +535,7 @@ _public_ int sd_pid_notify_with_fds(pid_t pid, int unset_environment, const char
         }
 
         /* If that failed, try with our own ucred instead */
-        if (have_pid) {
+        if (send_ucred) {
                 msghdr.msg_controllen -= CMSG_SPACE(sizeof(struct ucred));
                 if (msghdr.msg_controllen == 0)
                         msghdr.msg_control = NULL;
@@ -572,7 +604,13 @@ _public_ int sd_booted(void) {
          * created. This takes place in mount-setup.c, so is
          * guaranteed to happen very early during boot. */
 
-        return laccess("/run/systemd/system/", F_OK) >= 0;
+        if (laccess("/run/systemd/system/", F_OK) >= 0)
+                return true;
+
+        if (errno == ENOENT)
+                return false;
+
+        return -errno;
 }
 
 _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
@@ -601,7 +639,7 @@ _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
                         goto finish;
 
                 /* Is this for us? */
-                if (getpid() != pid) {
+                if (getpid_cached() != pid) {
                         r = 0;
                         goto finish;
                 }

@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <sys/prctl.h>
 
@@ -31,6 +14,7 @@
 #include "process-util.h"
 #include "pull-common.h"
 #include "pull-job.h"
+#include "rlimit-util.h"
 #include "rm-rf.h"
 #include "signal-util.h"
 #include "siphash24.h"
@@ -123,8 +107,7 @@ int pull_find_old_etags(
                         return r;
         }
 
-        *etags = l;
-        l = NULL;
+        *etags = TAKE_PTR(l);
 
         return 0;
 }
@@ -144,12 +127,12 @@ int pull_make_local_copy(const char *final, const char *image_root, const char *
         if (force_local)
                 (void) rm_rf(p, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME);
 
-        r = btrfs_subvol_snapshot(final, p, BTRFS_SNAPSHOT_QUOTA);
-        if (r == -ENOTTY) {
-                r = copy_tree(final, p, false);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to copy image: %m");
-        } else if (r < 0)
+        r = btrfs_subvol_snapshot(final, p,
+                                  BTRFS_SNAPSHOT_QUOTA|
+                                  BTRFS_SNAPSHOT_FALLBACK_COPY|
+                                  BTRFS_SNAPSHOT_FALLBACK_DIRECTORY|
+                                  BTRFS_SNAPSHOT_RECURSIVE);
+        if (r < 0)
                 return log_error_errno(r, "Failed to create local image: %m");
 
         log_info("Created new local image '%s'.", local);
@@ -191,7 +174,7 @@ int pull_make_path(const char *url, const char *etag, const char *image_root, co
         }
 
         path = strjoin(image_root, "/", strempty(prefix), escaped_url, escaped_etag ? "." : "",
-                       strempty(escaped_etag), strempty(suffix), NULL);
+                       strempty(escaped_etag), strempty(suffix));
         if (!path)
                 return -ENOMEM;
 
@@ -209,7 +192,7 @@ int pull_make_path(const char *url, const char *etag, const char *image_root, co
                         return r;
 
                 path = strjoin(image_root, "/", strempty(prefix), hash, escaped_etag ? "." : "",
-                               strempty(escaped_etag), strempty(suffix), NULL);
+                               strempty(escaped_etag), strempty(suffix));
                 if (!path)
                         return -ENOMEM;
         }
@@ -218,45 +201,47 @@ int pull_make_path(const char *url, const char *etag, const char *image_root, co
         return 0;
 }
 
-int pull_make_settings_job(
+int pull_make_auxiliary_job(
                 PullJob **ret,
                 const char *url,
+                int (*strip_suffixes)(const char *name, char **ret),
+                const char *suffix,
                 CurlGlue *glue,
                 PullJobFinished on_finished,
                 void *userdata) {
 
-        _cleanup_free_ char *last_component = NULL, *ll = NULL, *settings_url = NULL;
+        _cleanup_free_ char *last_component = NULL, *ll = NULL, *auxiliary_url = NULL;
         _cleanup_(pull_job_unrefp) PullJob *job = NULL;
         const char *q;
         int r;
 
         assert(ret);
         assert(url);
+        assert(strip_suffixes);
         assert(glue);
 
         r = import_url_last_component(url, &last_component);
         if (r < 0)
                 return r;
 
-        r = tar_strip_suffixes(last_component, &ll);
+        r = strip_suffixes(last_component, &ll);
         if (r < 0)
                 return r;
 
-        q = strjoina(ll, ".nspawn");
+        q = strjoina(ll, suffix);
 
-        r = import_url_change_last_component(url, q, &settings_url);
+        r = import_url_change_last_component(url, q, &auxiliary_url);
         if (r < 0)
                 return r;
 
-        r = pull_job_new(&job, settings_url, glue, userdata);
+        r = pull_job_new(&job, auxiliary_url, glue, userdata);
         if (r < 0)
                 return r;
 
         job->on_finished = on_finished;
         job->compressed_max = job->uncompressed_max = 1ULL * 1024ULL * 1024ULL;
 
-        *ret = job;
-        job = NULL;
+        *ret = TAKE_PTR(job);
 
         return 0;
 }
@@ -272,6 +257,7 @@ int pull_make_verification_jobs(
 
         _cleanup_(pull_job_unrefp) PullJob *checksum_job = NULL, *signature_job = NULL;
         int r;
+        const char *chksums = NULL;
 
         assert(ret_checksum_job);
         assert(ret_signature_job);
@@ -281,10 +267,16 @@ int pull_make_verification_jobs(
         assert(glue);
 
         if (verify != IMPORT_VERIFY_NO) {
-                _cleanup_free_ char *checksum_url = NULL;
+                _cleanup_free_ char *checksum_url = NULL, *fn = NULL;
 
-                /* Queue job for the SHA256SUMS file for the image */
-                r = import_url_change_last_component(url, "SHA256SUMS", &checksum_url);
+                /* Queue jobs for the checksum file for the image. */
+                r = import_url_last_component(url, &fn);
+                if (r < 0)
+                        return r;
+
+                chksums = strjoina(fn, ".sha256");
+
+                r = import_url_change_last_component(url, chksums, &checksum_url);
                 if (r < 0)
                         return r;
 
@@ -320,15 +312,69 @@ int pull_make_verification_jobs(
         return 0;
 }
 
+static int verify_one(PullJob *checksum_job, PullJob *job) {
+        _cleanup_free_ char *fn = NULL;
+        const char *line, *p;
+        int r;
+
+        assert(checksum_job);
+
+        if (!job)
+                return 0;
+
+        assert(IN_SET(job->state, PULL_JOB_DONE, PULL_JOB_FAILED));
+
+        /* Don't verify the checksum if we didn't actually successfully download something new */
+        if (job->state != PULL_JOB_DONE)
+                return 0;
+        if (job->error != 0)
+                return 0;
+        if (job->etag_exists)
+                return 0;
+
+        assert(job->calc_checksum);
+        assert(job->checksum);
+
+        r = import_url_last_component(job->url, &fn);
+        if (r < 0)
+                return log_oom();
+
+        if (!filename_is_valid(fn))
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Cannot verify checksum, could not determine server-side file name.");
+
+        line = strjoina(job->checksum, " *", fn, "\n");
+
+        p = memmem(checksum_job->payload,
+                   checksum_job->payload_size,
+                   line,
+                   strlen(line));
+
+        if (!p) {
+                line = strjoina(job->checksum, "  ", fn, "\n");
+
+                p = memmem(checksum_job->payload,
+                        checksum_job->payload_size,
+                        line,
+                        strlen(line));
+        }
+
+        if (!p || (p != (char*) checksum_job->payload && p[-1] != '\n'))
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "DOWNLOAD INVALID: Checksum of %s file did not checkout, file has been tampered with.", fn);
+
+        log_info("SHA256 checksum of %s is valid.", job->url);
+        return 1;
+}
+
 int pull_verify(PullJob *main_job,
+                PullJob *roothash_job,
                 PullJob *settings_job,
                 PullJob *checksum_job,
                 PullJob *signature_job) {
 
         _cleanup_close_pair_ int gpg_pipe[2] = { -1, -1 };
-        _cleanup_free_ char *fn = NULL;
         _cleanup_close_ int sig_file = -1;
-        const char *p, *line;
         char sig_file_path[] = "/tmp/sigXXXXXX", gpg_home[] = "/tmp/gpghomeXXXXXX";
         _cleanup_(sigkill_waitp) pid_t pid = 0;
         bool gpg_home_created = false;
@@ -342,6 +388,7 @@ int pull_verify(PullJob *main_job,
 
         assert(main_job->calc_checksum);
         assert(main_job->checksum);
+
         assert(checksum_job->state == PULL_JOB_DONE);
 
         if (!checksum_job->payload || checksum_job->payload_size <= 0) {
@@ -349,67 +396,23 @@ int pull_verify(PullJob *main_job,
                 return -EBADMSG;
         }
 
-        r = import_url_last_component(main_job->url, &fn);
+        r = verify_one(checksum_job, main_job);
         if (r < 0)
-                return log_oom();
+                return r;
 
-        if (!filename_is_valid(fn)) {
-                log_error("Cannot verify checksum, could not determine valid server-side file name.");
-                return -EBADMSG;
-        }
+        r = verify_one(checksum_job, roothash_job);
+        if (r < 0)
+                return r;
 
-        line = strjoina(main_job->checksum, " *", fn, "\n");
-
-        p = memmem(checksum_job->payload,
-                   checksum_job->payload_size,
-                   line,
-                   strlen(line));
-
-        if (!p || (p != (char*) checksum_job->payload && p[-1] != '\n')) {
-                log_error("DOWNLOAD INVALID: Checksum did not check out, payload has been tampered with.");
-                return -EBADMSG;
-        }
-
-        log_info("SHA256 checksum of %s is valid.", main_job->url);
-
-        assert(!settings_job || IN_SET(settings_job->state, PULL_JOB_DONE, PULL_JOB_FAILED));
-
-        if (settings_job &&
-            settings_job->state == PULL_JOB_DONE &&
-            settings_job->error == 0 &&
-            !settings_job->etag_exists) {
-
-                _cleanup_free_ char *settings_fn = NULL;
-
-                assert(settings_job->calc_checksum);
-                assert(settings_job->checksum);
-
-                r = import_url_last_component(settings_job->url, &settings_fn);
-                if (r < 0)
-                        return log_oom();
-
-                if (!filename_is_valid(settings_fn)) {
-                        log_error("Cannot verify checksum, could not determine server-side settings file name.");
-                        return -EBADMSG;
-                }
-
-                line = strjoina(settings_job->checksum, " *", settings_fn, "\n");
-
-                p = memmem(checksum_job->payload,
-                           checksum_job->payload_size,
-                           line,
-                           strlen(line));
-
-                if (!p || (p != (char*) checksum_job->payload && p[-1] != '\n')) {
-                        log_error("DOWNLOAD INVALID: Checksum of settings file did not checkout, settings file has been tampered with.");
-                        return -EBADMSG;
-                }
-
-                log_info("SHA256 checksum of %s is valid.", settings_job->url);
-        }
+        r = verify_one(checksum_job, settings_job);
+        if (r < 0)
+                return r;
 
         if (!signature_job)
                 return 0;
+
+        if (checksum_job->style == VERIFICATION_PER_FILE)
+                signature_job = checksum_job;
 
         assert(signature_job->state == PULL_JOB_DONE);
 
@@ -439,10 +442,10 @@ int pull_verify(PullJob *main_job,
 
         gpg_home_created = true;
 
-        pid = fork();
-        if (pid < 0)
-                return log_error_errno(errno, "Failed to fork off gpg: %m");
-        if (pid == 0) {
+        r = safe_fork("(gpg)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
                 const char *cmd[] = {
                         "gpg",
                         "--no-options",
@@ -459,37 +462,18 @@ int pull_verify(PullJob *main_job,
                         NULL  /* trailing NULL */
                 };
                 unsigned k = ELEMENTSOF(cmd) - 6;
-                int null_fd;
 
                 /* Child */
 
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
-                assert_se(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
-
                 gpg_pipe[1] = safe_close(gpg_pipe[1]);
 
-                if (dup2(gpg_pipe[0], STDIN_FILENO) != STDIN_FILENO) {
-                        log_error_errno(errno, "Failed to dup2() fd: %m");
+                r = rearrange_stdio(gpg_pipe[0], -1, STDERR_FILENO);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to rearrange stdin/stdout: %m");
                         _exit(EXIT_FAILURE);
                 }
 
-                if (gpg_pipe[0] != STDIN_FILENO)
-                        gpg_pipe[0] = safe_close(gpg_pipe[0]);
-
-                null_fd = open("/dev/null", O_WRONLY|O_NOCTTY);
-                if (null_fd < 0) {
-                        log_error_errno(errno, "Failed to open /dev/null: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (dup2(null_fd, STDOUT_FILENO) != STDOUT_FILENO) {
-                        log_error_errno(errno, "Failed to dup2() fd: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (null_fd != STDOUT_FILENO)
-                        null_fd = safe_close(null_fd);
+                (void) rlimit_nofile_safe();
 
                 cmd[k++] = strjoina("--homedir=", gpg_home);
 
@@ -502,11 +486,11 @@ int pull_verify(PullJob *main_job,
                         cmd[k++] = "--keyring=" VENDOR_KEYRING_PATH;
 
                 cmd[k++] = "--verify";
-                cmd[k++] = sig_file_path;
-                cmd[k++] = "-";
-                cmd[k++] = NULL;
-
-                stdio_unset_cloexec();
+                if (checksum_job->style == VERIFICATION_PER_DIRECTORY) {
+                        cmd[k++] = sig_file_path;
+                        cmd[k++] = "-";
+                        cmd[k++] = NULL;
+                }
 
                 execvp("gpg2", (char * const *) cmd);
                 execvp("gpg", (char * const *) cmd);
@@ -524,11 +508,11 @@ int pull_verify(PullJob *main_job,
 
         gpg_pipe[1] = safe_close(gpg_pipe[1]);
 
-        r = wait_for_terminate_and_warn("gpg", pid, true);
+        r = wait_for_terminate_and_check("gpg", pid, WAIT_LOG_ABNORMAL);
         pid = 0;
         if (r < 0)
                 goto finish;
-        if (r > 0) {
+        if (r != EXIT_SUCCESS) {
                 log_error("DOWNLOAD INVALID: Signature verification failed.");
                 r = -EBADMSG;
         } else {
@@ -537,8 +521,7 @@ int pull_verify(PullJob *main_job,
         }
 
 finish:
-        if (sig_file >= 0)
-                (void) unlink(sig_file_path);
+        (void) unlink(sig_file_path);
 
         if (gpg_home_created)
                 (void) rm_rf(gpg_home, REMOVE_ROOT|REMOVE_PHYSICAL);

@@ -1,31 +1,15 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-  Copyright 2013 Thomas H.P. Andersen
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "alloc-util.h"
 #include "fd-util.h"
-#include "fileio.h"
-#include "log.h"
 #include "macro.h"
+#include "strv.h"
 #include "terminal-util.h"
+#include "tests.h"
+#include "tmpfile-util.h"
 #include "util.h"
 
 static void test_default_term_for_tty(void) {
@@ -48,15 +32,11 @@ static void test_read_one_char(void) {
         char r;
         bool need_nl;
         char name[] = "/tmp/test-read_one_char.XXXXXX";
-        int fd;
 
-        fd = mkostemp_safe(name);
-        assert_se(fd >= 0);
-        file = fdopen(fd, "r+");
-        assert_se(file);
+        assert(fmkostemp_safe(name, "r+", &file) == 0);
+
         assert_se(fputs("c\n", file) >= 0);
         rewind(file);
-
         assert_se(read_one_char(file, &r, 1000000, &need_nl) >= 0);
         assert_se(!need_nl);
         assert_se(r == 'c');
@@ -76,8 +56,7 @@ static void test_read_one_char(void) {
 }
 
 int main(int argc, char *argv[]) {
-        log_parse_environment();
-        log_open();
+        test_setup_logging(LOG_INFO);
 
         test_default_term_for_tty();
         test_read_one_char();

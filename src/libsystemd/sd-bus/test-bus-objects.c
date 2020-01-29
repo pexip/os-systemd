@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -49,7 +32,7 @@ static int something_handler(sd_bus_message *m, void *userdata, sd_bus_error *er
         r = sd_bus_message_read(m, "s", &s);
         assert_se(r > 0);
 
-        n = strjoin("<<<", s, ">>>", NULL);
+        n = strjoin("<<<", s, ">>>");
         assert_se(n);
 
         free(c->something);
@@ -224,7 +207,7 @@ static const sd_bus_vtable vtable2[] = {
 static int enumerator_callback(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
 
         if (object_path_startswith("/value", path))
-                assert_se(*nodes = strv_new("/value/a", "/value/b", "/value/c", NULL));
+                assert_se(*nodes = strv_new("/value/a", "/value/b", "/value/c"));
 
         return 1;
 }
@@ -232,7 +215,7 @@ static int enumerator_callback(sd_bus *bus, const char *path, void *userdata, ch
 static int enumerator2_callback(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
 
         if (object_path_startswith("/value/a", path))
-                assert_se(*nodes = strv_new("/value/a/x", "/value/a/y", "/value/a/z", NULL));
+                assert_se(*nodes = strv_new("/value/a/x", "/value/a/y", "/value/a/z"));
 
         return 1;
 }
@@ -524,8 +507,6 @@ int main(int argc, char *argv[]) {
         pthread_t s;
         void *p;
         int r, q;
-
-        zero(c);
 
         c.automatic_integer_property = 4711;
         assert_se(c.automatic_string_property = strdup("dudeldu"));

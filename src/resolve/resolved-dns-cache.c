@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <net/if.h>
 
@@ -34,6 +17,10 @@
 /* We never keep any item longer than 2h in our cache */
 #define CACHE_TTL_MAX_USEC (2 * USEC_PER_HOUR)
 
+/* How long to cache strange rcodes, i.e. rcodes != SUCCESS and != NXDOMAIN (specifically: that's only SERVFAIL for
+ * now) */
+#define CACHE_TTL_STRANGE_RCODE_USEC (30 * USEC_PER_SEC)
+
 typedef enum DnsCacheItemType DnsCacheItemType;
 typedef struct DnsCacheItem DnsCacheItem;
 
@@ -41,12 +28,14 @@ enum DnsCacheItemType {
         DNS_CACHE_POSITIVE,
         DNS_CACHE_NODATA,
         DNS_CACHE_NXDOMAIN,
+        DNS_CACHE_RCODE,      /* "strange" RCODE (effective only SERVFAIL for now) */
 };
 
 struct DnsCacheItem {
         DnsCacheItemType type;
         DnsResourceKey *key;
         DnsResourceRecord *rr;
+        int rcode;
 
         usec_t until;
         bool authenticated:1;
@@ -59,6 +48,27 @@ struct DnsCacheItem {
         unsigned prioq_idx;
         LIST_FIELDS(DnsCacheItem, by_key);
 };
+
+static const char *dns_cache_item_type_to_string(DnsCacheItem *item) {
+        assert(item);
+
+        switch (item->type) {
+
+        case DNS_CACHE_POSITIVE:
+                return "POSITIVE";
+
+        case DNS_CACHE_NODATA:
+                return "NODATA";
+
+        case DNS_CACHE_NXDOMAIN:
+                return "NXDOMAIN";
+
+        case DNS_CACHE_RCODE:
+                return dns_rcode_to_string(item->rcode);
+        }
+
+        return NULL;
+}
 
 static void dns_cache_item_free(DnsCacheItem *i) {
         if (!i)
@@ -218,11 +228,7 @@ void dns_cache_prune(DnsCache *c) {
 static int dns_cache_item_prioq_compare_func(const void *a, const void *b) {
         const DnsCacheItem *x = a, *y = b;
 
-        if (x->until < y->until)
-                return -1;
-        if (x->until > y->until)
-                return 1;
-        return 0;
+        return CMP(x->until, y->until);
 }
 
 static int dns_cache_init(DnsCache *c) {
@@ -406,7 +412,7 @@ static int dns_cache_put_positive(
                 return 0;
         }
 
-        /* Entry exists already? Update TTL, timestamp and owner*/
+        /* Entry exists already? Update TTL, timestamp and owner */
         existing = dns_cache_get(c, rr);
         if (existing) {
                 dns_cache_item_update_positive(
@@ -448,7 +454,7 @@ static int dns_cache_put_positive(
         if (r < 0)
                 return r;
 
-        if (log_get_max_level() >= LOG_DEBUG) {
+        if (DEBUG_LOGGING) {
                 _cleanup_free_ char *t = NULL;
 
                 (void) in_addr_to_string(i->owner_family, &i->owner_address, &t);
@@ -484,7 +490,6 @@ static int dns_cache_put_negative(
 
         assert(c);
         assert(key);
-        assert(soa);
         assert(owner_address);
 
         /* Never cache pseudo RR keys. DNS_TYPE_ANY is particularly
@@ -495,13 +500,17 @@ static int dns_cache_put_negative(
         if (dns_type_is_pseudo(key->type))
                 return 0;
 
-        if (nsec_ttl <= 0 || soa->soa.minimum <= 0 || soa->ttl <= 0) {
-                log_debug("Not caching negative entry with zero SOA/NSEC/NSEC3 TTL: %s",
-                          dns_resource_key_to_string(key, key_str, sizeof key_str));
-                return 0;
-        }
+        if (IN_SET(rcode, DNS_RCODE_SUCCESS, DNS_RCODE_NXDOMAIN)) {
+                if (!soa)
+                        return 0;
 
-        if (!IN_SET(rcode, DNS_RCODE_SUCCESS, DNS_RCODE_NXDOMAIN))
+                /* For negative replies, check if we have a TTL of a SOA */
+                if (nsec_ttl <= 0 || soa->soa.minimum <= 0 || soa->ttl <= 0) {
+                        log_debug("Not caching negative entry with zero SOA/NSEC/NSEC3 TTL: %s",
+                                  dns_resource_key_to_string(key, key_str, sizeof key_str));
+                        return 0;
+                }
+        } else if (rcode != DNS_RCODE_SERVFAIL)
                 return 0;
 
         r = dns_cache_init(c);
@@ -514,12 +523,17 @@ static int dns_cache_put_negative(
         if (!i)
                 return -ENOMEM;
 
-        i->type = rcode == DNS_RCODE_SUCCESS ? DNS_CACHE_NODATA : DNS_CACHE_NXDOMAIN;
-        i->until = calculate_until(soa, nsec_ttl, timestamp, true);
+        i->type =
+                rcode == DNS_RCODE_SUCCESS ? DNS_CACHE_NODATA :
+                rcode == DNS_RCODE_NXDOMAIN ? DNS_CACHE_NXDOMAIN : DNS_CACHE_RCODE;
+        i->until =
+                i->type == DNS_CACHE_RCODE ? timestamp + CACHE_TTL_STRANGE_RCODE_USEC :
+                calculate_until(soa, nsec_ttl, timestamp, true);
         i->authenticated = authenticated;
         i->owner_family = owner_family;
         i->owner_address = *owner_address;
         i->prioq_idx = PRIOQ_IDX_NULL;
+        i->rcode = rcode;
 
         if (i->type == DNS_CACHE_NXDOMAIN) {
                 /* NXDOMAIN entries should apply equally to all types, so we use ANY as
@@ -543,7 +557,7 @@ static int dns_cache_put_negative(
                 return r;
 
         log_debug("Added %s cache entry for %s "USEC_FMT"s",
-                  i->type == DNS_CACHE_NODATA ? "NODATA" : "NXDOMAIN",
+                  dns_cache_item_type_to_string(i),
                   dns_resource_key_to_string(i->key, key_str, sizeof key_str),
                   (i->until - timestamp) / USEC_PER_SEC);
 
@@ -615,6 +629,7 @@ int dns_cache_put(
                 const union in_addr_union *owner_address) {
 
         DnsResourceRecord *soa = NULL, *rr;
+        bool weird_rcode = false;
         DnsAnswerFlags flags;
         unsigned cache_keys;
         int r, ifindex;
@@ -624,18 +639,29 @@ int dns_cache_put(
 
         dns_cache_remove_previous(c, key, answer);
 
-        /* We only care for positive replies and NXDOMAINs, on all
-         * other replies we will simply flush the respective entries,
-         * and that's it */
-        if (!IN_SET(rcode, DNS_RCODE_SUCCESS, DNS_RCODE_NXDOMAIN))
-                return 0;
+        /* We only care for positive replies and NXDOMAINs, on all other replies we will simply flush the respective
+         * entries, and that's it. (Well, with one further exception: since some DNS zones (akamai!) return SERVFAIL
+         * consistently for some lookups, and forwarders tend to propagate that we'll cache that too, but only for a
+         * short time.) */
 
-        if (dns_answer_size(answer) <= 0) {
-                char key_str[DNS_RESOURCE_KEY_STRING_MAX];
+        if (IN_SET(rcode, DNS_RCODE_SUCCESS, DNS_RCODE_NXDOMAIN)) {
+                if (dns_answer_size(answer) <= 0) {
+                        if (key) {
+                                char key_str[DNS_RESOURCE_KEY_STRING_MAX];
 
-                log_debug("Not caching negative entry without a SOA record: %s",
-                          dns_resource_key_to_string(key, key_str, sizeof key_str));
-                return 0;
+                                log_debug("Not caching negative entry without a SOA record: %s",
+                                          dns_resource_key_to_string(key, key_str, sizeof key_str));
+                        }
+                        return 0;
+                }
+
+        } else {
+                /* Only cache SERVFAIL as "weird" rcode for now. We can add more later, should that turn out to be
+                 * beneficial. */
+                if (rcode != DNS_RCODE_SERVFAIL)
+                        return 0;
+
+                weird_rcode = true;
         }
 
         cache_keys = dns_answer_size(answer);
@@ -650,13 +676,8 @@ int dns_cache_put(
 
         /* Second, add in positive entries for all contained RRs */
         DNS_ANSWER_FOREACH_FULL(rr, ifindex, flags, answer) {
-                if ((flags & DNS_ANSWER_CACHEABLE) == 0)
-                        continue;
-
-                r = rr_eligible(rr);
-                if (r < 0)
-                        return r;
-                if (r == 0)
+                if ((flags & DNS_ANSWER_CACHEABLE) == 0 ||
+                    !rr_eligible(rr))
                         continue;
 
                 r = dns_cache_put_positive(
@@ -690,19 +711,20 @@ int dns_cache_put(
         if (r > 0)
                 return 0;
 
-        /* See https://tools.ietf.org/html/rfc2308, which say that a
-         * matching SOA record in the packet is used to enable
-         * negative caching. */
+        /* See https://tools.ietf.org/html/rfc2308, which say that a matching SOA record in the packet is used to
+         * enable negative caching. We apply one exception though: if we are about to cache a weird rcode we do so
+         * regardless of a SOA. */
         r = dns_answer_find_soa(answer, key, &soa, &flags);
         if (r < 0)
                 goto fail;
-        if (r == 0)
+        if (r == 0 && !weird_rcode)
                 return 0;
-
-        /* Refuse using the SOA data if it is unsigned, but the key is
-         * signed */
-        if (authenticated && (flags & DNS_ANSWER_AUTHENTICATED) == 0)
-                return 0;
+        if (r > 0) {
+                /* Refuse using the SOA data if it is unsigned, but the key is
+                 * signed */
+                if (authenticated && (flags & DNS_ANSWER_AUTHENTICATED) == 0)
+                        return 0;
+        }
 
         r = dns_cache_put_negative(
                         c,
@@ -761,7 +783,7 @@ static DnsCacheItem *dns_cache_get_by_key_follow_cname_dname_nsec(DnsCache *c, D
         if (dns_type_may_redirect(k->type)) {
                 /* Check if we have a CNAME record instead */
                 i = hashmap_get(c->by_key, &DNS_RESOURCE_KEY_CONST(k->class, DNS_TYPE_CNAME, n));
-                if (i)
+                if (i && i->type != DNS_CACHE_NODATA)
                         return i;
 
                 /* OK, let's look for cached DNAME records. */
@@ -770,7 +792,7 @@ static DnsCacheItem *dns_cache_get_by_key_follow_cname_dname_nsec(DnsCache *c, D
                                 return NULL;
 
                         i = hashmap_get(c->by_key, &DNS_RESOURCE_KEY_CONST(k->class, DNS_TYPE_DNAME, n));
-                        if (i)
+                        if (i && i->type != DNS_CACHE_NODATA)
                                 return i;
 
                         /* Jump one label ahead */
@@ -799,6 +821,7 @@ int dns_cache_lookup(DnsCache *c, DnsResourceKey *key, bool clamp_ttl, int *rcod
         DnsCacheItem *j, *first, *nsec = NULL;
         bool have_authenticated = false, have_non_authenticated = false;
         usec_t current;
+        int found_rcode = -1;
 
         assert(c);
         assert(key);
@@ -817,6 +840,8 @@ int dns_cache_lookup(DnsCache *c, DnsResourceKey *key, bool clamp_ttl, int *rcod
 
                 *ret = NULL;
                 *rcode = DNS_RCODE_SUCCESS;
+                *authenticated = false;
+
                 return 0;
         }
 
@@ -831,6 +856,8 @@ int dns_cache_lookup(DnsCache *c, DnsResourceKey *key, bool clamp_ttl, int *rcod
 
                 *ret = NULL;
                 *rcode = DNS_RCODE_SUCCESS;
+                *authenticated = false;
+
                 return 0;
         }
 
@@ -842,11 +869,26 @@ int dns_cache_lookup(DnsCache *c, DnsResourceKey *key, bool clamp_ttl, int *rcod
                         n++;
                 } else if (j->type == DNS_CACHE_NXDOMAIN)
                         nxdomain = true;
+                else if (j->type == DNS_CACHE_RCODE)
+                        found_rcode = j->rcode;
 
                 if (j->authenticated)
                         have_authenticated = true;
                 else
                         have_non_authenticated = true;
+        }
+
+        if (found_rcode >= 0) {
+                log_debug("RCODE %s cache hit for %s",
+                          dns_rcode_to_string(found_rcode),
+                          dns_resource_key_to_string(key, key_str, sizeof(key_str)));
+
+                *ret = NULL;
+                *rcode = found_rcode;
+                *authenticated = false;
+
+                c->n_hit++;
+                return 1;
         }
 
         if (nsec && !IN_SET(key->type, DNS_TYPE_NSEC, DNS_TYPE_DS)) {
@@ -980,7 +1022,7 @@ int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p) {
                         if (!j->shared_owner)
                                 continue;
 
-                        r = dns_packet_append_rr(p, j->rr, NULL, NULL);
+                        r = dns_packet_append_rr(p, j->rr, 0, NULL, NULL);
                         if (r == -EMSGSIZE && p->protocol == DNS_PROTOCOL_MDNS) {
                                 /* For mDNS, if we're unable to stuff all known answers into the given packet,
                                  * allocate a new one, push the RR into that one and link it to the current one.
@@ -995,7 +1037,7 @@ int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p) {
 
                                 /* continue with new packet */
                                 p = p->more;
-                                r = dns_packet_append_rr(p, j->rr, NULL, NULL);
+                                r = dns_packet_append_rr(p, j->rr, 0, NULL, NULL);
                         }
 
                         if (r < 0)
@@ -1042,7 +1084,7 @@ void dns_cache_dump(DnsCache *cache, FILE *f) {
 
                                 fputs(dns_resource_key_to_string(j->key, key_str, sizeof key_str), f);
                                 fputs(" -- ", f);
-                                fputs(j->type == DNS_CACHE_NODATA ? "NODATA" : "NXDOMAIN", f);
+                                fputs(dns_cache_item_type_to_string(j), f);
                                 fputc('\n', f);
                         }
                 }

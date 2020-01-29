@@ -1,24 +1,9 @@
-<?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
+<?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
 "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-  This file is part of systemd.
-
-  Copyright 2016 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 
 <refentry id="systemd-mount"
@@ -27,15 +12,6 @@
   <refentryinfo>
     <title>systemd-mount</title>
     <productname>systemd</productname>
-
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Lennart</firstname>
-        <surname>Poettering</surname>
-        <email>lennart@poettering.net</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -45,7 +21,8 @@
 
   <refnamediv>
     <refname>systemd-mount</refname>
-    <refpurpose>Establish a mount or auto-mount point transiently</refpurpose>
+    <refname>systemd-umount</refname>
+    <refpurpose>Establish and destroy transient mount or auto-mount points</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
@@ -60,6 +37,12 @@
       <arg choice="opt" rep="repeat"><replaceable>OPTIONS</replaceable></arg>
       <arg choice="plain"><option>--list</option></arg>
     </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-mount</command>
+      <arg choice="opt" rep="repeat"><replaceable>OPTIONS</replaceable></arg>
+      <arg choice="plain"><option>--umount</option></arg>
+      <arg choice="plain" rep="repeat"><replaceable>WHAT|WHERE</replaceable></arg>
+    </cmdsynopsis>
   </refsynopsisdiv>
 
   <refsect1>
@@ -70,13 +53,14 @@
     <replaceable>WHERE</replaceable>.</para>
 
     <para>In many ways, <command>systemd-mount</command> is similar to the lower-level
-    <citerefentry><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry> command, however instead
+    <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry> command, however instead
     of executing the mount operation directly and immediately, <command>systemd-mount</command> schedules it through
     the service manager job queue, so that it may pull in further dependencies (such as parent mounts, or a file system
     checker to execute a priori), and may make use of the auto-mounting logic.</para>
 
     <para>The command takes either one or two arguments. If only one argument is specified it should refer to a block
-    device containing a file system (e.g. <literal>/dev/sdb1</literal>), which is then probed for a label and other
+    device or regular file containing a file system (e.g. <literal>/dev/sdb1</literal> or
+    <literal>/path/to/disk.img</literal>). If it is a block device, which is then probed for a label and other
     metadata, and is mounted to a directory whose name is generated from the label. In this mode the block device must
     exist at the time of invocation of the command, so that it may be probed. If the device is found to be a removable
     block device (e.g. a USB stick) an automount point instead of a regular mount point is created (i.e. the
@@ -91,6 +75,9 @@
 
     <para>Use the <option>--list</option> command to show a terse table of all local, known block devices with file
     systems that may be mounted with this command.</para>
+
+    <para><command>systemd-umount</command> can be used to unmount a mount or automount point. It is the same
+    as <command>systemd-mount</command> <option>--umount</option>.</para>
   </refsect1>
 
   <refsect1>
@@ -127,7 +114,7 @@
         the command line. If passed, additional metadata is read from the device to enhance the unit to create. For
         example, a descriptive string for the transient units is generated from the file system label and device
         model. Moreover if a removable block device (e.g. USB stick) is detected an automount unit instead of a regular
-        mount unit is created, with a short idle time-out, in order to ensure the file-system is placed in a clean
+        mount unit is created, with a short idle timeout, in order to ensure the file-system is placed in a clean
         state quickly after each access.</para></listitem>
       </varlistentry>
 
@@ -144,6 +131,14 @@
         <term><option>-o</option></term>
 
         <listitem><para>Additional mount options for the mount point.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--owner=<replaceable>USER</replaceable></option></term>
+
+        <listitem><para>Let the specified user <replaceable>USER</replaceable> own the mounted file system.
+        This is done by appending <option>uid=</option> and <option>gid=</option> options to the list
+        of mount options. Only certain file systems support this option.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -239,6 +234,35 @@
         such as labels, etc.</para></listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><option>-u</option></term>
+        <term><option>--umount</option></term>
+
+        <listitem><para>Stop the mount and automount units corresponding to the specified mount points
+        <replaceable>WHERE</replaceable> or the devices <replaceable>WHAT</replaceable>.
+        <command>systemd-mount</command> with this option or <command>systemd-umount</command> can take multiple arguments
+        which can be mount points, devices, <filename>/etc/fstab</filename> style node names, or backing files
+        corresponding to loop devices, like
+        <command>systemd-mount --umount /path/to/umount /dev/sda1 UUID=xxxxxx-xxxx LABEL=xxxxx /path/to/disk.img</command>.
+        Note that when <option>-H</option> or <option>-M</option> is specified, only absolute paths to mount points are
+        supported.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-G</option></term>
+        <term><option>--collect</option></term>
+
+        <listitem><para>Unload the transient unit after it completed, even if it failed. Normally, without this option,
+        all mount units that mount and failed are kept in memory until the user explicitly resets their failure state with
+        <command>systemctl reset-failed</command> or an equivalent command. On the other hand, units that stopped
+        successfully are unloaded immediately. If this option is turned on the "garbage collection" of units is more
+        aggressive, and unloads units regardless if they exited successfully or failed. This option is a shortcut for
+        <command>--property=CollectMode=inactive-or-failed</command>, see the explanation for
+        <varname>CollectMode=</varname> in
+        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry> for further
+        information.</para></listitem>
+      </varlistentry>
+
       <xi:include href="user-system-options.xml" xpointer="user" />
       <xi:include href="user-system-options.xml" xpointer="system" />
       <xi:include href="user-system-options.xml" xpointer="host" />
@@ -283,7 +307,7 @@
     <title>See Also</title>
     <para>
       <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+      <citerefentry project='man-pages'><refentrytitle>mount</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>,

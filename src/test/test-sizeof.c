@@ -1,23 +1,11 @@
-/***
-  This file is part of systemd.
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
-  Copyright 2016 Zbigniew Jędrzejewski-Szmek
+#include <stdio.h>
+#include <string.h>
 
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
+#define __STDC_WANT_IEC_60559_TYPES_EXT__
+#include <float.h>
 
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
-#include "log.h"
 #include "time-util.h"
 
 /* Print information about various types. Useful when diagnosing
@@ -25,11 +13,25 @@
 
 #pragma GCC diagnostic ignored "-Wtype-limits"
 
-#define info(t)                                                 \
-        log_info("%s → %zu bits%s", STRINGIFY(t),               \
-                 sizeof(t)*CHAR_BIT,                            \
-                 strstr(STRINGIFY(t), "signed") ? "" :          \
-                 ((t)-1 < (t)0 ? ", signed" : ", unsigned"));
+#define info(t)                                                         \
+        printf("%s → %zu bits%s, %zu byte alignment\n", STRINGIFY(t),   \
+               sizeof(t)*CHAR_BIT,                                      \
+               strstr(STRINGIFY(t), "signed") ? "" :                    \
+               (t)-1 < (t)0 ? ", signed" : ", unsigned",                \
+               __alignof__(t))
+
+enum Enum {
+        enum_value,
+};
+
+enum BigEnum {
+        big_enum_value = UINT64_C(1),
+};
+
+enum BigEnum2 {
+        big_enum2_pos = UINT64_C(1),
+        big_enum2_neg = UINT64_C(-1),
+};
 
 int main(void) {
         info(char);
@@ -39,15 +41,36 @@ int main(void) {
         info(unsigned);
         info(long unsigned);
         info(long long unsigned);
+        info(__syscall_ulong_t);
+        info(__syscall_slong_t);
 
         info(float);
         info(double);
         info(long double);
 
+#ifdef FLT128_MAX
+        info(_Float128);
+        info(_Float64);
+        info(_Float64x);
+        info(_Float32);
+        info(_Float32x);
+#endif
+
         info(size_t);
         info(ssize_t);
         info(time_t);
         info(usec_t);
+        info(__time_t);
+        info(pid_t);
+        info(uid_t);
+        info(gid_t);
+
+        info(enum Enum);
+        info(enum BigEnum);
+        info(enum BigEnum2);
+        assert_cc(sizeof(enum BigEnum2) == 8);
+        printf("big_enum2_pos → %zu\n", sizeof(big_enum2_pos));
+        printf("big_enum2_neg → %zu\n", sizeof(big_enum2_neg));
 
         return 0;
 }

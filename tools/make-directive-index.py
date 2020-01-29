@@ -1,26 +1,10 @@
-#  -*- Mode: python; coding: utf-8; indent-tabs-mode: nil -*- */
-#
-#  This file is part of systemd.
-#
-#  Copyright 2012-2013 Zbigniew Jędrzejewski-Szmek
-#
-#  systemd is free software; you can redistribute it and/or modify it
-#  under the terms of the GNU Lesser General Public License as published by
-#  the Free Software Foundation; either version 2.1 of the License, or
-#  (at your option) any later version.
-#
-#  systemd is distributed in the hope that it will be useful, but
-#  WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-#  Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1+
 
 import sys
 import collections
 import re
-from xml_helper import *
+from xml_helper import xml_parse, xml_print, tree
 from copy import deepcopy
 
 TEMPLATE = '''\
@@ -29,15 +13,6 @@ TEMPLATE = '''\
         <refentryinfo>
                 <title>systemd.directives</title>
                 <productname>systemd</productname>
-
-                <authorgroup>
-                        <author>
-                                <contrib>Developer</contrib>
-                                <firstname>Zbigniew</firstname>
-                                <surname>Jędrzejewski-Szmek</surname>
-                                <email>zbyszek@in.waw.pl</email>
-                        </author>
-                </authorgroup>
         </refentryinfo>
 
         <refmeta>
@@ -71,10 +46,20 @@ TEMPLATE = '''\
         <refsect1>
                 <title>Environment variables</title>
 
-                <para>Environment variables understood by the systemd
-                manager and other programs.</para>
+                <para>Environment variables understood by the systemd manager
+                and other programs and environment variable-compatible settings.</para>
 
                 <variablelist id='environment-variables' />
+        </refsect1>
+
+        <refsect1>
+                <title>EFI variables</title>
+
+                <para>EFI variables understood by
+                <citerefentry><refentrytitle>systemd-boot</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                and other programs.</para>
+
+                <variablelist id='efi-variables' />
         </refsect1>
 
         <refsect1>
@@ -123,16 +108,25 @@ TEMPLATE = '''\
         </refsect1>
 
         <refsect1>
-                <title>System manager directives</title>
+                <title><citerefentry><refentrytitle>systemd.nspawn</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+                directives</title>
 
-                <para>Directives for configuring the behaviour of the
-                systemd process.</para>
+                <para>Directives for configuring systemd-nspawn containers.</para>
 
-                <variablelist id='systemd-directives' />
+                <variablelist id='nspawn-directives' />
         </refsect1>
 
         <refsect1>
-                <title>command line options</title>
+                <title>Program configuration options</title>
+
+                <para>Directives for configuring the behaviour of the
+                systemd process and other tools through configuration files.</para>
+
+                <variablelist id='config-directives' />
+        </refsect1>
+
+        <refsect1>
+                <title>Command line options</title>
 
                 <para>Command-line options accepted by programs in the
                 systemd suite.</para>

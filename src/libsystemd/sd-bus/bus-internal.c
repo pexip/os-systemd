@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
 #include "bus-internal.h"
@@ -148,7 +131,7 @@ bool service_name_is_valid(const char *p) {
                                 (*q >= 'a' && *q <= 'z') ||
                                 (*q >= 'A' && *q <= 'Z') ||
                                 ((!dot || unique) && *q >= '0' && *q <= '9') ||
-                                *q == '_' || *q == '-';
+                                IN_SET(*q, '_', '-');
 
                         if (!good)
                                 return false;
@@ -166,26 +149,6 @@ bool service_name_is_valid(const char *p) {
                 return false;
 
         return true;
-}
-
-char* service_name_startswith(const char *a, const char *b) {
-        const char *p;
-
-        if (!service_name_is_valid(a) ||
-            !service_name_is_valid(b))
-                return NULL;
-
-        p = startswith(a, b);
-        if (!p)
-                return NULL;
-
-        if (*p == 0)
-                return (char*) p;
-
-        if (*p == '.')
-                return (char*) p + 1;
-
-        return NULL;
 }
 
 bool member_name_is_valid(const char *p) {
@@ -361,13 +324,18 @@ int bus_maybe_reply_error(sd_bus_message *m, int r, sd_bus_error *error) {
         } else
                 return r;
 
-        log_debug("Failed to process message [type=%s sender=%s path=%s interface=%s member=%s signature=%s]: %s",
+        log_debug("Failed to process message type=%s sender=%s destination=%s path=%s interface=%s member=%s cookie=%" PRIu64 " reply_cookie=%" PRIu64 " signature=%s error-name=%s error-message=%s: %s",
                   bus_message_type_to_string(m->header->type),
-                  strna(m->sender),
-                  strna(m->path),
-                  strna(m->interface),
-                  strna(m->member),
+                  strna(sd_bus_message_get_sender(m)),
+                  strna(sd_bus_message_get_destination(m)),
+                  strna(sd_bus_message_get_path(m)),
+                  strna(sd_bus_message_get_interface(m)),
+                  strna(sd_bus_message_get_member(m)),
+                  BUS_MESSAGE_COOKIE(m),
+                  m->reply_cookie,
                   strna(m->root_container.signature),
+                  strna(m->error.name),
+                  strna(m->error.message),
                   bus_error_message(error, r));
 
         return 1;

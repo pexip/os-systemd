@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <string.h>
@@ -56,6 +39,10 @@ struct JournalRateLimitGroup {
         JournalRateLimit *parent;
 
         char *id;
+
+        /* Interval is stored to keep track of when the group expires */
+        usec_t interval;
+
         JournalRateLimitPool pools[POOLS_MAX];
         uint64_t hash;
 
@@ -64,8 +51,6 @@ struct JournalRateLimitGroup {
 };
 
 struct JournalRateLimit {
-        usec_t interval;
-        unsigned burst;
 
         JournalRateLimitGroup* buckets[BUCKETS_MAX];
         JournalRateLimitGroup *lru, *lru_tail;
@@ -75,17 +60,12 @@ struct JournalRateLimit {
         uint8_t hash_key[16];
 };
 
-JournalRateLimit *journal_rate_limit_new(usec_t interval, unsigned burst) {
+JournalRateLimit *journal_rate_limit_new(void) {
         JournalRateLimit *r;
-
-        assert(interval > 0 || burst == 0);
 
         r = new0(JournalRateLimit, 1);
         if (!r)
                 return NULL;
-
-        r->interval = interval;
-        r->burst = burst;
 
         random_bytes(r->hash_key, sizeof(r->hash_key));
 
@@ -126,7 +106,7 @@ _pure_ static bool journal_rate_limit_group_expired(JournalRateLimitGroup *g, us
         assert(g);
 
         for (i = 0; i < POOLS_MAX; i++)
-                if (g->pools[i].begin + g->parent->interval >= ts)
+                if (g->pools[i].begin + g->interval >= ts)
                         return false;
 
         return true;
@@ -143,9 +123,8 @@ static void journal_rate_limit_vacuum(JournalRateLimit *r, usec_t ts) {
                 journal_rate_limit_group_free(r->lru_tail);
 }
 
-static JournalRateLimitGroup* journal_rate_limit_group_new(JournalRateLimit *r, const char *id, usec_t ts) {
+static JournalRateLimitGroup* journal_rate_limit_group_new(JournalRateLimit *r, const char *id, usec_t interval, usec_t ts) {
         JournalRateLimitGroup *g;
-        struct siphash state;
 
         assert(r);
         assert(id);
@@ -158,9 +137,9 @@ static JournalRateLimitGroup* journal_rate_limit_group_new(JournalRateLimit *r, 
         if (!g->id)
                 goto fail;
 
-        siphash24_init(&state, r->hash_key);
-        string_hash_func(g->id, &state);
-        g->hash = siphash24_finalize(&state);
+        g->hash = siphash24_string(g->id, r->hash_key);
+
+        g->interval = interval;
 
         journal_rate_limit_vacuum(r, ts);
 
@@ -206,29 +185,28 @@ static unsigned burst_modulate(unsigned burst, uint64_t available) {
         return burst;
 }
 
-int journal_rate_limit_test(JournalRateLimit *r, const char *id, int priority, uint64_t available) {
+int journal_rate_limit_test(JournalRateLimit *r, const char *id, usec_t rl_interval, unsigned rl_burst, int priority, uint64_t available) {
         uint64_t h;
         JournalRateLimitGroup *g;
         JournalRateLimitPool *p;
-        struct siphash state;
         unsigned burst;
         usec_t ts;
 
         assert(id);
 
+        /* Returns:
+         *
+         * 0     → the log message shall be suppressed,
+         * 1 + n → the log message shall be permitted, and n messages were dropped from the peer before
+         * < 0   → error
+         */
+
         if (!r)
                 return 1;
 
-        if (r->interval == 0 || r->burst == 0)
-                return 1;
-
-        burst = burst_modulate(r->burst, available);
-
         ts = now(CLOCK_MONOTONIC);
 
-        siphash24_init(&state, r->hash_key);
-        string_hash_func(id, &state);
-        h = siphash24_finalize(&state);
+        h = siphash24_string(id, r->hash_key);
         g = r->buckets[h % BUCKETS_MAX];
 
         LIST_FOREACH(bucket, g, g)
@@ -236,10 +214,16 @@ int journal_rate_limit_test(JournalRateLimit *r, const char *id, int priority, u
                         break;
 
         if (!g) {
-                g = journal_rate_limit_group_new(r, id, ts);
+                g = journal_rate_limit_group_new(r, id, rl_interval, ts);
                 if (!g)
                         return -ENOMEM;
-        }
+        } else
+                g->interval = rl_interval;
+
+        if (rl_interval == 0 || rl_burst == 0)
+                return 1;
+
+        burst = burst_modulate(rl_burst, available);
 
         p = &g->pools[priority_map[priority]];
 
@@ -250,7 +234,7 @@ int journal_rate_limit_test(JournalRateLimit *r, const char *id, int priority, u
                 return 1;
         }
 
-        if (p->begin + r->interval < ts) {
+        if (p->begin + rl_interval < ts) {
                 unsigned s;
 
                 s = p->suppressed;

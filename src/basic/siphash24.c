@@ -23,13 +23,13 @@
 #include "siphash24.h"
 #include "unaligned.h"
 
-static inline uint64_t rotate_left(uint64_t x, uint8_t b) {
+static uint64_t rotate_left(uint64_t x, uint8_t b) {
         assert(b < 64);
 
         return (x << b) | (x >> (64 - b));
 }
 
-static inline void sipround(struct siphash *state) {
+static void sipround(struct siphash *state) {
         assert(state);
 
         state->v0 += state->v1;
@@ -48,7 +48,7 @@ static inline void sipround(struct siphash *state) {
         state->v2 = rotate_left(state->v2, 32);
 }
 
-void siphash24_init(struct siphash *state, const uint8_t k[16]) {
+void siphash24_init(struct siphash *state, const uint8_t k[static 16]) {
         uint64_t k0, k1;
 
         assert(state);
@@ -90,7 +90,7 @@ void siphash24_compress(const void *_in, size_t inlen, struct siphash *state) {
                         /* We did not have enough input to fill out the padding completely */
                         return;
 
-#ifdef DEBUG
+#if ENABLE_DEBUG_SIPHASH
                 printf("(%3zu) v0 %08x %08x\n", state->inlen, (uint32_t) (state->v0 >> 32), (uint32_t) state->v0);
                 printf("(%3zu) v1 %08x %08x\n", state->inlen, (uint32_t) (state->v1 >> 32), (uint32_t) state->v1);
                 printf("(%3zu) v2 %08x %08x\n", state->inlen, (uint32_t) (state->v2 >> 32), (uint32_t) state->v2);
@@ -110,7 +110,7 @@ void siphash24_compress(const void *_in, size_t inlen, struct siphash *state) {
 
         for ( ; in < end; in += 8) {
                 m = unaligned_read_le64(in);
-#ifdef DEBUG
+#if ENABLE_DEBUG_SIPHASH
                 printf("(%3zu) v0 %08x %08x\n", state->inlen, (uint32_t) (state->v0 >> 32), (uint32_t) state->v0);
                 printf("(%3zu) v1 %08x %08x\n", state->inlen, (uint32_t) (state->v1 >> 32), (uint32_t) state->v1);
                 printf("(%3zu) v2 %08x %08x\n", state->inlen, (uint32_t) (state->v2 >> 32), (uint32_t) state->v2);
@@ -127,18 +127,25 @@ void siphash24_compress(const void *_in, size_t inlen, struct siphash *state) {
         switch (left) {
                 case 7:
                         state->padding |= ((uint64_t) in[6]) << 48;
+                        _fallthrough_;
                 case 6:
                         state->padding |= ((uint64_t) in[5]) << 40;
+                        _fallthrough_;
                 case 5:
                         state->padding |= ((uint64_t) in[4]) << 32;
+                        _fallthrough_;
                 case 4:
                         state->padding |= ((uint64_t) in[3]) << 24;
+                        _fallthrough_;
                 case 3:
                         state->padding |= ((uint64_t) in[2]) << 16;
+                        _fallthrough_;
                 case 2:
                         state->padding |= ((uint64_t) in[1]) <<  8;
+                        _fallthrough_;
                 case 1:
                         state->padding |= ((uint64_t) in[0]);
+                        _fallthrough_;
                 case 0:
                         break;
         }
@@ -151,7 +158,7 @@ uint64_t siphash24_finalize(struct siphash *state) {
 
         b = state->padding | (((uint64_t) state->inlen) << 56);
 
-#ifdef DEBUG
+#if ENABLE_DEBUG_SIPHASH
         printf("(%3zu) v0 %08x %08x\n", state->inlen, (uint32_t) (state->v0 >> 32), (uint32_t) state->v0);
         printf("(%3zu) v1 %08x %08x\n", state->inlen, (uint32_t) (state->v1 >> 32), (uint32_t) state->v1);
         printf("(%3zu) v2 %08x %08x\n", state->inlen, (uint32_t) (state->v2 >> 32), (uint32_t) state->v2);
@@ -164,7 +171,7 @@ uint64_t siphash24_finalize(struct siphash *state) {
         sipround(state);
         state->v0 ^= b;
 
-#ifdef DEBUG
+#if ENABLE_DEBUG_SIPHASH
         printf("(%3zu) v0 %08x %08x\n", state->inlen, (uint32_t) (state->v0 >> 32), (uint32_t) state->v0);
         printf("(%3zu) v1 %08x %08x\n", state->inlen, (uint32_t) (state->v1 >> 32), (uint32_t) state->v1);
         printf("(%3zu) v2 %08x %08x\n", state->inlen, (uint32_t) (state->v2 >> 32), (uint32_t) state->v2);
@@ -180,7 +187,7 @@ uint64_t siphash24_finalize(struct siphash *state) {
         return state->v0 ^ state->v1 ^ state->v2  ^ state->v3;
 }
 
-uint64_t siphash24(const void *in, size_t inlen, const uint8_t k[16]) {
+uint64_t siphash24(const void *in, size_t inlen, const uint8_t k[static 16]) {
         struct siphash state;
 
         assert(in);

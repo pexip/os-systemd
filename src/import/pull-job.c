@@ -1,30 +1,16 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <sys/xattr.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
+#include "gcrypt-util.h"
 #include "hexdecoct.h"
+#include "import-util.h"
 #include "io-util.h"
 #include "machine-pool.h"
 #include "parse-util.h"
+#include "pull-common.h"
 #include "pull-job.h"
 #include "string-util.h"
 #include "strv.h"
@@ -56,8 +42,7 @@ PullJob* pull_job_unref(PullJob *j) {
 static void pull_job_finish(PullJob *j, int ret) {
         assert(j);
 
-        if (j->state == PULL_JOB_DONE ||
-            j->state == PULL_JOB_FAILED)
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
                 return;
 
         if (ret == 0) {
@@ -73,6 +58,30 @@ static void pull_job_finish(PullJob *j, int ret) {
                 j->on_finished(j);
 }
 
+static int pull_job_restart(PullJob *j) {
+        int r;
+        char *chksum_url = NULL;
+
+        r = import_url_change_last_component(j->url, "SHA256SUMS", &chksum_url);
+        if (r < 0)
+                return r;
+
+        free(j->url);
+        j->url = chksum_url;
+        j->state = PULL_JOB_INIT;
+        j->payload = mfree(j->payload);
+        j->payload_size = 0;
+        j->payload_allocated = 0;
+        j->written_compressed = 0;
+        j->written_uncompressed = 0;
+
+        r = pull_job_begin(j);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
 void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
         PullJob *j = NULL;
         CURLcode code;
@@ -82,7 +91,7 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
         if (curl_easy_getinfo(curl, CURLINFO_PRIVATE, (char **)&j) != CURLE_OK)
                 return;
 
-        if (!j || j->state == PULL_JOB_DONE || j->state == PULL_JOB_FAILED)
+        if (!j || IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED))
                 return;
 
         if (result != CURLE_OK) {
@@ -102,6 +111,26 @@ void pull_job_curl_on_finished(CurlGlue *g, CURL *curl, CURLcode result) {
                 r = 0;
                 goto finish;
         } else if (status >= 300) {
+                if (status == 404 && j->style == VERIFICATION_PER_FILE) {
+
+                        /* retry pull job with SHA256SUMS file */
+                        r = pull_job_restart(j);
+                        if (r < 0)
+                                goto finish;
+
+                        code = curl_easy_getinfo(j->curl, CURLINFO_RESPONSE_CODE, &status);
+                        if (code != CURLE_OK) {
+                                log_error("Failed to retrieve response code: %s", curl_easy_strerror(code));
+                                r = -EIO;
+                                goto finish;
+                        }
+
+                        if (status == 0) {
+                                j->style = VERIFICATION_PER_DIRECTORY;
+                                return;
+                        }
+                }
+
                 log_error("HTTP request to %s failed with code %li.", j->url, status);
                 r = -EIO;
                 goto finish;
@@ -184,33 +213,27 @@ static int pull_job_write_uncompressed(const void *p, size_t sz, void *userdata)
         if (sz <= 0)
                 return 0;
 
-        if (j->written_uncompressed + sz < j->written_uncompressed) {
-                log_error("File too large, overflow");
-                return -EOVERFLOW;
-        }
+        if (j->written_uncompressed + sz < j->written_uncompressed)
+                return log_error_errno(SYNTHETIC_ERRNO(EOVERFLOW),
+                                       "File too large, overflow");
 
-        if (j->written_uncompressed + sz > j->uncompressed_max) {
-                log_error("File overly large, refusing");
-                return -EFBIG;
-        }
+        if (j->written_uncompressed + sz > j->uncompressed_max)
+                return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
+                                       "File overly large, refusing");
 
         if (j->disk_fd >= 0) {
 
-                if (j->grow_machine_directory && j->written_since_last_grow >= GROW_INTERVAL_BYTES) {
-                        j->written_since_last_grow = 0;
-                        grow_machine_directory();
-                }
-
                 if (j->allow_sparse)
                         n = sparse_write(j->disk_fd, p, sz, 64);
-                else
+                else {
                         n = write(j->disk_fd, p, sz);
-                if (n < 0)
-                        return log_error_errno(errno, "Failed to write file: %m");
-                if ((size_t) n < sz) {
-                        log_error("Short write");
-                        return -EIO;
+                        if (n < 0)
+                                n = -errno;
                 }
+                if (n < 0)
+                        return log_error_errno((int) n, "Failed to write file: %m");
+                if ((size_t) n < sz)
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short write");
         } else {
 
                 if (!GREEDY_REALLOC(j->payload, j->payload_allocated, j->payload_size + sz))
@@ -221,7 +244,6 @@ static int pull_job_write_uncompressed(const void *p, size_t sz, void *userdata)
         }
 
         j->written_uncompressed += sz;
-        j->written_since_last_grow += sz;
 
         return 0;
 }
@@ -235,21 +257,16 @@ static int pull_job_write_compressed(PullJob *j, void *p, size_t sz) {
         if (sz <= 0)
                 return 0;
 
-        if (j->written_compressed + sz < j->written_compressed) {
-                log_error("File too large, overflow");
-                return -EOVERFLOW;
-        }
+        if (j->written_compressed + sz < j->written_compressed)
+                return log_error_errno(SYNTHETIC_ERRNO(EOVERFLOW), "File too large, overflow");
 
-        if (j->written_compressed + sz > j->compressed_max) {
-                log_error("File overly large, refusing.");
-                return -EFBIG;
-        }
+        if (j->written_compressed + sz > j->compressed_max)
+                return log_error_errno(SYNTHETIC_ERRNO(EFBIG), "File overly large, refusing.");
 
         if (j->content_length != (uint64_t) -1 &&
-            j->written_compressed + sz > j->content_length) {
-                log_error("Content length incorrect.");
-                return -EFBIG;
-        }
+            j->written_compressed + sz > j->content_length)
+                return log_error_errno(SYNTHETIC_ERRNO(EFBIG),
+                                       "Content length incorrect.");
 
         if (j->checksum_context)
                 gcry_md_write(j->checksum_context, p, sz);
@@ -288,10 +305,11 @@ static int pull_job_open_disk(PullJob *j) {
         }
 
         if (j->calc_checksum) {
-                if (gcry_md_open(&j->checksum_context, GCRY_MD_SHA256, 0) != 0) {
-                        log_error("Failed to initialize hash context.");
-                        return -EIO;
-                }
+                initialize_libgcrypt(false);
+
+                if (gcry_md_open(&j->checksum_context, GCRY_MD_SHA256, 0) != 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO),
+                                               "Failed to initialize hash context.");
         }
 
         return 0;
@@ -395,7 +413,7 @@ static size_t pull_job_header_callback(void *contents, size_t size, size_t nmemb
         assert(contents);
         assert(j);
 
-        if (j->state == PULL_JOB_DONE || j->state == PULL_JOB_FAILED) {
+        if (IN_SET(j->state, PULL_JOB_DONE, PULL_JOB_FAILED)) {
                 r = -ESTALE;
                 goto fail;
         }
@@ -512,29 +530,34 @@ static int pull_job_progress_callback(void *userdata, curl_off_t dltotal, curl_o
 
 int pull_job_new(PullJob **ret, const char *url, CurlGlue *glue, void *userdata) {
         _cleanup_(pull_job_unrefp) PullJob *j = NULL;
+        _cleanup_free_ char *u = NULL;
 
         assert(url);
         assert(glue);
         assert(ret);
 
-        j = new0(PullJob, 1);
+        u = strdup(url);
+        if (!u)
+                return -ENOMEM;
+
+        j = new(PullJob, 1);
         if (!j)
                 return -ENOMEM;
 
-        j->state = PULL_JOB_INIT;
-        j->disk_fd = -1;
-        j->userdata = userdata;
-        j->glue = glue;
-        j->content_length = (uint64_t) -1;
-        j->start_usec = now(CLOCK_MONOTONIC);
-        j->compressed_max = j->uncompressed_max = 8LLU * 1024LLU * 1024LLU * 1024LLU; /* 8GB */
+        *j = (PullJob) {
+                .state = PULL_JOB_INIT,
+                .disk_fd = -1,
+                .userdata = userdata,
+                .glue = glue,
+                .content_length = (uint64_t) -1,
+                .start_usec = now(CLOCK_MONOTONIC),
+                .compressed_max = 64LLU * 1024LLU * 1024LLU * 1024LLU, /* 64GB safety limit */
+                .uncompressed_max = 64LLU * 1024LLU * 1024LLU * 1024LLU, /* 64GB safety limit */
+                .style = VERIFICATION_STYLE_UNSET,
+                .url = TAKE_PTR(u),
+        };
 
-        j->url = strdup(url);
-        if (!j->url)
-                return -ENOMEM;
-
-        *ret = j;
-        j = NULL;
+        *ret = TAKE_PTR(j);
 
         return 0;
 }
@@ -546,9 +569,6 @@ int pull_job_begin(PullJob *j) {
 
         if (j->state != PULL_JOB_INIT)
                 return -EBUSY;
-
-        if (j->grow_machine_directory)
-                grow_machine_directory();
 
         r = curl_glue_make(&j->curl, j->url, j);
         if (r < 0)

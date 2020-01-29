@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
 #include "dns-domain.h"
@@ -26,9 +9,6 @@
 #include "resolved-dns-synthesize.h"
 #include "resolved-etc-hosts.h"
 #include "string-util.h"
-
-/* How long to wait for the query in total */
-#define QUERY_TIMEOUT_USEC (30 * USEC_PER_SEC)
 
 #define CNAME_MAX 8
 #define QUERIES_MAX 2048
@@ -403,6 +383,7 @@ DnsQuery *dns_query_free(DnsQuery *q) {
         sd_bus_track_unref(q->bus_track);
 
         dns_packet_unref(q->request_dns_packet);
+        dns_packet_unref(q->reply_dns_packet);
 
         if (q->request_dns_stream) {
                 /* Detach the stream from our query, in case something else keeps a reference to it. */
@@ -573,17 +554,13 @@ static int dns_query_add_candidate(DnsQuery *q, DnsScope *s) {
                 return r;
 
         /* If this a single-label domain on DNS, we might append a suitable search domain first. */
-        if ((q->flags & SD_RESOLVED_NO_SEARCH) == 0)  {
-                r = dns_scope_name_needs_search_domain(s, dns_question_first_name(q->question_idna));
-                if (r < 0)
-                        goto fail;
-                if (r > 0) {
-                        /* OK, we need a search domain now. Let's find one for this scope */
+        if ((q->flags & SD_RESOLVED_NO_SEARCH) == 0 &&
+            dns_scope_name_needs_search_domain(s, dns_question_first_name(q->question_idna))) {
+                /* OK, we need a search domain now. Let's find one for this scope */
 
-                        r = dns_query_candidate_next_search_domain(c);
-                        if (r <= 0) /* if there's no search domain, then we won't add any transaction. */
-                                goto fail;
-                }
+                r = dns_query_candidate_next_search_domain(c);
+                if (r <= 0) /* if there's no search domain, then we won't add any transaction. */
+                        goto fail;
         }
 
         r = dns_query_candidate_setup_transactions(c);
@@ -622,14 +599,24 @@ static int dns_query_synthesize_reply(DnsQuery *q, DnsTransactionState *state) {
                         q->question_utf8,
                         q->ifindex,
                         &answer);
+        if (r == -ENXIO) {
+                /* If we get ENXIO this tells us to generate NXDOMAIN unconditionally. */
 
+                dns_query_reset_answer(q);
+                q->answer_rcode = DNS_RCODE_NXDOMAIN;
+                q->answer_protocol = dns_synthesize_protocol(q->flags);
+                q->answer_family = dns_synthesize_family(q->flags);
+                q->answer_authenticated = true;
+                *state = DNS_TRANSACTION_RCODE_FAILURE;
+
+                return 0;
+        }
         if (r <= 0)
                 return r;
 
         dns_query_reset_answer(q);
 
-        q->answer = answer;
-        answer = NULL;
+        q->answer = TAKE_PTR(answer);
         q->answer_rcode = DNS_RCODE_SUCCESS;
         q->answer_protocol = dns_synthesize_protocol(q->flags);
         q->answer_family = dns_synthesize_family(q->flags);
@@ -658,8 +645,7 @@ static int dns_query_try_etc_hosts(DnsQuery *q) {
 
         dns_query_reset_answer(q);
 
-        q->answer = answer;
-        answer = NULL;
+        q->answer = TAKE_PTR(answer);
         q->answer_rcode = DNS_RCODE_SUCCESS;
         q->answer_protocol = dns_synthesize_protocol(q->flags);
         q->answer_family = dns_synthesize_family(q->flags);
@@ -696,22 +682,15 @@ int dns_query_go(DnsQuery *q) {
                         continue;
 
                 match = dns_scope_good_domain(s, q->ifindex, q->flags, name);
-                if (match < 0)
-                        return match;
-
-                if (match == DNS_SCOPE_NO)
+                if (match < 0) {
+                        log_debug("Couldn't check if '%s' matches against scope, ignoring.", name);
                         continue;
+                }
 
-                found = match;
-
-                if (match == DNS_SCOPE_YES) {
+                if (match > found) { /* Does this match better? If so, remember how well it matched, and the first one
+                                      * that matches this well */
+                        found = match;
                         first = s;
-                        break;
-                } else {
-                        assert(match == DNS_SCOPE_MAYBE);
-
-                        if (!first)
-                                first = s;
                 }
         }
 
@@ -739,10 +718,12 @@ int dns_query_go(DnsQuery *q) {
                         continue;
 
                 match = dns_scope_good_domain(s, q->ifindex, q->flags, name);
-                if (match < 0)
-                        goto fail;
+                if (match < 0) {
+                        log_debug("Couldn't check if '%s' matches against scope, ignoring.", name);
+                        continue;
+                }
 
-                if (match != found)
+                if (match < found)
                         continue;
 
                 r = dns_query_add_candidate(q, s);
@@ -756,8 +737,8 @@ int dns_query_go(DnsQuery *q) {
                         q->manager->event,
                         &q->timeout_event_source,
                         clock_boottime_or_monotonic(),
-                        now(clock_boottime_or_monotonic()) + QUERY_TIMEOUT_USEC, 0,
-                        on_query_timeout, q);
+                        now(clock_boottime_or_monotonic()) + SD_RESOLVED_QUERY_TIMEOUT_USEC,
+                        0, on_query_timeout, q);
         if (r < 0)
                 goto fail;
 
@@ -810,6 +791,7 @@ static void dns_query_accept(DnsQuery *q, DnsQueryCandidate *c) {
                 q->answer = dns_answer_unref(q->answer);
                 q->answer_rcode = 0;
                 q->answer_dnssec_result = _DNSSEC_RESULT_INVALID;
+                q->answer_authenticated = false;
                 q->answer_errno = c->error_code;
         }
 
@@ -846,15 +828,18 @@ static void dns_query_accept(DnsQuery *q, DnsQueryCandidate *c) {
                         continue;
 
                 default:
-                        /* Any kind of failure? Store the data away,
-                         * if there's nothing stored yet. */
-
+                        /* Any kind of failure? Store the data away, if there's nothing stored yet. */
                         if (state == DNS_TRANSACTION_SUCCESS)
+                                continue;
+
+                        /* If there's already an authenticated negative reply stored, then prefer that over any unauthenticated one */
+                        if (q->answer_authenticated && !t->answer_authenticated)
                                 continue;
 
                         q->answer = dns_answer_unref(q->answer);
                         q->answer_rcode = t->answer_rcode;
                         q->answer_dnssec_result = t->answer_dnssec_result;
+                        q->answer_authenticated = t->answer_authenticated;
                         q->answer_errno = t->answer_errno;
 
                         state = t->state;
@@ -980,12 +965,10 @@ static int dns_query_cname_redirect(DnsQuery *q, const DnsResourceRecord *cname)
         q->flags |= SD_RESOLVED_NO_SEARCH;
 
         dns_question_unref(q->question_idna);
-        q->question_idna = nq_idna;
-        nq_idna = NULL;
+        q->question_idna = TAKE_PTR(nq_idna);
 
         dns_question_unref(q->question_utf8);
-        q->question_utf8 = nq_utf8;
-        nq_utf8 = NULL;
+        q->question_utf8 = TAKE_PTR(nq_utf8);
 
         dns_query_free_candidates(q);
         dns_query_reset_answer(q);
@@ -1027,6 +1010,9 @@ int dns_query_process_cname(DnsQuery *q) {
 
         if (q->flags & SD_RESOLVED_NO_CNAME)
                 return -ELOOP;
+
+        if (!q->answer_authenticated)
+                q->previous_redirect_unauthenticated = true;
 
         /* OK, let's actually follow the CNAME */
         r = dns_query_cname_redirect(q, cname);
@@ -1114,4 +1100,10 @@ const char *dns_query_string(DnsQuery *q) {
                 return name;
 
         return dns_question_first_name(q->question_idna);
+}
+
+bool dns_query_fully_authenticated(DnsQuery *q) {
+        assert(q);
+
+        return q->answer_authenticated && !q->previous_redirect_unauthenticated;
 }

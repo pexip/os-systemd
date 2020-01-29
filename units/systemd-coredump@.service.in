@@ -1,3 +1,5 @@
+#  SPDX-License-Identifier: LGPL-2.1+
+#
 #  This file is part of systemd.
 #
 #  systemd is free software; you can redistribute it and/or modify it
@@ -9,7 +11,6 @@
 Description=Process Core Dump
 Documentation=man:systemd-coredump(8)
 DefaultDependencies=no
-RequiresMountsFor=/var/lib/systemd/coredump
 Conflicts=shutdown.target
 After=systemd-remount-fs.service systemd-journald.socket
 Requires=systemd-journald.socket
@@ -17,8 +18,25 @@ Before=shutdown.target
 
 [Service]
 ExecStart=-@rootlibexecdir@/systemd-coredump
+IPAddressDeny=any
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
 Nice=9
+NoNewPrivileges=yes
 OOMScoreAdjust=500
+PrivateDevices=yes
 PrivateNetwork=yes
-ProtectSystem=full
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
 RuntimeMaxSec=5min
+StateDirectory=systemd/coredump
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service

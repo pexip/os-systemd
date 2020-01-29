@@ -1,29 +1,12 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <alloca.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 
+#include "alloc-util.h"
 #include "macro.h"
 
 /* What is interpreted as whitespace? */
@@ -51,15 +34,15 @@ static inline bool streq_ptr(const char *a, const char *b) {
 }
 
 static inline const char* strempty(const char *s) {
-        return s ? s : "";
+        return s ?: "";
 }
 
 static inline const char* strnull(const char *s) {
-        return s ? s : "(null)";
+        return s ?: "(null)";
 }
 
 static inline const char *strna(const char *s) {
-        return s ? s : "n/a";
+        return s ?: "n/a";
 }
 
 static inline bool isempty(const char *p) {
@@ -70,7 +53,7 @@ static inline const char *empty_to_null(const char *p) {
         return isempty(p) ? NULL : p;
 }
 
-static inline const char *strdash_if_empty(const char *str) {
+static inline const char *empty_to_dash(const char *str) {
         return isempty(str) ? "-" : str;
 }
 
@@ -99,34 +82,37 @@ char *endswith_no_case(const char *s, const char *postfix) _pure_;
 
 char *first_word(const char *s, const char *word) _pure_;
 
-const char* split(const char **state, size_t *l, const char *separator, bool quoted);
+typedef enum SplitFlags {
+        SPLIT_QUOTES                     = 0x01 << 0,
+        SPLIT_RELAX                      = 0x01 << 1,
+} SplitFlags;
+
+const char* split(const char **state, size_t *l, const char *separator, SplitFlags flags);
 
 #define FOREACH_WORD(word, length, s, state)                            \
-        _FOREACH_WORD(word, length, s, WHITESPACE, false, state)
+        _FOREACH_WORD(word, length, s, WHITESPACE, 0, state)
 
 #define FOREACH_WORD_SEPARATOR(word, length, s, separator, state)       \
-        _FOREACH_WORD(word, length, s, separator, false, state)
+        _FOREACH_WORD(word, length, s, separator, 0, state)
 
-#define FOREACH_WORD_QUOTED(word, length, s, state)                     \
-        _FOREACH_WORD(word, length, s, WHITESPACE, true, state)
-
-#define _FOREACH_WORD(word, length, s, separator, quoted, state)        \
-        for ((state) = (s), (word) = split(&(state), &(length), (separator), (quoted)); (word); (word) = split(&(state), &(length), (separator), (quoted)))
+#define _FOREACH_WORD(word, length, s, separator, flags, state)         \
+        for ((state) = (s), (word) = split(&(state), &(length), (separator), (flags)); (word); (word) = split(&(state), &(length), (separator), (flags)))
 
 char *strappend(const char *s, const char *suffix);
 char *strnappend(const char *s, const char *suffix, size_t length);
 
-char *strjoin(const char *x, ...) _sentinel_;
+char *strjoin_real(const char *x, ...) _sentinel_;
+#define strjoin(a, ...) strjoin_real((a), __VA_ARGS__, NULL)
 
 #define strjoina(a, ...)                                                \
         ({                                                              \
                 const char *_appendees_[] = { a, __VA_ARGS__ };         \
                 char *_d_, *_p_;                                        \
-                int _len_ = 0;                                          \
-                unsigned _i_;                                           \
+                size_t _len_ = 0;                                          \
+                size_t _i_;                                           \
                 for (_i_ = 0; _i_ < ELEMENTSOF(_appendees_) && _appendees_[_i_]; _i_++) \
                         _len_ += strlen(_appendees_[_i_]);              \
-                _p_ = _d_ = alloca(_len_ + 1);                          \
+                _p_ = _d_ = newa(char, _len_ + 1);                      \
                 for (_i_ = 0; _i_ < ELEMENTSOF(_appendees_) && _appendees_[_i_]; _i_++) \
                         _p_ = stpcpy(_p_, _appendees_[_i_]);            \
                 *_p_ = 0;                                               \
@@ -135,7 +121,19 @@ char *strjoin(const char *x, ...) _sentinel_;
 
 char *strstrip(char *s);
 char *delete_chars(char *s, const char *bad);
+char *delete_trailing_chars(char *s, const char *bad);
 char *truncate_nl(char *s);
+
+static inline char *skip_leading_chars(const char *s, const char *bad) {
+
+        if (!s)
+                return NULL;
+
+        if (!bad)
+                bad = WHITESPACE;
+
+        return (char*) s + strspn(s, bad);
+}
 
 char ascii_tolower(char x);
 char *ascii_strlower(char *s);
@@ -158,23 +156,33 @@ static inline bool _pure_ in_charset(const char *s, const char* charset) {
 bool string_has_cc(const char *p, const char *ok) _pure_;
 
 char *ellipsize_mem(const char *s, size_t old_length_bytes, size_t new_length_columns, unsigned percent);
-char *ellipsize(const char *s, size_t length, unsigned percent);
+static inline char *ellipsize(const char *s, size_t length, unsigned percent) {
+        return ellipsize_mem(s, strlen(s), length, percent);
+}
 
-bool nulstr_contains(const char*nulstr, const char *needle);
+char *cellescape(char *buf, size_t len, const char *s);
+
+/* This limit is arbitrary, enough to give some idea what the string contains */
+#define CELLESCAPE_DEFAULT_LENGTH 64
+
+bool nulstr_contains(const char *nulstr, const char *needle);
 
 char* strshorten(char *s, size_t l);
 
 char *strreplace(const char *text, const char *old_string, const char *new_string);
 
-char *strip_tab_ansi(char **p, size_t *l);
+char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]);
 
-char *strextend(char **x, ...) _sentinel_;
+char *strextend_with_separator(char **x, const char *separator, ...) _sentinel_;
+
+#define strextend(x, ...) strextend_with_separator(x, NULL, __VA_ARGS__)
 
 char *strrep(const char *s, unsigned n);
 
 int split_pair(const char *s, const char *sep, char **l, char **r);
 
 int free_and_strdup(char **p, const char *s);
+int free_and_strndup(char **p, const char *s, size_t l);
 
 /* Normal memmem() requires haystack to be nonnull, which is annoying for zero-length buffers */
 static inline void *memmem_safe(const void *haystack, size_t haystacklen, const void *needle, size_t needlelen) {
@@ -191,7 +199,17 @@ static inline void *memmem_safe(const void *haystack, size_t haystacklen, const 
         return memmem(haystack, haystacklen, needle, needlelen);
 }
 
-void* memory_erase(void *p, size_t l);
+#if HAVE_EXPLICIT_BZERO
+static inline void* explicit_bzero_safe(void *p, size_t l) {
+        if (l > 0)
+                explicit_bzero(p, l);
+
+        return p;
+}
+#else
+void *explicit_bzero_safe(void *p, size_t l);
+#endif
+
 char *string_erase(char *x);
 
 char *string_free_erase(char *s);
@@ -199,3 +217,50 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(char *, string_free_erase);
 #define _cleanup_string_free_erase_ _cleanup_(string_free_erasep)
 
 bool string_is_safe(const char *p) _pure_;
+
+static inline size_t strlen_ptr(const char *s) {
+        if (!s)
+                return 0;
+
+        return strlen(s);
+}
+
+/* Like startswith(), but operates on arbitrary memory blocks */
+static inline void *memory_startswith(const void *p, size_t sz, const char *token) {
+        size_t n;
+
+        assert(token);
+
+        n = strlen(token);
+        if (sz < n)
+                return NULL;
+
+        assert(p);
+
+        if (memcmp(p, token, n) != 0)
+                return NULL;
+
+        return (uint8_t*) p + n;
+}
+
+/* Like startswith_no_case(), but operates on arbitrary memory blocks.
+ * It works only for ASCII strings.
+ */
+static inline void *memory_startswith_no_case(const void *p, size_t sz, const char *token) {
+        size_t n, i;
+
+        assert(token);
+
+        n = strlen(token);
+        if (sz < n)
+                return NULL;
+
+        assert(p);
+
+        for (i = 0; i < n; i++) {
+                if (ascii_tolower(((char *)p)[i]) != ascii_tolower(token[i]))
+                        return NULL;
+        }
+
+        return (uint8_t*) p + n;
+}

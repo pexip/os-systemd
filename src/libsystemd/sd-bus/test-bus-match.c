@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "bus-match.h"
 #include "bus-message.h"
@@ -23,6 +6,7 @@
 #include "bus-util.h"
 #include "log.h"
 #include "macro.h"
+#include "tests.h"
 
 static bool mask[32];
 
@@ -94,9 +78,13 @@ int main(int argc, char *argv[]) {
         sd_bus_slot slots[19];
         int r;
 
-        r = sd_bus_open_system(&bus);
+        test_setup_logging(LOG_INFO);
+
+        r = sd_bus_open_user(&bus);
         if (r < 0)
-                return EXIT_TEST_SKIP;
+                r = sd_bus_open_system(&bus);
+        if (r < 0)
+                return log_tests_skipped("Failed to connect to bus");
 
         assert_se(match_add(slots, &root, "arg2='wal\\'do',sender='foo',type='signal',interface='bar.x',", 1) >= 0);
         assert_se(match_add(slots, &root, "arg2='wal\\'do2',sender='foo',type='signal',interface='bar.x',", 2) >= 0);
@@ -121,7 +109,7 @@ int main(int argc, char *argv[]) {
 
         assert_se(sd_bus_message_new_signal(bus, &m, "/foo/bar", "bar.x", "waldo") >= 0);
         assert_se(sd_bus_message_append(m, "ssssas", "one", "two", "/prefix/three", "prefix.four", 3, "pi", "pa", "po") >= 0);
-        assert_se(bus_message_seal(m, 1, 0) >= 0);
+        assert_se(sd_bus_message_seal(m, 1, 0) >= 0);
 
         zero(mask);
         assert_se(bus_match_run(NULL, &root, m) == 0);

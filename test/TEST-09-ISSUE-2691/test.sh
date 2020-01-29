@@ -1,35 +1,12 @@
 #!/bin/bash
 # -*- mode: shell-script; indent-tabs-mode: nil; sh-basic-offset: 4; -*-
 # ex: ts=8 sw=4 sts=4 et filetype=sh
+set -e
 TEST_DESCRIPTION="https://github.com/systemd/systemd/issues/2691"
+TEST_NO_NSPAWN=1
 
 . $TEST_BASE_DIR/test-functions
-SKIP_INITRD=yes
-QEMU_TIMEOUT=90
-
-check_result_qemu() {
-    ret=1
-    mkdir -p $TESTDIR/root
-    mount ${LOOPDEV}p1 $TESTDIR/root
-    [[ -e $TESTDIR/root/testok ]] && ret=0
-    [[ -f $TESTDIR/root/failed ]] && cp -a $TESTDIR/root/failed $TESTDIR
-    cp -a $TESTDIR/root/var/log/journal $TESTDIR
-    umount $TESTDIR/root
-    [[ -f $TESTDIR/failed ]] && cat $TESTDIR/failed
-    ls -l $TESTDIR/journal/*/*.journal
-    test -s $TESTDIR/failed && ret=$(($ret+1))
-    [ -n "$TIMED_OUT" ] && ret=$(($ret+1))
-    return $ret
-}
-
-test_run() {
-    if run_qemu; then
-        check_result_qemu || return 1
-    else
-        dwarn "can't run QEMU, skipping"
-    fi
-    return 0
-}
+QEMU_TIMEOUT=180
 
 test_setup() {
     create_empty_image
@@ -47,14 +24,13 @@ test_setup() {
         cat >$initdir/etc/systemd/system/testsuite.service <<'EOF'
 [Unit]
 Description=Testsuite service
-After=multi-user.target
 
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c '>/testok'
 RemainAfterExit=yes
 ExecStop=/bin/sh -c 'kill -SEGV $$$$'
-TimeoutStopSec=180s
+TimeoutStopSec=270s
 EOF
 
         setup_testsuite
@@ -69,12 +45,6 @@ EOF
 
     ddebug "umount $TESTDIR/root"
     umount $TESTDIR/root
-}
-
-test_cleanup() {
-    umount $TESTDIR/root 2>/dev/null
-    [[ $LOOPDEV ]] && losetup -d $LOOPDEV
-    return 0
 }
 
 do_test "$@"

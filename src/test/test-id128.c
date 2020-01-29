@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <string.h>
 
@@ -24,10 +7,10 @@
 
 #include "alloc-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "id128-util.h"
 #include "macro.h"
 #include "string-util.h"
+#include "tmpfile-util.h"
 #include "util.h"
 
 #define ID128_WALDI SD_ID128_MAKE(01, 02, 03, 04, 05, 06, 07, 08, 09, 0a, 0b, 0c, 0d, 0e, 0f, 10)
@@ -39,6 +22,7 @@ int main(int argc, char *argv[]) {
         char t[33], q[37];
         _cleanup_free_ char *b = NULL;
         _cleanup_close_ int fd = -1;
+        int r;
 
         assert_se(sd_id128_randomize(&id) == 0);
         printf("random: %s\n", sd_id128_to_string(id, t));
@@ -152,6 +136,24 @@ int main(int argc, char *argv[]) {
         assert_se(lseek(fd, 0, SEEK_SET) == 0);
         assert_se(id128_read_fd(fd, ID128_UUID, &id2) >= 0);
         assert_se(sd_id128_equal(id, id2));
+
+        r = sd_id128_get_machine_app_specific(SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id);
+        if (r == -EOPNOTSUPP)
+                log_info("khash not supported on this kernel, skipping sd_id128_get_machine_app_specific() checks");
+        else {
+                assert_se(r >= 0);
+                assert_se(sd_id128_get_machine_app_specific(SD_ID128_MAKE(f0,3d,aa,eb,1c,33,4b,43,a7,32,17,29,44,bf,77,2e), &id2) >= 0);
+                assert_se(sd_id128_equal(id, id2));
+                assert_se(sd_id128_get_machine_app_specific(SD_ID128_MAKE(51,df,0b,4b,c3,b0,4c,97,80,e2,99,b9,8c,a3,73,b8), &id2) >= 0);
+                assert_se(!sd_id128_equal(id, id2));
+        }
+
+        /* Query the invocation ID */
+        r = sd_id128_get_invocation(&id);
+        if (r < 0)
+                log_warning_errno(r, "Failed to get invocation ID, ignoring: %m");
+        else
+                log_info("Invocation ID: " SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(id));
 
         return 0;
 }

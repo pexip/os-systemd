@@ -1,46 +1,35 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdio_ext.h>
 
 #include "sd-messages.h"
 
 #include "alloc-util.h"
 #include "bus-error.h"
 #include "bus-util.h"
+#include "env-file.h"
 #include "escape.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "formats-util.h"
+#include "format-util.h"
 #include "hashmap.h"
 #include "machine-dbus.h"
 #include "machine.h"
 #include "mkdir.h"
 #include "parse-util.h"
 #include "process-util.h"
+#include "serialize.h"
 #include "special.h"
+#include "stdio-util.h"
 #include "string-table.h"
 #include "terminal-util.h"
+#include "tmpfile-util.h"
 #include "unit-name.h"
+#include "user-util.h"
 #include "util.h"
 
 Machine* machine_new(Manager *manager, MachineClass class, const char *name) {
@@ -83,8 +72,9 @@ fail:
         return mfree(m);
 }
 
-void machine_free(Machine *m) {
-        assert(m);
+Machine* machine_free(Machine *m) {
+        if (!m)
+                return NULL;
 
         while (m->operations)
                 operation_free(m->operations);
@@ -111,7 +101,7 @@ void machine_free(Machine *m) {
         free(m->service);
         free(m->root_directory);
         free(m->netif);
-        free(m);
+        return mfree(m);
 }
 
 int machine_save(Machine *m) {
@@ -127,7 +117,7 @@ int machine_save(Machine *m) {
         if (!m->started)
                 return 0;
 
-        r = mkdir_safe_label("/run/systemd/machines", 0755, 0, 0);
+        r = mkdir_safe_label("/run/systemd/machines", 0755, 0, 0, MKDIR_WARN_MODE);
         if (r < 0)
                 goto fail;
 
@@ -135,6 +125,7 @@ int machine_save(Machine *m) {
         if (r < 0)
                 goto fail;
 
+        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
         (void) fchmod(fileno(f), 0644);
 
         fprintf(f,
@@ -196,7 +187,7 @@ int machine_save(Machine *m) {
                         m->timestamp.monotonic);
 
         if (m->n_netif > 0) {
-                unsigned i;
+                size_t i;
 
                 fputs("NETIF=", f);
 
@@ -244,7 +235,6 @@ static void machine_unlink(Machine *m) {
         assert(m);
 
         if (m->unit) {
-
                 char *sl;
 
                 sl = strjoina("/run/systemd/machines/unit:", m->unit);
@@ -264,7 +254,7 @@ int machine_load(Machine *m) {
         if (!m->state_file)
                 return 0;
 
-        r = parse_env_file(m->state_file, NEWLINE,
+        r = parse_env_file(NULL, m->state_file,
                            "SCOPE",     &m->unit,
                            "SCOPE_JOB", &m->scope_job,
                            "SERVICE",   &m->service,
@@ -274,8 +264,7 @@ int machine_load(Machine *m) {
                            "CLASS",     &class,
                            "REALTIME",  &realtime,
                            "MONOTONIC", &monotonic,
-                           "NETIF",     &netif,
-                           NULL);
+                           "NETIF",     &netif);
         if (r < 0) {
                 if (r == -ENOENT)
                         return 0;
@@ -298,9 +287,9 @@ int machine_load(Machine *m) {
         }
 
         if (realtime)
-                timestamp_deserialize(realtime, &m->timestamp.realtime);
+                (void) deserialize_usec(realtime, &m->timestamp.realtime);
         if (monotonic)
-                timestamp_deserialize(monotonic, &m->timestamp.monotonic);
+                (void) deserialize_usec(monotonic, &m->timestamp.monotonic);
 
         if (netif) {
                 size_t allocated = 0, nr = 0;
@@ -342,42 +331,36 @@ int machine_load(Machine *m) {
 }
 
 static int machine_start_scope(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
-        int r = 0;
-
         assert(m);
         assert(m->class != MACHINE_HOST);
 
         if (!m->unit) {
-                _cleanup_free_ char *escaped = NULL;
-                char *scope, *description, *job = NULL;
+                _cleanup_free_ char *escaped = NULL, *scope = NULL;
+                char *description, *job = NULL;
+                int r;
 
                 escaped = unit_name_escape(m->name);
                 if (!escaped)
                         return log_oom();
 
-                scope = strjoin("machine-", escaped, ".scope", NULL);
+                scope = strjoin("machine-", escaped, ".scope");
                 if (!scope)
                         return log_oom();
 
                 description = strjoina(m->class == MACHINE_VM ? "Virtual Machine " : "Container ", m->name);
 
                 r = manager_start_scope(m->manager, scope, m->leader, SPECIAL_MACHINE_SLICE, description, properties, error, &job);
-                if (r < 0) {
-                        log_error("Failed to start machine scope: %s", bus_error_message(error, r));
-                        free(scope);
-                        return r;
-                } else {
-                        m->unit = scope;
+                if (r < 0)
+                        return log_error_errno(r, "Failed to start machine scope: %s", bus_error_message(error, r));
 
-                        free(m->scope_job);
-                        m->scope_job = job;
-                }
+                m->unit = TAKE_PTR(scope);
+                free_and_replace(m->scope_job, job);
         }
 
         if (m->unit)
                 hashmap_put(m->manager->machine_units, m->unit, m);
 
-        return r;
+        return 0;
 }
 
 int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
@@ -401,11 +384,10 @@ int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
                 return r;
 
         log_struct(LOG_INFO,
-                   LOG_MESSAGE_ID(SD_MESSAGE_MACHINE_START),
+                   "MESSAGE_ID=" SD_MESSAGE_MACHINE_START_STR,
                    "NAME=%s", m->name,
                    "LEADER="PID_FMT, m->leader,
-                   LOG_MESSAGE("New machine %s.", m->name),
-                   NULL);
+                   LOG_MESSAGE("New machine %s.", m->name));
 
         if (!dual_timestamp_is_set(&m->timestamp))
                 dual_timestamp_get(&m->timestamp);
@@ -416,6 +398,7 @@ int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
         machine_save(m);
 
         machine_send_signal(m, true);
+        (void) manager_enqueue_nscd_cache_flush(m->manager);
 
         return 0;
 }
@@ -423,7 +406,7 @@ int machine_start(Machine *m, sd_bus_message *properties, sd_bus_error *error) {
 static int machine_stop_scope(Machine *m) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         char *job = NULL;
-        int r;
+        int r, q;
 
         assert(m);
         assert(m->class != MACHINE_HOST);
@@ -433,14 +416,16 @@ static int machine_stop_scope(Machine *m) {
 
         r = manager_stop_unit(m->manager, m->unit, &error, &job);
         if (r < 0) {
-                log_error("Failed to stop machine scope: %s", bus_error_message(&error, r));
-                return r;
-        }
+                log_error_errno(r, "Failed to stop machine scope: %s", bus_error_message(&error, r));
+                sd_bus_error_free(&error);
+        } else
+                free_and_replace(m->scope_job, job);
 
-        free(m->scope_job);
-        m->scope_job = job;
+        q = manager_unref_unit(m->manager, m->unit, &error);
+        if (q < 0)
+                log_warning_errno(q, "Failed to drop reference to machine scope, ignoring: %s", bus_error_message(&error, r));
 
-        return 0;
+        return r;
 }
 
 int machine_stop(Machine *m) {
@@ -455,6 +440,7 @@ int machine_stop(Machine *m) {
         m->stopping = true;
 
         machine_save(m);
+        (void) manager_enqueue_nscd_cache_flush(m->manager);
 
         return r;
 }
@@ -464,11 +450,10 @@ int machine_finalize(Machine *m) {
 
         if (m->started)
                 log_struct(LOG_INFO,
-                           LOG_MESSAGE_ID(SD_MESSAGE_MACHINE_STOP),
+                           "MESSAGE_ID=" SD_MESSAGE_MACHINE_STOP_STR,
                            "NAME=%s", m->name,
                            "LEADER="PID_FMT, m->leader,
-                           LOG_MESSAGE("Machine %s terminated.", m->name),
-                           NULL);
+                           LOG_MESSAGE("Machine %s terminated.", m->name));
 
         machine_unlink(m);
         machine_add_to_gc_queue(m);
@@ -481,22 +466,22 @@ int machine_finalize(Machine *m) {
         return 0;
 }
 
-bool machine_check_gc(Machine *m, bool drop_not_started) {
+bool machine_may_gc(Machine *m, bool drop_not_started) {
         assert(m);
 
         if (m->class == MACHINE_HOST)
-                return true;
-
-        if (drop_not_started && !m->started)
                 return false;
 
-        if (m->scope_job && manager_job_is_active(m->manager, m->scope_job))
+        if (drop_not_started && !m->started)
                 return true;
+
+        if (m->scope_job && manager_job_is_active(m->manager, m->scope_job))
+                return false;
 
         if (m->unit && manager_unit_is_active(m->manager, m->unit))
-                return true;
+                return false;
 
-        return false;
+        return true;
 }
 
 void machine_add_to_gc_queue(Machine *m) {
@@ -602,6 +587,102 @@ void machine_release_unit(Machine *m) {
 
         (void) hashmap_remove(m->manager->machine_units, m->unit);
         m->unit = mfree(m->unit);
+}
+
+int machine_get_uid_shift(Machine *m, uid_t *ret) {
+        char p[STRLEN("/proc//uid_map") + DECIMAL_STR_MAX(pid_t) + 1];
+        uid_t uid_base, uid_shift, uid_range;
+        gid_t gid_base, gid_shift, gid_range;
+        _cleanup_fclose_ FILE *f = NULL;
+        int k, r;
+
+        assert(m);
+        assert(ret);
+
+        /* Return the base UID/GID of the specified machine. Note that this only works for containers with simple
+         * mappings. In most cases setups should be simple like this, and administrators should only care about the
+         * basic offset a container has relative to the host. This is what this function exposes.
+         *
+         * If we encounter any more complex mappings we politely refuse this with ENXIO. */
+
+        if (m->class == MACHINE_HOST) {
+                *ret = 0;
+                return 0;
+        }
+
+        if (m->class != MACHINE_CONTAINER)
+                return -EOPNOTSUPP;
+
+        xsprintf(p, "/proc/" PID_FMT "/uid_map", m->leader);
+        f = fopen(p, "re");
+        if (!f) {
+                if (errno == ENOENT) {
+                        /* If the file doesn't exist, user namespacing is off in the kernel, return a zero mapping hence. */
+                        *ret = 0;
+                        return 0;
+                }
+
+                return -errno;
+        }
+
+        /* Read the first line. There's at least one. */
+        errno = 0;
+        k = fscanf(f, UID_FMT " " UID_FMT " " UID_FMT "\n", &uid_base, &uid_shift, &uid_range);
+        if (k != 3) {
+                if (ferror(f))
+                        return -errno;
+
+                return -EBADMSG;
+        }
+
+        /* Not a mapping starting at 0? Then it's a complex mapping we can't expose here. */
+        if (uid_base != 0)
+                return -ENXIO;
+        /* Insist that at least the nobody user is mapped, everything else is weird, and hence complex, and we don't support it */
+        if (uid_range < UID_NOBODY)
+                return -ENXIO;
+
+        /* If there's more than one line, then we don't support this mapping. */
+        r = safe_fgetc(f, NULL);
+        if (r < 0)
+                return r;
+        if (r != 0) /* Insist on EOF */
+                return -ENXIO;
+
+        fclose(f);
+
+        xsprintf(p, "/proc/" PID_FMT "/gid_map", m->leader);
+        f = fopen(p, "re");
+        if (!f)
+                return -errno;
+
+        /* Read the first line. There's at least one. */
+        errno = 0;
+        k = fscanf(f, GID_FMT " " GID_FMT " " GID_FMT "\n", &gid_base, &gid_shift, &gid_range);
+        if (k != 3) {
+                if (ferror(f))
+                        return -errno;
+
+                return -EBADMSG;
+        }
+
+        /* If there's more than one line, then we don't support this file. */
+        r = safe_fgetc(f, NULL);
+        if (r < 0)
+                return r;
+        if (r != 0) /* Insist on EOF */
+                return -ENXIO;
+
+        /* If the UID and GID mapping doesn't match, we don't support this mapping. */
+        if (uid_base != (uid_t) gid_base)
+                return -ENXIO;
+        if (uid_shift != (uid_t) gid_shift)
+                return -ENXIO;
+        if (uid_range != (uid_t) gid_range)
+                return -ENXIO;
+
+        *ret = uid_shift;
+        return 0;
 }
 
 static const char* const machine_class_table[_MACHINE_CLASS_MAX] = {

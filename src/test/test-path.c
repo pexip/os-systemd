@@ -1,31 +1,18 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Ronny Chevalier
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "alloc-util.h"
+#include "all-units.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "macro.h"
 #include "manager.h"
 #include "mkdir.h"
+#include "path-util.h"
 #include "rm-rf.h"
 #include "string-util.h"
 #include "strv.h"
@@ -45,18 +32,20 @@ static int setup_test(Manager **m) {
 
         assert_se(m);
 
-        r = manager_new(UNIT_FILE_USER, true, &tmp);
-        if (MANAGER_SKIP_TEST(r)) {
-                log_notice_errno(r, "Skipping test: manager_new: %m");
-                return -EXIT_TEST_SKIP;
-        }
+        r = enter_cgroup_subroot();
+        if (r == -ENOMEDIUM)
+                return log_tests_skipped("cgroupfs not available");
+
+        r = manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_BASIC, &tmp);
+        if (MANAGER_SKIP_TEST(r))
+                return log_tests_skipped_errno(r, "manager_new");
         assert_se(r >= 0);
         assert_se(manager_startup(tmp, NULL, NULL) >= 0);
 
         STRV_FOREACH(test_path, tests_path) {
                 _cleanup_free_ char *p = NULL;
 
-                p = strjoin("/tmp/test-path_", *test_path, NULL);
+                p = strjoin("/tmp/test-path_", *test_path);
                 assert_se(p);
 
                 (void) rm_rf(p, REMOVE_ROOT|REMOVE_PHYSICAL);
@@ -106,7 +95,6 @@ static void check_stop_unlink(Manager *m, Unit *unit, const char *test_path, con
                                 service_state_to_string(service->state),
                                 service_result_to_string(service->result));
 
-
                 /* But we timeout if the service has not been started in the allocated time */
                 n = now(CLOCK_MONOTONIC);
                 if (ts + timeout < n) {
@@ -115,7 +103,7 @@ static void check_stop_unlink(Manager *m, Unit *unit, const char *test_path, con
                 }
         }
 
-        assert_se(UNIT_VTABLE(unit)->stop(unit) >= 0);
+        assert_se(unit_stop(unit) >= 0);
         (void) rm_rf(test_path, REMOVE_ROOT|REMOVE_PHYSICAL);
 }
 
@@ -125,8 +113,8 @@ static void test_path_exists(Manager *m) {
 
         assert_se(m);
 
-        assert_se(manager_load_unit(m, "path-exists.path", NULL, NULL, &unit) >= 0);
-        assert_se(UNIT_VTABLE(unit)->start(unit) >= 0);
+        assert_se(manager_load_startable_unit_or_warn(m, "path-exists.path", NULL, &unit) >= 0);
+        assert_se(unit_start(unit) >= 0);
 
         assert_se(touch(test_path) >= 0);
 
@@ -138,8 +126,8 @@ static void test_path_existsglob(Manager *m) {
         Unit *unit = NULL;
 
         assert_se(m);
-        assert_se(manager_load_unit(m, "path-existsglob.path", NULL, NULL, &unit) >= 0);
-        assert_se(UNIT_VTABLE(unit)->start(unit) >= 0);
+        assert_se(manager_load_startable_unit_or_warn(m, "path-existsglob.path", NULL, &unit) >= 0);
+        assert_se(unit_start(unit) >= 0);
 
         assert_se(touch(test_path) >= 0);
 
@@ -155,8 +143,8 @@ static void test_path_changed(Manager *m) {
 
         assert_se(touch(test_path) >= 0);
 
-        assert_se(manager_load_unit(m, "path-changed.path", NULL, NULL, &unit) >= 0);
-        assert_se(UNIT_VTABLE(unit)->start(unit) >= 0);
+        assert_se(manager_load_startable_unit_or_warn(m, "path-changed.path", NULL, &unit) >= 0);
+        assert_se(unit_start(unit) >= 0);
 
         f = fopen(test_path, "w");
         assert_se(f);
@@ -174,8 +162,8 @@ static void test_path_modified(Manager *m) {
 
         assert_se(touch(test_path) >= 0);
 
-        assert_se(manager_load_unit(m, "path-modified.path", NULL, NULL, &unit) >= 0);
-        assert_se(UNIT_VTABLE(unit)->start(unit) >= 0);
+        assert_se(manager_load_startable_unit_or_warn(m, "path-modified.path", NULL, &unit) >= 0);
+        assert_se(unit_start(unit) >= 0);
 
         f = fopen(test_path, "w");
         assert_se(f);
@@ -190,8 +178,8 @@ static void test_path_unit(Manager *m) {
 
         assert_se(m);
 
-        assert_se(manager_load_unit(m, "path-unit.path", NULL, NULL, &unit) >= 0);
-        assert_se(UNIT_VTABLE(unit)->start(unit) >= 0);
+        assert_se(manager_load_startable_unit_or_warn(m, "path-unit.path", NULL, &unit) >= 0);
+        assert_se(unit_start(unit) >= 0);
 
         assert_se(touch(test_path) >= 0);
 
@@ -206,8 +194,8 @@ static void test_path_directorynotempty(Manager *m) {
 
         assert_se(access(test_path, F_OK) < 0);
 
-        assert_se(manager_load_unit(m, "path-directorynotempty.path", NULL, NULL, &unit) >= 0);
-        assert_se(UNIT_VTABLE(unit)->start(unit) >= 0);
+        assert_se(manager_load_startable_unit_or_warn(m, "path-directorynotempty.path", NULL, &unit) >= 0);
+        assert_se(unit_start(unit) >= 0);
 
         /* MakeDirectory default to no */
         assert_se(access(test_path, F_OK) < 0);
@@ -227,8 +215,8 @@ static void test_path_makedirectory_directorymode(Manager *m) {
 
         assert_se(access(test_path, F_OK) < 0);
 
-        assert_se(manager_load_unit(m, "path-makedirectory.path", NULL, NULL, &unit) >= 0);
-        assert_se(UNIT_VTABLE(unit)->start(unit) >= 0);
+        assert_se(manager_load_startable_unit_or_warn(m, "path-makedirectory.path", NULL, &unit) >= 0);
+        assert_se(unit_start(unit) >= 0);
 
         /* Check if the directory has been created */
         assert_se(access(test_path, F_OK) >= 0);
@@ -239,7 +227,7 @@ static void test_path_makedirectory_directorymode(Manager *m) {
         assert_se((s.st_mode & S_IRWXG) == 0040);
         assert_se((s.st_mode & S_IRWXO) == 0004);
 
-        assert_se(UNIT_VTABLE(unit)->stop(unit) >= 0);
+        assert_se(unit_stop(unit) >= 0);
         (void) rm_rf(test_path, REMOVE_ROOT|REMOVE_PHYSICAL);
 }
 
@@ -256,22 +244,25 @@ int main(int argc, char *argv[]) {
         };
 
         _cleanup_(rm_rf_physical_and_freep) char *runtime_dir = NULL;
+        _cleanup_free_ char *test_path = NULL;
         const test_function_t *test = NULL;
         Manager *m = NULL;
 
-        log_parse_environment();
-        log_open();
+        umask(022);
 
+        test_setup_logging(LOG_INFO);
+
+        test_path = path_join(get_testdata_dir(), "test-path");
+        assert_se(set_unit_path(test_path) >= 0);
         assert_se(runtime_dir = setup_fake_runtime_dir());
-        assert_se(set_unit_path(TEST_DIR "/test-path/") >= 0);
 
         for (test = tests; test && *test; test++) {
                 int r;
 
                 /* We create a clean environment for each test */
                 r = setup_test(&m);
-                if (r < 0)
-                        return -r;
+                if (r != 0)
+                        return r;
 
                 (*test)(m);
 
