@@ -1,11 +1,8 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #ifndef foosddaemonhfoo
 #define foosddaemonhfoo
 
 /***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
   systemd is free software; you can redistribute it and/or modify it
   under the terms of the GNU Lesser General Public License as published by
   the Free Software Foundation; either version 2.1 of the License, or
@@ -22,6 +19,7 @@
 
 #include <inttypes.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 
 #include "_sd-common.h"
 
@@ -131,6 +129,18 @@ int sd_is_socket(int fd, int family, int type, int listening);
 int sd_is_socket_inet(int fd, int family, int type, int listening, uint16_t port);
 
 /*
+  Helper call for identifying a passed file descriptor. Returns 1 if the
+  file descriptor is an Internet socket of the specified type
+  (SOCK_DGRAM, SOCK_STREAM, ...), and if the address of the socket is
+  the same as the address specified by addr. The listening flag is used
+  the same way as in sd_is_socket(). Returns a negative errno style
+  error code on failure.
+
+  See sd_is_socket_sockaddr(3) for more information.
+*/
+int sd_is_socket_sockaddr(int fd, int type, const struct sockaddr* addr, unsigned addr_len, int listening);
+
+/*
   Helper call for identifying a passed file descriptor. Returns 1 if
   the file descriptor is an AF_UNIX socket of the specified type
   (SOCK_DGRAM, SOCK_STREAM, ...) and path, 0 otherwise. If type is 0
@@ -161,11 +171,21 @@ int sd_is_mq(int fd, const char *path);
   newline separated environment-style variable assignments in a
   string. The following variables are known:
 
-     READY=1      Tells systemd that daemon startup is finished (only
-                  relevant for services of Type=notify). The passed
-                  argument is a boolean "1" or "0". Since there is
-                  little value in signaling non-readiness the only
+     MAINPID=...  The main PID of a daemon, in case systemd did not
+                  fork off the process itself. Example: "MAINPID=4711"
+
+     READY=1      Tells systemd that daemon startup or daemon reload
+                  is finished (only relevant for services of Type=notify).
+                  The passed argument is a boolean "1" or "0". Since there
+                  is little value in signaling non-readiness the only
                   value daemons should send is "READY=1".
+
+     RELOADING=1  Tell systemd that the daemon began reloading its
+                  configuration. When the configuration has been
+                  reloaded completely, READY=1 should be sent to inform
+                  systemd about this.
+
+     STOPPING=1   Tells systemd that the daemon is about to go down.
 
      STATUS=...   Passes a single-line status string back to systemd
                   that describes the daemon state. This is free-form
@@ -181,14 +201,16 @@ int sd_is_mq(int fd, const char *path);
      BUSERROR=... If a daemon fails, the D-Bus error-style error
                   code. Example: "BUSERROR=org.freedesktop.DBus.Error.TimedOut"
 
-     MAINPID=...  The main pid of a daemon, in case systemd did not
-                  fork off the process itself. Example: "MAINPID=4711"
-
      WATCHDOG=1   Tells systemd to update the watchdog timestamp.
                   Services using this feature should do this in
                   regular intervals. A watchdog framework can use the
                   timestamps to detect failed services. Also see
                   sd_watchdog_enabled() below.
+
+     WATCHDOG_USEC=...
+                  Reset watchdog_usec value during runtime.
+                  To reset watchdog_usec value, start the service again.
+                  Example: "WATCHDOG_USEC=20000000"
 
      FDSTORE=1    Store the file descriptors passed along with the
                   message in the per-service file descriptor store,
@@ -196,10 +218,14 @@ int sd_is_mq(int fd, const char *path);
                   invocation. This variable is only supported with
                   sd_pid_notify_with_fds().
 
-     WATCHDOG_USEC=...
-                  Reset watchdog_usec value during runtime.
-                  To reset watchdog_usec value, start the service again.
-                  Example: "WATCHDOG_USEC=20000000"
+     FDSTOREREMOVE=1
+                  Remove one or more file descriptors from the file
+                  descriptor store, identified by the name specified
+                  in FDNAME=, see below.
+
+     FDNAME=      A name to assign to new file descriptors stored in the
+                  file descriptor store, or the name of the file descriptors
+                  to remove in case of FDSTOREREMOVE=1.
 
   Daemons can choose to send additional variables. However, it is
   recommended to prefix variable names not listed above with X_.

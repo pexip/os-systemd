@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "sd-path.h"
 
@@ -23,6 +6,7 @@
 #include "architecture.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "missing.h"
 #include "path-util.h"
 #include "string-util.h"
@@ -77,7 +61,7 @@ static int from_home_dir(const char *envname, const char *suffix, char **buffer,
         if (endswith(h, "/"))
                 cc = strappend(h, suffix);
         else
-                cc = strjoin(h, "/", suffix, NULL);
+                cc = strjoin(h, "/", suffix);
         if (!cc)
                 return -ENOMEM;
 
@@ -91,7 +75,6 @@ static int from_user_dir(const char *field, char **buffer, const char **ret) {
         _cleanup_free_ char *b = NULL;
         _cleanup_free_ const char *fn = NULL;
         const char *c = NULL;
-        char line[LINE_MAX];
         size_t n;
         int r;
 
@@ -119,8 +102,15 @@ static int from_user_dir(const char *field, char **buffer, const char **ret) {
          * xdg-user-dirs does upstream */
 
         n = strlen(field);
-        FOREACH_LINE(line, f, return -errno) {
+        for (;;) {
+                _cleanup_free_ char *line = NULL;
                 char *l, *p, *e;
+
+                r = read_line(f, LONG_LINE_MAX, &line);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
 
                 l = strstrip(line);
 
@@ -219,10 +209,10 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
         switch (type) {
 
         case SD_PATH_TEMPORARY:
-                return from_environment("TMPDIR", "/tmp", ret);
+                return tmp_dir(ret);
 
         case SD_PATH_TEMPORARY_LARGE:
-                return from_environment("TMPDIR", "/var/tmp", ret);
+                return var_tmp_dir(ret);
 
         case SD_PATH_SYSTEM_BINARIES:
                 *ret = "/usr/bin";
@@ -346,6 +336,7 @@ _public_ int sd_path_home(uint64_t type, const char *suffix, char **path) {
 
         if (IN_SET(type,
                    SD_PATH_SEARCH_BINARIES,
+                   SD_PATH_SEARCH_BINARIES_DEFAULT,
                    SD_PATH_SEARCH_LIBRARY_PRIVATE,
                    SD_PATH_SEARCH_LIBRARY_ARCH,
                    SD_PATH_SEARCH_SHARED,
@@ -387,7 +378,7 @@ _public_ int sd_path_home(uint64_t type, const char *suffix, char **path) {
         if (endswith(ret, "/"))
                 cc = strappend(ret, suffix);
         else
-                cc = strjoin(ret, "/", suffix, NULL);
+                cc = strjoin(ret, "/", suffix);
 
         free(buffer);
 
@@ -455,7 +446,7 @@ static int search_from_environment(
                         if (endswith(e, "/"))
                                 h = strappend(e, home_suffix);
                         else
-                                h = strjoin(e, "/", home_suffix, NULL);
+                                h = strjoin(e, "/", home_suffix);
 
                         if (!h) {
                                 strv_free(l);
@@ -476,6 +467,12 @@ static int search_from_environment(
         return 0;
 }
 
+#if HAVE_SPLIT_BIN
+#  define ARRAY_SBIN_BIN(x) x "sbin", x "bin"
+#else
+#  define ARRAY_SBIN_BIN(x) x "bin"
+#endif
+
 static int get_search(uint64_t type, char ***list) {
 
         assert(list);
@@ -488,13 +485,10 @@ static int get_search(uint64_t type, char ***list) {
                                                ".local/bin",
                                                "PATH",
                                                true,
-                                               "/usr/local/sbin",
-                                               "/usr/local/bin",
-                                               "/usr/sbin",
-                                               "/usr/bin",
-#ifdef HAVE_SPLIT_USR
-                                               "/sbin",
-                                               "/bin",
+                                               ARRAY_SBIN_BIN("/usr/local/"),
+                                               ARRAY_SBIN_BIN("/usr/"),
+#if HAVE_SPLIT_USR
+                                               ARRAY_SBIN_BIN("/"),
 #endif
                                                NULL);
 
@@ -506,7 +500,7 @@ static int get_search(uint64_t type, char ***list) {
                                                false,
                                                "/usr/local/lib",
                                                "/usr/lib",
-#ifdef HAVE_SPLIT_USR
+#if HAVE_SPLIT_USR
                                                "/lib",
 #endif
                                                NULL);
@@ -518,7 +512,7 @@ static int get_search(uint64_t type, char ***list) {
                                                "LD_LIBRARY_PATH",
                                                true,
                                                LIBDIR,
-#ifdef HAVE_SPLIT_USR
+#if HAVE_SPLIT_USR
                                                ROOTLIBDIR,
 #endif
                                                NULL);
@@ -561,19 +555,31 @@ static int get_search(uint64_t type, char ***list) {
                                                false,
                                                "/etc",
                                                NULL);
-        }
+
+        case SD_PATH_SEARCH_BINARIES_DEFAULT: {
+                char **t;
+
+                t = strv_split_nulstr(DEFAULT_PATH_NULSTR);
+                if (!t)
+                        return -ENOMEM;
+
+                *list = t;
+                return 0;
+        }}
 
         return -EOPNOTSUPP;
 }
 
 _public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
-        char **l, **i, **j, **n;
+        char **i, **j;
+        _cleanup_strv_free_ char **l = NULL, **n = NULL;
         int r;
 
         assert_return(paths, -EINVAL);
 
         if (!IN_SET(type,
                     SD_PATH_SEARCH_BINARIES,
+                    SD_PATH_SEARCH_BINARIES_DEFAULT,
                     SD_PATH_SEARCH_LIBRARY_PRIVATE,
                     SD_PATH_SEARCH_LIBRARY_ARCH,
                     SD_PATH_SEARCH_SHARED,
@@ -596,7 +602,7 @@ _public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
                 l[0] = p;
                 l[1] = NULL;
 
-                *paths = l;
+                *paths = TAKE_PTR(l);
                 return 0;
         }
 
@@ -605,15 +611,13 @@ _public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
                 return r;
 
         if (!suffix) {
-                *paths = l;
+                *paths = TAKE_PTR(l);
                 return 0;
         }
 
         n = new(char*, strv_length(l)+1);
-        if (!n) {
-                strv_free(l);
+        if (!n)
                 return -ENOMEM;
-        }
 
         j = n;
         STRV_FOREACH(i, l) {
@@ -621,18 +625,15 @@ _public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
                 if (endswith(*i, "/"))
                         *j = strappend(*i, suffix);
                 else
-                        *j = strjoin(*i, "/", suffix, NULL);
+                        *j = strjoin(*i, "/", suffix);
 
-                if (!*j) {
-                        strv_free(l);
-                        strv_free(n);
+                if (!*j)
                         return -ENOMEM;
-                }
 
                 j++;
         }
 
         *j = NULL;
-        *paths = n;
+        *paths = TAKE_PTR(n);
         return 0;
 }

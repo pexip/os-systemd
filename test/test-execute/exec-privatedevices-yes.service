@@ -1,7 +1,7 @@
 [Unit]
-Description=Test for PrivateDev=yes
+Description=Test for PrivateDevices=yes
 
 [Service]
-ExecStart=/bin/sh -c 'test ! -c /dev/mem'
+ExecStart=/bin/sh -c 'test ! -c /dev/kmsg'
 Type=oneshot
 PrivateDevices=yes

@@ -1,31 +1,15 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <string.h>
 #include <unistd.h>
 
 #include "cgroup-util.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "string-util.h"
 #include "util.h"
 
-int main(int argc, char*argv[]) {
+int main(int argc, char *argv[]) {
         char *path;
         char *c, *p;
 
@@ -35,19 +19,19 @@ int main(int argc, char*argv[]) {
         assert_se(cg_create(SYSTEMD_CGROUP_CONTROLLER, "/test-b/test-c") == 0);
         assert_se(cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, "/test-b", 0) == 0);
 
-        assert_se(cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, getpid(), &path) == 0);
+        assert_se(cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, getpid_cached(), &path) == 0);
         assert_se(streq(path, "/test-b"));
         free(path);
 
         assert_se(cg_attach(SYSTEMD_CGROUP_CONTROLLER, "/test-a", 0) == 0);
 
-        assert_se(cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, getpid(), &path) == 0);
+        assert_se(cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, getpid_cached(), &path) == 0);
         assert_se(path_equal(path, "/test-a"));
         free(path);
 
         assert_se(cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, "/test-b/test-d", 0) == 0);
 
-        assert_se(cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, getpid(), &path) == 0);
+        assert_se(cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, getpid_cached(), &path) == 0);
         assert_se(path_equal(path, "/test-b/test-d"));
         free(path);
 

@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <stdlib.h>
@@ -27,8 +10,10 @@
 #include "macro.h"
 #include "utf8.h"
 
-size_t cescape_char(char c, char *buf) {
-        char * buf_old = buf;
+int cescape_char(char c, char *buf) {
+        char *buf_old = buf;
+
+        /* Needs space for 4 characters in the buffer */
 
         switch (c) {
 
@@ -121,7 +106,6 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) 
         int r = 1;
 
         assert(p);
-        assert(*p);
         assert(ret);
 
         /* Unescapes C style. Returns the unescaped character in ret.
@@ -200,7 +184,7 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) 
                 /* C++11 style 16bit unicode */
 
                 int a[4];
-                unsigned i;
+                size_t i;
                 uint32_t c;
 
                 if (length != (size_t) -1 && length < 5)
@@ -227,7 +211,7 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) 
                 /* C++11 style 32bit unicode */
 
                 int a[8];
-                unsigned i;
+                size_t i;
                 char32_t c;
 
                 if (length != (size_t) -1 && length < 9)
@@ -314,7 +298,7 @@ int cunescape_length_with_prefix(const char *s, size_t length, const char *prefi
 
         /* Undoes C style string escaping, and optionally prefixes it. */
 
-        pl = prefix ? strlen(prefix) : 0;
+        pl = strlen_ptr(prefix);
 
         r = new(char, pl+length+1);
         if (!r)
@@ -426,7 +410,7 @@ char *octescape(const char *s, size_t len) {
 
         for (f = s, t = r; f < s + len; f++) {
 
-                if (*f < ' ' || *f >= 127 || *f == '\\' || *f == '"') {
+                if (*f < ' ' || *f >= 127 || IN_SET(*f, '\\', '"')) {
                         *(t++) = '\\';
                         *(t++) = '0' + (*f >> 6);
                         *(t++) = '0' + ((*f >> 3) & 8);
@@ -441,10 +425,16 @@ char *octescape(const char *s, size_t len) {
 
 }
 
-static char *strcpy_backslash_escaped(char *t, const char *s, const char *bad) {
+static char *strcpy_backslash_escaped(char *t, const char *s, const char *bad, bool escape_tab_nl) {
         assert(bad);
 
         for (; *s; s++) {
+                if (escape_tab_nl && IN_SET(*s, '\n', '\t')) {
+                        *(t++) = '\\';
+                        *(t++) = *s == '\n' ? 'n' : 't';
+                        continue;
+                }
+
                 if (*s == '\\' || strchr(bad, *s))
                         *(t++) = '\\';
 
@@ -461,20 +451,21 @@ char *shell_escape(const char *s, const char *bad) {
         if (!r)
                 return NULL;
 
-        t = strcpy_backslash_escaped(r, s, bad);
+        t = strcpy_backslash_escaped(r, s, bad, false);
         *t = 0;
 
         return r;
 }
 
-char *shell_maybe_quote(const char *s) {
+char* shell_maybe_quote(const char *s, EscapeStyle style) {
         const char *p;
         char *r, *t;
 
         assert(s);
 
-        /* Encloses a string in double quotes if necessary to make it
-         * OK as shell string. */
+        /* Encloses a string in quotes if necessary to make it OK as a shell
+         * string. Note that we treat benign UTF-8 characters as needing
+         * escaping too, but that should be OK. */
 
         for (p = s; *p; p++)
                 if (*p <= ' ' ||
@@ -485,17 +476,30 @@ char *shell_maybe_quote(const char *s) {
         if (!*p)
                 return strdup(s);
 
-        r = new(char, 1+strlen(s)*2+1+1);
+        r = new(char, (style == ESCAPE_POSIX) + 1 + strlen(s)*2 + 1 + 1);
         if (!r)
                 return NULL;
 
         t = r;
-        *(t++) = '"';
+        if (style == ESCAPE_BACKSLASH)
+                *(t++) = '"';
+        else if (style == ESCAPE_POSIX) {
+                *(t++) = '$';
+                *(t++) = '\'';
+        } else
+                assert_not_reached("Bad EscapeStyle");
+
         t = mempcpy(t, s, p - s);
 
-        t = strcpy_backslash_escaped(t, p, SHELL_NEED_ESCAPE);
+        if (style == ESCAPE_BACKSLASH)
+                t = strcpy_backslash_escaped(t, p, SHELL_NEED_ESCAPE, false);
+        else
+                t = strcpy_backslash_escaped(t, p, SHELL_NEED_ESCAPE_POSIX, true);
 
-        *(t++)= '"';
+        if (style == ESCAPE_BACKSLASH)
+                *(t++) = '"';
+        else
+                *(t++) = '\'';
         *t = 0;
 
         return r;

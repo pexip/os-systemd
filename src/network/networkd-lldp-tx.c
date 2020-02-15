@@ -1,32 +1,16 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2016 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <endian.h>
 #include <inttypes.h>
 #include <string.h>
 
 #include "alloc-util.h"
+#include "env-file.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "hostname-util.h"
+#include "missing_network.h"
 #include "networkd-lldp-tx.h"
-#include "networkd.h"
+#include "networkd-manager.h"
 #include "parse-util.h"
 #include "random-util.h"
 #include "socket-util.h"
@@ -197,10 +181,9 @@ static int lldp_make_packet(
 
         assert(p == (uint8_t*) packet + l);
 
-        *ret = packet;
+        *ret = TAKE_PTR(packet);
         *sz = l;
 
-        packet = NULL;
         return 0;
 }
 
@@ -262,7 +245,7 @@ static int link_send_lldp(Link *link) {
                 return r;
 
         (void) gethostname_strict(&hostname);
-        (void) parse_env_file("/etc/machine-info", NEWLINE, "PRETTY_HOSTNAME", &pretty_hostname, NULL);
+        (void) parse_env_file(NULL, "/etc/machine-info", "PRETTY_HOSTNAME", &pretty_hostname);
 
         assert_cc(LLDP_TX_INTERVAL_USEC * LLDP_TX_HOLD + 1 <= (UINT16_MAX - 1) * USEC_PER_SEC);
         ttl = DIV_ROUND_UP(LLDP_TX_INTERVAL_USEC * LLDP_TX_HOLD + 1, USEC_PER_SEC);

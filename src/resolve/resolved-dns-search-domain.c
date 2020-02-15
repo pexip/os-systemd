@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
 #include "dns-domain.h"
@@ -36,7 +19,7 @@ int dns_search_domain_new(
         assert((type == DNS_SEARCH_DOMAIN_LINK) == !!l);
         assert(name);
 
-        r = dns_name_normalize(name, &normalized);
+        r = dns_name_normalize(name, 0, &normalized);
         if (r < 0)
                 return r;
 
@@ -55,8 +38,7 @@ int dns_search_domain_new(
         d->n_ref = 1;
         d->manager = m;
         d->type = type;
-        d->name = normalized;
-        normalized = NULL;
+        d->name = TAKE_PTR(normalized);
 
         switch (type) {
 
@@ -83,29 +65,14 @@ int dns_search_domain_new(
         return 0;
 }
 
-DnsSearchDomain* dns_search_domain_ref(DnsSearchDomain *d) {
-        if (!d)
-                return NULL;
-
-        assert(d->n_ref > 0);
-        d->n_ref++;
-
-        return d;
-}
-
-DnsSearchDomain* dns_search_domain_unref(DnsSearchDomain *d) {
-        if (!d)
-                return NULL;
-
-        assert(d->n_ref > 0);
-        d->n_ref--;
-
-        if (d->n_ref > 0)
-                return NULL;
+static DnsSearchDomain* dns_search_domain_free(DnsSearchDomain *d) {
+        assert(d);
 
         free(d->name);
         return mfree(d);
 }
+
+DEFINE_TRIVIAL_REF_UNREF_FUNC(DnsSearchDomain, dns_search_domain, dns_search_domain_free);
 
 void dns_search_domain_unlink(DnsSearchDomain *d) {
         assert(d);

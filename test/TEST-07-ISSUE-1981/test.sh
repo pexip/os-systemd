@@ -1,21 +1,13 @@
 #!/bin/bash
 # -*- mode: shell-script; indent-tabs-mode: nil; sh-basic-offset: 4; -*-
 # ex: ts=8 sw=4 sts=4 et filetype=sh
+set -e
 TEST_DESCRIPTION="https://github.com/systemd/systemd/issues/1981"
+TEST_NO_QEMU=1
 
 . $TEST_BASE_DIR/test-functions
 
 NSPAWN_TIMEOUT=30s
-
-test_run() {
-    dwarn "skipping QEMU"
-    if run_nspawn; then
-        check_result_nspawn || return 1
-    else
-        dwarn "can't run systemd-nspawn, skipping"
-    fi
-    return 0
-}
 
 test_setup() {
     create_empty_image
@@ -29,11 +21,18 @@ test_setup() {
 
         setup_basic_environment
 
+        # mask some services that we do not want to run in these tests
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-hwdb-update.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-journal-catalog-update.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-networkd.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-networkd.socket
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-resolved.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-machined.service
+
         # setup the testsuite service
         cat >$initdir/etc/systemd/system/testsuite.service <<EOF
 [Unit]
 Description=Testsuite service
-After=multi-user.target
 
 [Service]
 ExecStart=/test-segfault.sh
@@ -48,12 +47,6 @@ EOF
 
     ddebug "umount $TESTDIR/root"
     umount $TESTDIR/root
-}
-
-test_cleanup() {
-    umount $TESTDIR/root 2>/dev/null
-    [[ $LOOPDEV ]] && losetup -d $LOOPDEV
-    return 0
 }
 
 do_test "$@"

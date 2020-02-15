@@ -1,27 +1,12 @@
-/***
-  This file is part of systemd.
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 #include "log.h"
 #include "namespace.h"
+#include "tests.h"
 
 int main(int argc, char *argv[]) {
         const char * const writable[] = {
@@ -46,7 +31,7 @@ int main(int argc, char *argv[]) {
                 NULL
         };
 
-        static const NameSpaceInfo ns_info = {
+        static const NamespaceInfo ns_info = {
                 .private_dev = true,
                 .protect_control_groups = true,
                 .protect_kernel_tunables = true,
@@ -59,7 +44,7 @@ int main(int argc, char *argv[]) {
         char tmp_dir[] = "/tmp/systemd-private-XXXXXX",
              var_tmp_dir[] = "/var/tmp/systemd-private-XXXXXX";
 
-        log_set_max_level(LOG_DEBUG);
+        test_setup_logging(LOG_DEBUG);
 
         assert_se(mkdtemp(tmp_dir));
         assert_se(mkdtemp(var_tmp_dir));
@@ -77,14 +62,19 @@ int main(int argc, char *argv[]) {
                 log_info("Not chrooted");
 
         r = setup_namespace(root_directory,
+                            NULL,
                             &ns_info,
                             (char **) writable,
                             (char **) readonly,
                             (char **) inaccessible,
+                            NULL,
+                            &(BindMount) { .source = (char*) "/usr/bin", .destination = (char*) "/etc/systemd", .read_only = true }, 1,
+                            &(TemporaryFileSystem) { .path = (char*) "/var", .options = (char*) "ro" }, 1,
                             tmp_dir,
                             var_tmp_dir,
                             PROTECT_HOME_NO,
                             PROTECT_SYSTEM_NO,
+                            0,
                             0);
         if (r < 0) {
                 log_error_errno(r, "Failed to setup namespace: %m");

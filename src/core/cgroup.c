@@ -1,26 +1,14 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <fcntl.h>
 #include <fnmatch.h>
 
 #include "alloc-util.h"
+#include "blockdev-util.h"
+#include "bpf-firewall.h"
+#include "btrfs-util.h"
+#include "bpf-devices.h"
+#include "bus-error.h"
 #include "cgroup-util.h"
 #include "cgroup.h"
 #include "fd-util.h"
@@ -29,12 +17,60 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "procfs-util.h"
 #include "special.h"
+#include "stat-util.h"
+#include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
-#include "stdio-util.h"
+#include "virt.h"
 
 #define CGROUP_CPU_QUOTA_PERIOD_USEC ((usec_t) 100 * USEC_PER_MSEC)
+
+/* Returns the log level to use when cgroup attribute writes fail. When an attribute is missing or we have access
+ * problems we downgrade to LOG_DEBUG. This is supposed to be nice to container managers and kernels which want to mask
+ * out specific attributes from us. */
+#define LOG_LEVEL_CGROUP_WRITE(r) (IN_SET(abs(r), ENOENT, EROFS, EACCES, EPERM) ? LOG_DEBUG : LOG_WARNING)
+
+bool manager_owns_host_root_cgroup(Manager *m) {
+        assert(m);
+
+        /* Returns true if we are managing the root cgroup. Note that it isn't sufficient to just check whether the
+         * group root path equals "/" since that will also be the case if CLONE_NEWCGROUP is in the mix. Since there's
+         * appears to be no nice way to detect whether we are in a CLONE_NEWCGROUP namespace we instead just check if
+         * we run in any kind of container virtualization. */
+
+        if (MANAGER_IS_USER(m))
+                return false;
+
+        if (detect_container() > 0)
+                return false;
+
+        return empty_or_root(m->cgroup_root);
+}
+
+bool unit_has_host_root_cgroup(Unit *u) {
+        assert(u);
+
+        /* Returns whether this unit manages the root cgroup. This will return true if this unit is the root slice and
+         * the manager manages the root cgroup. */
+
+        if (!manager_owns_host_root_cgroup(u->manager))
+                return false;
+
+        return unit_has_name(u, SPECIAL_ROOT_SLICE);
+}
+
+static int set_attribute_and_warn(Unit *u, const char *controller, const char *attribute, const char *value) {
+        int r;
+
+        r = cg_set_attribute(controller, u->cgroup_path, attribute, value);
+        if (r < 0)
+                log_unit_full(u, LOG_LEVEL_CGROUP_WRITE(r), r, "Failed to set '%s' attribute on '%s' to '%.*s': %m",
+                              strna(attribute), isempty(u->cgroup_path) ? "/" : u->cgroup_path, (int) strcspn(value, NEWLINE), value);
+
+        return r;
+}
 
 static void cgroup_compat_warn(void) {
         static bool cgroup_compat_warned = false;
@@ -42,7 +78,9 @@ static void cgroup_compat_warn(void) {
         if (cgroup_compat_warned)
                 return;
 
-        log_warning("cgroup compatibility translation between legacy and unified hierarchy settings activated. See cgroup-compat debug messages for details.");
+        log_warning("cgroup compatibility translation between legacy and unified hierarchy settings activated. "
+                    "See cgroup-compat debug messages for details.");
+
         cgroup_compat_warned = true;
 }
 
@@ -54,29 +92,30 @@ static void cgroup_compat_warn(void) {
 void cgroup_context_init(CGroupContext *c) {
         assert(c);
 
-        /* Initialize everything to the kernel defaults, assuming the
-         * structure is preinitialized to 0 */
+        /* Initialize everything to the kernel defaults. */
 
-        c->cpu_weight = CGROUP_WEIGHT_INVALID;
-        c->startup_cpu_weight = CGROUP_WEIGHT_INVALID;
-        c->cpu_quota_per_sec_usec = USEC_INFINITY;
+        *c = (CGroupContext) {
+                .cpu_weight = CGROUP_WEIGHT_INVALID,
+                .startup_cpu_weight = CGROUP_WEIGHT_INVALID,
+                .cpu_quota_per_sec_usec = USEC_INFINITY,
 
-        c->cpu_shares = CGROUP_CPU_SHARES_INVALID;
-        c->startup_cpu_shares = CGROUP_CPU_SHARES_INVALID;
+                .cpu_shares = CGROUP_CPU_SHARES_INVALID,
+                .startup_cpu_shares = CGROUP_CPU_SHARES_INVALID,
 
-        c->memory_high = CGROUP_LIMIT_MAX;
-        c->memory_max = CGROUP_LIMIT_MAX;
-        c->memory_swap_max = CGROUP_LIMIT_MAX;
+                .memory_high = CGROUP_LIMIT_MAX,
+                .memory_max = CGROUP_LIMIT_MAX,
+                .memory_swap_max = CGROUP_LIMIT_MAX,
 
-        c->memory_limit = CGROUP_LIMIT_MAX;
+                .memory_limit = CGROUP_LIMIT_MAX,
 
-        c->io_weight = CGROUP_WEIGHT_INVALID;
-        c->startup_io_weight = CGROUP_WEIGHT_INVALID;
+                .io_weight = CGROUP_WEIGHT_INVALID,
+                .startup_io_weight = CGROUP_WEIGHT_INVALID,
 
-        c->blockio_weight = CGROUP_BLKIO_WEIGHT_INVALID;
-        c->startup_blockio_weight = CGROUP_BLKIO_WEIGHT_INVALID;
+                .blockio_weight = CGROUP_BLKIO_WEIGHT_INVALID,
+                .startup_blockio_weight = CGROUP_BLKIO_WEIGHT_INVALID,
 
-        c->tasks_max = (uint64_t) -1;
+                .tasks_max = CGROUP_LIMIT_MAX,
+        };
 }
 
 void cgroup_context_free_device_allow(CGroupContext *c, CGroupDeviceAllow *a) {
@@ -95,6 +134,15 @@ void cgroup_context_free_io_device_weight(CGroupContext *c, CGroupIODeviceWeight
         LIST_REMOVE(device_weights, c->io_device_weights, w);
         free(w->path);
         free(w);
+}
+
+void cgroup_context_free_io_device_latency(CGroupContext *c, CGroupIODeviceLatency *l) {
+        assert(c);
+        assert(l);
+
+        LIST_REMOVE(device_latencies, c->io_device_latencies, l);
+        free(l->path);
+        free(l);
 }
 
 void cgroup_context_free_io_device_limit(CGroupContext *c, CGroupIODeviceLimit *l) {
@@ -130,6 +178,9 @@ void cgroup_context_done(CGroupContext *c) {
         while (c->io_device_weights)
                 cgroup_context_free_io_device_weight(c, c->io_device_weights);
 
+        while (c->io_device_latencies)
+                cgroup_context_free_io_device_latency(c, c->io_device_latencies);
+
         while (c->io_device_limits)
                 cgroup_context_free_io_device_limit(c, c->io_device_limits);
 
@@ -141,14 +192,19 @@ void cgroup_context_done(CGroupContext *c) {
 
         while (c->device_allow)
                 cgroup_context_free_device_allow(c, c->device_allow);
+
+        c->ip_address_allow = ip_address_access_free_all(c->ip_address_allow);
+        c->ip_address_deny = ip_address_access_free_all(c->ip_address_deny);
 }
 
 void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
         CGroupIODeviceLimit *il;
         CGroupIODeviceWeight *iw;
+        CGroupIODeviceLatency *l;
         CGroupBlockIODeviceBandwidth *b;
         CGroupBlockIODeviceWeight *w;
         CGroupDeviceAllow *a;
+        IPAddressAccessItem *iaai;
         char u[FORMAT_TIMESPAN_MAX];
 
         assert(c);
@@ -162,6 +218,7 @@ void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
                 "%sBlockIOAccounting=%s\n"
                 "%sMemoryAccounting=%s\n"
                 "%sTasksAccounting=%s\n"
+                "%sIPAccounting=%s\n"
                 "%sCPUWeight=%" PRIu64 "\n"
                 "%sStartupCPUWeight=%" PRIu64 "\n"
                 "%sCPUShares=%" PRIu64 "\n"
@@ -171,6 +228,7 @@ void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
                 "%sStartupIOWeight=%" PRIu64 "\n"
                 "%sBlockIOWeight=%" PRIu64 "\n"
                 "%sStartupBlockIOWeight=%" PRIu64 "\n"
+                "%sMemoryMin=%" PRIu64 "\n"
                 "%sMemoryLow=%" PRIu64 "\n"
                 "%sMemoryHigh=%" PRIu64 "\n"
                 "%sMemoryMax=%" PRIu64 "\n"
@@ -184,6 +242,7 @@ void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
                 prefix, yes_no(c->blockio_accounting),
                 prefix, yes_no(c->memory_accounting),
                 prefix, yes_no(c->tasks_accounting),
+                prefix, yes_no(c->ip_accounting),
                 prefix, c->cpu_weight,
                 prefix, c->startup_cpu_weight,
                 prefix, c->cpu_shares,
@@ -193,6 +252,7 @@ void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
                 prefix, c->startup_io_weight,
                 prefix, c->blockio_weight,
                 prefix, c->startup_blockio_weight,
+                prefix, c->memory_min,
                 prefix, c->memory_low,
                 prefix, c->memory_high,
                 prefix, c->memory_max,
@@ -201,6 +261,16 @@ void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
                 prefix, c->tasks_max,
                 prefix, cgroup_device_policy_to_string(c->device_policy),
                 prefix, yes_no(c->delegate));
+
+        if (c->delegate) {
+                _cleanup_free_ char *t = NULL;
+
+                (void) cg_mask_to_string(c->delegate_controllers, &t);
+
+                fprintf(f, "%sDelegateControllers=%s\n",
+                        prefix,
+                        strempty(t));
+        }
 
         LIST_FOREACH(device_allow, a, c->device_allow)
                 fprintf(f,
@@ -211,10 +281,17 @@ void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
 
         LIST_FOREACH(device_weights, iw, c->io_device_weights)
                 fprintf(f,
-                        "%sIODeviceWeight=%s %" PRIu64,
+                        "%sIODeviceWeight=%s %" PRIu64 "\n",
                         prefix,
                         iw->path,
                         iw->weight);
+
+        LIST_FOREACH(device_latencies, l, c->io_device_latencies)
+                fprintf(f,
+                        "%sIODeviceLatencyTargetSec=%s %s\n",
+                        prefix,
+                        l->path,
+                        format_timespan(u, sizeof(u), l->target_usec, 1));
 
         LIST_FOREACH(device_limits, il, c->io_device_limits) {
                 char buf[FORMAT_BYTES_MAX];
@@ -253,88 +330,237 @@ void cgroup_context_dump(CGroupContext *c, FILE* f, const char *prefix) {
                                 b->path,
                                 format_bytes(buf, sizeof(buf), b->wbps));
         }
+
+        LIST_FOREACH(items, iaai, c->ip_address_allow) {
+                _cleanup_free_ char *k = NULL;
+
+                (void) in_addr_to_string(iaai->family, &iaai->address, &k);
+                fprintf(f, "%sIPAddressAllow=%s/%u\n", prefix, strnull(k), iaai->prefixlen);
+        }
+
+        LIST_FOREACH(items, iaai, c->ip_address_deny) {
+                _cleanup_free_ char *k = NULL;
+
+                (void) in_addr_to_string(iaai->family, &iaai->address, &k);
+                fprintf(f, "%sIPAddressDeny=%s/%u\n", prefix, strnull(k), iaai->prefixlen);
+        }
 }
 
-static int lookup_block_device(const char *p, dev_t *dev) {
-        struct stat st;
-        int r;
+int cgroup_add_device_allow(CGroupContext *c, const char *dev, const char *mode) {
+        _cleanup_free_ CGroupDeviceAllow *a = NULL;
+        _cleanup_free_ char *d = NULL;
 
-        assert(p);
+        assert(c);
         assert(dev);
+        assert(isempty(mode) || in_charset(mode, "rwm"));
 
-        r = stat(p, &st);
-        if (r < 0)
-                return log_warning_errno(errno, "Couldn't stat device %s: %m", p);
+        a = new(CGroupDeviceAllow, 1);
+        if (!a)
+                return -ENOMEM;
 
-        if (S_ISBLK(st.st_mode))
-                *dev = st.st_rdev;
-        else if (major(st.st_dev) != 0) {
-                /* If this is not a device node then find the block
-                 * device this file is stored on */
-                *dev = st.st_dev;
+        d = strdup(dev);
+        if (!d)
+                return -ENOMEM;
 
-                /* If this is a partition, try to get the originating
-                 * block device */
-                block_get_whole_disk(*dev, dev);
-        } else {
-                log_warning("%s is not a block device and file system block device cannot be determined or is not local.", p);
-                return -ENODEV;
-        }
+        *a = (CGroupDeviceAllow) {
+                .path = TAKE_PTR(d),
+                .r = isempty(mode) || strchr(mode, 'r'),
+                .w = isempty(mode) || strchr(mode, 'w'),
+                .m = isempty(mode) || strchr(mode, 'm'),
+        };
+
+        LIST_PREPEND(device_allow, c->device_allow, a);
+        TAKE_PTR(a);
 
         return 0;
 }
 
-static int whitelist_device(const char *path, const char *node, const char *acc) {
-        char buf[2+DECIMAL_STR_MAX(dev_t)*2+2+4];
-        struct stat st;
+static void cgroup_xattr_apply(Unit *u) {
+        char ids[SD_ID128_STRING_MAX];
         int r;
 
-        assert(path);
-        assert(acc);
+        assert(u);
 
-        if (stat(node, &st) < 0) {
-                log_warning("Couldn't stat device %s", node);
-                return -errno;
-        }
+        if (!MANAGER_IS_SYSTEM(u->manager))
+                return;
 
-        if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode)) {
-                log_warning("%s is not a device.", node);
-                return -ENODEV;
-        }
+        if (sd_id128_is_null(u->invocation_id))
+                return;
 
-        sprintf(buf,
-                "%c %u:%u %s",
-                S_ISCHR(st.st_mode) ? 'c' : 'b',
-                major(st.st_rdev), minor(st.st_rdev),
-                acc);
-
-        r = cg_set_attribute("devices", path, "devices.allow", buf);
+        r = cg_set_xattr(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path,
+                         "trusted.invocation_id",
+                         sd_id128_to_string(u->invocation_id, ids), 32,
+                         0);
         if (r < 0)
-                log_full_errno(IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                               "Failed to set devices.allow on %s: %m", path);
-
-        return r;
+                log_unit_debug_errno(u, r, "Failed to set invocation ID on control group %s, ignoring: %m", u->cgroup_path);
 }
 
-static int whitelist_major(const char *path, const char *name, char type, const char *acc) {
-        _cleanup_fclose_ FILE *f = NULL;
-        char line[LINE_MAX];
-        bool good = false;
+static int lookup_block_device(const char *p, dev_t *ret) {
+        dev_t rdev, dev = 0;
+        mode_t mode;
+        int r;
+
+        assert(p);
+        assert(ret);
+
+        r = device_path_parse_major_minor(p, &mode, &rdev);
+        if (r == -ENODEV) { /* not a parsable device node, need to go to disk */
+                struct stat st;
+                if (stat(p, &st) < 0)
+                        return log_warning_errno(errno, "Couldn't stat device '%s': %m", p);
+                rdev = (dev_t)st.st_rdev;
+                dev = (dev_t)st.st_dev;
+                mode = st.st_mode;
+        } else if (r < 0)
+                return log_warning_errno(r, "Failed to parse major/minor from path '%s': %m", p);
+
+        if (S_ISCHR(mode)) {
+                log_warning("Device node '%s' is a character device, but block device needed.", p);
+                return -ENOTBLK;
+        } else if (S_ISBLK(mode))
+                *ret = rdev;
+        else if (major(dev) != 0)
+                *ret = dev; /* If this is not a device node then use the block device this file is stored on */
+        else {
+                /* If this is btrfs, getting the backing block device is a bit harder */
+                r = btrfs_get_block_device(p, ret);
+                if (r < 0 && r != -ENOTTY)
+                        return log_warning_errno(r, "Failed to determine block device backing btrfs file system '%s': %m", p);
+                if (r == -ENOTTY) {
+                        log_warning("'%s' is not a block device node, and file system block device cannot be determined or is not local.", p);
+                        return -ENODEV;
+                }
+        }
+
+        /* If this is a LUKS device, try to get the originating block device */
+        (void) block_get_originating(*ret, ret);
+
+        /* If this is a partition, try to get the originating block device */
+        (void) block_get_whole_disk(*ret, ret);
+        return 0;
+}
+
+static int whitelist_device(BPFProgram *prog, const char *path, const char *node, const char *acc) {
+        dev_t rdev;
+        mode_t mode;
         int r;
 
         assert(path);
         assert(acc);
-        assert(type == 'b' || type == 'c');
+
+        /* Some special handling for /dev/block/%u:%u, /dev/char/%u:%u, /run/systemd/inaccessible/chr and
+         * /run/systemd/inaccessible/blk paths. Instead of stat()ing these we parse out the major/minor directly. This
+         * means clients can use these path without the device node actually around */
+        r = device_path_parse_major_minor(node, &mode, &rdev);
+        if (r < 0) {
+                if (r != -ENODEV)
+                        return log_warning_errno(r, "Couldn't parse major/minor from device path '%s': %m", node);
+
+                struct stat st;
+                if (stat(node, &st) < 0)
+                        return log_warning_errno(errno, "Couldn't stat device %s: %m", node);
+
+                if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode)) {
+                        log_warning("%s is not a device.", node);
+                        return -ENODEV;
+                }
+                rdev = (dev_t) st.st_rdev;
+                mode = st.st_mode;
+        }
+
+        if (cg_all_unified() > 0) {
+                if (!prog)
+                        return 0;
+
+                return cgroup_bpf_whitelist_device(prog, S_ISCHR(mode) ? BPF_DEVCG_DEV_CHAR : BPF_DEVCG_DEV_BLOCK,
+                                                   major(rdev), minor(rdev), acc);
+
+        } else {
+                char buf[2+DECIMAL_STR_MAX(dev_t)*2+2+4];
+
+                sprintf(buf,
+                        "%c %u:%u %s",
+                        S_ISCHR(mode) ? 'c' : 'b',
+                        major(rdev), minor(rdev),
+                        acc);
+
+                /* Changing the devices list of a populated cgroup might result in EINVAL, hence ignore EINVAL here. */
+
+                r = cg_set_attribute("devices", path, "devices.allow", buf);
+                if (r < 0)
+                        return log_full_errno(IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES, -EPERM) ? LOG_DEBUG : LOG_WARNING,
+                                              r, "Failed to set devices.allow on %s: %m", path);
+
+                return 0;
+        }
+}
+
+static int whitelist_major(BPFProgram *prog, const char *path, const char *name, char type, const char *acc) {
+        _cleanup_fclose_ FILE *f = NULL;
+        char buf[2+DECIMAL_STR_MAX(unsigned)+3+4];
+        bool good = false;
+        unsigned maj;
+        int r;
+
+        assert(path);
+        assert(acc);
+        assert(IN_SET(type, 'b', 'c'));
+
+        if (streq(name, "*")) {
+                /* If the name is a wildcard, then apply this list to all devices of this type */
+
+                if (cg_all_unified() > 0) {
+                        if (!prog)
+                                return 0;
+
+                        (void) cgroup_bpf_whitelist_class(prog, type == 'c' ? BPF_DEVCG_DEV_CHAR : BPF_DEVCG_DEV_BLOCK, acc);
+                } else {
+                        xsprintf(buf, "%c *:* %s", type, acc);
+
+                        r = cg_set_attribute("devices", path, "devices.allow", buf);
+                        if (r < 0)
+                                log_full_errno(IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
+                                               "Failed to set devices.allow on %s: %m", path);
+                        return 0;
+                }
+        }
+
+        if (safe_atou(name, &maj) >= 0 && DEVICE_MAJOR_VALID(maj)) {
+                /* The name is numeric and suitable as major. In that case, let's take is major, and create the entry
+                 * directly */
+
+                if (cg_all_unified() > 0) {
+                        if (!prog)
+                                return 0;
+
+                        (void) cgroup_bpf_whitelist_major(prog,
+                                                          type == 'c' ? BPF_DEVCG_DEV_CHAR : BPF_DEVCG_DEV_BLOCK,
+                                                          maj, acc);
+                } else {
+                        xsprintf(buf, "%c %u:* %s", type, maj, acc);
+
+                        r = cg_set_attribute("devices", path, "devices.allow", buf);
+                        if (r < 0)
+                                log_full_errno(IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
+                                               "Failed to set devices.allow on %s: %m", path);
+                }
+
+                return 0;
+        }
 
         f = fopen("/proc/devices", "re");
         if (!f)
                 return log_warning_errno(errno, "Cannot open /proc/devices to resolve %s (%c): %m", name, type);
 
-        FOREACH_LINE(line, f, goto fail) {
-                char buf[2+DECIMAL_STR_MAX(unsigned)+3+4], *p, *w;
-                unsigned maj;
+        for (;;) {
+                _cleanup_free_ char *line = NULL;
+                char *w, *p;
 
-                truncate_nl(line);
+                r = read_line(f, LONG_LINE_MAX, &line);
+                if (r < 0)
+                        return log_warning_errno(r, "Failed to read /proc/devices: %m");
+                if (r == 0)
+                        break;
 
                 if (type == 'c' && streq(line, "Character devices:")) {
                         good = true;
@@ -373,23 +599,31 @@ static int whitelist_major(const char *path, const char *name, char type, const 
                 if (fnmatch(name, w, 0) != 0)
                         continue;
 
-                sprintf(buf,
-                        "%c %u:* %s",
-                        type,
-                        maj,
-                        acc);
+                if (cg_all_unified() > 0) {
+                        if (!prog)
+                                continue;
 
-                r = cg_set_attribute("devices", path, "devices.allow", buf);
-                if (r < 0)
-                        log_full_errno(IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                                       "Failed to set devices.allow on %s: %m", path);
+                        (void) cgroup_bpf_whitelist_major(prog,
+                                                          type == 'c' ? BPF_DEVCG_DEV_CHAR : BPF_DEVCG_DEV_BLOCK,
+                                                          maj, acc);
+                } else {
+                        sprintf(buf,
+                                "%c %u:* %s",
+                                type,
+                                maj,
+                                acc);
+
+                        /* Changing the devices list of a populated cgroup might result in EINVAL, hence ignore EINVAL
+                         * here. */
+
+                        r = cg_set_attribute("devices", path, "devices.allow", buf);
+                        if (r < 0)
+                                log_full_errno(IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES, -EPERM) ? LOG_DEBUG : LOG_WARNING,
+                                               r, "Failed to set devices.allow on %s: %m", path);
+                }
         }
 
         return 0;
-
-fail:
-        log_warning_errno(errno, "Failed to read /proc/devices: %m");
-        return -errno;
 }
 
 static bool cgroup_context_has_cpu_weight(CGroupContext *c) {
@@ -422,53 +656,42 @@ static uint64_t cgroup_context_cpu_shares(CGroupContext *c, ManagerState state) 
                 return CGROUP_CPU_SHARES_DEFAULT;
 }
 
-static void cgroup_apply_unified_cpu_config(Unit *u, uint64_t weight, uint64_t quota) {
-        char buf[MAX(DECIMAL_STR_MAX(uint64_t) + 1, (DECIMAL_STR_MAX(usec_t) + 1) * 2)];
-        int r;
+static void cgroup_apply_unified_cpu_weight(Unit *u, uint64_t weight) {
+        char buf[DECIMAL_STR_MAX(uint64_t) + 2];
 
         xsprintf(buf, "%" PRIu64 "\n", weight);
-        r = cg_set_attribute("cpu", u->cgroup_path, "cpu.weight", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set cpu.weight: %m");
+        (void) set_attribute_and_warn(u, "cpu", "cpu.weight", buf);
+}
+
+static void cgroup_apply_unified_cpu_quota(Unit *u, usec_t quota) {
+        char buf[(DECIMAL_STR_MAX(usec_t) + 1) * 2 + 1];
 
         if (quota != USEC_INFINITY)
                 xsprintf(buf, USEC_FMT " " USEC_FMT "\n",
                          quota * CGROUP_CPU_QUOTA_PERIOD_USEC / USEC_PER_SEC, CGROUP_CPU_QUOTA_PERIOD_USEC);
         else
                 xsprintf(buf, "max " USEC_FMT "\n", CGROUP_CPU_QUOTA_PERIOD_USEC);
-
-        r = cg_set_attribute("cpu", u->cgroup_path, "cpu.max", buf);
-
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set cpu.max: %m");
+        (void) set_attribute_and_warn(u, "cpu", "cpu.max", buf);
 }
 
-static void cgroup_apply_legacy_cpu_config(Unit *u, uint64_t shares, uint64_t quota) {
-        char buf[MAX(DECIMAL_STR_MAX(uint64_t), DECIMAL_STR_MAX(usec_t)) + 1];
-        int r;
+static void cgroup_apply_legacy_cpu_shares(Unit *u, uint64_t shares) {
+        char buf[DECIMAL_STR_MAX(uint64_t) + 2];
 
         xsprintf(buf, "%" PRIu64 "\n", shares);
-        r = cg_set_attribute("cpu", u->cgroup_path, "cpu.shares", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set cpu.shares: %m");
+        (void) set_attribute_and_warn(u, "cpu", "cpu.shares", buf);
+}
+
+static void cgroup_apply_legacy_cpu_quota(Unit *u, usec_t quota) {
+        char buf[DECIMAL_STR_MAX(usec_t) + 2];
 
         xsprintf(buf, USEC_FMT "\n", CGROUP_CPU_QUOTA_PERIOD_USEC);
-        r = cg_set_attribute("cpu", u->cgroup_path, "cpu.cfs_period_us", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set cpu.cfs_period_us: %m");
+        (void) set_attribute_and_warn(u, "cpu", "cpu.cfs_period_us", buf);
 
         if (quota != USEC_INFINITY) {
                 xsprintf(buf, USEC_FMT "\n", quota * CGROUP_CPU_QUOTA_PERIOD_USEC / USEC_PER_SEC);
-                r = cg_set_attribute("cpu", u->cgroup_path, "cpu.cfs_quota_us", buf);
+                (void) set_attribute_and_warn(u, "cpu", "cpu.cfs_quota_us", buf);
         } else
-                r = cg_set_attribute("cpu", u->cgroup_path, "cpu.cfs_quota_us", "-1");
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set cpu.cfs_quota_us: %m");
+                (void) set_attribute_and_warn(u, "cpu", "cpu.cfs_quota_us", "-1\n");
 }
 
 static uint64_t cgroup_cpu_shares_to_weight(uint64_t shares) {
@@ -486,6 +709,7 @@ static bool cgroup_context_has_io_config(CGroupContext *c) {
                 c->io_weight != CGROUP_WEIGHT_INVALID ||
                 c->startup_io_weight != CGROUP_WEIGHT_INVALID ||
                 c->io_device_weights ||
+                c->io_device_latencies ||
                 c->io_device_limits;
 }
 
@@ -537,10 +761,7 @@ static void cgroup_apply_io_device_weight(Unit *u, const char *dev_path, uint64_
                 return;
 
         xsprintf(buf, "%u:%u %" PRIu64 "\n", major(dev), minor(dev), io_weight);
-        r = cg_set_attribute("io", u->cgroup_path, "io.weight", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set io.weight: %m");
+        (void) set_attribute_and_warn(u, "io", "io.weight", buf);
 }
 
 static void cgroup_apply_blkio_device_weight(Unit *u, const char *dev_path, uint64_t blkio_weight) {
@@ -553,215 +774,221 @@ static void cgroup_apply_blkio_device_weight(Unit *u, const char *dev_path, uint
                 return;
 
         xsprintf(buf, "%u:%u %" PRIu64 "\n", major(dev), minor(dev), blkio_weight);
-        r = cg_set_attribute("blkio", u->cgroup_path, "blkio.weight_device", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set blkio.weight_device: %m");
+        (void) set_attribute_and_warn(u, "blkio", "blkio.weight_device", buf);
 }
 
-static unsigned cgroup_apply_io_device_limit(Unit *u, const char *dev_path, uint64_t *limits) {
+static void cgroup_apply_io_device_latency(Unit *u, const char *dev_path, usec_t target) {
+        char buf[DECIMAL_STR_MAX(dev_t)*2+2+7+DECIMAL_STR_MAX(uint64_t)+1];
+        dev_t dev;
+        int r;
+
+        r = lookup_block_device(dev_path, &dev);
+        if (r < 0)
+                return;
+
+        if (target != USEC_INFINITY)
+                xsprintf(buf, "%u:%u target=%" PRIu64 "\n", major(dev), minor(dev), target);
+        else
+                xsprintf(buf, "%u:%u target=max\n", major(dev), minor(dev));
+
+        (void) set_attribute_and_warn(u, "io", "io.latency", buf);
+}
+
+static void cgroup_apply_io_device_limit(Unit *u, const char *dev_path, uint64_t *limits) {
         char limit_bufs[_CGROUP_IO_LIMIT_TYPE_MAX][DECIMAL_STR_MAX(uint64_t)];
         char buf[DECIMAL_STR_MAX(dev_t)*2+2+(6+DECIMAL_STR_MAX(uint64_t)+1)*4];
         CGroupIOLimitType type;
         dev_t dev;
-        unsigned n = 0;
         int r;
 
         r = lookup_block_device(dev_path, &dev);
         if (r < 0)
-                return 0;
+                return;
 
-        for (type = 0; type < _CGROUP_IO_LIMIT_TYPE_MAX; type++) {
-                if (limits[type] != cgroup_io_limit_defaults[type]) {
+        for (type = 0; type < _CGROUP_IO_LIMIT_TYPE_MAX; type++)
+                if (limits[type] != cgroup_io_limit_defaults[type])
                         xsprintf(limit_bufs[type], "%" PRIu64, limits[type]);
-                        n++;
-                } else {
+                else
                         xsprintf(limit_bufs[type], "%s", limits[type] == CGROUP_LIMIT_MAX ? "max" : "0");
-                }
-        }
 
         xsprintf(buf, "%u:%u rbps=%s wbps=%s riops=%s wiops=%s\n", major(dev), minor(dev),
                  limit_bufs[CGROUP_IO_RBPS_MAX], limit_bufs[CGROUP_IO_WBPS_MAX],
                  limit_bufs[CGROUP_IO_RIOPS_MAX], limit_bufs[CGROUP_IO_WIOPS_MAX]);
-        r = cg_set_attribute("io", u->cgroup_path, "io.max", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set io.max: %m");
-        return n;
+        (void) set_attribute_and_warn(u, "io", "io.max", buf);
 }
 
-static unsigned cgroup_apply_blkio_device_limit(Unit *u, const char *dev_path, uint64_t rbps, uint64_t wbps) {
+static void cgroup_apply_blkio_device_limit(Unit *u, const char *dev_path, uint64_t rbps, uint64_t wbps) {
         char buf[DECIMAL_STR_MAX(dev_t)*2+2+DECIMAL_STR_MAX(uint64_t)+1];
         dev_t dev;
-        unsigned n = 0;
         int r;
 
         r = lookup_block_device(dev_path, &dev);
         if (r < 0)
-                return 0;
+                return;
 
-        if (rbps != CGROUP_LIMIT_MAX)
-                n++;
         sprintf(buf, "%u:%u %" PRIu64 "\n", major(dev), minor(dev), rbps);
-        r = cg_set_attribute("blkio", u->cgroup_path, "blkio.throttle.read_bps_device", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set blkio.throttle.read_bps_device: %m");
+        (void) set_attribute_and_warn(u, "blkio", "blkio.throttle.read_bps_device", buf);
 
-        if (wbps != CGROUP_LIMIT_MAX)
-                n++;
         sprintf(buf, "%u:%u %" PRIu64 "\n", major(dev), minor(dev), wbps);
-        r = cg_set_attribute("blkio", u->cgroup_path, "blkio.throttle.write_bps_device", buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set blkio.throttle.write_bps_device: %m");
-
-        return n;
+        (void) set_attribute_and_warn(u, "blkio", "blkio.throttle.write_bps_device", buf);
 }
 
 static bool cgroup_context_has_unified_memory_config(CGroupContext *c) {
-        return c->memory_low > 0 || c->memory_high != CGROUP_LIMIT_MAX || c->memory_max != CGROUP_LIMIT_MAX || c->memory_swap_max != CGROUP_LIMIT_MAX;
+        return c->memory_min > 0 || c->memory_low > 0 || c->memory_high != CGROUP_LIMIT_MAX || c->memory_max != CGROUP_LIMIT_MAX || c->memory_swap_max != CGROUP_LIMIT_MAX;
 }
 
 static void cgroup_apply_unified_memory_limit(Unit *u, const char *file, uint64_t v) {
-        char buf[DECIMAL_STR_MAX(uint64_t) + 1] = "max";
-        int r;
+        char buf[DECIMAL_STR_MAX(uint64_t) + 1] = "max\n";
 
         if (v != CGROUP_LIMIT_MAX)
                 xsprintf(buf, "%" PRIu64 "\n", v);
 
-        r = cg_set_attribute("memory", u->cgroup_path, file, buf);
-        if (r < 0)
-                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                              "Failed to set %s: %m", file);
+        (void) set_attribute_and_warn(u, "memory", file, buf);
 }
 
-static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
+static void cgroup_apply_firewall(Unit *u) {
+        assert(u);
+
+        /* Best-effort: let's apply IP firewalling and/or accounting if that's enabled */
+
+        if (bpf_firewall_compile(u) < 0)
+                return;
+
+        (void) bpf_firewall_install(u);
+}
+
+static void cgroup_context_apply(
+                Unit *u,
+                CGroupMask apply_mask,
+                ManagerState state) {
+
         const char *path;
         CGroupContext *c;
-        bool is_root;
+        bool is_host_root, is_local_root;
         int r;
 
         assert(u);
 
-        c = unit_get_cgroup_context(u);
-        path = u->cgroup_path;
-
-        assert(c);
-        assert(path);
-
-        if (mask == 0)
+        /* Nothing to do? Exit early! */
+        if (apply_mask == 0)
                 return;
 
-        /* Some cgroup attributes are not supported on the root cgroup,
-         * hence silently ignore */
-        is_root = isempty(path) || path_equal(path, "/");
-        if (is_root)
-                /* Make sure we don't try to display messages with an empty path. */
+        /* Some cgroup attributes are not supported on the host root cgroup, hence silently ignore them here. And other
+         * attributes should only be managed for cgroups further down the tree. */
+        is_local_root = unit_has_name(u, SPECIAL_ROOT_SLICE);
+        is_host_root = unit_has_host_root_cgroup(u);
+
+        assert_se(c = unit_get_cgroup_context(u));
+        assert_se(path = u->cgroup_path);
+
+        if (is_local_root) /* Make sure we don't try to display messages with an empty path. */
                 path = "/";
 
-        /* We generally ignore errors caused by read-only mounted
-         * cgroup trees (assuming we are running in a container then),
-         * and missing cgroups, i.e. EROFS and ENOENT. */
+        /* We generally ignore errors caused by read-only mounted cgroup trees (assuming we are running in a container
+         * then), and missing cgroups, i.e. EROFS and ENOENT. */
 
-        if ((mask & CGROUP_MASK_CPU) && !is_root) {
-                bool has_weight = cgroup_context_has_cpu_weight(c);
-                bool has_shares = cgroup_context_has_cpu_shares(c);
+        /* In fully unified mode these attributes don't exist on the host cgroup root. On legacy the weights exist, but
+         * setting the weight makes very little sense on the host root cgroup, as there are no other cgroups at this
+         * level. The quota exists there too, but any attempt to write to it is refused with EINVAL. Inside of
+         * containers we want to leave control of these to the container manager (and if cgroup v2 delegation is used
+         * we couldn't even write to them if we wanted to). */
+        if ((apply_mask & CGROUP_MASK_CPU) && !is_local_root) {
 
                 if (cg_all_unified() > 0) {
                         uint64_t weight;
 
-                        if (has_weight)
+                        if (cgroup_context_has_cpu_weight(c))
                                 weight = cgroup_context_cpu_weight(c, state);
-                        else if (has_shares) {
-                                uint64_t shares = cgroup_context_cpu_shares(c, state);
+                        else if (cgroup_context_has_cpu_shares(c)) {
+                                uint64_t shares;
 
+                                shares = cgroup_context_cpu_shares(c, state);
                                 weight = cgroup_cpu_shares_to_weight(shares);
 
-                                log_cgroup_compat(u, "Applying [Startup]CpuShares %" PRIu64 " as [Startup]CpuWeight %" PRIu64 " on %s",
+                                log_cgroup_compat(u, "Applying [Startup]CPUShares=%" PRIu64 " as [Startup]CPUWeight=%" PRIu64 " on %s",
                                                   shares, weight, path);
                         } else
                                 weight = CGROUP_WEIGHT_DEFAULT;
 
-                        cgroup_apply_unified_cpu_config(u, weight, c->cpu_quota_per_sec_usec);
+                        cgroup_apply_unified_cpu_weight(u, weight);
+                        cgroup_apply_unified_cpu_quota(u, c->cpu_quota_per_sec_usec);
+
                 } else {
                         uint64_t shares;
 
-                        if (has_weight) {
-                                uint64_t weight = cgroup_context_cpu_weight(c, state);
+                        if (cgroup_context_has_cpu_weight(c)) {
+                                uint64_t weight;
 
+                                weight = cgroup_context_cpu_weight(c, state);
                                 shares = cgroup_cpu_weight_to_shares(weight);
 
-                                log_cgroup_compat(u, "Applying [Startup]CpuWeight %" PRIu64 " as [Startup]CpuShares %" PRIu64 " on %s",
+                                log_cgroup_compat(u, "Applying [Startup]CPUWeight=%" PRIu64 " as [Startup]CPUShares=%" PRIu64 " on %s",
                                                   weight, shares, path);
-                        } else if (has_shares)
+                        } else if (cgroup_context_has_cpu_shares(c))
                                 shares = cgroup_context_cpu_shares(c, state);
                         else
                                 shares = CGROUP_CPU_SHARES_DEFAULT;
 
-                        cgroup_apply_legacy_cpu_config(u, shares, c->cpu_quota_per_sec_usec);
+                        cgroup_apply_legacy_cpu_shares(u, shares);
+                        cgroup_apply_legacy_cpu_quota(u, c->cpu_quota_per_sec_usec);
                 }
         }
 
-        if (mask & CGROUP_MASK_IO) {
-                bool has_io = cgroup_context_has_io_config(c);
-                bool has_blockio = cgroup_context_has_blockio_config(c);
+        /* The 'io' controller attributes are not exported on the host's root cgroup (being a pure cgroup v2
+         * controller), and in case of containers we want to leave control of these attributes to the container manager
+         * (and we couldn't access that stuff anyway, even if we tried if proper delegation is used). */
+        if ((apply_mask & CGROUP_MASK_IO) && !is_local_root) {
+                char buf[8+DECIMAL_STR_MAX(uint64_t)+1];
+                bool has_io, has_blockio;
+                uint64_t weight;
 
-                if (!is_root) {
-                        char buf[8+DECIMAL_STR_MAX(uint64_t)+1];
-                        uint64_t weight;
+                has_io = cgroup_context_has_io_config(c);
+                has_blockio = cgroup_context_has_blockio_config(c);
 
-                        if (has_io)
-                                weight = cgroup_context_io_weight(c, state);
-                        else if (has_blockio) {
-                                uint64_t blkio_weight = cgroup_context_blkio_weight(c, state);
+                if (has_io)
+                        weight = cgroup_context_io_weight(c, state);
+                else if (has_blockio) {
+                        uint64_t blkio_weight;
 
-                                weight = cgroup_weight_blkio_to_io(blkio_weight);
+                        blkio_weight = cgroup_context_blkio_weight(c, state);
+                        weight = cgroup_weight_blkio_to_io(blkio_weight);
 
-                                log_cgroup_compat(u, "Applying [Startup]BlockIOWeight %" PRIu64 " as [Startup]IOWeight %" PRIu64,
-                                                  blkio_weight, weight);
-                        } else
-                                weight = CGROUP_WEIGHT_DEFAULT;
+                        log_cgroup_compat(u, "Applying [Startup]BlockIOWeight=%" PRIu64 " as [Startup]IOWeight=%" PRIu64,
+                                          blkio_weight, weight);
+                } else
+                        weight = CGROUP_WEIGHT_DEFAULT;
 
-                        xsprintf(buf, "default %" PRIu64 "\n", weight);
-                        r = cg_set_attribute("io", path, "io.weight", buf);
-                        if (r < 0)
-                                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                                              "Failed to set io.weight: %m");
+                xsprintf(buf, "default %" PRIu64 "\n", weight);
+                (void) set_attribute_and_warn(u, "io", "io.weight", buf);
 
-                        if (has_io) {
-                                CGroupIODeviceWeight *w;
-
-                                /* FIXME: no way to reset this list */
-                                LIST_FOREACH(device_weights, w, c->io_device_weights)
-                                        cgroup_apply_io_device_weight(u, w->path, w->weight);
-                        } else if (has_blockio) {
-                                CGroupBlockIODeviceWeight *w;
-
-                                /* FIXME: no way to reset this list */
-                                LIST_FOREACH(device_weights, w, c->blockio_device_weights) {
-                                        weight = cgroup_weight_blkio_to_io(w->weight);
-
-                                        log_cgroup_compat(u, "Applying BlockIODeviceWeight %" PRIu64 " as IODeviceWeight %" PRIu64 " for %s",
-                                                          w->weight, weight, w->path);
-
-                                        cgroup_apply_io_device_weight(u, w->path, weight);
-                                }
-                        }
-                }
-
-                /* Apply limits and free ones without config. */
                 if (has_io) {
-                        CGroupIODeviceLimit *l, *next;
+                        CGroupIODeviceLatency *latency;
+                        CGroupIODeviceLimit *limit;
+                        CGroupIODeviceWeight *w;
 
-                        LIST_FOREACH_SAFE(device_limits, l, next, c->io_device_limits) {
-                                if (!cgroup_apply_io_device_limit(u, l->path, l->limits))
-                                        cgroup_context_free_io_device_limit(c, l);
-                        }
+                        LIST_FOREACH(device_weights, w, c->io_device_weights)
+                                cgroup_apply_io_device_weight(u, w->path, w->weight);
+
+                        LIST_FOREACH(device_limits, limit, c->io_device_limits)
+                                cgroup_apply_io_device_limit(u, limit->path, limit->limits);
+
+                        LIST_FOREACH(device_latencies, latency, c->io_device_latencies)
+                                cgroup_apply_io_device_latency(u, latency->path, latency->target_usec);
+
                 } else if (has_blockio) {
-                        CGroupBlockIODeviceBandwidth *b, *next;
+                        CGroupBlockIODeviceWeight *w;
+                        CGroupBlockIODeviceBandwidth *b;
 
-                        LIST_FOREACH_SAFE(device_bandwidths, b, next, c->blockio_device_bandwidths) {
+                        LIST_FOREACH(device_weights, w, c->blockio_device_weights) {
+                                weight = cgroup_weight_blkio_to_io(w->weight);
+
+                                log_cgroup_compat(u, "Applying BlockIODeviceWeight=%" PRIu64 " as IODeviceWeight=%" PRIu64 " for %s",
+                                                  w->weight, weight, w->path);
+
+                                cgroup_apply_io_device_weight(u, w->path, weight);
+                        }
+
+                        LIST_FOREACH(device_bandwidths, b, c->blockio_device_bandwidths) {
                                 uint64_t limits[_CGROUP_IO_LIMIT_TYPE_MAX];
                                 CGroupIOLimitType type;
 
@@ -771,29 +998,33 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
                                 limits[CGROUP_IO_RBPS_MAX] = b->rbps;
                                 limits[CGROUP_IO_WBPS_MAX] = b->wbps;
 
-                                log_cgroup_compat(u, "Applying BlockIO{Read|Write}Bandwidth %" PRIu64 " %" PRIu64 " as IO{Read|Write}BandwidthMax for %s",
+                                log_cgroup_compat(u, "Applying BlockIO{Read|Write}Bandwidth=%" PRIu64 " %" PRIu64 " as IO{Read|Write}BandwidthMax= for %s",
                                                   b->rbps, b->wbps, b->path);
 
-                                if (!cgroup_apply_io_device_limit(u, b->path, limits))
-                                        cgroup_context_free_blockio_device_bandwidth(c, b);
+                                cgroup_apply_io_device_limit(u, b->path, limits);
                         }
                 }
         }
 
-        if (mask & CGROUP_MASK_BLKIO) {
-                bool has_io = cgroup_context_has_io_config(c);
-                bool has_blockio = cgroup_context_has_blockio_config(c);
+        if (apply_mask & CGROUP_MASK_BLKIO) {
+                bool has_io, has_blockio;
 
-                if (!is_root) {
+                has_io = cgroup_context_has_io_config(c);
+                has_blockio = cgroup_context_has_blockio_config(c);
+
+                /* Applying a 'weight' never makes sense for the host root cgroup, and for containers this should be
+                 * left to our container manager, too. */
+                if (!is_local_root) {
                         char buf[DECIMAL_STR_MAX(uint64_t)+1];
                         uint64_t weight;
 
                         if (has_io) {
-                                uint64_t io_weight = cgroup_context_io_weight(c, state);
+                                uint64_t io_weight;
 
+                                io_weight = cgroup_context_io_weight(c, state);
                                 weight = cgroup_weight_io_to_blkio(cgroup_context_io_weight(c, state));
 
-                                log_cgroup_compat(u, "Applying [Startup]IOWeight %" PRIu64 " as [Startup]BlockIOWeight %" PRIu64,
+                                log_cgroup_compat(u, "Applying [Startup]IOWeight=%" PRIu64 " as [Startup]BlockIOWeight=%" PRIu64,
                                                   io_weight, weight);
                         } else if (has_blockio)
                                 weight = cgroup_context_blkio_weight(c, state);
@@ -801,19 +1032,15 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
                                 weight = CGROUP_BLKIO_WEIGHT_DEFAULT;
 
                         xsprintf(buf, "%" PRIu64 "\n", weight);
-                        r = cg_set_attribute("blkio", path, "blkio.weight", buf);
-                        if (r < 0)
-                                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                                              "Failed to set blkio.weight: %m");
+                        (void) set_attribute_and_warn(u, "blkio", "blkio.weight", buf);
 
                         if (has_io) {
                                 CGroupIODeviceWeight *w;
 
-                                /* FIXME: no way to reset this list */
                                 LIST_FOREACH(device_weights, w, c->io_device_weights) {
                                         weight = cgroup_weight_io_to_blkio(w->weight);
 
-                                        log_cgroup_compat(u, "Applying IODeviceWeight %" PRIu64 " as BlockIODeviceWeight %" PRIu64 " for %s",
+                                        log_cgroup_compat(u, "Applying IODeviceWeight=%" PRIu64 " as BlockIODeviceWeight=%" PRIu64 " for %s",
                                                           w->weight, weight, w->path);
 
                                         cgroup_apply_blkio_device_weight(u, w->path, weight);
@@ -821,36 +1048,40 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
                         } else if (has_blockio) {
                                 CGroupBlockIODeviceWeight *w;
 
-                                /* FIXME: no way to reset this list */
                                 LIST_FOREACH(device_weights, w, c->blockio_device_weights)
                                         cgroup_apply_blkio_device_weight(u, w->path, w->weight);
                         }
                 }
 
-                /* Apply limits and free ones without config. */
-                if (has_io) {
-                        CGroupIODeviceLimit *l, *next;
+                /* The bandwith limits are something that make sense to be applied to the host's root but not container
+                 * roots, as there we want the container manager to handle it */
+                if (is_host_root || !is_local_root) {
+                        if (has_io) {
+                                CGroupIODeviceLimit *l;
 
-                        LIST_FOREACH_SAFE(device_limits, l, next, c->io_device_limits) {
-                                log_cgroup_compat(u, "Applying IO{Read|Write}Bandwidth %" PRIu64 " %" PRIu64 " as BlockIO{Read|Write}BandwidthMax for %s",
-                                                  l->limits[CGROUP_IO_RBPS_MAX], l->limits[CGROUP_IO_WBPS_MAX], l->path);
+                                LIST_FOREACH(device_limits, l, c->io_device_limits) {
+                                        log_cgroup_compat(u, "Applying IO{Read|Write}Bandwidth=%" PRIu64 " %" PRIu64 " as BlockIO{Read|Write}BandwidthMax= for %s",
+                                                          l->limits[CGROUP_IO_RBPS_MAX], l->limits[CGROUP_IO_WBPS_MAX], l->path);
 
-                                if (!cgroup_apply_blkio_device_limit(u, l->path, l->limits[CGROUP_IO_RBPS_MAX], l->limits[CGROUP_IO_WBPS_MAX]))
-                                        cgroup_context_free_io_device_limit(c, l);
+                                        cgroup_apply_blkio_device_limit(u, l->path, l->limits[CGROUP_IO_RBPS_MAX], l->limits[CGROUP_IO_WBPS_MAX]);
+                                }
+                        } else if (has_blockio) {
+                                CGroupBlockIODeviceBandwidth *b;
+
+                                LIST_FOREACH(device_bandwidths, b, c->blockio_device_bandwidths)
+                                        cgroup_apply_blkio_device_limit(u, b->path, b->rbps, b->wbps);
                         }
-                } else if (has_blockio) {
-                        CGroupBlockIODeviceBandwidth *b, *next;
-
-                        LIST_FOREACH_SAFE(device_bandwidths, b, next, c->blockio_device_bandwidths)
-                                if (!cgroup_apply_blkio_device_limit(u, b->path, b->rbps, b->wbps))
-                                        cgroup_context_free_blockio_device_bandwidth(c, b);
                 }
         }
 
-        if ((mask & CGROUP_MASK_MEMORY) && !is_root) {
+        /* In unified mode 'memory' attributes do not exist on the root cgroup. In legacy mode 'memory.limit_in_bytes'
+         * exists on the root cgroup, but any writes to it are refused with EINVAL. And if we run in a container we
+         * want to leave control to the container manager (and if proper cgroup v2 delegation is used we couldn't even
+         * write to this if we wanted to.) */
+        if ((apply_mask & CGROUP_MASK_MEMORY) && !is_local_root) {
+
                 if (cg_all_unified() > 0) {
-                        uint64_t max;
-                        uint64_t swap_max = CGROUP_LIMIT_MAX;
+                        uint64_t max, swap_max = CGROUP_LIMIT_MAX;
 
                         if (cgroup_context_has_unified_memory_config(c)) {
                                 max = c->memory_max;
@@ -859,20 +1090,22 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
                                 max = c->memory_limit;
 
                                 if (max != CGROUP_LIMIT_MAX)
-                                        log_cgroup_compat(u, "Applying MemoryLimit %" PRIu64 " as MemoryMax", max);
+                                        log_cgroup_compat(u, "Applying MemoryLimit=%" PRIu64 " as MemoryMax=", max);
                         }
 
+                        cgroup_apply_unified_memory_limit(u, "memory.min", c->memory_min);
                         cgroup_apply_unified_memory_limit(u, "memory.low", c->memory_low);
                         cgroup_apply_unified_memory_limit(u, "memory.high", c->memory_high);
                         cgroup_apply_unified_memory_limit(u, "memory.max", max);
                         cgroup_apply_unified_memory_limit(u, "memory.swap.max", swap_max);
+
                 } else {
                         char buf[DECIMAL_STR_MAX(uint64_t) + 1];
                         uint64_t val;
 
                         if (cgroup_context_has_unified_memory_config(c)) {
                                 val = c->memory_max;
-                                log_cgroup_compat(u, "Applying MemoryMax %" PRIi64 " as MemoryLimit", val);
+                                log_cgroup_compat(u, "Applying MemoryMax=%" PRIi64 " as MemoryLimit=", val);
                         } else
                                 val = c->memory_limit;
 
@@ -881,27 +1114,33 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
                         else
                                 xsprintf(buf, "%" PRIu64 "\n", val);
 
-                        r = cg_set_attribute("memory", path, "memory.limit_in_bytes", buf);
-                        if (r < 0)
-                                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                                              "Failed to set memory.limit_in_bytes: %m");
+                        (void) set_attribute_and_warn(u, "memory", "memory.limit_in_bytes", buf);
                 }
         }
 
-        if ((mask & CGROUP_MASK_DEVICES) && !is_root) {
+        /* On cgroup v2 we can apply BPF everywhere. On cgroup v1 we apply it everywhere except for the root of
+         * containers, where we leave this to the manager */
+        if ((apply_mask & (CGROUP_MASK_DEVICES | CGROUP_MASK_BPF_DEVICES)) &&
+            (is_host_root || cg_all_unified() > 0 || !is_local_root)) {
+                _cleanup_(bpf_program_unrefp) BPFProgram *prog = NULL;
                 CGroupDeviceAllow *a;
 
-                /* Changing the devices list of a populated cgroup
-                 * might result in EINVAL, hence ignore EINVAL
-                 * here. */
+                if (cg_all_unified() > 0) {
+                        r = cgroup_init_device_bpf(&prog, c->device_policy, c->device_allow);
+                        if (r < 0)
+                                log_unit_warning_errno(u, r, "Failed to initialize device control bpf program: %m");
+                } else {
+                        /* Changing the devices list of a populated cgroup might result in EINVAL, hence ignore EINVAL
+                         * here. */
 
-                if (c->device_allow || c->device_policy != CGROUP_AUTO)
-                        r = cg_set_attribute("devices", path, "devices.deny", "a");
-                else
-                        r = cg_set_attribute("devices", path, "devices.allow", "a");
-                if (r < 0)
-                        log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                                      "Failed to reset devices.list: %m");
+                        if (c->device_allow || c->device_policy != CGROUP_AUTO)
+                                r = cg_set_attribute("devices", path, "devices.deny", "a");
+                        else
+                                r = cg_set_attribute("devices", path, "devices.allow", "a");
+                        if (r < 0)
+                                log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES, -EPERM) ? LOG_DEBUG : LOG_WARNING, r,
+                                              "Failed to reset devices.allow/devices.deny: %m");
+                }
 
                 if (c->device_policy == CGROUP_CLOSED ||
                     (c->device_policy == CGROUP_AUTO && c->device_allow)) {
@@ -912,7 +1151,7 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
                                 "/dev/random\0" "rwm\0"
                                 "/dev/urandom\0" "rwm\0"
                                 "/dev/tty\0" "rwm\0"
-                                "/dev/pts/ptmx\0" "rw\0" /* /dev/pts/ptmx may not be duplicated, but accessed */
+                                "/dev/ptmx\0" "rwm\0"
                                 /* Allow /run/systemd/inaccessible/{chr,blk} devices for mapping InaccessiblePaths */
                                 "/run/systemd/inaccessible/chr\0" "rwm\0"
                                 "/run/systemd/inaccessible/blk\0" "rwm\0";
@@ -920,15 +1159,14 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
                         const char *x, *y;
 
                         NULSTR_FOREACH_PAIR(x, y, auto_devices)
-                                whitelist_device(path, x, y);
+                                (void) whitelist_device(prog, path, x, y);
 
-                        whitelist_major(path, "pts", 'c', "rw");
-                        whitelist_major(path, "kdbus", 'c', "rw");
-                        whitelist_major(path, "kdbus/*", 'c', "rw");
+                        /* PTS (/dev/pts) devices may not be duplicated, but accessed */
+                        (void) whitelist_major(prog, path, "pts", 'c', "rw");
                 }
 
                 LIST_FOREACH(device_allow, a, c->device_allow) {
-                        char acc[4];
+                        char acc[4], *val;
                         unsigned k = 0;
 
                         if (a->r)
@@ -943,43 +1181,114 @@ static void cgroup_context_apply(Unit *u, CGroupMask mask, ManagerState state) {
 
                         acc[k++] = 0;
 
-                        if (startswith(a->path, "/dev/"))
-                                whitelist_device(path, a->path, acc);
-                        else if (startswith(a->path, "block-"))
-                                whitelist_major(path, a->path + 6, 'b', acc);
-                        else if (startswith(a->path, "char-"))
-                                whitelist_major(path, a->path + 5, 'c', acc);
+                        if (path_startswith(a->path, "/dev/"))
+                                (void) whitelist_device(prog, path, a->path, acc);
+                        else if ((val = startswith(a->path, "block-")))
+                                (void) whitelist_major(prog, path, val, 'b', acc);
+                        else if ((val = startswith(a->path, "char-")))
+                                (void) whitelist_major(prog, path, val, 'c', acc);
                         else
-                                log_unit_debug(u, "Ignoring device %s while writing cgroup attribute.", a->path);
+                                log_unit_debug(u, "Ignoring device '%s' while writing cgroup attribute.", a->path);
+                }
+
+                r = cgroup_apply_device_bpf(u, prog, c->device_policy, c->device_allow);
+                if (r < 0) {
+                        static bool warned = false;
+
+                        log_full_errno(warned ? LOG_DEBUG : LOG_WARNING, r,
+                                 "Unit %s configures device ACL, but the local system doesn't seem to support the BPF-based device controller.\n"
+                                 "Proceeding WITHOUT applying ACL (all devices will be accessible)!\n"
+                                 "(This warning is only shown for the first loaded unit using device ACL.)", u->id);
+
+                        warned = true;
                 }
         }
 
-        if ((mask & CGROUP_MASK_PIDS) && !is_root) {
+        if (apply_mask & CGROUP_MASK_PIDS) {
 
-                if (c->tasks_max != CGROUP_LIMIT_MAX) {
-                        char buf[DECIMAL_STR_MAX(uint64_t) + 2];
+                if (is_host_root) {
+                        /* So, the "pids" controller does not expose anything on the root cgroup, in order not to
+                         * replicate knobs exposed elsewhere needlessly. We abstract this away here however, and when
+                         * the knobs of the root cgroup are modified propagate this to the relevant sysctls. There's a
+                         * non-obvious asymmetry however: unlike the cgroup properties we don't really want to take
+                         * exclusive ownership of the sysctls, but we still want to honour things if the user sets
+                         * limits. Hence we employ sort of a one-way strategy: when the user sets a bounded limit
+                         * through us it counts. When the user afterwards unsets it again (i.e. sets it to unbounded)
+                         * it also counts. But if the user never set a limit through us (i.e. we are the default of
+                         * "unbounded") we leave things unmodified. For this we manage a global boolean that we turn on
+                         * the first time we set a limit. Note that this boolean is flushed out on manager reload,
+                         * which is desirable so that there's an offical way to release control of the sysctl from
+                         * systemd: set the limit to unbounded and reload. */
 
-                        sprintf(buf, "%" PRIu64 "\n", c->tasks_max);
-                        r = cg_set_attribute("pids", path, "pids.max", buf);
-                } else
-                        r = cg_set_attribute("pids", path, "pids.max", "max");
+                        if (c->tasks_max != CGROUP_LIMIT_MAX) {
+                                u->manager->sysctl_pid_max_changed = true;
+                                r = procfs_tasks_set_limit(c->tasks_max);
+                        } else if (u->manager->sysctl_pid_max_changed)
+                                r = procfs_tasks_set_limit(TASKS_MAX);
+                        else
+                                r = 0;
+                        if (r < 0)
+                                log_unit_full(u, LOG_LEVEL_CGROUP_WRITE(r), r,
+                                              "Failed to write to tasks limit sysctls: %m");
+                }
 
-                if (r < 0)
-                        log_unit_full(u, IN_SET(r, -ENOENT, -EROFS, -EACCES) ? LOG_DEBUG : LOG_WARNING, r,
-                                      "Failed to set pids.max: %m");
+                /* The attribute itself is not available on the host root cgroup, and in the container case we want to
+                 * leave it for the container manager. */
+                if (!is_local_root) {
+                        if (c->tasks_max != CGROUP_LIMIT_MAX) {
+                                char buf[DECIMAL_STR_MAX(uint64_t) + 2];
+
+                                sprintf(buf, "%" PRIu64 "\n", c->tasks_max);
+                                (void) set_attribute_and_warn(u, "pids", "pids.max", buf);
+                        } else
+                                (void) set_attribute_and_warn(u, "pids", "pids.max", "max\n");
+                }
         }
+
+        if (apply_mask & CGROUP_MASK_BPF_FIREWALL)
+                cgroup_apply_firewall(u);
 }
 
-CGroupMask cgroup_context_get_mask(CGroupContext *c) {
+static bool unit_get_needs_bpf_firewall(Unit *u) {
+        CGroupContext *c;
+        Unit *p;
+        assert(u);
+
+        c = unit_get_cgroup_context(u);
+        if (!c)
+                return false;
+
+        if (c->ip_accounting ||
+            c->ip_address_allow ||
+            c->ip_address_deny)
+                return true;
+
+        /* If any parent slice has an IP access list defined, it applies too */
+        for (p = UNIT_DEREF(u->slice); p; p = UNIT_DEREF(p->slice)) {
+                c = unit_get_cgroup_context(p);
+                if (!c)
+                        return false;
+
+                if (c->ip_address_allow ||
+                    c->ip_address_deny)
+                        return true;
+        }
+
+        return false;
+}
+
+static CGroupMask cgroup_context_get_mask(CGroupContext *c) {
         CGroupMask mask = 0;
 
-        /* Figure out which controllers we need */
+        /* Figure out which controllers we need, based on the cgroup context object */
 
-        if (c->cpu_accounting ||
-            cgroup_context_has_cpu_weight(c) ||
+        if (c->cpu_accounting)
+                mask |= get_cpu_accounting_mask();
+
+        if (cgroup_context_has_cpu_weight(c) ||
             cgroup_context_has_cpu_shares(c) ||
             c->cpu_quota_per_sec_usec != USEC_INFINITY)
-                mask |= CGROUP_MASK_CPUACCT | CGROUP_MASK_CPU;
+                mask |= CGROUP_MASK_CPU;
 
         if (cgroup_context_has_io_config(c) || cgroup_context_has_blockio_config(c))
                 mask |= CGROUP_MASK_IO | CGROUP_MASK_BLKIO;
@@ -991,11 +1300,23 @@ CGroupMask cgroup_context_get_mask(CGroupContext *c) {
 
         if (c->device_allow ||
             c->device_policy != CGROUP_AUTO)
-                mask |= CGROUP_MASK_DEVICES;
+                mask |= CGROUP_MASK_DEVICES | CGROUP_MASK_BPF_DEVICES;
 
         if (c->tasks_accounting ||
-            c->tasks_max != (uint64_t) -1)
+            c->tasks_max != CGROUP_LIMIT_MAX)
                 mask |= CGROUP_MASK_PIDS;
+
+        return CGROUP_MASK_EXTEND_JOINED(mask);
+}
+
+static CGroupMask unit_get_bpf_mask(Unit *u) {
+        CGroupMask mask = 0;
+
+        /* Figure out which controllers we need, based on the cgroup context, possibly taking into account children
+         * too. */
+
+        if (unit_get_needs_bpf_firewall(u))
+                mask |= CGROUP_MASK_BPF_FIREWALL;
 
         return mask;
 }
@@ -1003,59 +1324,60 @@ CGroupMask cgroup_context_get_mask(CGroupContext *c) {
 CGroupMask unit_get_own_mask(Unit *u) {
         CGroupContext *c;
 
-        /* Returns the mask of controllers the unit needs for itself */
+        /* Returns the mask of controllers the unit needs for itself. If a unit is not properly loaded, return an empty
+         * mask, as we shouldn't reflect it in the cgroup hierarchy then. */
+
+        if (u->load_state != UNIT_LOADED)
+                return 0;
 
         c = unit_get_cgroup_context(u);
         if (!c)
                 return 0;
 
-        /* If delegation is turned on, then turn on all cgroups,
-         * unless we are on the legacy hierarchy and the process we
-         * fork into it is known to drop privileges, and hence
-         * shouldn't get access to the controllers.
-         *
-         * Note that on the unified hierarchy it is safe to delegate
-         * controllers to unprivileged services. */
+        return (cgroup_context_get_mask(c) | unit_get_bpf_mask(u) | unit_get_delegate_mask(u)) & ~unit_get_ancestor_disable_mask(u);
+}
 
-        if (c->delegate) {
+CGroupMask unit_get_delegate_mask(Unit *u) {
+        CGroupContext *c;
+
+        /* If delegation is turned on, then turn on selected controllers, unless we are on the legacy hierarchy and the
+         * process we fork into is known to drop privileges, and hence shouldn't get access to the controllers.
+         *
+         * Note that on the unified hierarchy it is safe to delegate controllers to unprivileged services. */
+
+        if (!unit_cgroup_delegate(u))
+                return 0;
+
+        if (cg_all_unified() <= 0) {
                 ExecContext *e;
 
                 e = unit_get_exec_context(u);
-                if (!e ||
-                    exec_context_maintains_privileges(e) ||
-                    cg_all_unified() > 0)
-                        return _CGROUP_MASK_ALL;
+                if (e && !exec_context_maintains_privileges(e))
+                        return 0;
         }
 
-        return cgroup_context_get_mask(c);
+        assert_se(c = unit_get_cgroup_context(u));
+        return CGROUP_MASK_EXTEND_JOINED(c->delegate_controllers);
 }
 
 CGroupMask unit_get_members_mask(Unit *u) {
         assert(u);
 
-        /* Returns the mask of controllers all of the unit's children
-         * require, merged */
+        /* Returns the mask of controllers all of the unit's children require, merged */
 
         if (u->cgroup_members_mask_valid)
-                return u->cgroup_members_mask;
+                return u->cgroup_members_mask; /* Use cached value if possible */
 
         u->cgroup_members_mask = 0;
 
         if (u->type == UNIT_SLICE) {
+                void *v;
                 Unit *member;
                 Iterator i;
 
-                SET_FOREACH(member, u->dependencies[UNIT_BEFORE], i) {
-
-                        if (member == u)
-                                continue;
-
-                        if (UNIT_DEREF(member->slice) != u)
-                                continue;
-
-                        u->cgroup_members_mask |=
-                                unit_get_own_mask(member) |
-                                unit_get_members_mask(member);
+                HASHMAP_FOREACH_KEY(v, member, u->dependencies[UNIT_BEFORE], i) {
+                        if (UNIT_DEREF(member->slice) == u)
+                                u->cgroup_members_mask |= unit_get_subtree_mask(member); /* note that this calls ourselves again, for the children */
                 }
         }
 
@@ -1073,7 +1395,32 @@ CGroupMask unit_get_siblings_mask(Unit *u) {
         if (UNIT_ISSET(u->slice))
                 return unit_get_members_mask(UNIT_DEREF(u->slice));
 
-        return unit_get_own_mask(u) | unit_get_members_mask(u);
+        return unit_get_subtree_mask(u); /* we are the top-level slice */
+}
+
+CGroupMask unit_get_disable_mask(Unit *u) {
+        CGroupContext *c;
+
+        c = unit_get_cgroup_context(u);
+        if (!c)
+                return 0;
+
+        return c->disable_controllers;
+}
+
+CGroupMask unit_get_ancestor_disable_mask(Unit *u) {
+        CGroupMask mask;
+
+        assert(u);
+        mask = unit_get_disable_mask(u);
+
+        /* Returns the mask of controllers which are marked as forcibly
+         * disabled in any ancestor unit or the unit in question. */
+
+        if (UNIT_ISSET(u->slice))
+                mask |= unit_get_ancestor_disable_mask(UNIT_DEREF(u->slice));
+
+        return mask;
 }
 
 CGroupMask unit_get_subtree_mask(Unit *u) {
@@ -1096,6 +1443,7 @@ CGroupMask unit_get_target_mask(Unit *u) {
 
         mask = unit_get_own_mask(u) | unit_get_members_mask(u) | unit_get_siblings_mask(u);
         mask &= u->manager->cgroup_supported;
+        mask &= ~unit_get_ancestor_disable_mask(u);
 
         return mask;
 }
@@ -1110,69 +1458,30 @@ CGroupMask unit_get_enable_mask(Unit *u) {
 
         mask = unit_get_members_mask(u);
         mask &= u->manager->cgroup_supported;
+        mask &= ~unit_get_ancestor_disable_mask(u);
 
         return mask;
 }
 
-/* Recurse from a unit up through its containing slices, propagating
- * mask bits upward. A unit is also member of itself. */
-void unit_update_cgroup_members_masks(Unit *u) {
-        CGroupMask m;
-        bool more;
-
+void unit_invalidate_cgroup_members_masks(Unit *u) {
         assert(u);
 
-        /* Calculate subtree mask */
-        m = unit_get_subtree_mask(u);
+        /* Recurse invalidate the member masks cache all the way up the tree */
+        u->cgroup_members_mask_valid = false;
 
-        /* See if anything changed from the previous invocation. If
-         * not, we're done. */
-        if (u->cgroup_subtree_mask_valid && m == u->cgroup_subtree_mask)
-                return;
-
-        more =
-                u->cgroup_subtree_mask_valid &&
-                ((m & ~u->cgroup_subtree_mask) != 0) &&
-                ((~m & u->cgroup_subtree_mask) == 0);
-
-        u->cgroup_subtree_mask = m;
-        u->cgroup_subtree_mask_valid = true;
-
-        if (UNIT_ISSET(u->slice)) {
-                Unit *s = UNIT_DEREF(u->slice);
-
-                if (more)
-                        /* There's more set now than before. We
-                         * propagate the new mask to the parent's mask
-                         * (not caring if it actually was valid or
-                         * not). */
-
-                        s->cgroup_members_mask |= m;
-
-                else
-                        /* There's less set now than before (or we
-                         * don't know), we need to recalculate
-                         * everything, so let's invalidate the
-                         * parent's members mask */
-
-                        s->cgroup_members_mask_valid = false;
-
-                /* And now make sure that this change also hits our
-                 * grandparents */
-                unit_update_cgroup_members_masks(s);
-        }
+        if (UNIT_ISSET(u->slice))
+                unit_invalidate_cgroup_members_masks(UNIT_DEREF(u->slice));
 }
 
-static const char *migrate_callback(CGroupMask mask, void *userdata) {
-        Unit *u = userdata;
+const char *unit_get_realized_cgroup_path(Unit *u, CGroupMask mask) {
 
-        assert(mask != 0);
-        assert(u);
+        /* Returns the realized cgroup path of the specified unit where all specified controllers are available. */
 
         while (u) {
+
                 if (u->cgroup_path &&
                     u->cgroup_realized &&
-                    (u->cgroup_realized_mask & mask) == mask)
+                    FLAGS_SET(u->cgroup_realized_mask, mask))
                         return u->cgroup_path;
 
                 u = UNIT_DEREF(u->slice);
@@ -1181,7 +1490,11 @@ static const char *migrate_callback(CGroupMask mask, void *userdata) {
         return NULL;
 }
 
-char *unit_default_cgroup_path(Unit *u) {
+static const char *migrate_callback(CGroupMask mask, void *userdata) {
+        return unit_get_realized_cgroup_path(userdata, mask);
+}
+
+char *unit_default_cgroup_path(const Unit *u) {
         _cleanup_free_ char *escaped = NULL, *slice = NULL;
         int r;
 
@@ -1201,9 +1514,10 @@ char *unit_default_cgroup_path(Unit *u) {
                 return NULL;
 
         if (slice)
-                return strjoin(u->manager->cgroup_root, "/", slice, "/", escaped, NULL);
+                return strjoin(u->manager->cgroup_root, "/", slice, "/",
+                               escaped);
         else
-                return strjoin(u->manager->cgroup_root, "/", escaped, NULL);
+                return strjoin(u->manager->cgroup_root, "/", escaped);
 }
 
 int unit_set_cgroup_path(Unit *u, const char *path) {
@@ -1230,8 +1544,7 @@ int unit_set_cgroup_path(Unit *u, const char *path) {
 
         unit_release_cgroup(u);
 
-        u->cgroup_path = p;
-        p = NULL;
+        u->cgroup_path = TAKE_PTR(p);
 
         return 1;
 }
@@ -1249,9 +1562,9 @@ int unit_watch_cgroup(Unit *u) {
                 return 0;
 
         /* Only applies to the unified hierarchy */
-        r = cg_unified(SYSTEMD_CGROUP_CONTROLLER);
+        r = cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER);
         if (r < 0)
-                return log_unit_error_errno(u, r, "Failed detect whether the unified hierarchy is used: %m");
+                return log_error_errno(r, "Failed to determine whether the name=systemd hierarchy is unified: %m");
         if (r == 0)
                 return 0;
 
@@ -1285,53 +1598,94 @@ int unit_watch_cgroup(Unit *u) {
         return 0;
 }
 
-static int unit_create_cgroup(
-                Unit *u,
-                CGroupMask target_mask,
-                CGroupMask enable_mask) {
-
-        CGroupContext *c;
+int unit_pick_cgroup_path(Unit *u) {
+        _cleanup_free_ char *path = NULL;
         int r;
 
         assert(u);
 
-        c = unit_get_cgroup_context(u);
-        if (!c)
+        if (u->cgroup_path)
                 return 0;
 
-        if (!u->cgroup_path) {
-                _cleanup_free_ char *path = NULL;
+        if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return -EINVAL;
 
-                path = unit_default_cgroup_path(u);
-                if (!path)
-                        return log_oom();
+        path = unit_default_cgroup_path(u);
+        if (!path)
+                return log_oom();
 
-                r = unit_set_cgroup_path(u, path);
-                if (r == -EEXIST)
-                        return log_unit_error_errno(u, r, "Control group %s exists already.", path);
-                if (r < 0)
-                        return log_unit_error_errno(u, r, "Failed to set unit's control group path to %s: %m", path);
-        }
+        r = unit_set_cgroup_path(u, path);
+        if (r == -EEXIST)
+                return log_unit_error_errno(u, r, "Control group %s exists already.", path);
+        if (r < 0)
+                return log_unit_error_errno(u, r, "Failed to set unit's control group path to %s: %m", path);
+
+        return 0;
+}
+
+static int unit_create_cgroup(
+                Unit *u,
+                CGroupMask target_mask,
+                CGroupMask enable_mask,
+                ManagerState state) {
+
+        bool created;
+        int r;
+
+        assert(u);
+
+        if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return 0;
+
+        /* Figure out our cgroup path */
+        r = unit_pick_cgroup_path(u);
+        if (r < 0)
+                return r;
 
         /* First, create our own group */
         r = cg_create_everywhere(u->manager->cgroup_supported, target_mask, u->cgroup_path);
         if (r < 0)
                 return log_unit_error_errno(u, r, "Failed to create cgroup %s: %m", u->cgroup_path);
+        created = r;
 
         /* Start watching it */
         (void) unit_watch_cgroup(u);
 
-        /* Enable all controllers we need */
-        r = cg_enable_everywhere(u->manager->cgroup_supported, enable_mask, u->cgroup_path);
-        if (r < 0)
-                log_unit_warning_errno(u, r, "Failed to enable controllers on cgroup %s, ignoring: %m", u->cgroup_path);
+        /* Preserve enabled controllers in delegated units, adjust others. */
+        if (created || !u->cgroup_realized || !unit_cgroup_delegate(u)) {
+                CGroupMask result_mask = 0;
+
+                /* Enable all controllers we need */
+                r = cg_enable_everywhere(u->manager->cgroup_supported, enable_mask, u->cgroup_path, &result_mask);
+                if (r < 0)
+                        log_unit_warning_errno(u, r, "Failed to enable/disable controllers on cgroup %s, ignoring: %m", u->cgroup_path);
+
+                /* If we just turned off a controller, this might release the controller for our parent too, let's
+                 * enqueue the parent for re-realization in that case again. */
+                if (UNIT_ISSET(u->slice)) {
+                        CGroupMask turned_off;
+
+                        turned_off = (u->cgroup_realized ? u->cgroup_enabled_mask & ~result_mask : 0);
+                        if (turned_off != 0) {
+                                Unit *parent;
+
+                                /* Force the parent to propagate the enable mask to the kernel again, by invalidating
+                                 * the controller we just turned off. */
+
+                                for (parent = UNIT_DEREF(u->slice); parent; parent = UNIT_DEREF(parent->slice))
+                                        unit_invalidate_cgroup(parent, turned_off);
+                        }
+                }
+
+                /* Remember what's actually enabled now */
+                u->cgroup_enabled_mask = result_mask;
+        }
 
         /* Keep track that this is now realized */
         u->cgroup_realized = true;
         u->cgroup_realized_mask = target_mask;
-        u->cgroup_enabled_mask = enable_mask;
 
-        if (u->type != UNIT_SLICE && !c->delegate) {
+        if (u->type != UNIT_SLICE && !unit_cgroup_delegate(u)) {
 
                 /* Then, possibly move things over, but not if
                  * subgroups may contain processes, which is the case
@@ -1341,54 +1695,354 @@ static int unit_create_cgroup(
                         log_unit_warning_errno(u, r, "Failed to migrate cgroup from to %s, ignoring: %m", u->cgroup_path);
         }
 
+        /* Set attributes */
+        cgroup_context_apply(u, target_mask, state);
+        cgroup_xattr_apply(u);
+
         return 0;
 }
 
-int unit_attach_pids_to_cgroup(Unit *u) {
+static int unit_attach_pid_to_cgroup_via_bus(Unit *u, pid_t pid, const char *suffix_path) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        char *pp;
         int r;
+
         assert(u);
+
+        if (MANAGER_IS_SYSTEM(u->manager))
+                return -EINVAL;
+
+        if (!u->manager->system_bus)
+                return -EIO;
+
+        if (!u->cgroup_path)
+                return -EINVAL;
+
+        /* Determine this unit's cgroup path relative to our cgroup root */
+        pp = path_startswith(u->cgroup_path, u->manager->cgroup_root);
+        if (!pp)
+                return -EINVAL;
+
+        pp = strjoina("/", pp, suffix_path);
+        path_simplify(pp, false);
+
+        r = sd_bus_call_method(u->manager->system_bus,
+                               "org.freedesktop.systemd1",
+                               "/org/freedesktop/systemd1",
+                               "org.freedesktop.systemd1.Manager",
+                               "AttachProcessesToUnit",
+                               &error, NULL,
+                               "ssau",
+                               NULL /* empty unit name means client's unit, i.e. us */, pp, 1, (uint32_t) pid);
+        if (r < 0)
+                return log_unit_debug_errno(u, r, "Failed to attach unit process " PID_FMT " via the bus: %s", pid, bus_error_message(&error, r));
+
+        return 0;
+}
+
+int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
+        CGroupMask delegated_mask;
+        const char *p;
+        Iterator i;
+        void *pidp;
+        int r, q;
+
+        assert(u);
+
+        if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return -EINVAL;
+
+        if (set_isempty(pids))
+                return 0;
 
         r = unit_realize_cgroup(u);
         if (r < 0)
                 return r;
 
-        r = cg_attach_many_everywhere(u->manager->cgroup_supported, u->cgroup_path, u->pids, migrate_callback, u);
-        if (r < 0)
-                return r;
+        if (isempty(suffix_path))
+                p = u->cgroup_path;
+        else
+                p = strjoina(u->cgroup_path, "/", suffix_path);
 
-        return 0;
+        delegated_mask = unit_get_delegate_mask(u);
+
+        r = 0;
+        SET_FOREACH(pidp, pids, i) {
+                pid_t pid = PTR_TO_PID(pidp);
+                CGroupController c;
+
+                /* First, attach the PID to the main cgroup hierarchy */
+                q = cg_attach(SYSTEMD_CGROUP_CONTROLLER, p, pid);
+                if (q < 0) {
+                        log_unit_debug_errno(u, q, "Couldn't move process " PID_FMT " to requested cgroup '%s': %m", pid, p);
+
+                        if (MANAGER_IS_USER(u->manager) && IN_SET(q, -EPERM, -EACCES)) {
+                                int z;
+
+                                /* If we are in a user instance, and we can't move the process ourselves due to
+                                 * permission problems, let's ask the system instance about it instead. Since it's more
+                                 * privileged it might be able to move the process across the leaves of a subtree who's
+                                 * top node is not owned by us. */
+
+                                z = unit_attach_pid_to_cgroup_via_bus(u, pid, suffix_path);
+                                if (z < 0)
+                                        log_unit_debug_errno(u, z, "Couldn't move process " PID_FMT " to requested cgroup '%s' via the system bus either: %m", pid, p);
+                                else
+                                        continue; /* When the bus thing worked via the bus we are fully done for this PID. */
+                        }
+
+                        if (r >= 0)
+                                r = q; /* Remember first error */
+
+                        continue;
+                }
+
+                q = cg_all_unified();
+                if (q < 0)
+                        return q;
+                if (q > 0)
+                        continue;
+
+                /* In the legacy hierarchy, attach the process to the request cgroup if possible, and if not to the
+                 * innermost realized one */
+
+                for (c = 0; c < _CGROUP_CONTROLLER_MAX; c++) {
+                        CGroupMask bit = CGROUP_CONTROLLER_TO_MASK(c);
+                        const char *realized;
+
+                        if (!(u->manager->cgroup_supported & bit))
+                                continue;
+
+                        /* If this controller is delegated and realized, honour the caller's request for the cgroup suffix. */
+                        if (delegated_mask & u->cgroup_realized_mask & bit) {
+                                q = cg_attach(cgroup_controller_to_string(c), p, pid);
+                                if (q >= 0)
+                                        continue; /* Success! */
+
+                                log_unit_debug_errno(u, q, "Failed to attach PID " PID_FMT " to requested cgroup %s in controller %s, falling back to unit's cgroup: %m",
+                                                     pid, p, cgroup_controller_to_string(c));
+                        }
+
+                        /* So this controller is either not delegate or realized, or something else weird happened. In
+                         * that case let's attach the PID at least to the closest cgroup up the tree that is
+                         * realized. */
+                        realized = unit_get_realized_cgroup_path(u, bit);
+                        if (!realized)
+                                continue; /* Not even realized in the root slice? Then let's not bother */
+
+                        q = cg_attach(cgroup_controller_to_string(c), realized, pid);
+                        if (q < 0)
+                                log_unit_debug_errno(u, q, "Failed to attach PID " PID_FMT " to realized cgroup %s in controller %s, ignoring: %m",
+                                                     pid, realized, cgroup_controller_to_string(c));
+                }
+        }
+
+        return r;
 }
 
-static void cgroup_xattr_apply(Unit *u) {
-        char ids[SD_ID128_STRING_MAX];
+static bool unit_has_mask_realized(
+                Unit *u,
+                CGroupMask target_mask,
+                CGroupMask enable_mask) {
+
+        assert(u);
+
+        /* Returns true if this unit is fully realized. We check four things:
+         *
+         * 1. Whether the cgroup was created at all
+         * 2. Whether the cgroup was created in all the hierarchies we need it to be created in (in case of cgroup v1)
+         * 3. Whether the cgroup has all the right controllers enabled (in case of cgroup v2)
+         * 4. Whether the invalidation mask is currently zero
+         *
+         * If you wonder why we mask the target realization and enable mask with CGROUP_MASK_V1/CGROUP_MASK_V2: note
+         * that there are three sets of bitmasks: CGROUP_MASK_V1 (for real cgroup v1 controllers), CGROUP_MASK_V2 (for
+         * real cgroup v2 controllers) and CGROUP_MASK_BPF (for BPF-based pseudo-controllers). Now, cgroup_realized_mask
+         * is only matters for cgroup v1 controllers, and cgroup_enabled_mask only used for cgroup v2, and if they
+         * differ in the others, we don't really care. (After all, the cgroup_enabled_mask tracks with controllers are
+         * enabled through cgroup.subtree_control, and since the BPF pseudo-controllers don't show up there, they
+         * simply don't matter. */
+
+        return u->cgroup_realized &&
+                ((u->cgroup_realized_mask ^ target_mask) & CGROUP_MASK_V1) == 0 &&
+                ((u->cgroup_enabled_mask ^ enable_mask) & CGROUP_MASK_V2) == 0 &&
+                u->cgroup_invalidated_mask == 0;
+}
+
+static bool unit_has_mask_disables_realized(
+                Unit *u,
+                CGroupMask target_mask,
+                CGroupMask enable_mask) {
+
+        assert(u);
+
+        /* Returns true if all controllers which should be disabled are indeed disabled.
+         *
+         * Unlike unit_has_mask_realized, we don't care what was enabled, only that anything we want to remove is
+         * already removed. */
+
+        return !u->cgroup_realized ||
+                (FLAGS_SET(u->cgroup_realized_mask, target_mask & CGROUP_MASK_V1) &&
+                 FLAGS_SET(u->cgroup_enabled_mask, enable_mask & CGROUP_MASK_V2));
+}
+
+static bool unit_has_mask_enables_realized(
+                Unit *u,
+                CGroupMask target_mask,
+                CGroupMask enable_mask) {
+
+        assert(u);
+
+        /* Returns true if all controllers which should be enabled are indeed enabled.
+         *
+         * Unlike unit_has_mask_realized, we don't care about the controllers that are not present, only that anything
+         * we want to add is already added. */
+
+        return u->cgroup_realized &&
+                ((u->cgroup_realized_mask | target_mask) & CGROUP_MASK_V1) == (u->cgroup_realized_mask & CGROUP_MASK_V1) &&
+                ((u->cgroup_enabled_mask | enable_mask) & CGROUP_MASK_V2) == (u->cgroup_enabled_mask & CGROUP_MASK_V2);
+}
+
+void unit_add_to_cgroup_realize_queue(Unit *u) {
+        assert(u);
+
+        if (u->in_cgroup_realize_queue)
+                return;
+
+        LIST_PREPEND(cgroup_realize_queue, u->manager->cgroup_realize_queue, u);
+        u->in_cgroup_realize_queue = true;
+}
+
+static void unit_remove_from_cgroup_realize_queue(Unit *u) {
+        assert(u);
+
+        if (!u->in_cgroup_realize_queue)
+                return;
+
+        LIST_REMOVE(cgroup_realize_queue, u->manager->cgroup_realize_queue, u);
+        u->in_cgroup_realize_queue = false;
+}
+
+/* Controllers can only be enabled breadth-first, from the root of the
+ * hierarchy downwards to the unit in question. */
+static int unit_realize_cgroup_now_enable(Unit *u, ManagerState state) {
+        CGroupMask target_mask, enable_mask, new_target_mask, new_enable_mask;
         int r;
 
         assert(u);
 
-        if (!MANAGER_IS_SYSTEM(u->manager))
-                return;
+        /* First go deal with this unit's parent, or we won't be able to enable
+         * any new controllers at this layer. */
+        if (UNIT_ISSET(u->slice)) {
+                r = unit_realize_cgroup_now_enable(UNIT_DEREF(u->slice), state);
+                if (r < 0)
+                        return r;
+        }
 
-        if (sd_id128_is_null(u->invocation_id))
-                return;
+        target_mask = unit_get_target_mask(u);
+        enable_mask = unit_get_enable_mask(u);
 
-        r = cg_set_xattr(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path,
-                         "trusted.invocation_id",
-                         sd_id128_to_string(u->invocation_id, ids), 32,
-                         0);
-        if (r < 0)
-                log_unit_warning_errno(u, r, "Failed to set invocation ID on control group %s, ignoring: %m", u->cgroup_path);
+        /* We can only enable in this direction, don't try to disable anything.
+         */
+        if (unit_has_mask_enables_realized(u, target_mask, enable_mask))
+                return 0;
+
+        new_target_mask = u->cgroup_realized_mask | target_mask;
+        new_enable_mask = u->cgroup_enabled_mask | enable_mask;
+
+        return unit_create_cgroup(u, new_target_mask, new_enable_mask, state);
 }
 
-static bool unit_has_mask_realized(Unit *u, CGroupMask target_mask, CGroupMask enable_mask) {
+/* Controllers can only be disabled depth-first, from the leaves of the
+ * hierarchy upwards to the unit in question. */
+static int unit_realize_cgroup_now_disable(Unit *u, ManagerState state) {
+        Iterator i;
+        Unit *m;
+        void *v;
+
         assert(u);
 
-        return u->cgroup_realized && u->cgroup_realized_mask == target_mask && u->cgroup_enabled_mask == enable_mask;
+        if (u->type != UNIT_SLICE)
+                return 0;
+
+        HASHMAP_FOREACH_KEY(v, m, u->dependencies[UNIT_BEFORE], i) {
+                CGroupMask target_mask, enable_mask, new_target_mask, new_enable_mask;
+                int r;
+
+                if (UNIT_DEREF(m->slice) != u)
+                        continue;
+
+                /* The cgroup for this unit might not actually be fully
+                 * realised yet, in which case it isn't holding any controllers
+                 * open anyway. */
+                if (!m->cgroup_path)
+                        continue;
+
+                /* We must disable those below us first in order to release the
+                 * controller. */
+                if (m->type == UNIT_SLICE)
+                        (void) unit_realize_cgroup_now_disable(m, state);
+
+                target_mask = unit_get_target_mask(m);
+                enable_mask = unit_get_enable_mask(m);
+
+                /* We can only disable in this direction, don't try to enable
+                 * anything. */
+                if (unit_has_mask_disables_realized(m, target_mask, enable_mask))
+                        continue;
+
+                new_target_mask = m->cgroup_realized_mask & target_mask;
+                new_enable_mask = m->cgroup_enabled_mask & enable_mask;
+
+                r = unit_create_cgroup(m, new_target_mask, new_enable_mask, state);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
 }
 
 /* Check if necessary controllers and attributes for a unit are in place.
  *
- * If so, do nothing.
- * If not, create paths, move processes over, and set attributes.
+ * - If so, do nothing.
+ * - If not, create paths, move processes over, and set attributes.
+ *
+ * Controllers can only be *enabled* in a breadth-first way, and *disabled* in
+ * a depth-first way. As such the process looks like this:
+ *
+ * Suppose we have a cgroup hierarchy which looks like this:
+ *
+ *             root
+ *            /    \
+ *           /      \
+ *          /        \
+ *         a          b
+ *        / \        / \
+ *       /   \      /   \
+ *      c     d    e     f
+ *     / \   / \  / \   / \
+ *     h i   j k  l m   n o
+ *
+ * 1. We want to realise cgroup "d" now.
+ * 2. cgroup "a" has DisableControllers=cpu in the associated unit.
+ * 3. cgroup "k" just started requesting the memory controller.
+ *
+ * To make this work we must do the following in order:
+ *
+ * 1. Disable CPU controller in k, j
+ * 2. Disable CPU controller in d
+ * 3. Enable memory controller in root
+ * 4. Enable memory controller in a
+ * 5. Enable memory controller in d
+ * 6. Enable memory controller in k
+ *
+ * Notice that we need to touch j in one direction, but not the other. We also
+ * don't go beyond d when disabling -- it's up to "a" to get realized if it
+ * wants to disable further. The basic rules are therefore:
+ *
+ * - If you're disabling something, you need to realise all of the cgroups from
+ *   your recursive descendants to the root. This starts from the leaves.
+ * - If you're enabling something, you need to realise from the root cgroup
+ *   downwards, but you don't need to iterate your recursive descendants.
  *
  * Returns 0 on success and < 0 on failure. */
 static int unit_realize_cgroup_now(Unit *u, ManagerState state) {
@@ -1397,10 +2051,7 @@ static int unit_realize_cgroup_now(Unit *u, ManagerState state) {
 
         assert(u);
 
-        if (u->in_cgroup_queue) {
-                LIST_REMOVE(cgroup_queue, u->manager->cgroup_queue, u);
-                u->in_cgroup_queue = false;
-        }
+        unit_remove_from_cgroup_realize_queue(u);
 
         target_mask = unit_get_target_mask(u);
         enable_mask = unit_get_enable_mask(u);
@@ -1408,44 +2059,46 @@ static int unit_realize_cgroup_now(Unit *u, ManagerState state) {
         if (unit_has_mask_realized(u, target_mask, enable_mask))
                 return 0;
 
-        /* First, realize parents */
+        /* Disable controllers below us, if there are any */
+        r = unit_realize_cgroup_now_disable(u, state);
+        if (r < 0)
+                return r;
+
+        /* Enable controllers above us, if there are any */
         if (UNIT_ISSET(u->slice)) {
-                r = unit_realize_cgroup_now(UNIT_DEREF(u->slice), state);
+                r = unit_realize_cgroup_now_enable(UNIT_DEREF(u->slice), state);
                 if (r < 0)
                         return r;
         }
 
-        /* And then do the real work */
-        r = unit_create_cgroup(u, target_mask, enable_mask);
+        /* Now actually deal with the cgroup we were trying to realise and set attributes */
+        r = unit_create_cgroup(u, target_mask, enable_mask, state);
         if (r < 0)
                 return r;
 
-        /* Finally, apply the necessary attributes. */
-        cgroup_context_apply(u, target_mask, state);
-        cgroup_xattr_apply(u);
-
+        /* Now, reset the invalidation mask */
+        u->cgroup_invalidated_mask = 0;
         return 0;
 }
 
-static void unit_add_to_cgroup_queue(Unit *u) {
-
-        if (u->in_cgroup_queue)
-                return;
-
-        LIST_PREPEND(cgroup_queue, u->manager->cgroup_queue, u);
-        u->in_cgroup_queue = true;
-}
-
-unsigned manager_dispatch_cgroup_queue(Manager *m) {
+unsigned manager_dispatch_cgroup_realize_queue(Manager *m) {
         ManagerState state;
         unsigned n = 0;
         Unit *i;
         int r;
 
+        assert(m);
+
         state = manager_state(m);
 
-        while ((i = m->cgroup_queue)) {
-                assert(i->in_cgroup_queue);
+        while ((i = m->cgroup_realize_queue)) {
+                assert(i->in_cgroup_realize_queue);
+
+                if (UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(i))) {
+                        /* Maybe things changed, and the unit is not actually active anymore? */
+                        unit_remove_from_cgroup_realize_queue(i);
+                        continue;
+                }
 
                 r = unit_realize_cgroup_now(i, state);
                 if (r < 0)
@@ -1457,7 +2110,7 @@ unsigned manager_dispatch_cgroup_queue(Manager *m) {
         return n;
 }
 
-static void unit_queue_siblings(Unit *u) {
+static void unit_add_siblings_to_cgroup_realize_queue(Unit *u) {
         Unit *slice;
 
         /* This adds the siblings of the specified unit and the
@@ -1467,11 +2120,9 @@ static void unit_queue_siblings(Unit *u) {
         while ((slice = UNIT_DEREF(u->slice))) {
                 Iterator i;
                 Unit *m;
+                void *v;
 
-                SET_FOREACH(m, slice->dependencies[UNIT_BEFORE], i) {
-                        if (m == u)
-                                continue;
-
+                HASHMAP_FOREACH_KEY(v, m, u->dependencies[UNIT_BEFORE], i) {
                         /* Skip units that have a dependency on the slice
                          * but aren't actually in it. */
                         if (UNIT_DEREF(m->slice) != slice)
@@ -1485,10 +2136,12 @@ static void unit_queue_siblings(Unit *u) {
                         /* If the unit doesn't need any new controllers
                          * and has current ones realized, it doesn't need
                          * any changes. */
-                        if (unit_has_mask_realized(m, unit_get_target_mask(m), unit_get_enable_mask(m)))
+                        if (unit_has_mask_realized(m,
+                                                   unit_get_target_mask(m),
+                                                   unit_get_enable_mask(m)))
                                 continue;
 
-                        unit_add_to_cgroup_queue(m);
+                        unit_add_to_cgroup_realize_queue(m);
                 }
 
                 u = slice;
@@ -1513,7 +2166,7 @@ int unit_realize_cgroup(Unit *u) {
          * iteration. */
 
         /* Add all sibling slices to the cgroup queue. */
-        unit_queue_siblings(u);
+        unit_add_siblings_to_cgroup_realize_queue(u);
 
         /* And realize this one now (and apply the values) */
         return unit_realize_cgroup_now(u, manager_state(u->manager));
@@ -1522,7 +2175,8 @@ int unit_realize_cgroup(Unit *u) {
 void unit_release_cgroup(Unit *u) {
         assert(u);
 
-        /* Forgets all cgroup details for this cgroup */
+        /* Forgets all cgroup details for this cgroup — but does *not* destroy the cgroup. This is hence OK to call
+         * when we close down everything for reexecution, where we really want to leave the cgroup in place. */
 
         if (u->cgroup_path) {
                 (void) hashmap_remove(u->manager->cgroup_unit, u->cgroup_path);
@@ -1531,7 +2185,7 @@ void unit_release_cgroup(Unit *u) {
 
         if (u->cgroup_inotify_wd >= 0) {
                 if (inotify_rm_watch(u->manager->cgroup_inotify_fd, u->cgroup_inotify_wd) < 0)
-                        log_unit_debug_errno(u, errno, "Failed to remove cgroup inotify watch %i for %s, ignoring", u->cgroup_inotify_wd, u->id);
+                        log_unit_debug_errno(u, errno, "Failed to remove cgroup inotify watch %i for %s, ignoring: %m", u->cgroup_inotify_wd, u->id);
 
                 (void) hashmap_remove(u->manager->cgroup_inotify_wd_unit, INT_TO_PTR(u->cgroup_inotify_wd));
                 u->cgroup_inotify_wd = -1;
@@ -1567,6 +2221,8 @@ void unit_prune_cgroup(Unit *u) {
         u->cgroup_realized = false;
         u->cgroup_realized_mask = 0;
         u->cgroup_enabled_mask = 0;
+
+        u->bpf_device_control_installed = bpf_program_unref(u->bpf_device_control_installed);
 }
 
 int unit_search_main_pid(Unit *u, pid_t *ret) {
@@ -1584,7 +2240,7 @@ int unit_search_main_pid(Unit *u, pid_t *ret) {
         if (r < 0)
                 return r;
 
-        mypid = getpid();
+        mypid = getpid_cached();
         while (cg_read_pid(f, &npid) > 0)  {
                 pid_t ppid;
 
@@ -1643,7 +2299,7 @@ static int unit_watch_pids_in_path(Unit *u, const char *path) {
                 while ((r = cg_read_subgroup(d, &fn)) > 0) {
                         _cleanup_free_ char *p = NULL;
 
-                        p = strjoin(path, "/", fn, NULL);
+                        p = strjoin(path, "/", fn);
                         free(fn);
 
                         if (!p)
@@ -1661,7 +2317,34 @@ static int unit_watch_pids_in_path(Unit *u, const char *path) {
         return ret;
 }
 
+int unit_synthesize_cgroup_empty_event(Unit *u) {
+        int r;
+
+        assert(u);
+
+        /* Enqueue a synthetic cgroup empty event if this unit doesn't watch any PIDs anymore. This is compatibility
+         * support for non-unified systems where notifications aren't reliable, and hence need to take whatever we can
+         * get as notification source as soon as we stopped having any useful PIDs to watch for. */
+
+        if (!u->cgroup_path)
+                return -ENOENT;
+
+        r = cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER);
+        if (r < 0)
+                return r;
+        if (r > 0) /* On unified we have reliable notifications, and don't need this */
+                return 0;
+
+        if (!set_isempty(u->pids))
+                return 0;
+
+        unit_add_to_cgroup_empty_queue(u);
+        return 0;
+}
+
 int unit_watch_all_pids(Unit *u) {
+        int r;
+
         assert(u);
 
         /* Adds all PIDs from our cgroup to the set of PIDs we
@@ -1672,23 +2355,37 @@ int unit_watch_all_pids(Unit *u) {
         if (!u->cgroup_path)
                 return -ENOENT;
 
-        if (cg_unified(SYSTEMD_CGROUP_CONTROLLER) > 0) /* On unified we can use proper notifications */
+        r = cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER);
+        if (r < 0)
+                return r;
+        if (r > 0) /* On unified we can use proper notifications */
                 return 0;
 
         return unit_watch_pids_in_path(u, u->cgroup_path);
 }
 
-int unit_notify_cgroup_empty(Unit *u) {
+static int on_cgroup_empty_event(sd_event_source *s, void *userdata) {
+        Manager *m = userdata;
+        Unit *u;
         int r;
 
-        assert(u);
+        assert(s);
+        assert(m);
 
-        if (!u->cgroup_path)
+        u = m->cgroup_empty_queue;
+        if (!u)
                 return 0;
 
-        r = cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path);
-        if (r <= 0)
-                return r;
+        assert(u->in_cgroup_empty_queue);
+        u->in_cgroup_empty_queue = false;
+        LIST_REMOVE(cgroup_empty_queue, m->cgroup_empty_queue, u);
+
+        if (m->cgroup_empty_queue) {
+                /* More stuff queued, let's make sure we remain enabled */
+                r = sd_event_source_set_enabled(s, SD_EVENT_ONESHOT);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to reenable cgroup empty event source, ignoring: %m");
+        }
 
         unit_add_to_gc_queue(u);
 
@@ -1696,6 +2393,51 @@ int unit_notify_cgroup_empty(Unit *u) {
                 UNIT_VTABLE(u)->notify_cgroup_empty(u);
 
         return 0;
+}
+
+void unit_add_to_cgroup_empty_queue(Unit *u) {
+        int r;
+
+        assert(u);
+
+        /* Note that there are four different ways how cgroup empty events reach us:
+         *
+         * 1. On the unified hierarchy we get an inotify event on the cgroup
+         *
+         * 2. On the legacy hierarchy, when running in system mode, we get a datagram on the cgroup agent socket
+         *
+         * 3. On the legacy hierarchy, when running in user mode, we get a D-Bus signal on the system bus
+         *
+         * 4. On the legacy hierarchy, in service units we start watching all processes of the cgroup for SIGCHLD as
+         *    soon as we get one SIGCHLD, to deal with unreliable cgroup notifications.
+         *
+         * Regardless which way we got the notification, we'll verify it here, and then add it to a separate
+         * queue. This queue will be dispatched at a lower priority than the SIGCHLD handler, so that we always use
+         * SIGCHLD if we can get it first, and only use the cgroup empty notifications if there's no SIGCHLD pending
+         * (which might happen if the cgroup doesn't contain processes that are our own child, which is typically the
+         * case for scope units). */
+
+        if (u->in_cgroup_empty_queue)
+                return;
+
+        /* Let's verify that the cgroup is really empty */
+        if (!u->cgroup_path)
+                return;
+        r = cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path);
+        if (r < 0) {
+                log_unit_debug_errno(u, r, "Failed to determine whether cgroup %s is empty: %m", u->cgroup_path);
+                return;
+        }
+        if (r == 0)
+                return;
+
+        LIST_PREPEND(cgroup_empty_queue, u->manager->cgroup_empty_queue, u);
+        u->in_cgroup_empty_queue = true;
+
+        /* Trigger the defer event */
+        r = sd_event_source_set_enabled(u->manager->cgroup_empty_event_source, SD_EVENT_ONESHOT);
+        if (r < 0)
+                log_debug_errno(r, "Failed to enable cgroup empty event source: %m");
 }
 
 static int on_cgroup_inotify_event(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
@@ -1712,7 +2454,7 @@ static int on_cgroup_inotify_event(sd_event_source *s, int fd, uint32_t revents,
 
                 l = read(fd, &buffer, sizeof(buffer));
                 if (l < 0) {
-                        if (errno == EINTR || errno == EAGAIN)
+                        if (IN_SET(errno, EINTR, EAGAIN))
                                 return 0;
 
                         return log_error_errno(errno, "Failed to read control group inotify events: %m");
@@ -1737,15 +2479,35 @@ static int on_cgroup_inotify_event(sd_event_source *s, int fd, uint32_t revents,
                                  * this here safely. */
                                 continue;
 
-                        (void) unit_notify_cgroup_empty(u);
+                        unit_add_to_cgroup_empty_queue(u);
                 }
         }
 }
 
+static int cg_bpf_mask_supported(CGroupMask *ret) {
+        CGroupMask mask = 0;
+        int r;
+
+        /* BPF-based firewall */
+        r = bpf_firewall_supported();
+        if (r > 0)
+                mask |= CGROUP_MASK_BPF_FIREWALL;
+
+        /* BPF-based device access control */
+        r = bpf_devices_supported();
+        if (r > 0)
+                mask |= CGROUP_MASK_BPF_DEVICES;
+
+        *ret = mask;
+        return 0;
+}
+
 int manager_setup_cgroup(Manager *m) {
         _cleanup_free_ char *path = NULL;
+        const char *scope_path;
         CGroupController c;
-        int r, all_unified, systemd_unified;
+        int r, all_unified;
+        CGroupMask mask;
         char *e;
 
         assert(m);
@@ -1771,104 +2533,122 @@ int manager_setup_cgroup(Manager *m) {
         if (e)
                 *e = 0;
 
-        /* And make sure to store away the root value without trailing
-         * slash, even for the root dir, so that we can easily prepend
-         * it everywhere. */
-        while ((e = endswith(m->cgroup_root, "/")))
-                *e = 0;
+        /* And make sure to store away the root value without trailing slash, even for the root dir, so that we can
+         * easily prepend it everywhere. */
+        delete_trailing_chars(m->cgroup_root, "/");
 
         /* 2. Show data */
         r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, m->cgroup_root, NULL, &path);
         if (r < 0)
                 return log_error_errno(r, "Cannot find cgroup mount point: %m");
 
+        r = cg_unified_flush();
+        if (r < 0)
+                return log_error_errno(r, "Couldn't determine if we are running in the unified hierarchy: %m");
+
         all_unified = cg_all_unified();
-        systemd_unified = cg_unified(SYSTEMD_CGROUP_CONTROLLER);
-
-        if (all_unified < 0 || systemd_unified < 0)
-                return log_error_errno(all_unified < 0 ? all_unified : systemd_unified,
-                                       "Couldn't determine if we are running in the unified hierarchy: %m");
-
+        if (all_unified < 0)
+                return log_error_errno(all_unified, "Couldn't determine whether we are in all unified mode: %m");
         if (all_unified > 0)
                 log_debug("Unified cgroup hierarchy is located at %s.", path);
-        else if (systemd_unified > 0)
-                log_debug("Unified cgroup hierarchy is located at %s. Controllers are on legacy hierarchies.", path);
-        else
-                log_debug("Using cgroup controller " SYSTEMD_CGROUP_CONTROLLER ". File system hierarchy is at %s.", path);
-
-        if (!m->test_run) {
-                const char *scope_path;
-
-                /* 3. Install agent */
-                if (systemd_unified) {
-
-                        /* In the unified hierarchy we can get
-                         * cgroup empty notifications via inotify. */
-
-                        m->cgroup_inotify_event_source = sd_event_source_unref(m->cgroup_inotify_event_source);
-                        safe_close(m->cgroup_inotify_fd);
-
-                        m->cgroup_inotify_fd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
-                        if (m->cgroup_inotify_fd < 0)
-                                return log_error_errno(errno, "Failed to create control group inotify object: %m");
-
-                        r = sd_event_add_io(m->event, &m->cgroup_inotify_event_source, m->cgroup_inotify_fd, EPOLLIN, on_cgroup_inotify_event, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to watch control group inotify object: %m");
-
-                        /* Process cgroup empty notifications early, but after service notifications and SIGCHLD. Also
-                         * see handling of cgroup agent notifications, for the classic cgroup hierarchy support. */
-                        r = sd_event_source_set_priority(m->cgroup_inotify_event_source, SD_EVENT_PRIORITY_NORMAL-5);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set priority of inotify event source: %m");
-
-                        (void) sd_event_source_set_description(m->cgroup_inotify_event_source, "cgroup-inotify");
-
-                } else if (MANAGER_IS_SYSTEM(m)) {
-
-                        /* On the legacy hierarchy we only get
-                         * notifications via cgroup agents. (Which
-                         * isn't really reliable, since it does not
-                         * generate events when control groups with
-                         * children run empty. */
-
-                        r = cg_install_release_agent(SYSTEMD_CGROUP_CONTROLLER, SYSTEMD_CGROUP_AGENT_PATH);
-                        if (r < 0)
-                                log_warning_errno(r, "Failed to install release agent, ignoring: %m");
-                        else if (r > 0)
-                                log_debug("Installed release agent.");
-                        else if (r == 0)
-                                log_debug("Release agent already installed.");
-                }
-
-                /* 4. Make sure we are in the special "init.scope" unit in the root slice. */
-                scope_path = strjoina(m->cgroup_root, "/" SPECIAL_INIT_SCOPE);
-                r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, scope_path, 0);
+        else {
+                r = cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to create %s control group: %m", scope_path);
+                        return log_error_errno(r, "Failed to determine whether systemd's own controller is in unified mode: %m");
+                if (r > 0)
+                        log_debug("Unified cgroup hierarchy is located at %s. Controllers are on legacy hierarchies.", path);
+                else
+                        log_debug("Using cgroup controller " SYSTEMD_CGROUP_CONTROLLER_LEGACY ". File system hierarchy is at %s.", path);
+        }
 
-                /* also, move all other userspace processes remaining
-                 * in the root cgroup into that scope. */
+        /* 3. Allocate cgroup empty defer event source */
+        m->cgroup_empty_event_source = sd_event_source_unref(m->cgroup_empty_event_source);
+        r = sd_event_add_defer(m->event, &m->cgroup_empty_event_source, on_cgroup_empty_event, m);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create cgroup empty event source: %m");
+
+        r = sd_event_source_set_priority(m->cgroup_empty_event_source, SD_EVENT_PRIORITY_NORMAL-5);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set priority of cgroup empty event source: %m");
+
+        r = sd_event_source_set_enabled(m->cgroup_empty_event_source, SD_EVENT_OFF);
+        if (r < 0)
+                return log_error_errno(r, "Failed to disable cgroup empty event source: %m");
+
+        (void) sd_event_source_set_description(m->cgroup_empty_event_source, "cgroup-empty");
+
+        /* 4. Install notifier inotify object, or agent */
+        if (cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER) > 0) {
+
+                /* In the unified hierarchy we can get cgroup empty notifications via inotify. */
+
+                m->cgroup_inotify_event_source = sd_event_source_unref(m->cgroup_inotify_event_source);
+                safe_close(m->cgroup_inotify_fd);
+
+                m->cgroup_inotify_fd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
+                if (m->cgroup_inotify_fd < 0)
+                        return log_error_errno(errno, "Failed to create control group inotify object: %m");
+
+                r = sd_event_add_io(m->event, &m->cgroup_inotify_event_source, m->cgroup_inotify_fd, EPOLLIN, on_cgroup_inotify_event, m);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to watch control group inotify object: %m");
+
+                /* Process cgroup empty notifications early, but after service notifications and SIGCHLD. Also
+                 * see handling of cgroup agent notifications, for the classic cgroup hierarchy support. */
+                r = sd_event_source_set_priority(m->cgroup_inotify_event_source, SD_EVENT_PRIORITY_NORMAL-4);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set priority of inotify event source: %m");
+
+                (void) sd_event_source_set_description(m->cgroup_inotify_event_source, "cgroup-inotify");
+
+        } else if (MANAGER_IS_SYSTEM(m) && manager_owns_host_root_cgroup(m) && !MANAGER_IS_TEST_RUN(m)) {
+
+                /* On the legacy hierarchy we only get notifications via cgroup agents. (Which isn't really reliable,
+                 * since it does not generate events when control groups with children run empty. */
+
+                r = cg_install_release_agent(SYSTEMD_CGROUP_CONTROLLER, SYSTEMD_CGROUP_AGENT_PATH);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to install release agent, ignoring: %m");
+                else if (r > 0)
+                        log_debug("Installed release agent.");
+                else if (r == 0)
+                        log_debug("Release agent already installed.");
+        }
+
+        /* 5. Make sure we are in the special "init.scope" unit in the root slice. */
+        scope_path = strjoina(m->cgroup_root, "/" SPECIAL_INIT_SCOPE);
+        r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, scope_path, 0);
+        if (r >= 0) {
+                /* Also, move all other userspace processes remaining in the root cgroup into that scope. */
                 r = cg_migrate(SYSTEMD_CGROUP_CONTROLLER, m->cgroup_root, SYSTEMD_CGROUP_CONTROLLER, scope_path, 0);
                 if (r < 0)
                         log_warning_errno(r, "Couldn't move remaining userspace processes, ignoring: %m");
 
-                /* 5. And pin it, so that it cannot be unmounted */
+                /* 6. And pin it, so that it cannot be unmounted */
                 safe_close(m->pin_cgroupfs_fd);
                 m->pin_cgroupfs_fd = open(path, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOCTTY|O_NONBLOCK);
                 if (m->pin_cgroupfs_fd < 0)
                         return log_error_errno(errno, "Failed to open pin file: %m");
 
-                /* 6.  Always enable hierarchical support if it exists... */
-                if (!all_unified)
-                        (void) cg_set_attribute("memory", "/", "memory.use_hierarchy", "1");
-        }
+        } else if (!MANAGER_IS_TEST_RUN(m))
+                return log_error_errno(r, "Failed to create %s control group: %m", scope_path);
 
-        /* 7. Figure out which controllers are supported */
+        /* 7. Always enable hierarchical support if it exists... */
+        if (!all_unified && !MANAGER_IS_TEST_RUN(m))
+                (void) cg_set_attribute("memory", "/", "memory.use_hierarchy", "1");
+
+        /* 8. Figure out which controllers are supported */
         r = cg_mask_supported(&m->cgroup_supported);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine supported controllers: %m");
 
+        /* 9. Figure out which bpf-based pseudo-controllers are supported */
+        r = cg_bpf_mask_supported(&mask);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine supported bpf-based pseudo-controllers: %m");
+        m->cgroup_supported |= mask;
+
+        /* 10. Log which controllers are supported */
         for (c = 0; c < _CGROUP_CONTROLLER_MAX; c++)
                 log_debug("Controller '%s' supported: %s", cgroup_controller_to_string(c), yes_no(m->cgroup_supported & CGROUP_CONTROLLER_TO_MASK(c)));
 
@@ -1880,8 +2660,10 @@ void manager_shutdown_cgroup(Manager *m, bool delete) {
 
         /* We can't really delete the group, since we are in it. But
          * let's trim it. */
-        if (delete && m->cgroup_root)
+        if (delete && m->cgroup_root && m->test_run_flags != MANAGER_TEST_RUN_MINIMAL)
                 (void) cg_trim(SYSTEMD_CGROUP_CONTROLLER, m->cgroup_root, false);
+
+        m->cgroup_empty_event_source = sd_event_source_unref(m->cgroup_empty_event_source);
 
         m->cgroup_inotify_wd_unit = hashmap_free(m->cgroup_inotify_wd_unit);
 
@@ -1922,40 +2704,46 @@ Unit* manager_get_unit_by_cgroup(Manager *m, const char *cgroup) {
 
 Unit *manager_get_unit_by_pid_cgroup(Manager *m, pid_t pid) {
         _cleanup_free_ char *cgroup = NULL;
-        int r;
 
         assert(m);
 
-        if (pid <= 0)
+        if (!pid_is_valid(pid))
                 return NULL;
 
-        r = cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, pid, &cgroup);
-        if (r < 0)
+        if (cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, pid, &cgroup) < 0)
                 return NULL;
 
         return manager_get_unit_by_cgroup(m, cgroup);
 }
 
 Unit *manager_get_unit_by_pid(Manager *m, pid_t pid) {
-        Unit *u;
+        Unit *u, **array;
 
         assert(m);
 
-        if (pid <= 0)
+        /* Note that a process might be owned by multiple units, we return only one here, which is good enough for most
+         * cases, though not strictly correct. We prefer the one reported by cgroup membership, as that's the most
+         * relevant one as children of the process will be assigned to that one, too, before all else. */
+
+        if (!pid_is_valid(pid))
                 return NULL;
 
-        if (pid == 1)
+        if (pid == getpid_cached())
                 return hashmap_get(m->units, SPECIAL_INIT_SCOPE);
 
-        u = hashmap_get(m->watch_pids1, PID_TO_PTR(pid));
+        u = manager_get_unit_by_pid_cgroup(m, pid);
         if (u)
                 return u;
 
-        u = hashmap_get(m->watch_pids2, PID_TO_PTR(pid));
+        u = hashmap_get(m->watch_pids, PID_TO_PTR(pid));
         if (u)
                 return u;
 
-        return manager_get_unit_by_pid_cgroup(m, pid);
+        array = hashmap_get(m->watch_pids, PID_TO_PTR(-pid));
+        if (array)
+                return array[0];
+
+        return NULL;
 }
 
 int manager_notify_cgroup_empty(Manager *m, const char *cgroup) {
@@ -1964,13 +2752,17 @@ int manager_notify_cgroup_empty(Manager *m, const char *cgroup) {
         assert(m);
         assert(cgroup);
 
+        /* Called on the legacy hierarchy whenever we get an explicit cgroup notification from the cgroup agent process
+         * or from the --system instance */
+
         log_debug("Got cgroup empty notification for: %s", cgroup);
 
         u = manager_get_unit_by_cgroup(m, cgroup);
         if (!u)
                 return 0;
 
-        return unit_notify_cgroup_empty(u);
+        unit_add_to_cgroup_empty_queue(u);
+        return 1;
 }
 
 int unit_get_memory_current(Unit *u, uint64_t *ret) {
@@ -1980,16 +2772,26 @@ int unit_get_memory_current(Unit *u, uint64_t *ret) {
         assert(u);
         assert(ret);
 
+        if (!UNIT_CGROUP_BOOL(u, memory_accounting))
+                return -ENODATA;
+
         if (!u->cgroup_path)
                 return -ENODATA;
+
+        /* The root cgroup doesn't expose this information, let's get it from /proc instead */
+        if (unit_has_host_root_cgroup(u))
+                return procfs_memory_get_used(ret);
 
         if ((u->cgroup_realized_mask & CGROUP_MASK_MEMORY) == 0)
                 return -ENODATA;
 
-        if (cg_all_unified() <= 0)
-                r = cg_get_attribute("memory", u->cgroup_path, "memory.usage_in_bytes", &v);
-        else
+        r = cg_all_unified();
+        if (r < 0)
+                return r;
+        if (r > 0)
                 r = cg_get_attribute("memory", u->cgroup_path, "memory.current", &v);
+        else
+                r = cg_get_attribute("memory", u->cgroup_path, "memory.usage_in_bytes", &v);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
@@ -2005,8 +2807,15 @@ int unit_get_tasks_current(Unit *u, uint64_t *ret) {
         assert(u);
         assert(ret);
 
+        if (!UNIT_CGROUP_BOOL(u, tasks_accounting))
+                return -ENODATA;
+
         if (!u->cgroup_path)
                 return -ENODATA;
+
+        /* The root cgroup doesn't expose this information, let's get it from /proc instead */
+        if (unit_has_host_root_cgroup(u))
+                return procfs_tasks_get_current(ret);
 
         if ((u->cgroup_realized_mask & CGROUP_MASK_PIDS) == 0)
                 return -ENODATA;
@@ -2031,15 +2840,24 @@ static int unit_get_cpu_usage_raw(Unit *u, nsec_t *ret) {
         if (!u->cgroup_path)
                 return -ENODATA;
 
-        if (cg_all_unified() > 0) {
-                const char *keys[] = { "usage_usec", NULL };
+        /* The root cgroup doesn't expose this information, let's get it from /proc instead */
+        if (unit_has_host_root_cgroup(u))
+                return procfs_cpu_get_usage(ret);
+
+        /* Requisite controllers for CPU accounting are not enabled */
+        if ((get_cpu_accounting_mask() & ~u->cgroup_realized_mask) != 0)
+                return -ENODATA;
+
+        r = cg_all_unified();
+        if (r < 0)
+                return r;
+        if (r > 0) {
                 _cleanup_free_ char *val = NULL;
                 uint64_t us;
 
-                if ((u->cgroup_realized_mask & CGROUP_MASK_CPU) == 0)
+                r = cg_get_keyed_attribute("cpu", u->cgroup_path, "cpu.stat", STRV_MAKE("usage_usec"), &val);
+                if (IN_SET(r, -ENOENT, -ENXIO))
                         return -ENODATA;
-
-                r = cg_get_keyed_attribute("cpu", u->cgroup_path, "cpu.stat", keys, &val);
                 if (r < 0)
                         return r;
 
@@ -2049,9 +2867,6 @@ static int unit_get_cpu_usage_raw(Unit *u, nsec_t *ret) {
 
                 ns = us * NSEC_PER_USEC;
         } else {
-                if ((u->cgroup_realized_mask & CGROUP_MASK_CPUACCT) == 0)
-                        return -ENODATA;
-
                 r = cg_get_attribute("cpuacct", u->cgroup_path, "cpuacct.usage", &v);
                 if (r == -ENOENT)
                         return -ENODATA;
@@ -2077,6 +2892,9 @@ int unit_get_cpu_usage(Unit *u, nsec_t *ret) {
          * started. If the cgroup has been removed already, returns the last cached value. To cache the value, simply
          * call this function with a NULL return value. */
 
+        if (!UNIT_CGROUP_BOOL(u, cpu_accounting))
+                return -ENODATA;
+
         r = unit_get_cpu_usage_raw(u, &ns);
         if (r == -ENODATA && u->cpu_usage_last != NSEC_INFINITY) {
                 /* If we can't get the CPU usage anymore (because the cgroup was already removed, for example), use our
@@ -2101,7 +2919,45 @@ int unit_get_cpu_usage(Unit *u, nsec_t *ret) {
         return 0;
 }
 
-int unit_reset_cpu_usage(Unit *u) {
+int unit_get_ip_accounting(
+                Unit *u,
+                CGroupIPAccountingMetric metric,
+                uint64_t *ret) {
+
+        uint64_t value;
+        int fd, r;
+
+        assert(u);
+        assert(metric >= 0);
+        assert(metric < _CGROUP_IP_ACCOUNTING_METRIC_MAX);
+        assert(ret);
+
+        if (!UNIT_CGROUP_BOOL(u, ip_accounting))
+                return -ENODATA;
+
+        fd = IN_SET(metric, CGROUP_IP_INGRESS_BYTES, CGROUP_IP_INGRESS_PACKETS) ?
+                u->ip_accounting_ingress_map_fd :
+                u->ip_accounting_egress_map_fd;
+        if (fd < 0)
+                return -ENODATA;
+
+        if (IN_SET(metric, CGROUP_IP_INGRESS_BYTES, CGROUP_IP_EGRESS_BYTES))
+                r = bpf_firewall_read_accounting(fd, &value, NULL);
+        else
+                r = bpf_firewall_read_accounting(fd, NULL, &value);
+        if (r < 0)
+                return r;
+
+        /* Add in additional metrics from a previous runtime. Note that when reexecing/reloading the daemon we compile
+         * all BPF programs and maps anew, but serialize the old counters. When deserializing we store them in the
+         * ip_accounting_extra[] field, and add them in here transparently. */
+
+        *ret = value + u->ip_accounting_extra[metric];
+
+        return r;
+}
+
+int unit_reset_cpu_accounting(Unit *u) {
         nsec_t ns;
         int r;
 
@@ -2119,16 +2975,20 @@ int unit_reset_cpu_usage(Unit *u) {
         return 0;
 }
 
-bool unit_cgroup_delegate(Unit *u) {
-        CGroupContext *c;
+int unit_reset_ip_accounting(Unit *u) {
+        int r = 0, q = 0;
 
         assert(u);
 
-        c = unit_get_cgroup_context(u);
-        if (!c)
-                return false;
+        if (u->ip_accounting_ingress_map_fd >= 0)
+                r = bpf_firewall_reset_accounting(u->ip_accounting_ingress_map_fd);
 
-        return c->delegate;
+        if (u->ip_accounting_egress_map_fd >= 0)
+                q = bpf_firewall_reset_accounting(u->ip_accounting_egress_map_fd);
+
+        zero(u->ip_accounting_extra);
+
+        return r < 0 ? r : q;
 }
 
 void unit_invalidate_cgroup(Unit *u, CGroupMask m) {
@@ -2144,11 +3004,55 @@ void unit_invalidate_cgroup(Unit *u, CGroupMask m) {
         if (m & (CGROUP_MASK_IO | CGROUP_MASK_BLKIO))
                 m |= CGROUP_MASK_IO | CGROUP_MASK_BLKIO;
 
-        if ((u->cgroup_realized_mask & m) == 0)
+        if (m & (CGROUP_MASK_CPU | CGROUP_MASK_CPUACCT))
+                m |= CGROUP_MASK_CPU | CGROUP_MASK_CPUACCT;
+
+        if (FLAGS_SET(u->cgroup_invalidated_mask, m)) /* NOP? */
                 return;
 
-        u->cgroup_realized_mask &= ~m;
-        unit_add_to_cgroup_queue(u);
+        u->cgroup_invalidated_mask |= m;
+        unit_add_to_cgroup_realize_queue(u);
+}
+
+void unit_invalidate_cgroup_bpf(Unit *u) {
+        assert(u);
+
+        if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return;
+
+        if (u->cgroup_invalidated_mask & CGROUP_MASK_BPF_FIREWALL) /* NOP? */
+                return;
+
+        u->cgroup_invalidated_mask |= CGROUP_MASK_BPF_FIREWALL;
+        unit_add_to_cgroup_realize_queue(u);
+
+        /* If we are a slice unit, we also need to put compile a new BPF program for all our children, as the IP access
+         * list of our children includes our own. */
+        if (u->type == UNIT_SLICE) {
+                Unit *member;
+                Iterator i;
+                void *v;
+
+                HASHMAP_FOREACH_KEY(v, member, u->dependencies[UNIT_BEFORE], i) {
+                        if (UNIT_DEREF(member->slice) == u)
+                                unit_invalidate_cgroup_bpf(member);
+                }
+        }
+}
+
+bool unit_cgroup_delegate(Unit *u) {
+        CGroupContext *c;
+
+        assert(u);
+
+        if (!UNIT_VTABLE(u)->can_delegate)
+                return false;
+
+        c = unit_get_cgroup_context(u);
+        if (!c)
+                return false;
+
+        return c->delegate;
 }
 
 void manager_invalidate_startup_units(Manager *m) {

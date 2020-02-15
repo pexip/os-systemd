@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <stdarg.h>
@@ -71,8 +54,8 @@ BUS_ERROR_MAP_ELF_REGISTER const sd_bus_error_map bus_standard_errors[] = {
 };
 
 /* GCC maps this magically to the beginning and end of the BUS_ERROR_MAP section */
-extern const sd_bus_error_map __start_BUS_ERROR_MAP[];
-extern const sd_bus_error_map __stop_BUS_ERROR_MAP[];
+extern const sd_bus_error_map __start_SYSTEMD_BUS_ERROR_MAP[];
+extern const sd_bus_error_map __stop_SYSTEMD_BUS_ERROR_MAP[];
 
 /* Additional maps registered with sd_bus_error_add_map() are in this
  * NULL terminated array */
@@ -106,8 +89,8 @@ static int bus_error_name_to_errno(const char *name) {
                                         return m->code;
                         }
 
-        m = __start_BUS_ERROR_MAP;
-        while (m < __stop_BUS_ERROR_MAP) {
+        m = ALIGN_TO_PTR(__start_SYSTEMD_BUS_ERROR_MAP, sizeof(void*));
+        while (m < __stop_SYSTEMD_BUS_ERROR_MAP) {
                 /* For magic ELF error maps, the end marker might
                  * appear in the middle of things, since multiple maps
                  * might appear in the same section. Hence, let's skip
@@ -115,7 +98,7 @@ static int bus_error_name_to_errno(const char *name) {
                  * boundary, which is the selected alignment for the
                  * arrays. */
                 if (m->code == BUS_ERROR_MAP_END_MARKER) {
-                        m = ALIGN8_PTR(m+1);
+                        m = ALIGN_TO_PTR(m + 1, sizeof(void*));
                         continue;
                 }
 
@@ -220,8 +203,7 @@ _public_ void sd_bus_error_free(sd_bus_error *e) {
                 free((void*) e->message);
         }
 
-        e->name = e->message = NULL;
-        e->_need_free = 0;
+        *e = SD_BUS_ERROR_NULL;
 }
 
 _public_ int sd_bus_error_set(sd_bus_error *e, const char *name, const char *message) {
@@ -321,6 +303,28 @@ _public_ int sd_bus_error_copy(sd_bus_error *dest, const sd_bus_error *e) {
 
 finish:
         return -bus_error_name_to_errno(e->name);
+}
+
+_public_ int sd_bus_error_move(sd_bus_error *dest, sd_bus_error *e) {
+        int r;
+
+        if (!sd_bus_error_is_set(e)) {
+
+                if (dest)
+                        *dest = SD_BUS_ERROR_NULL;
+
+                return 0;
+        }
+
+        r = -bus_error_name_to_errno(e->name);
+
+        if (dest) {
+                *dest = *e;
+                *e = SD_BUS_ERROR_NULL;
+        } else
+                sd_bus_error_free(e);
+
+        return r;
 }
 
 _public_ int sd_bus_error_set_const(sd_bus_error *e, const char *name, const char *message) {
@@ -594,7 +598,7 @@ _public_ int sd_bus_error_add_map(const sd_bus_error_map *map) {
                         if (additional_error_maps[n] == map)
                                 return 0;
 
-        maps = realloc_multiply(additional_error_maps, sizeof(struct sd_bus_error_map*), n + 2);
+        maps = reallocarray(additional_error_maps, n + 2, sizeof(struct sd_bus_error_map*));
         if (!maps)
                 return -ENOMEM;
 

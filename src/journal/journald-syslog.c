@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <stddef.h>
 #include <sys/epoll.h>
@@ -25,7 +8,7 @@
 
 #include "alloc-util.h"
 #include "fd-util.h"
-#include "formats-util.h"
+#include "format-util.h"
 #include "io-util.h"
 #include "journald-console.h"
 #include "journald-kmsg.h"
@@ -91,7 +74,7 @@ static void forward_syslog_iovec(Server *s, const struct iovec *iovec, unsigned 
                 return;
         }
 
-        if (ucred && (errno == ESRCH || errno == EPERM)) {
+        if (ucred && IN_SET(errno, ESRCH, EPERM)) {
                 struct ucred u;
 
                 /* Hmm, presumably the sender process vanished
@@ -99,7 +82,7 @@ static void forward_syslog_iovec(Server *s, const struct iovec *iovec, unsigned 
                  * let's fix it as good as we can, and retry */
 
                 u = *ucred;
-                u.pid = getpid();
+                u.pid = getpid_cached();
                 memcpy(CMSG_DATA(cmsg), &u, sizeof(struct ucred));
 
                 if (sendmsg(s->syslog_fd, &msghdr, MSG_NOSIGNAL) >= 0)
@@ -115,7 +98,7 @@ static void forward_syslog_iovec(Server *s, const struct iovec *iovec, unsigned 
                 log_debug_errno(errno, "Failed to forward syslog message: %m");
 }
 
-static void forward_syslog_raw(Server *s, int priority, const char *buffer, const struct ucred *ucred, const struct timeval *tv) {
+static void forward_syslog_raw(Server *s, int priority, const char *buffer, size_t buffer_len, const struct ucred *ucred, const struct timeval *tv) {
         struct iovec iovec;
 
         assert(s);
@@ -124,18 +107,18 @@ static void forward_syslog_raw(Server *s, int priority, const char *buffer, cons
         if (LOG_PRI(priority) > s->max_level_syslog)
                 return;
 
-        IOVEC_SET_STRING(iovec, buffer);
+        iovec = IOVEC_MAKE((char *) buffer, buffer_len);
         forward_syslog_iovec(s, &iovec, 1, ucred, tv);
 }
 
 void server_forward_syslog(Server *s, int priority, const char *identifier, const char *message, const struct ucred *ucred, const struct timeval *tv) {
         struct iovec iovec[5];
         char header_priority[DECIMAL_STR_MAX(priority) + 3], header_time[64],
-             header_pid[sizeof("[]: ")-1 + DECIMAL_STR_MAX(pid_t) + 1];
+             header_pid[STRLEN("[]: ") + DECIMAL_STR_MAX(pid_t) + 1];
         int n = 0;
         time_t t;
-        struct tm *tm;
-        char *ident_buf = NULL;
+        struct tm tm;
+        _cleanup_free_ char *ident_buf = NULL;
 
         assert(s);
         assert(priority >= 0);
@@ -147,16 +130,15 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
 
         /* First: priority field */
         xsprintf(header_priority, "<%i>", priority);
-        IOVEC_SET_STRING(iovec[n++], header_priority);
+        iovec[n++] = IOVEC_MAKE_STRING(header_priority);
 
         /* Second: timestamp */
         t = tv ? tv->tv_sec : ((time_t) (now(CLOCK_REALTIME) / USEC_PER_SEC));
-        tm = localtime(&t);
-        if (!tm)
+        if (!localtime_r(&t, &tm))
                 return;
-        if (strftime(header_time, sizeof(header_time), "%h %e %T ", tm) <= 0)
+        if (strftime(header_time, sizeof(header_time), "%h %e %T ", &tm) <= 0)
                 return;
-        IOVEC_SET_STRING(iovec[n++], header_time);
+        iovec[n++] = IOVEC_MAKE_STRING(header_time);
 
         /* Third: identifier and PID */
         if (ucred) {
@@ -168,20 +150,18 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
                 xsprintf(header_pid, "["PID_FMT"]: ", ucred->pid);
 
                 if (identifier)
-                        IOVEC_SET_STRING(iovec[n++], identifier);
+                        iovec[n++] = IOVEC_MAKE_STRING(identifier);
 
-                IOVEC_SET_STRING(iovec[n++], header_pid);
+                iovec[n++] = IOVEC_MAKE_STRING(header_pid);
         } else if (identifier) {
-                IOVEC_SET_STRING(iovec[n++], identifier);
-                IOVEC_SET_STRING(iovec[n++], ": ");
+                iovec[n++] = IOVEC_MAKE_STRING(identifier);
+                iovec[n++] = IOVEC_MAKE_STRING(": ");
         }
 
         /* Fourth: message */
-        IOVEC_SET_STRING(iovec[n++], message);
+        iovec[n++] = IOVEC_MAKE_STRING(message);
 
         forward_syslog_iovec(s, iovec, n, ucred, tv);
-
-        free(ident_buf);
 }
 
 int syslog_fixup_facility(int priority) {
@@ -213,7 +193,7 @@ size_t syslog_parse_identifier(const char **buf, char **identifier, char **pid) 
         e = l;
         l--;
 
-        if (p[l-1] == ']') {
+        if (l > 0 && p[l-1] == ']') {
                 size_t k = l-1;
 
                 for (;;) {
@@ -238,13 +218,16 @@ size_t syslog_parse_identifier(const char **buf, char **identifier, char **pid) 
         if (t)
                 *identifier = t;
 
-        if (strchr(WHITESPACE, p[e]))
+        /* Single space is used as separator */
+        if (p[e] != '\0' && strchr(WHITESPACE, p[e]))
                 e++;
+
+        l = (p - *buf) + e;
         *buf = p + e;
-        return e;
+        return l;
 }
 
-static void syslog_skip_date(char **buf) {
+static int syslog_skip_timestamp(const char **buf) {
         enum {
                 LETTER,
                 SPACE,
@@ -264,119 +247,198 @@ static void syslog_skip_date(char **buf) {
                 SPACE
         };
 
-        char *p;
+        const char *p, *t;
         unsigned i;
 
         assert(buf);
         assert(*buf);
 
-        p = *buf;
-
-        for (i = 0; i < ELEMENTSOF(sequence); i++, p++) {
-
+        for (i = 0, p = *buf; i < ELEMENTSOF(sequence); i++, p++) {
                 if (!*p)
-                        return;
+                        return 0;
 
                 switch (sequence[i]) {
 
                 case SPACE:
                         if (*p != ' ')
-                                return;
+                                return 0;
                         break;
 
                 case SPACE_OR_NUMBER:
                         if (*p == ' ')
                                 break;
 
-                        /* fall through */
-
+                        _fallthrough_;
                 case NUMBER:
                         if (*p < '0' || *p > '9')
-                                return;
+                                return 0;
 
                         break;
 
                 case LETTER:
                         if (!(*p >= 'A' && *p <= 'Z') &&
                             !(*p >= 'a' && *p <= 'z'))
-                                return;
+                                return 0;
 
                         break;
 
                 case COLON:
                         if (*p != ':')
-                                return;
+                                return 0;
                         break;
 
                 }
         }
 
+        t = *buf;
         *buf = p;
+        return p - t;
 }
 
 void server_process_syslog_message(
                 Server *s,
                 const char *buf,
+                size_t raw_len,
                 const struct ucred *ucred,
                 const struct timeval *tv,
                 const char *label,
                 size_t label_len) {
 
-        char syslog_priority[sizeof("PRIORITY=") + DECIMAL_STR_MAX(int)],
-             syslog_facility[sizeof("SYSLOG_FACILITY=") + DECIMAL_STR_MAX(int)];
-        const char *message = NULL, *syslog_identifier = NULL, *syslog_pid = NULL;
-        struct iovec iovec[N_IOVEC_META_FIELDS + 6];
-        unsigned n = 0;
-        int priority = LOG_USER | LOG_INFO;
-        _cleanup_free_ char *identifier = NULL, *pid = NULL;
-        const char *orig;
+        char *t, syslog_priority[sizeof("PRIORITY=") + DECIMAL_STR_MAX(int)],
+                 syslog_facility[sizeof("SYSLOG_FACILITY=") + DECIMAL_STR_MAX(int)];
+        const char *msg, *syslog_ts, *a;
+        _cleanup_free_ char *identifier = NULL, *pid = NULL,
+                *dummy = NULL, *msg_msg = NULL, *msg_raw = NULL;
+        int priority = LOG_USER | LOG_INFO, r;
+        ClientContext *context = NULL;
+        struct iovec *iovec;
+        size_t n = 0, m, i, leading_ws, syslog_ts_len;
+        bool store_raw;
 
         assert(s);
         assert(buf);
+        /* The message cannot be empty. */
+        assert(raw_len > 0);
+        /* The buffer NUL-terminated and can be used a string. raw_len is the length
+         * without the terminating NUL byte, the buffer is actually one bigger. */
+        assert(buf[raw_len] == '\0');
 
-        orig = buf;
-        syslog_parse_priority(&buf, &priority, true);
+        if (ucred && pid_is_valid(ucred->pid)) {
+                r = client_context_get(s, ucred->pid, ucred, label, label_len, NULL, &context);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to retrieve credentials for PID " PID_FMT ", ignoring: %m", ucred->pid);
+        }
+
+        /* We are creating a copy of the message because we want to forward the original message
+           verbatim to the legacy syslog implementation */
+        for (i = raw_len; i > 0; i--)
+                if (!strchr(WHITESPACE, buf[i-1]))
+                        break;
+
+        leading_ws = strspn(buf, WHITESPACE);
+
+        if (i == 0)
+                /* The message contains only whitespaces */
+                msg = buf + raw_len;
+        else if (i == raw_len)
+                /* Nice! No need to strip anything on the end, let's optimize this a bit */
+                msg = buf + leading_ws;
+        else {
+                msg = dummy = new(char, i - leading_ws + 1);
+                if (!dummy) {
+                        log_oom();
+                        return;
+                }
+
+                memcpy(dummy, buf + leading_ws, i - leading_ws);
+                dummy[i - leading_ws] = 0;
+        }
+
+        /* We will add the SYSLOG_RAW= field when we stripped anything
+         * _or_ if the input message contained NUL bytes. */
+        store_raw = msg != buf || strlen(msg) != raw_len;
+
+        syslog_parse_priority(&msg, &priority, true);
+
+        if (!client_context_test_priority(context, priority))
+                return;
+
+        syslog_ts = msg;
+        syslog_ts_len = syslog_skip_timestamp(&msg);
+        if (syslog_ts_len == 0)
+                /* We failed to parse the full timestamp, store the raw message too */
+                store_raw = true;
+
+        syslog_parse_identifier(&msg, &identifier, &pid);
 
         if (s->forward_to_syslog)
-                forward_syslog_raw(s, priority, orig, ucred, tv);
-
-        syslog_skip_date((char**) &buf);
-        syslog_parse_identifier(&buf, &identifier, &pid);
+                forward_syslog_raw(s, priority, buf, raw_len, ucred, tv);
 
         if (s->forward_to_kmsg)
-                server_forward_kmsg(s, priority, identifier, buf, ucred);
+                server_forward_kmsg(s, priority, identifier, msg, ucred);
 
         if (s->forward_to_console)
-                server_forward_console(s, priority, identifier, buf, ucred);
+                server_forward_console(s, priority, identifier, msg, ucred);
 
         if (s->forward_to_wall)
-                server_forward_wall(s, priority, identifier, buf, ucred);
+                server_forward_wall(s, priority, identifier, msg, ucred);
 
-        IOVEC_SET_STRING(iovec[n++], "_TRANSPORT=syslog");
+        m = N_IOVEC_META_FIELDS + 8 + client_context_extra_fields_n_iovec(context);
+        iovec = newa(struct iovec, m);
+
+        iovec[n++] = IOVEC_MAKE_STRING("_TRANSPORT=syslog");
 
         xsprintf(syslog_priority, "PRIORITY=%i", priority & LOG_PRIMASK);
-        IOVEC_SET_STRING(iovec[n++], syslog_priority);
+        iovec[n++] = IOVEC_MAKE_STRING(syslog_priority);
 
         if (priority & LOG_FACMASK) {
                 xsprintf(syslog_facility, "SYSLOG_FACILITY=%i", LOG_FAC(priority));
-                IOVEC_SET_STRING(iovec[n++], syslog_facility);
+                iovec[n++] = IOVEC_MAKE_STRING(syslog_facility);
         }
 
         if (identifier) {
-                syslog_identifier = strjoina("SYSLOG_IDENTIFIER=", identifier);
-                IOVEC_SET_STRING(iovec[n++], syslog_identifier);
+                a = strjoina("SYSLOG_IDENTIFIER=", identifier);
+                iovec[n++] = IOVEC_MAKE_STRING(a);
         }
 
         if (pid) {
-                syslog_pid = strjoina("SYSLOG_PID=", pid);
-                IOVEC_SET_STRING(iovec[n++], syslog_pid);
+                a = strjoina("SYSLOG_PID=", pid);
+                iovec[n++] = IOVEC_MAKE_STRING(a);
         }
 
-        message = strjoina("MESSAGE=", buf);
-        if (message)
-                IOVEC_SET_STRING(iovec[n++], message);
+        if (syslog_ts_len > 0) {
+                const size_t hlen = STRLEN("SYSLOG_TIMESTAMP=");
 
-        server_dispatch_message(s, iovec, n, ELEMENTSOF(iovec), ucred, tv, label, label_len, NULL, priority, 0);
+                t = newa(char, hlen + syslog_ts_len);
+                memcpy(t, "SYSLOG_TIMESTAMP=", hlen);
+                memcpy(t + hlen, syslog_ts, syslog_ts_len);
+
+                iovec[n++] = IOVEC_MAKE(t, hlen + syslog_ts_len);
+        }
+
+        msg_msg = strjoin("MESSAGE=", msg);
+        if (!msg_msg) {
+                log_oom();
+                return;
+        }
+        iovec[n++] = IOVEC_MAKE_STRING(msg_msg);
+
+        if (store_raw) {
+                const size_t hlen = STRLEN("SYSLOG_RAW=");
+
+                msg_raw = new(char, hlen + raw_len);
+                if (!msg_raw) {
+                        log_oom();
+                        return;
+                }
+
+                memcpy(msg_raw, "SYSLOG_RAW=", hlen);
+                memcpy(msg_raw + hlen, buf, raw_len);
+
+                iovec[n++] = IOVEC_MAKE(msg_raw, hlen + raw_len);
+        }
+
+        server_dispatch_message(s, iovec, n, m, context, tv, priority, 0);
 }
 
 int server_open_syslog_socket(Server *s) {
@@ -385,7 +447,6 @@ int server_open_syslog_socket(Server *s) {
                 .un.sun_family = AF_UNIX,
                 .un.sun_path = "/run/systemd/journal/dev-log",
         };
-        static const int one = 1;
         int r;
 
         assert(s);
@@ -395,7 +456,7 @@ int server_open_syslog_socket(Server *s) {
                 if (s->syslog_fd < 0)
                         return log_error_errno(errno, "socket() failed: %m");
 
-                (void) unlink(sa.un.sun_path);
+                (void) sockaddr_un_unlink(&sa.un);
 
                 r = bind(s->syslog_fd, &sa.sa, SOCKADDR_UN_LEN(sa.un));
                 if (r < 0)
@@ -403,23 +464,23 @@ int server_open_syslog_socket(Server *s) {
 
                 (void) chmod(sa.un.sun_path, 0666);
         } else
-                fd_nonblock(s->syslog_fd, 1);
+                (void) fd_nonblock(s->syslog_fd, true);
 
-        r = setsockopt(s->syslog_fd, SOL_SOCKET, SO_PASSCRED, &one, sizeof(one));
+        r = setsockopt_int(s->syslog_fd, SOL_SOCKET, SO_PASSCRED, true);
         if (r < 0)
-                return log_error_errno(errno, "SO_PASSCRED failed: %m");
+                return log_error_errno(r, "SO_PASSCRED failed: %m");
 
-#ifdef HAVE_SELINUX
-        if (mac_selinux_have()) {
-                r = setsockopt(s->syslog_fd, SOL_SOCKET, SO_PASSSEC, &one, sizeof(one));
+#if HAVE_SELINUX
+        if (mac_selinux_use()) {
+                r = setsockopt_int(s->syslog_fd, SOL_SOCKET, SO_PASSSEC, true);
                 if (r < 0)
-                        log_warning_errno(errno, "SO_PASSSEC failed: %m");
+                        log_warning_errno(r, "SO_PASSSEC failed: %m");
         }
 #endif
 
-        r = setsockopt(s->syslog_fd, SOL_SOCKET, SO_TIMESTAMP, &one, sizeof(one));
+        r = setsockopt_int(s->syslog_fd, SOL_SOCKET, SO_TIMESTAMP, true);
         if (r < 0)
-                return log_error_errno(errno, "SO_TIMESTAMP failed: %m");
+                return log_error_errno(r, "SO_TIMESTAMP failed: %m");
 
         r = sd_event_add_io(s->event, &s->syslog_event_source, s->syslog_fd, EPOLLIN, server_process_datagram, s);
         if (r < 0)
@@ -444,7 +505,8 @@ void server_maybe_warn_forward_syslog_missed(Server *s) {
         if (s->last_warn_forward_syslog_missed + WARN_FORWARD_SYSLOG_MISSED_USEC > n)
                 return;
 
-        server_driver_message(s, SD_MESSAGE_FORWARD_SYSLOG_MISSED,
+        server_driver_message(s, 0,
+                              "MESSAGE_ID=" SD_MESSAGE_FORWARD_SYSLOG_MISSED_STR,
                               LOG_MESSAGE("Forwarding to syslog missed %u messages.",
                                           s->n_forward_syslog_missed),
                               NULL);

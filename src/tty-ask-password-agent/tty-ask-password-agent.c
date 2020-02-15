@@ -1,21 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-  Copyright 2015 Werner Fink
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2015 Werner Fink
 ***/
 
 #include <errno.h>
@@ -45,8 +30,10 @@
 #include "hashmap.h"
 #include "io-util.h"
 #include "macro.h"
+#include "main-func.h"
 #include "mkdir.h"
 #include "path-util.h"
+#include "pretty-print.h"
 #include "process-util.h"
 #include "signal-util.h"
 #include "socket-util.h"
@@ -158,14 +145,14 @@ static int ask_password_plymouth(
                 }
 
                 if (notify >= 0 && pollfd[POLL_INOTIFY].revents != 0)
-                        flush_fd(notify);
+                        (void) flush_fd(notify);
 
                 if (pollfd[POLL_SOCKET].revents == 0)
                         continue;
 
                 k = read(fd, buffer + p, sizeof(buffer) - p);
                 if (k < 0) {
-                        if (errno == EINTR || errno == EAGAIN)
+                        if (IN_SET(errno, EINTR, EAGAIN))
                                 continue;
 
                         r = -errno;
@@ -206,7 +193,7 @@ static int ask_password_plymouth(
                         r = -ENOENT;
                         goto finish;
 
-                } else if (buffer[0] == 2 || buffer[0] == 9) {
+                } else if (IN_SET(buffer[0], 2, 9)) {
                         uint32_t size;
                         char **l;
 
@@ -243,19 +230,24 @@ static int ask_password_plymouth(
         r = 0;
 
 finish:
-        memory_erase(buffer, sizeof(buffer));
+        explicit_bzero_safe(buffer, sizeof(buffer));
         return r;
 }
 
 static int send_passwords(const char *socket_name, char **passwords) {
         _cleanup_free_ char *packet = NULL;
         _cleanup_close_ int socket_fd = -1;
-        union sockaddr_union sa = { .un.sun_family = AF_UNIX };
+        union sockaddr_union sa = {};
         size_t packet_length = 1;
         char **p, *d;
-        int r;
+        ssize_t n;
+        int r, salen;
 
         assert(socket_name);
+
+        salen = sockaddr_un_set_path(&sa.un, socket_name);
+        if (salen < 0)
+                return salen;
 
         STRV_FOREACH(p, passwords)
                 packet_length += strlen(*p) + 1;
@@ -276,14 +268,16 @@ static int send_passwords(const char *socket_name, char **passwords) {
                 goto finish;
         }
 
-        strncpy(sa.un.sun_path, socket_name, sizeof(sa.un.sun_path));
-
-        r = sendto(socket_fd, packet, packet_length, MSG_NOSIGNAL, &sa.sa, SOCKADDR_UN_LEN(sa.un));
-        if (r < 0)
+        n = sendto(socket_fd, packet, packet_length, MSG_NOSIGNAL, &sa.sa, salen);
+        if (n < 0) {
                 r = log_debug_errno(errno, "sendto(): %m");
+                goto finish;
+        }
+
+        r = (int) n;
 
 finish:
-        memory_erase(packet, packet_length);
+        explicit_bzero_safe(packet, packet_length);
         return r;
 }
 
@@ -310,14 +304,13 @@ static int parse_password(const char *filename, char **wall) {
         r = config_parse(NULL, filename, NULL,
                          NULL,
                          config_item_table_lookup, items,
-                         true, false, true, NULL);
+                         CONFIG_PARSE_RELAXED|CONFIG_PARSE_WARN, NULL);
         if (r < 0)
                 return r;
 
-        if (!socket_name) {
-                log_error("Invalid password file %s", filename);
-                return -EBADMSG;
-        }
+        if (!socket_name)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Invalid password file %s", filename);
 
         if (not_after > 0 && now(CLOCK_MONOTONIC) > not_after)
                 return 0;
@@ -333,7 +326,7 @@ static int parse_password(const char *filename, char **wall) {
 
                 if (asprintf(&_wall,
                              "%s%sPassword entry required for \'%s\' (PID %u).\r\n"
-                             "Please enter password with the systemd-tty-ask-password-agent tool!",
+                             "Please enter password with the systemd-tty-ask-password-agent tool:",
                              strempty(*wall),
                              *wall ? "\r\n\r\n" : "",
                              message,
@@ -346,8 +339,7 @@ static int parse_password(const char *filename, char **wall) {
         } else {
                 _cleanup_strv_free_erase_ char **passwords = NULL;
 
-                assert(arg_action == ACTION_QUERY ||
-                       arg_action == ACTION_WATCH);
+                assert(IN_SET(arg_action, ACTION_QUERY, ACTION_WATCH));
 
                 if (access(socket_name, W_OK) < 0) {
                         if (arg_action == ACTION_QUERY)
@@ -359,33 +351,29 @@ static int parse_password(const char *filename, char **wall) {
                 if (arg_plymouth)
                         r = ask_password_plymouth(message, not_after, accept_cached ? ASK_PASSWORD_ACCEPT_CACHED : 0, filename, &passwords);
                 else {
-                        char *password = NULL;
                         int tty_fd = -1;
 
                         if (arg_console) {
-                                const char *con = arg_device ? arg_device : "/dev/console";
+                                const char *con = arg_device ?: "/dev/console";
 
-                                tty_fd = acquire_terminal(con, false, false, false, USEC_INFINITY);
+                                tty_fd = acquire_terminal(con, ACQUIRE_TERMINAL_WAIT, USEC_INFINITY);
                                 if (tty_fd < 0)
-                                        return log_error_errno(tty_fd, "Failed to acquire /dev/console: %m");
+                                        return log_error_errno(tty_fd, "Failed to acquire %s: %m", con);
 
                                 r = reset_terminal_fd(tty_fd, true);
                                 if (r < 0)
                                         log_warning_errno(r, "Failed to reset terminal, ignoring: %m");
                         }
 
-                        r = ask_password_tty(message, NULL, not_after, echo ? ASK_PASSWORD_ECHO : 0, filename, &password);
+                        r = ask_password_tty(tty_fd, message, NULL, not_after,
+                                             (echo ? ASK_PASSWORD_ECHO : 0) |
+                                             (arg_console ? ASK_PASSWORD_CONSOLE_COLOR : 0),
+                                             filename, &passwords);
 
                         if (arg_console) {
                                 tty_fd = safe_close(tty_fd);
                                 release_terminal();
                         }
-
-                        if (r >= 0)
-                                r = strv_push(&passwords, password);
-
-                        if (r < 0)
-                                string_free_erase(password);
                 }
 
                 /* If the query went away, that's OK */
@@ -417,8 +405,8 @@ static int wall_tty_block(void) {
         if (asprintf(&p, "/run/systemd/ask-password-block/%u:%u", major(devnr), minor(devnr)) < 0)
                 return log_oom();
 
-        mkdir_parents_label(p, 0700);
-        mkfifo(p, 0600);
+        (void) mkdir_parents_label(p, 0700);
+        (void) mkfifo(p, 0600);
 
         fd = open(p, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
         if (fd < 0)
@@ -460,7 +448,7 @@ static bool wall_tty_match(const char *path, void *userdata) {
 
         fd = open(p, O_WRONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
         if (fd < 0) {
-                log_debug_errno(errno, "Failed top open the wall pipe: %m");
+                log_debug_errno(errno, "Failed to open the wall pipe: %m");
                 return 1;
         }
 
@@ -532,8 +520,12 @@ static int watch_passwords(void) {
         if (notify < 0)
                 return log_error_errno(errno, "Failed to allocate directory watch: %m");
 
-        if (inotify_add_watch(notify, "/run/systemd/ask-password", IN_CLOSE_WRITE|IN_MOVED_TO) < 0)
-                return log_error_errno(errno, "Failed to add /run/systemd/ask-password to directory watch: %m");
+        if (inotify_add_watch(notify, "/run/systemd/ask-password", IN_CLOSE_WRITE|IN_MOVED_TO) < 0) {
+                if (errno == ENOSPC)
+                        return log_error_errno(errno, "Failed to add /run/systemd/ask-password to directory watch: inotify watch limit reached");
+                else
+                        return log_error_errno(errno, "Failed to add /run/systemd/ask-password to directory watch: %m");
+        }
 
         assert_se(sigemptyset(&mask) >= 0);
         assert_se(sigset_add_many(&mask, SIGINT, SIGTERM, -1) >= 0);
@@ -570,7 +562,14 @@ static int watch_passwords(void) {
         return 0;
 }
 
-static void help(void) {
+static int help(void) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        r = terminal_urlify_man("systemd-tty-ask-password-agent", "1", &link);
+        if (r < 0)
+                return log_oom();
+
         printf("%s [OPTIONS...]\n\n"
                "Process system password requests.\n\n"
                "  -h --help     Show this help\n"
@@ -580,8 +579,13 @@ static void help(void) {
                "     --watch    Continuously process password requests\n"
                "     --wall     Continuously forward password requests to wall\n"
                "     --plymouth Ask question with Plymouth instead of on TTY\n"
-               "     --console  Ask question on /dev/console instead of current TTY\n",
-               program_invocation_short_name);
+               "     --console  Ask question on /dev/console instead of current TTY\n"
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , link
+        );
+
+        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -618,8 +622,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 case 'h':
-                        help();
-                        return 0;
+                        return help();
 
                 case ARG_VERSION:
                         return version();
@@ -648,10 +651,9 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_console = true;
                         if (optarg) {
 
-                                if (isempty(optarg)) {
-                                        log_error("Empty console device path is not allowed.");
-                                        return -EINVAL;
-                                }
+                                if (isempty(optarg))
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                               "Empty console device path is not allowed.");
 
                                 arg_device = optarg;
                         }
@@ -664,22 +666,19 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option");
                 }
 
-        if (optind != argc) {
-                log_error("%s takes no arguments.", program_invocation_short_name);
-                return -EINVAL;
-        }
+        if (optind != argc)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "%s takes no arguments.", program_invocation_short_name);
 
         if (arg_plymouth || arg_console) {
 
-                if (!IN_SET(arg_action, ACTION_QUERY, ACTION_WATCH)) {
-                        log_error("Options --query and --watch conflict.");
-                        return -EINVAL;
-                }
+                if (!IN_SET(arg_action, ACTION_QUERY, ACTION_WATCH))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Options --query and --watch conflict.");
 
-                if (arg_plymouth && arg_console) {
-                        log_error("Options --plymouth and --console conflict.");
-                        return -EINVAL;
-                }
+                if (arg_plymouth && arg_console)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Options --plymouth and --console conflict.");
         }
 
         return 1;
@@ -693,11 +692,13 @@ static int parse_argv(int argc, char *argv[]) {
  * If one of the tasks does handle a password, the remaining tasks
  * will be terminated.
  */
-static int ask_on_this_console(const char *tty, pid_t *pid, int argc, char *argv[]) {
+static int ask_on_this_console(const char *tty, pid_t *ret_pid, int argc, char *argv[]) {
         struct sigaction sig = {
                 .sa_handler = nop_signal_handler,
                 .sa_flags = SA_NOCLDSTOP | SA_RESTART,
         };
+        pid_t pid;
+        int r;
 
         assert_se(sigprocmask_many(SIG_UNBLOCK, NULL, SIGHUP, SIGCHLD, -1) >= 0);
 
@@ -707,21 +708,17 @@ static int ask_on_this_console(const char *tty, pid_t *pid, int argc, char *argv
         sig.sa_handler = SIG_DFL;
         assert_se(sigaction(SIGHUP, &sig, NULL) >= 0);
 
-        *pid = fork();
-        if (*pid < 0)
-                return log_error_errno(errno, "Failed to fork process: %m");
-
-        if (*pid == 0) {
+        r = safe_fork("(sd-passwd)", FORK_RESET_SIGNALS|FORK_LOG, &pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
                 int ac;
 
                 assert_se(prctl(PR_SET_PDEATHSIG, SIGHUP) >= 0);
 
-                reset_signal_mask();
-                reset_all_signal_handlers();
-
                 for (ac = 0; ac < argc; ac++) {
                         if (streq(argv[ac], "--console")) {
-                                argv[ac] = strjoina("--console=", tty, NULL);
+                                argv[ac] = strjoina("--console=", tty);
                                 break;
                         }
                 }
@@ -731,6 +728,8 @@ static int ask_on_this_console(const char *tty, pid_t *pid, int argc, char *argv
                 execv(SYSTEMD_TTY_ASK_PASSWORD_AGENT_BINARY_PATH, argv);
                 _exit(EXIT_FAILURE);
         }
+
+        *ret_pid = pid;
         return 0;
 }
 
@@ -834,42 +833,37 @@ static int ask_on_consoles(int argc, char *argv[]) {
         return 0;
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
         int r;
 
-        log_set_target(LOG_TARGET_AUTO);
-        log_parse_environment();
-        log_open();
+        log_setup_service();
 
         umask(0022);
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return r;
 
         if (arg_console && !arg_device)
                 /*
-                 * Spawn for each console device a separate process.
+                 * Spawn a separate process for each console device.
                  */
-                r = ask_on_consoles(argc, argv);
-        else {
+                return ask_on_consoles(argc, argv);
 
-                if (arg_device) {
-                        /*
-                         * Later on, a controlling terminal will be acquired,
-                         * therefore the current process has to become a session
-                         * leader and should not have a controlling terminal already.
-                         */
-                        (void) setsid();
-                        (void) release_terminal();
-                }
-
-                if (IN_SET(arg_action, ACTION_WATCH, ACTION_WALL))
-                        r = watch_passwords();
-                else
-                        r = show_passwords();
+        if (arg_device) {
+                /*
+                 * Later on, a controlling terminal will be acquired,
+                 * therefore the current process has to become a session
+                 * leader and should not have a controlling terminal already.
+                 */
+                (void) setsid();
+                (void) release_terminal();
         }
 
-finish:
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        if (IN_SET(arg_action, ACTION_WATCH, ACTION_WALL))
+                return watch_passwords();
+        else
+                return show_passwords();
 }
+
+DEFINE_MAIN_FUNCTION(run);

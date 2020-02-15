@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <mntent.h>
@@ -34,18 +17,43 @@
 #include "strv.h"
 #include "util.h"
 
-bool fstab_is_mount_point(const char *mount) {
+int fstab_has_fstype(const char *fstype) {
         _cleanup_endmntent_ FILE *f = NULL;
         struct mntent *m;
 
-        f = setmntent("/etc/fstab", "r");
+        f = setmntent("/etc/fstab", "re");
         if (!f)
-                return false;
+                return errno == ENOENT ? false : -errno;
 
-        while ((m = getmntent(f)))
+        for (;;) {
+                errno = 0;
+                m = getmntent(f);
+                if (!m)
+                        return errno != 0 ? -errno : false;
+
+                if (streq(m->mnt_type, fstype))
+                        return true;
+        }
+        return false;
+}
+
+int fstab_is_mount_point(const char *mount) {
+        _cleanup_endmntent_ FILE *f = NULL;
+        struct mntent *m;
+
+        f = setmntent("/etc/fstab", "re");
+        if (!f)
+                return errno == ENOENT ? false : -errno;
+
+        for (;;) {
+                errno = 0;
+                m = getmntent(f);
+                if (!m)
+                        return errno != 0 ? -errno : false;
+
                 if (path_equal(m->mnt_dir, mount))
                         return true;
-
+        }
         return false;
 }
 
@@ -143,10 +151,8 @@ answer:
 
                 *filtered = f;
         }
-        if (value) {
-                *value = v;
-                v = NULL;
-        }
+        if (value)
+                *value = TAKE_PTR(v);
 
         return !!n;
 }
@@ -175,8 +181,7 @@ int fstab_extract_values(const char *opts, const char *name, char ***values) {
                         return r;
         }
 
-        *values = res;
-        res = NULL;
+        *values = TAKE_PTR(res);
 
         return !!*values;
 }
@@ -213,7 +218,7 @@ static char *unquote(const char *s, const char* quotes) {
          * trailing quotes if there is one. Doesn't care about
          * escaping or anything.
          *
-         * DON'T USE THIS FOR NEW CODE ANYMORE!*/
+         * DON'T USE THIS FOR NEW CODE ANYMORE! */
 
         l = strlen(s);
         if (l < 2)
@@ -241,7 +246,7 @@ static char *tag_to_udev_node(const char *tagvalue, const char *by) {
         if (encode_devnode_name(u, t, enc_len) < 0)
                 return NULL;
 
-        return strjoin("/dev/disk/by-", by, "/", t, NULL);
+        return strjoin("/dev/disk/by-", by, "/", t);
 }
 
 char *fstab_node_to_udev_node(const char *p) {

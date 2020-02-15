@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <stdbool.h>
 
@@ -49,13 +31,15 @@ int bus_error_set_errnofv(sd_bus_error *e, int error, const char *format, va_lis
  */
 
 #define BUS_ERROR_MAP_ELF_REGISTER                                      \
-        __attribute__ ((__section__("BUS_ERROR_MAP")))                  \
-        __attribute__ ((__used__))                                      \
-        __attribute__ ((aligned(8)))
+        _section_("SYSTEMD_BUS_ERROR_MAP")                              \
+        _used_                                                          \
+        _alignptr_                                                      \
+        _variable_no_sanitize_address_
 
 #define BUS_ERROR_MAP_ELF_USE(errors)                                   \
         extern const sd_bus_error_map errors[];                         \
-        __attribute__ ((used)) static const sd_bus_error_map * const CONCATENATE(errors ## _copy_, __COUNTER__) = errors;
+        _used_                                                          \
+        static const sd_bus_error_map * const CONCATENATE(errors ## _copy_, __COUNTER__) = errors;
 
 /* We use something exotic as end marker, to ensure people build the
  * maps using the macsd-ros. */

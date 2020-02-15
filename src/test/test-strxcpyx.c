@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Thomas H.P. Andersen
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <string.h>
 
@@ -51,6 +34,13 @@ static void test_strpcpyf(void) {
 
         assert_se(streq(target, "space left: 25. foobar"));
         assert_se(space_left == 3);
+
+        /* test overflow */
+        s = target;
+        space_left = strpcpyf(&s, 12, "00 left: %i. ", 999);
+        assert_se(streq(target, "00 left: 99"));
+        assert_se(space_left == 0);
+        assert_se(target[12] == '2');
 }
 
 static void test_strpcpyl(void) {

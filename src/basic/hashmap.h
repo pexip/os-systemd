@@ -1,24 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-  Copyright 2014 Michal Schmidt
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <limits.h>
 #include <stdbool.h>
@@ -34,12 +15,14 @@
  * necessary to instantiate an object for each Hashmap use.
  *
  * If ENABLE_DEBUG_HASHMAP is defined (by configuring with --enable-debug=hashmap),
- * the implemention will:
+ * the implementation will:
  * - store extra data for debugging and statistics (see tools/gdb-sd_dump_hashmaps.py)
  * - perform extra checks for invalid use of iterators
  */
 
 #define HASH_KEY_SIZE 16
+
+typedef void* (*hashmap_destroy_t)(void *p);
 
 /* The base type for all hashmap and set types. Many functions in the
  * implementation take (HashmapBase*) parameters and are run-time polymorphic,
@@ -52,13 +35,15 @@ typedef struct Hashmap Hashmap;               /* Maps keys to values */
 typedef struct OrderedHashmap OrderedHashmap; /* Like Hashmap, but also remembers entry insertion order */
 typedef struct Set Set;                       /* Stores just keys */
 
+typedef struct IteratedCache IteratedCache;   /* Caches the iterated order of one of the above */
+
 /* Ideally the Iterator would be an opaque struct, but it is instantiated
  * by hashmap users, so the definition has to be here. Do not use its fields
  * directly. */
 typedef struct {
         unsigned idx;         /* index of an entry to be iterated next */
         const void *next_key; /* expected value of that entry's key pointer */
-#ifdef ENABLE_DEBUG_HASHMAP
+#if ENABLE_DEBUG_HASHMAP
         unsigned put_count;   /* hashmap's put_count recorded at start of iteration */
         unsigned rem_count;   /* hashmap's rem_count in previous iteration */
         unsigned prev_idx;    /* idx in previous iteration */
@@ -89,7 +74,7 @@ typedef struct {
                 (Hashmap*)(h), \
                 (void)0)
 
-#ifdef ENABLE_DEBUG_HASHMAP
+#if ENABLE_DEBUG_HASHMAP
 # define HASHMAP_DEBUG_PARAMS , const char *func, const char *file, int line
 # define HASHMAP_DEBUG_SRC_ARGS   , __func__, __FILE__, __LINE__
 # define HASHMAP_DEBUG_PASS_ARGS   , func, file, line
@@ -104,26 +89,37 @@ OrderedHashmap *internal_ordered_hashmap_new(const struct hash_ops *hash_ops  HA
 #define hashmap_new(ops) internal_hashmap_new(ops  HASHMAP_DEBUG_SRC_ARGS)
 #define ordered_hashmap_new(ops) internal_ordered_hashmap_new(ops  HASHMAP_DEBUG_SRC_ARGS)
 
-HashmapBase *internal_hashmap_free(HashmapBase *h);
+HashmapBase *internal_hashmap_free(HashmapBase *h, free_func_t default_free_key, free_func_t default_free_value);
 static inline Hashmap *hashmap_free(Hashmap *h) {
-        return (void*)internal_hashmap_free(HASHMAP_BASE(h));
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), NULL, NULL);
 }
 static inline OrderedHashmap *ordered_hashmap_free(OrderedHashmap *h) {
-        return (void*)internal_hashmap_free(HASHMAP_BASE(h));
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), NULL, NULL);
 }
 
-HashmapBase *internal_hashmap_free_free(HashmapBase *h);
 static inline Hashmap *hashmap_free_free(Hashmap *h) {
-        return (void*)internal_hashmap_free_free(HASHMAP_BASE(h));
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), NULL, free);
 }
 static inline OrderedHashmap *ordered_hashmap_free_free(OrderedHashmap *h) {
-        return (void*)internal_hashmap_free_free(HASHMAP_BASE(h));
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), NULL, free);
 }
 
-Hashmap *hashmap_free_free_free(Hashmap *h);
-static inline OrderedHashmap *ordered_hashmap_free_free_free(OrderedHashmap *h) {
-        return (void*)hashmap_free_free_free(PLAIN_HASHMAP(h));
+static inline Hashmap *hashmap_free_free_key(Hashmap *h) {
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), free, NULL);
 }
+static inline OrderedHashmap *ordered_hashmap_free_free_key(OrderedHashmap *h) {
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), free, NULL);
+}
+
+static inline Hashmap *hashmap_free_free_free(Hashmap *h) {
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), free, free);
+}
+static inline OrderedHashmap *ordered_hashmap_free_free_free(OrderedHashmap *h) {
+        return (void*) internal_hashmap_free(HASHMAP_BASE(h), free, free);
+}
+
+IteratedCache *iterated_cache_free(IteratedCache *cache);
+int iterated_cache_get(IteratedCache *cache, const void ***res_keys, const void ***res_values, unsigned *res_n_entries);
 
 HashmapBase *internal_hashmap_copy(HashmapBase *h);
 static inline Hashmap *hashmap_copy(Hashmap *h) {
@@ -137,6 +133,14 @@ int internal_hashmap_ensure_allocated(Hashmap **h, const struct hash_ops *hash_o
 int internal_ordered_hashmap_ensure_allocated(OrderedHashmap **h, const struct hash_ops *hash_ops  HASHMAP_DEBUG_PARAMS);
 #define hashmap_ensure_allocated(h, ops) internal_hashmap_ensure_allocated(h, ops  HASHMAP_DEBUG_SRC_ARGS)
 #define ordered_hashmap_ensure_allocated(h, ops) internal_ordered_hashmap_ensure_allocated(h, ops  HASHMAP_DEBUG_SRC_ARGS)
+
+IteratedCache *internal_hashmap_iterated_cache_new(HashmapBase *h);
+static inline IteratedCache *hashmap_iterated_cache_new(Hashmap *h) {
+        return (IteratedCache*) internal_hashmap_iterated_cache_new(HASHMAP_BASE(h));
+}
+static inline IteratedCache *ordered_hashmap_iterated_cache_new(OrderedHashmap *h) {
+        return (IteratedCache*) internal_hashmap_iterated_cache_new(HASHMAP_BASE(h));
+}
 
 int hashmap_put(Hashmap *h, const void *key, void *value);
 static inline int ordered_hashmap_put(OrderedHashmap *h, const void *key, void *value) {
@@ -187,7 +191,11 @@ static inline void *ordered_hashmap_remove2(OrderedHashmap *h, const void *key, 
         return hashmap_remove2(PLAIN_HASHMAP(h), key, rkey);
 }
 
-void *hashmap_remove_value(Hashmap *h, const void *key, void *value);
+void *internal_hashmap_remove_value(HashmapBase *h, const void *key, void *value);
+static inline void *hashmap_remove_value(Hashmap *h, const void *key, void *value) {
+        return internal_hashmap_remove_value(HASHMAP_BASE(h), key, value);
+}
+
 static inline void *ordered_hashmap_remove_value(OrderedHashmap *h, const void *key, void *value) {
         return hashmap_remove_value(PLAIN_HASHMAP(h), key, value);
 }
@@ -264,25 +272,33 @@ static inline bool ordered_hashmap_iterate(OrderedHashmap *h, Iterator *i, void 
         return internal_hashmap_iterate(HASHMAP_BASE(h), i, value, key);
 }
 
-void internal_hashmap_clear(HashmapBase *h);
+void internal_hashmap_clear(HashmapBase *h, free_func_t default_free_key, free_func_t default_free_value);
 static inline void hashmap_clear(Hashmap *h) {
-        internal_hashmap_clear(HASHMAP_BASE(h));
+        internal_hashmap_clear(HASHMAP_BASE(h), NULL, NULL);
 }
 static inline void ordered_hashmap_clear(OrderedHashmap *h) {
-        internal_hashmap_clear(HASHMAP_BASE(h));
+        internal_hashmap_clear(HASHMAP_BASE(h), NULL, NULL);
 }
 
-void internal_hashmap_clear_free(HashmapBase *h);
 static inline void hashmap_clear_free(Hashmap *h) {
-        internal_hashmap_clear_free(HASHMAP_BASE(h));
+        internal_hashmap_clear(HASHMAP_BASE(h), NULL, free);
 }
 static inline void ordered_hashmap_clear_free(OrderedHashmap *h) {
-        internal_hashmap_clear_free(HASHMAP_BASE(h));
+        internal_hashmap_clear(HASHMAP_BASE(h), NULL, free);
 }
 
-void hashmap_clear_free_free(Hashmap *h);
+static inline void hashmap_clear_free_key(Hashmap *h) {
+        internal_hashmap_clear(HASHMAP_BASE(h), free, NULL);
+}
+static inline void ordered_hashmap_clear_free_key(OrderedHashmap *h) {
+        internal_hashmap_clear(HASHMAP_BASE(h), free, NULL);
+}
+
+static inline void hashmap_clear_free_free(Hashmap *h) {
+        internal_hashmap_clear(HASHMAP_BASE(h), free, free);
+}
 static inline void ordered_hashmap_clear_free_free(OrderedHashmap *h) {
-        hashmap_clear_free_free(PLAIN_HASHMAP(h));
+        internal_hashmap_clear(HASHMAP_BASE(h), free, free);
 }
 
 /*
@@ -296,37 +312,74 @@ static inline void ordered_hashmap_clear_free_free(OrderedHashmap *h) {
  * the first entry is O(1).
  */
 
-void *internal_hashmap_steal_first(HashmapBase *h);
+void *internal_hashmap_first_key_and_value(HashmapBase *h, bool remove, void **ret_key);
+static inline void *hashmap_steal_first_key_and_value(Hashmap *h, void **ret) {
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), true, ret);
+}
+static inline void *ordered_hashmap_steal_first_key_and_value(OrderedHashmap *h, void **ret) {
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), true, ret);
+}
+static inline void *hashmap_first_key_and_value(Hashmap *h, void **ret) {
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), false, ret);
+}
+static inline void *ordered_hashmap_first_key_and_value(OrderedHashmap *h, void **ret) {
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), false, ret);
+}
+
 static inline void *hashmap_steal_first(Hashmap *h) {
-        return internal_hashmap_steal_first(HASHMAP_BASE(h));
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), true, NULL);
 }
 static inline void *ordered_hashmap_steal_first(OrderedHashmap *h) {
-        return internal_hashmap_steal_first(HASHMAP_BASE(h));
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), true, NULL);
 }
-
-void *internal_hashmap_steal_first_key(HashmapBase *h);
-static inline void *hashmap_steal_first_key(Hashmap *h) {
-        return internal_hashmap_steal_first_key(HASHMAP_BASE(h));
-}
-static inline void *ordered_hashmap_steal_first_key(OrderedHashmap *h) {
-        return internal_hashmap_steal_first_key(HASHMAP_BASE(h));
-}
-
-void *internal_hashmap_first_key(HashmapBase *h) _pure_;
-static inline void *hashmap_first_key(Hashmap *h) {
-        return internal_hashmap_first_key(HASHMAP_BASE(h));
-}
-static inline void *ordered_hashmap_first_key(OrderedHashmap *h) {
-        return internal_hashmap_first_key(HASHMAP_BASE(h));
-}
-
-void *internal_hashmap_first(HashmapBase *h) _pure_;
 static inline void *hashmap_first(Hashmap *h) {
-        return internal_hashmap_first(HASHMAP_BASE(h));
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), false, NULL);
 }
 static inline void *ordered_hashmap_first(OrderedHashmap *h) {
-        return internal_hashmap_first(HASHMAP_BASE(h));
+        return internal_hashmap_first_key_and_value(HASHMAP_BASE(h), false, NULL);
 }
+
+static inline void *internal_hashmap_first_key(HashmapBase *h, bool remove) {
+        void *key = NULL;
+
+        (void) internal_hashmap_first_key_and_value(HASHMAP_BASE(h), remove, &key);
+        return key;
+}
+static inline void *hashmap_steal_first_key(Hashmap *h) {
+        return internal_hashmap_first_key(HASHMAP_BASE(h), true);
+}
+static inline void *ordered_hashmap_steal_first_key(OrderedHashmap *h) {
+        return internal_hashmap_first_key(HASHMAP_BASE(h), true);
+}
+static inline void *hashmap_first_key(Hashmap *h) {
+        return internal_hashmap_first_key(HASHMAP_BASE(h), false);
+}
+static inline void *ordered_hashmap_first_key(OrderedHashmap *h) {
+        return internal_hashmap_first_key(HASHMAP_BASE(h), false);
+}
+
+#define hashmap_clear_with_destructor(_s, _f)                   \
+        ({                                                      \
+                void *_item;                                    \
+                while ((_item = hashmap_steal_first(_s)))       \
+                        _f(_item);                              \
+        })
+#define hashmap_free_with_destructor(_s, _f)                    \
+        ({                                                      \
+                hashmap_clear_with_destructor(_s, _f);          \
+                hashmap_free(_s);                               \
+        })
+#define ordered_hashmap_clear_with_destructor(_s, _f)                   \
+        ({                                                              \
+                void *_item;                                            \
+                while ((_item = ordered_hashmap_steal_first(_s)))       \
+                        _f(_item);                                      \
+        })
+#define ordered_hashmap_free_with_destructor(_s, _f)                    \
+        ({                                                              \
+                ordered_hashmap_clear_with_destructor(_s, _f);          \
+                ordered_hashmap_free(_s);                               \
+        })
 
 /* no hashmap_next */
 void *ordered_hashmap_next(OrderedHashmap *h, const void *key);
@@ -370,3 +423,7 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(OrderedHashmap*, ordered_hashmap_free_free_free);
 #define _cleanup_ordered_hashmap_free_ _cleanup_(ordered_hashmap_freep)
 #define _cleanup_ordered_hashmap_free_free_ _cleanup_(ordered_hashmap_free_freep)
 #define _cleanup_ordered_hashmap_free_free_free_ _cleanup_(ordered_hashmap_free_free_freep)
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(IteratedCache*, iterated_cache_free);
+
+#define _cleanup_iterated_cache_free_ _cleanup_(iterated_cache_freep)

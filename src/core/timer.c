@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 
@@ -23,9 +6,11 @@
 #include "bus-error.h"
 #include "bus-util.h"
 #include "dbus-timer.h"
+#include "dbus-unit.h"
 #include "fs-util.h"
 #include "parse-util.h"
 #include "random-util.h"
+#include "serialize.h"
 #include "special.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -90,7 +75,7 @@ static int timer_verify(Timer *t) {
 
         if (!t->values) {
                 log_unit_error(UNIT(t), "Timer unit lacks value setting. Refusing.");
-                return -EINVAL;
+                return -ENOEXEC;
         }
 
         return 0;
@@ -105,18 +90,18 @@ static int timer_add_default_dependencies(Timer *t) {
         if (!UNIT(t)->default_dependencies)
                 return 0;
 
-        r = unit_add_dependency_by_name(UNIT(t), UNIT_BEFORE, SPECIAL_TIMERS_TARGET, NULL, true);
+        r = unit_add_dependency_by_name(UNIT(t), UNIT_BEFORE, SPECIAL_TIMERS_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
         if (r < 0)
                 return r;
 
         if (MANAGER_IS_SYSTEM(UNIT(t)->manager)) {
-                r = unit_add_two_dependencies_by_name(UNIT(t), UNIT_AFTER, UNIT_REQUIRES, SPECIAL_SYSINIT_TARGET, NULL, true);
+                r = unit_add_two_dependencies_by_name(UNIT(t), UNIT_AFTER, UNIT_REQUIRES, SPECIAL_SYSINIT_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
                 if (r < 0)
                         return r;
 
                 LIST_FOREACH(value, v, t->values) {
                         if (v->base == TIMER_CALENDAR) {
-                                r = unit_add_dependency_by_name(UNIT(t), UNIT_AFTER, SPECIAL_TIME_SYNC_TARGET, NULL, true);
+                                r = unit_add_dependency_by_name(UNIT(t), UNIT_AFTER, SPECIAL_TIME_SYNC_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
                                 if (r < 0)
                                         return r;
                                 break;
@@ -124,7 +109,23 @@ static int timer_add_default_dependencies(Timer *t) {
                 }
         }
 
-        return unit_add_two_dependencies_by_name(UNIT(t), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, NULL, true);
+        return unit_add_two_dependencies_by_name(UNIT(t), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+}
+
+static int timer_add_trigger_dependencies(Timer *t) {
+        Unit *x;
+        int r;
+
+        assert(t);
+
+        if (!hashmap_isempty(UNIT(t)->dependencies[UNIT_TRIGGERS]))
+                return 0;
+
+        r = unit_load_related_unit(UNIT(t), ".service", &x);
+        if (r < 0)
+                return r;
+
+        return unit_add_two_dependencies(UNIT(t), UNIT_BEFORE, UNIT_TRIGGERS, x, true, UNIT_DEPENDENCY_IMPLICIT);
 }
 
 static int timer_setup_persistent(Timer *t) {
@@ -137,7 +138,7 @@ static int timer_setup_persistent(Timer *t) {
 
         if (MANAGER_IS_SYSTEM(UNIT(t)->manager)) {
 
-                r = unit_require_mounts_for(UNIT(t), "/var/lib/systemd/timers");
+                r = unit_require_mounts_for(UNIT(t), "/var/lib/systemd/timers", UNIT_DEPENDENCY_FILE);
                 if (r < 0)
                         return r;
 
@@ -147,7 +148,7 @@ static int timer_setup_persistent(Timer *t) {
 
                 e = getenv("XDG_DATA_HOME");
                 if (e)
-                        t->stamp_path = strjoin(e, "/systemd/timers/stamp-", UNIT(t)->id, NULL);
+                        t->stamp_path = strjoin(e, "/systemd/timers/stamp-", UNIT(t)->id);
                 else {
 
                         _cleanup_free_ char *h = NULL;
@@ -156,7 +157,7 @@ static int timer_setup_persistent(Timer *t) {
                         if (r < 0)
                                 return log_unit_error_errno(UNIT(t), r, "Failed to determine home directory: %m");
 
-                        t->stamp_path = strjoin(h, "/.local/share/systemd/timers/stamp-", UNIT(t)->id, NULL);
+                        t->stamp_path = strjoin(h, "/.local/share/systemd/timers/stamp-", UNIT(t)->id);
                 }
         }
 
@@ -179,17 +180,9 @@ static int timer_load(Unit *u) {
 
         if (u->load_state == UNIT_LOADED) {
 
-                if (set_isempty(u->dependencies[UNIT_TRIGGERS])) {
-                        Unit *x;
-
-                        r = unit_load_related_unit(u, ".service", &x);
-                        if (r < 0)
-                                return r;
-
-                        r = unit_add_two_dependencies(u, UNIT_BEFORE, UNIT_TRIGGERS, x, true);
-                        if (r < 0)
-                                return r;
-                }
+                r = timer_add_trigger_dependencies(t);
+                if (r < 0)
+                        return r;
 
                 r = timer_setup_persistent(t);
                 if (r < 0)
@@ -232,7 +225,7 @@ static void timer_dump(Unit *u, FILE *f, const char *prefix) {
                 if (v->base == TIMER_CALENDAR) {
                         _cleanup_free_ char *p = NULL;
 
-                        calendar_spec_to_string(v->calendar_spec, &p);
+                        (void) calendar_spec_to_string(v->calendar_spec, &p);
 
                         fprintf(f,
                                 "%s%s: %s\n",
@@ -255,6 +248,9 @@ static void timer_set_state(Timer *t, TimerState state) {
         TimerState old_state;
         assert(t);
 
+        if (t->state != state)
+                bus_unit_send_pending_change_signal(UNIT(t), false);
+
         old_state = t->state;
         t->state = state;
 
@@ -268,10 +264,10 @@ static void timer_set_state(Timer *t, TimerState state) {
         if (state != old_state)
                 log_unit_debug(UNIT(t), "Changed %s -> %s", timer_state_to_string(old_state), timer_state_to_string(state));
 
-        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], true);
+        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], 0);
 }
 
-static void timer_enter_waiting(Timer *t, bool initial);
+static void timer_enter_waiting(Timer *t, bool time_change);
 
 static int timer_coldplug(Unit *u) {
         Timer *t = TIMER(u);
@@ -296,6 +292,7 @@ static void timer_enter_dead(Timer *t, TimerResult f) {
         if (t->result == TIMER_SUCCESS)
                 t->result = f;
 
+        unit_log_result(UNIT(t), t->result == TIMER_SUCCESS, timer_result_to_string(t->result));
         timer_set_state(t, t->result != TIMER_SUCCESS ? TIMER_FAILED : TIMER_DEAD);
 }
 
@@ -314,21 +311,6 @@ static void timer_enter_elapsed(Timer *t, bool leave_around) {
                 timer_set_state(t, TIMER_ELAPSED);
         else
                 timer_enter_dead(t, TIMER_SUCCESS);
-}
-
-static usec_t monotonic_to_boottime(usec_t t) {
-        usec_t a, b;
-
-        if (t <= 0)
-                return 0;
-
-        a = now(clock_boottime_or_monotonic());
-        b = now(CLOCK_MONOTONIC);
-
-        if (t + a > b)
-                return t + a - b;
-        else
-                return 0;
 }
 
 static void add_random(Timer *t, usec_t *v) {
@@ -350,14 +332,13 @@ static void add_random(Timer *t, usec_t *v) {
         else
                 *v += add;
 
-        log_unit_info(UNIT(t), "Adding %s random time.", format_timespan(s, sizeof(s), add, 0));
+        log_unit_debug(UNIT(t), "Adding %s random time.", format_timespan(s, sizeof(s), add, 0));
 }
 
-static void timer_enter_waiting(Timer *t, bool initial) {
+static void timer_enter_waiting(Timer *t, bool time_change) {
         bool found_monotonic = false, found_realtime = false;
-        usec_t ts_realtime, ts_monotonic;
-        usec_t base = 0;
         bool leave_around = false;
+        triple_timestamp ts;
         TimerValue *v;
         Unit *trigger;
         int r;
@@ -371,15 +352,10 @@ static void timer_enter_waiting(Timer *t, bool initial) {
                 return;
         }
 
-        /* If we shall wake the system we use the boottime clock
-         * rather than the monotonic clock. */
-
-        ts_realtime = now(CLOCK_REALTIME);
-        ts_monotonic = now(t->wake_system ? clock_boottime_or_monotonic() : CLOCK_MONOTONIC);
+        triple_timestamp_get(&ts);
         t->next_elapse_monotonic_or_boottime = t->next_elapse_realtime = 0;
 
         LIST_FOREACH(value, v, t->values) {
-
                 if (v->disabled)
                         continue;
 
@@ -388,10 +364,17 @@ static void timer_enter_waiting(Timer *t, bool initial) {
 
                         /* If we know the last time this was
                          * triggered, schedule the job based relative
-                         * to that. If we don't just start from
-                         * now. */
+                         * to that. If we don't, just start from
+                         * the activation time. */
 
-                        b = t->last_trigger.realtime > 0 ? t->last_trigger.realtime : ts_realtime;
+                        if (t->last_trigger.realtime > 0)
+                                b = t->last_trigger.realtime;
+                        else {
+                                if (state_translation_table[t->state] == UNIT_ACTIVE)
+                                        b = UNIT(t)->inactive_exit_timestamp.realtime;
+                                else
+                                        b = ts.realtime;
+                        }
 
                         r = calendar_spec_next_usec(v->calendar_spec, b, &v->next_elapse);
                         if (r < 0)
@@ -404,14 +387,16 @@ static void timer_enter_waiting(Timer *t, bool initial) {
 
                         found_realtime = true;
 
-                } else  {
+                } else {
+                        usec_t base;
+
                         switch (v->base) {
 
                         case TIMER_ACTIVE:
                                 if (state_translation_table[t->state] == UNIT_ACTIVE)
                                         base = UNIT(t)->inactive_exit_timestamp.monotonic;
                                 else
-                                        base = ts_monotonic;
+                                        base = ts.monotonic;
                                 break;
 
                         case TIMER_BOOT:
@@ -422,9 +407,10 @@ static void timer_enter_waiting(Timer *t, bool initial) {
                                 }
                                 /* In a container we don't want to include the time the host
                                  * was already up when the container started, so count from
-                                 * our own startup. Fall through. */
+                                 * our own startup. */
+                                _fallthrough_;
                         case TIMER_STARTUP:
-                                base = UNIT(t)->manager->userspace_timestamp.monotonic;
+                                base = UNIT(t)->manager->timestamps[MANAGER_TIMESTAMP_USERSPACE].monotonic;
                                 break;
 
                         case TIMER_UNIT_ACTIVE:
@@ -436,6 +422,7 @@ static void timer_enter_waiting(Timer *t, bool initial) {
 
                                 if (base <= 0)
                                         continue;
+                                base = MAX(base, t->last_trigger.monotonic);
 
                                 break;
 
@@ -448,6 +435,7 @@ static void timer_enter_waiting(Timer *t, bool initial) {
 
                                 if (base <= 0)
                                         continue;
+                                base = MAX(base, t->last_trigger.monotonic);
 
                                 break;
 
@@ -455,12 +443,12 @@ static void timer_enter_waiting(Timer *t, bool initial) {
                                 assert_not_reached("Unknown timer base");
                         }
 
-                        if (t->wake_system)
-                                base = monotonic_to_boottime(base);
+                        v->next_elapse = usec_add(usec_shift_clock(base, CLOCK_MONOTONIC, TIMER_MONOTONIC_CLOCK(t)), v->value);
 
-                        v->next_elapse = base + v->value;
-
-                        if (!initial && v->next_elapse < ts_monotonic && IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP)) {
+                        if (dual_timestamp_is_set(&t->last_trigger) &&
+                            !time_change &&
+                            v->next_elapse < triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)) &&
+                            IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP)) {
                                 /* This is a one time trigger, disable it now */
                                 v->disabled = true;
                                 continue;
@@ -487,7 +475,7 @@ static void timer_enter_waiting(Timer *t, bool initial) {
 
                 add_random(t, &t->next_elapse_monotonic_or_boottime);
 
-                left = t->next_elapse_monotonic_or_boottime > ts_monotonic ? t->next_elapse_monotonic_or_boottime - ts_monotonic : 0;
+                left = usec_sub_unsigned(t->next_elapse_monotonic_or_boottime, triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)));
                 log_unit_debug(UNIT(t), "Monotonic timer elapses in %s.", format_timespan(buf, sizeof(buf), left, 0));
 
                 if (t->monotonic_event_source) {
@@ -604,7 +592,7 @@ static int timer_start(Unit *u) {
         int r;
 
         assert(t);
-        assert(t->state == TIMER_DEAD || t->state == TIMER_FAILED);
+        assert(IN_SET(t->state, TIMER_DEAD, TIMER_FAILED));
 
         trigger = UNIT_TRIGGER(u);
         if (!trigger || trigger->load_state != UNIT_LOADED) {
@@ -632,9 +620,23 @@ static int timer_start(Unit *u) {
         if (t->stamp_path) {
                 struct stat st;
 
-                if (stat(t->stamp_path, &st) >= 0)
-                        t->last_trigger.realtime = timespec_load(&st.st_atim);
-                else if (errno == ENOENT)
+                if (stat(t->stamp_path, &st) >= 0) {
+                        usec_t ft;
+
+                        /* Load the file timestamp, but only if it is actually in the past. If it is in the future,
+                         * something is wrong with the system clock. */
+
+                        ft = timespec_load(&st.st_mtim);
+                        if (ft < now(CLOCK_REALTIME))
+                                t->last_trigger.realtime = ft;
+                        else {
+                                char z[FORMAT_TIMESTAMP_MAX];
+
+                                log_unit_warning(u, "Not using persistent file timestamp %s as it is in the future.",
+                                                 format_timestamp(z, sizeof(z), ft));
+                        }
+
+                } else if (errno == ENOENT)
                         /* The timer has never run before,
                          * make sure a stamp file exists.
                          */
@@ -642,7 +644,7 @@ static int timer_start(Unit *u) {
         }
 
         t->result = TIMER_SUCCESS;
-        timer_enter_waiting(t, true);
+        timer_enter_waiting(t, false);
         return 1;
 }
 
@@ -650,7 +652,7 @@ static int timer_stop(Unit *u) {
         Timer *t = TIMER(u);
 
         assert(t);
-        assert(t->state == TIMER_WAITING || t->state == TIMER_RUNNING || t->state == TIMER_ELAPSED);
+        assert(IN_SET(t->state, TIMER_WAITING, TIMER_RUNNING, TIMER_ELAPSED));
 
         timer_enter_dead(t, TIMER_SUCCESS);
         return 1;
@@ -663,21 +665,20 @@ static int timer_serialize(Unit *u, FILE *f, FDSet *fds) {
         assert(f);
         assert(fds);
 
-        unit_serialize_item(u, f, "state", timer_state_to_string(t->state));
-        unit_serialize_item(u, f, "result", timer_result_to_string(t->result));
+        (void) serialize_item(f, "state", timer_state_to_string(t->state));
+        (void) serialize_item(f, "result", timer_result_to_string(t->result));
 
         if (t->last_trigger.realtime > 0)
-                unit_serialize_item_format(u, f, "last-trigger-realtime", "%" PRIu64, t->last_trigger.realtime);
+                (void) serialize_usec(f, "last-trigger-realtime", t->last_trigger.realtime);
 
         if (t->last_trigger.monotonic > 0)
-                unit_serialize_item_format(u, f, "last-trigger-monotonic", "%" PRIu64, t->last_trigger.monotonic);
+                (void) serialize_usec(f, "last-trigger-monotonic", t->last_trigger.monotonic);
 
         return 0;
 }
 
 static int timer_deserialize_item(Unit *u, const char *key, const char *value, FDSet *fds) {
         Timer *t = TIMER(u);
-        int r;
 
         assert(u);
         assert(key);
@@ -692,6 +693,7 @@ static int timer_deserialize_item(Unit *u, const char *key, const char *value, F
                         log_unit_debug(u, "Failed to parse state value: %s", value);
                 else
                         t->deserialized_state = state;
+
         } else if (streq(key, "result")) {
                 TimerResult f;
 
@@ -700,19 +702,12 @@ static int timer_deserialize_item(Unit *u, const char *key, const char *value, F
                         log_unit_debug(u, "Failed to parse result value: %s", value);
                 else if (f != TIMER_SUCCESS)
                         t->result = f;
-        } else if (streq(key, "last-trigger-realtime")) {
 
-                r = safe_atou64(value, &t->last_trigger.realtime);
-                if (r < 0)
-                        log_unit_debug(u, "Failed to parse last-trigger-realtime value: %s", value);
-
-        } else if (streq(key, "last-trigger-monotonic")) {
-
-                r = safe_atou64(value, &t->last_trigger.monotonic);
-                if (r < 0)
-                        log_unit_debug(u, "Failed to parse last-trigger-monotonic value: %s", value);
-
-        } else
+        } else if (streq(key, "last-trigger-realtime"))
+                (void) deserialize_usec(value, &t->last_trigger.realtime);
+        else if (streq(key, "last-trigger-monotonic"))
+                (void) deserialize_usec(value, &t->last_trigger.monotonic);
+        else
                 log_unit_debug(u, "Unknown serialization key: %s", key);
 
         return 0;
@@ -755,8 +750,7 @@ static void timer_trigger_notify(Unit *u, Unit *other) {
 
         /* Reenable all timers that depend on unit state */
         LIST_FOREACH(value, v, t->values)
-                if (v->base == TIMER_UNIT_ACTIVE ||
-                    v->base == TIMER_UNIT_INACTIVE)
+                if (IN_SET(v->base, TIMER_UNIT_ACTIVE, TIMER_UNIT_INACTIVE))
                         v->disabled = false;
 
         switch (t->state) {
@@ -798,13 +792,34 @@ static void timer_reset_failed(Unit *u) {
 
 static void timer_time_change(Unit *u) {
         Timer *t = TIMER(u);
+        usec_t ts;
 
         assert(u);
 
         if (t->state != TIMER_WAITING)
                 return;
 
+        /* If we appear to have triggered in the future, the system clock must
+         * have been set backwards.  So let's rewind our own clock and allow
+         * the future trigger(s) to happen again :).  Exactly the same as when
+         * you start a timer unit with Persistent=yes. */
+        ts = now(CLOCK_REALTIME);
+        if (t->last_trigger.realtime > ts)
+                t->last_trigger.realtime = ts;
+
         log_unit_debug(u, "Time change, recalculating next elapse.");
+        timer_enter_waiting(t, true);
+}
+
+static void timer_timezone_change(Unit *u) {
+        Timer *t = TIMER(u);
+
+        assert(u);
+
+        if (t->state != TIMER_WAITING)
+                return;
+
+        log_unit_debug(u, "Timezone change, recalculating next elapse.");
         timer_enter_waiting(t, false);
 }
 
@@ -857,6 +872,7 @@ const UnitVTable timer_vtable = {
 
         .reset_failed = timer_reset_failed,
         .time_change = timer_time_change,
+        .timezone_change = timer_timezone_change,
 
         .bus_vtable = bus_timer_vtable,
         .bus_set_property = bus_timer_set_property,

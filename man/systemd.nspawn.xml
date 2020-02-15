@@ -1,4 +1,4 @@
-<?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
+<?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
@@ -6,22 +6,7 @@
 ]>
 
 <!--
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 
 <refentry id="systemd.nspawn">
@@ -29,15 +14,6 @@
   <refentryinfo>
     <title>systemd.nspawn</title>
     <productname>systemd</productname>
-
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Lennart</firstname>
-        <surname>Poettering</surname>
-        <email>lennart@poettering.net</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -136,7 +112,7 @@
     <para>Settings files may include an <literal>[Exec]</literal>
     section, which carries various execution parameters:</para>
 
-    <variablelist>
+    <variablelist class='nspawn-directives'>
 
       <varlistentry>
         <term><varname>Boot=</varname></term>
@@ -148,6 +124,16 @@
         <command>systemd-nspawn</command> command line. This option may not be combined with
         <varname>ProcessTwo=yes</varname>. This option is the default if the
         <filename>systemd-nspawn@.service</filename> template unit file is used.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>Ephemeral=</varname></term>
+
+        <listitem><para>Takes a boolean argument, which defaults to off, If enabled, the container is run with
+        a temporary snapshot of its file system that is removed immediately when the container terminates.
+        This is equivalent to the <option>--ephemeral</option> command line switch. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for details
+        about the specific options supported.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -202,6 +188,15 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>PivotRoot=</varname></term>
+
+        <listitem><para>Selects a directory to pivot to <filename>/</filename> inside the container when starting up.
+        Takes a single path, or a pair of two paths separated by a colon. Both paths must be absolute, and are resolved
+        in the container's file system namespace. This corresponds to the <option>--pivot-root=</option> command line
+        switch.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>Capability=</varname></term>
         <term><varname>DropCapability=</varname></term>
 
@@ -222,6 +217,17 @@
         <filename>/run/system/nspawn/</filename> (see above). On the
         other hand, <varname>DropCapability=</varname> takes effect in
         all cases.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>NoNewPrivileges=</varname></term>
+
+        <listitem><para>Takes a boolean argument that controls the <constant>PR_SET_NO_NEW_PRIVS</constant> flag for
+        the container payload. This is equivalent to the
+        <option>--no-new-privileges=</option> command line switch. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -265,11 +271,99 @@
       <varlistentry>
         <term><varname>NotifyReady=</varname></term>
 
-        <listitem><para>Configures support for notifications from the container's init process.
-        This is equivalent to use <option>--notify-ready=</option> command line switch,
-        and takes the same options. See <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-        for details about the specific options supported.</para></listitem>
+        <listitem><para>Configures support for notifications from the container's init process.  This is equivalent to
+        the <option>--notify-ready=</option> command line switch, and takes the same parameters. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for details
+        about the specific options supported.</para></listitem>
       </varlistentry>
+
+      <varlistentry>
+        <term><varname>SystemCallFilter=</varname></term>
+
+        <listitem><para>Configures the system call filter applied to containers. This is equivalent to the
+        <option>--system-call-filter=</option> command line switch, and takes the same list parameter. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>LimitCPU=</varname></term>
+        <term><varname>LimitFSIZE=</varname></term>
+        <term><varname>LimitDATA=</varname></term>
+        <term><varname>LimitSTACK=</varname></term>
+        <term><varname>LimitCORE=</varname></term>
+        <term><varname>LimitRSS=</varname></term>
+        <term><varname>LimitNOFILE=</varname></term>
+        <term><varname>LimitAS=</varname></term>
+        <term><varname>LimitNPROC=</varname></term>
+        <term><varname>LimitMEMLOCK=</varname></term>
+        <term><varname>LimitLOCKS=</varname></term>
+        <term><varname>LimitSIGPENDING=</varname></term>
+        <term><varname>LimitMSGQUEUE=</varname></term>
+        <term><varname>LimitNICE=</varname></term>
+        <term><varname>LimitRTPRIO=</varname></term>
+        <term><varname>LimitRTTIME=</varname></term>
+
+        <listitem><para>Configures various types of resource limits applied to containers. This is equivalent to the
+        <option>--rlimit=</option> command line switch, and takes the same arguments. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>OOMScoreAdjust=</varname></term>
+
+        <listitem><para>Configures the OOM score adjustment value. This is equivalent to the
+        <option>--oom-score-adjust=</option> command line switch, and takes the same argument. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>CPUAffinity=</varname></term>
+
+        <listitem><para>Configures the CPU affinity. This is equivalent to the <option>--cpu-affinity=</option> command
+        line switch, and takes the same argument. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>Hostname=</varname></term>
+
+        <listitem><para>Configures the kernel hostname set for the container. This is equivalent to the
+        <option>--hostname=</option> command line switch, and takes the same argument. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>ResolvConf=</varname></term>
+
+        <listitem><para>Configures how <filename>/etc/resolv.conf</filename> in the container shall be handled. This is
+        equivalent to the <option>--resolv-conf=</option> command line switch, and takes the same argument. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>Timezone=</varname></term>
+
+        <listitem><para>Configures how <filename>/etc/localtime</filename> in the container shall be handled. This is
+        equivalent to the <option>--timezone=</option> command line switch, and takes the same argument. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>LinkJournal=</varname></term>
+
+        <listitem><para>Configures how to link host and container journal setups. This is equivalent to the
+        <option>--link-journal=</option> command line switch, and takes the same parameter. See
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for
+        details.</para></listitem>
+      </varlistentry>
+
     </variablelist>
   </refsect1>
 
@@ -280,7 +374,7 @@
     section, which carries various parameters configuring the file
     system of the container:</para>
 
-    <variablelist>
+    <variablelist class='nspawn-directives'>
 
       <varlistentry>
         <term><varname>ReadOnly=</varname></term>
@@ -335,6 +429,17 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>Overlay=</varname></term>
+        <term><varname>OverlayReadOnly=</varname></term>
+
+        <listitem><para>Adds an overlay mount point. Takes a colon-separated list of paths.  This option may be used
+        multiple times to configure multiple overlay mounts. This option is equivalent to the command line switches
+        <option>--overlay=</option> and <option>--overlay-ro=</option>, see
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry> for details
+        about the specific options supported. This setting is privileged (see above).</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>PrivateUsersChown=</varname></term>
 
         <listitem><para>Configures whether the ownership of the files and directories in the container tree shall be
@@ -353,7 +458,7 @@
     section, which carries various parameters configuring the network
     connectivity of the container:</para>
 
-    <variablelist>
+    <variablelist class='nspawn-directives'>
 
       <varlistentry>
         <term><varname>Private=</varname></term>

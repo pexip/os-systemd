@@ -1,12 +1,12 @@
-#!/usr/bin/python
-from __future__ import print_function
+#!/usr/bin/env python3
 import sys
 import argparse
 
 PARSER = argparse.ArgumentParser()
 PARSER.add_argument('n', type=int)
 PARSER.add_argument('--dots', action='store_true')
-PARSER.add_argument('--data-size', type=int, default=4000)
+PARSER.add_argument('-m', '--message-size', type=int, default=200)
+PARSER.add_argument('-d', '--data-size', type=int, default=4000)
 PARSER.add_argument('--data-type', choices={'random', 'simple'})
 OPTIONS = PARSER.parse_args()
 
@@ -30,7 +30,7 @@ _SOURCE_REALTIME_TIMESTAMP={source_realtime_ts}
 DATA={data}
 """
 
-m  = 0x198603b12d7
+m = 0x198603b12d7
 realtime_ts = 1404101101501873
 monotonic_ts = 1753961140951
 source_realtime_ts = 1404101101483516
@@ -43,7 +43,9 @@ bytes = 0
 counter = 0
 
 for i in range(OPTIONS.n):
-    message = repr(src.read(2000))
+    message = src.read(OPTIONS.message_size)
+    message = repr(message)[2:-1]
+
     if OPTIONS.data_type == 'random':
         data = repr(src.read(OPTIONS.data_size))
     else:
@@ -72,5 +74,5 @@ for i in range(OPTIONS.n):
         print('.', file=sys.stderr, end='', flush=True)
 
 if OPTIONS.dots:
-        print(file=sys.stderr)
+    print(file=sys.stderr)
 print('Wrote {} bytes'.format(bytes), file=sys.stderr)

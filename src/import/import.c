@@ -1,25 +1,9 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <getopt.h>
 
 #include "sd-event.h"
+#include "sd-id128.h"
 
 #include "alloc-util.h"
 #include "fd-util.h"
@@ -29,6 +13,7 @@
 #include "import-tar.h"
 #include "import-util.h"
 #include "machine-image.h"
+#include "main-func.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "verbs.h"
@@ -86,10 +71,11 @@ static int import_tar(int argc, char *argv[], void *userdata) {
                 }
 
                 if (!arg_force) {
-                        r = image_find(local, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
-                        else if (r > 0) {
+                        r = image_find(IMAGE_MACHINE, local, NULL);
+                        if (r < 0) {
+                                if (r != -ENOENT)
+                                        return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
+                        } else {
                                 log_error("Image '%s' already exists.", local);
                                 return -EEXIST;
                         }
@@ -110,7 +96,7 @@ static int import_tar(int argc, char *argv[], void *userdata) {
 
                 fd = STDIN_FILENO;
 
-                (void) readlink_malloc("/proc/self/fd/0", &pretty);
+                (void) fd_get_path(fd, &pretty);
                 log_info("Importing '%s', saving as '%s'.", strna(pretty), local);
         }
 
@@ -181,10 +167,11 @@ static int import_raw(int argc, char *argv[], void *userdata) {
                 }
 
                 if (!arg_force) {
-                        r = image_find(local, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
-                        else if (r > 0) {
+                        r = image_find(IMAGE_MACHINE, local, NULL);
+                        if (r < 0) {
+                                if (r != -ENOENT)
+                                        return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
+                        } else {
                                 log_error("Image '%s' already exists.", local);
                                 return -EEXIST;
                         }
@@ -205,8 +192,8 @@ static int import_raw(int argc, char *argv[], void *userdata) {
 
                 fd = STDIN_FILENO;
 
-                (void) readlink_malloc("/proc/self/fd/0", &pretty);
-                log_info("Importing '%s', saving as '%s'.", pretty, local);
+                (void) fd_get_path(fd, &pretty);
+                log_info("Importing '%s', saving as '%s'.", strempty(pretty), local);
         }
 
         r = sd_event_default(&event);
@@ -306,7 +293,6 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int import_main(int argc, char *argv[]) {
-
         static const Verb verbs[] = {
                 { "help", VERB_ANY, VERB_ANY, 0, help       },
                 { "tar",  2,        3,        0, import_tar },
@@ -317,7 +303,7 @@ static int import_main(int argc, char *argv[]) {
         return dispatch_verb(argc, argv, verbs, NULL);
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
@@ -326,12 +312,11 @@ int main(int argc, char *argv[]) {
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return 0;
 
         (void) ignore_signals(SIGPIPE, -1);
 
-        r = import_main(argc, argv);
-
-finish:
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return import_main(argc, argv);
 }
+
+DEFINE_MAIN_FUNCTION(run);

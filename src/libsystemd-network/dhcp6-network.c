@@ -1,20 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2014 Intel Corporation. All rights reserved.
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2014 Intel Corporation. All rights reserved.
 ***/
 
 #include <errno.h>
@@ -39,7 +25,7 @@ int dhcp6_network_bind_udp_socket(int index, struct in6_addr *local_address) {
                 .in6.sin6_scope_id = index,
         };
         _cleanup_close_ int s = -1;
-        int r, off = 0, on = 1;
+        int r;
 
         assert(index > 0);
         assert(local_address);
@@ -50,25 +36,23 @@ int dhcp6_network_bind_udp_socket(int index, struct in6_addr *local_address) {
         if (s < 0)
                 return -errno;
 
-        r = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_V6ONLY, true);
         if (r < 0)
-                return -errno;
+                return r;
 
-        r = setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &off, sizeof(off));
+        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, false);
         if (r < 0)
-                return -errno;
+                return r;
 
-        r = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        r = setsockopt_int(s, SOL_SOCKET, SO_REUSEADDR, true);
         if (r < 0)
-                return -errno;
+                return r;
 
         r = bind(s, &src.sa, sizeof(src.in6));
         if (r < 0)
                 return -errno;
 
-        r = s;
-        s = -1;
-        return r;
+        return TAKE_FD(s);
 }
 
 int dhcp6_network_send_udp_socket(int s, struct in6_addr *server_address,

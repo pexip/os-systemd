@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 typedef struct DnsTransaction DnsTransaction;
 typedef enum DnsTransactionState DnsTransactionState;
@@ -78,6 +60,8 @@ struct DnsTransaction {
 
         bool clamp_ttl:1;
 
+        bool probing:1;
+
         DnsPacket *sent, *received;
 
         DnsAnswer *answer;
@@ -105,6 +89,8 @@ struct DnsTransaction {
         usec_t next_attempt_after;
         sd_event_source *timeout_event_source;
         unsigned n_attempts;
+
+        unsigned n_picked_servers;
 
         /* UDP connection logic, if we need it */
         int dns_udp_fd;
@@ -144,6 +130,7 @@ struct DnsTransaction {
         unsigned block_gc;
 
         LIST_FIELDS(DnsTransaction, transactions_by_scope);
+        LIST_FIELDS(DnsTransaction, transactions_by_stream);
 };
 
 int dns_transaction_new(DnsTransaction **ret, DnsScope *s, DnsResourceKey *key);
@@ -172,10 +159,20 @@ DnsTransactionSource dns_transaction_source_from_string(const char *s) _pure_;
 #define MDNS_JITTER_MIN_USEC   (20 * USEC_PER_MSEC)
 #define MDNS_JITTER_RANGE_USEC (100 * USEC_PER_MSEC)
 
+/* mDNS probing interval, see RFC 6762 Section 8.1 */
+#define MDNS_PROBING_INTERVAL_USEC (250 * USEC_PER_MSEC)
+
 /* Maximum attempts to send DNS requests, across all DNS servers */
-#define DNS_TRANSACTION_ATTEMPTS_MAX 16
+#define DNS_TRANSACTION_ATTEMPTS_MAX 24
 
 /* Maximum attempts to send LLMNR requests, see RFC 4795 Section 2.7 */
 #define LLMNR_TRANSACTION_ATTEMPTS_MAX 3
 
-#define TRANSACTION_ATTEMPTS_MAX(p) ((p) == DNS_PROTOCOL_LLMNR ? LLMNR_TRANSACTION_ATTEMPTS_MAX : DNS_TRANSACTION_ATTEMPTS_MAX)
+/* Maximum attempts to send MDNS requests, see RFC 6762 Section 8.1 */
+#define MDNS_TRANSACTION_ATTEMPTS_MAX 3
+
+#define TRANSACTION_ATTEMPTS_MAX(p) (((p) == DNS_PROTOCOL_LLMNR) ? \
+                                         LLMNR_TRANSACTION_ATTEMPTS_MAX : \
+                                         (((p) == DNS_PROTOCOL_MDNS) ? \
+                                             MDNS_TRANSACTION_ATTEMPTS_MAX : \
+                                             DNS_TRANSACTION_ATTEMPTS_MAX))

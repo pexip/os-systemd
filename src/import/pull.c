@@ -1,30 +1,15 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <getopt.h>
 
 #include "sd-event.h"
+#include "sd-id128.h"
 
 #include "alloc-util.h"
 #include "hostname-util.h"
 #include "import-util.h"
 #include "machine-image.h"
+#include "main-func.h"
 #include "parse-util.h"
 #include "pull-raw.h"
 #include "pull-tar.h"
@@ -37,6 +22,7 @@ static bool arg_force = false;
 static const char *arg_image_root = "/var/lib/machines";
 static ImportVerify arg_verify = IMPORT_VERIFY_SIGNATURE;
 static bool arg_settings = true;
+static bool arg_roothash = true;
 
 static int interrupt_signal_handler(sd_event_source *s, const struct signalfd_siginfo *si, void *userdata) {
         log_notice("Transfer aborted.");
@@ -93,10 +79,11 @@ static int pull_tar(int argc, char *argv[], void *userdata) {
                 }
 
                 if (!arg_force) {
-                        r = image_find(local, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
-                        else if (r > 0) {
+                        r = image_find(IMAGE_MACHINE, local, NULL);
+                        if (r < 0) {
+                                if (r != -ENOENT)
+                                        return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
+                        } else {
                                 log_error("Image '%s' already exists.", local);
                                 return -EEXIST;
                         }
@@ -179,10 +166,11 @@ static int pull_raw(int argc, char *argv[], void *userdata) {
                 }
 
                 if (!arg_force) {
-                        r = image_find(local, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
-                        else if (r > 0) {
+                        r = image_find(IMAGE_MACHINE, local, NULL);
+                        if (r < 0) {
+                                if (r != -ENOENT)
+                                        return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
+                        } else {
                                 log_error("Image '%s' already exists.", local);
                                 return -EEXIST;
                         }
@@ -204,7 +192,7 @@ static int pull_raw(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate puller: %m");
 
-        r = raw_pull_start(pull, url, local, arg_force, arg_verify, arg_settings);
+        r = raw_pull_start(pull, url, local, arg_force, arg_verify, arg_settings, arg_roothash);
         if (r < 0)
                 return log_error_errno(r, "Failed to pull image: %m");
 
@@ -226,6 +214,7 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --verify=MODE            Verify downloaded image, one of: 'no',\n"
                "                              'checksum', 'signature'\n"
                "     --settings=BOOL          Download settings file with image\n"
+               "     --roothash=BOOL          Download root hash file with image\n"
                "     --image-root=PATH        Image root directory\n\n"
                "Commands:\n"
                "  tar URL [NAME]              Download a TAR image\n"
@@ -243,6 +232,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_IMAGE_ROOT,
                 ARG_VERIFY,
                 ARG_SETTINGS,
+                ARG_ROOTHASH,
         };
 
         static const struct option options[] = {
@@ -252,6 +242,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "image-root",      required_argument, NULL, ARG_IMAGE_ROOT      },
                 { "verify",          required_argument, NULL, ARG_VERIFY          },
                 { "settings",        required_argument, NULL, ARG_SETTINGS        },
+                { "roothash",        required_argument, NULL, ARG_ROOTHASH        },
                 {}
         };
 
@@ -280,19 +271,26 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_VERIFY:
                         arg_verify = import_verify_from_string(optarg);
-                        if (arg_verify < 0) {
-                                log_error("Invalid verification setting '%s'", optarg);
-                                return -EINVAL;
-                        }
+                        if (arg_verify < 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Invalid verification setting '%s'", optarg);
 
                         break;
 
                 case ARG_SETTINGS:
                         r = parse_boolean(optarg);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --settings= parameter '%s'", optarg);
+                                return log_error_errno(r, "Failed to parse --settings= parameter '%s': %m", optarg);
 
                         arg_settings = r;
+                        break;
+
+                case ARG_ROOTHASH:
+                        r = parse_boolean(optarg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --roothash= parameter '%s': %m", optarg);
+
+                        arg_roothash = r;
                         break;
 
                 case '?':
@@ -306,7 +304,6 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int pull_main(int argc, char *argv[]) {
-
         static const Verb verbs[] = {
                 { "help", VERB_ANY, VERB_ANY, 0, help     },
                 { "tar",  2,        3,        0, pull_tar },
@@ -317,7 +314,7 @@ static int pull_main(int argc, char *argv[]) {
         return dispatch_verb(argc, argv, verbs, NULL);
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
@@ -326,12 +323,11 @@ int main(int argc, char *argv[]) {
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return r;
 
         (void) ignore_signals(SIGPIPE, -1);
 
-        r = pull_main(argc, argv);
-
-finish:
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return pull_main(argc, argv);
 }
+
+DEFINE_MAIN_FUNCTION(run);

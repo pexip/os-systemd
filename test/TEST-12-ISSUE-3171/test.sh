@@ -1,18 +1,11 @@
 #!/bin/bash
 # -*- mode: shell-script; indent-tabs-mode: nil; sh-basic-offset: 4; -*-
 # ex: ts=8 sw=4 sts=4 et filetype=sh
+set -e
 TEST_DESCRIPTION="https://github.com/systemd/systemd/issues/3171"
+TEST_NO_QEMU=1
 
 . $TEST_BASE_DIR/test-functions
-
-test_run() {
-    if run_nspawn; then
-        check_result_nspawn || return 1
-    else
-        dwarn "can't run systemd-nspawn, skipping"
-    fi
-    return 0
-}
 
 test_setup() {
     create_empty_image
@@ -27,6 +20,14 @@ test_setup() {
         setup_basic_environment
         dracut_install cat mv stat nc
 
+        # mask some services that we do not want to run in these tests
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-hwdb-update.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-journal-catalog-update.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-networkd.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-networkd.socket
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-resolved.service
+        ln -fs /dev/null $initdir/etc/systemd/system/systemd-machined.service
+
         # setup the testsuite service
         cat >$initdir/etc/systemd/system/testsuite.service <<EOF
 [Unit]
@@ -37,7 +38,6 @@ After=multi-user.target
 ExecStart=/test-socket-group.sh
 Type=oneshot
 EOF
-
 
         cat >$initdir/test-socket-group.sh <<'EOF'
 #!/bin/bash
@@ -67,23 +67,23 @@ EOL
 systemctl start test.socket
 systemctl is-active test.socket
 [[ "$(stat --format='%G' /run/test.socket)" == adm ]]
-echo A | nc -U /run/test.socket
+echo A | nc -w1 -U /run/test.socket
 
 mv $U ${U}.disabled
 systemctl daemon-reload
 systemctl is-active test.socket
 [[ "$(stat --format='%G' /run/test.socket)" == adm ]]
-echo B | nc -U /run/test.socket && exit 1
+echo B | nc -w1 -U /run/test.socket && exit 1
 
 mv ${U}.disabled $U
 systemctl daemon-reload
 systemctl is-active test.socket
-echo C | nc -U /run/test.socket && exit 1
+echo C | nc -w1 -U /run/test.socket && exit 1
 [[ "$(stat --format='%G' /run/test.socket)" == adm ]]
 
 systemctl restart test.socket
 systemctl is-active test.socket
-echo D | nc -U /run/test.socket
+echo D | nc -w1 -U /run/test.socket
 [[ "$(stat --format='%G' /run/test.socket)" == adm ]]
 
 
@@ -98,12 +98,6 @@ EOF
 
     ddebug "umount $TESTDIR/root"
     umount $TESTDIR/root
-}
-
-test_cleanup() {
-    umount $TESTDIR/root 2>/dev/null
-    [[ $LOOPDEV ]] && losetup -d $LOOPDEV
-    return 0
 }
 
 do_test "$@"

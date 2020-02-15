@@ -1,25 +1,10 @@
-#  This file is part of systemd.
-#
-#  Copyright 2012 Lennart Poettering
-#
-#  systemd is free software; you can redistribute it and/or modify it
-#  under the terms of the GNU Lesser General Public License as published by
-#  the Free Software Foundation; either version 2.1 of the License, or
-#  (at your option) any later version.
-#
-#  systemd is distributed in the hope that it will be useful, but
-#  WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-#  Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: LGPL-2.1+
 
 # Message catalog for systemd's own messages
 # Danish translation
 
 # The catalog format is documented on
-# http://www.freedesktop.org/wiki/Software/systemd/catalog
+# https://www.freedesktop.org/wiki/Software/systemd/catalog
 
 # For an explanation why we do all this, see https://xkcd.com/1024/
 
@@ -79,7 +64,7 @@ og burde blive reporteret som en bug til folkene bag
 Subject: En ny session @SESSION_ID@ er blevet lavet for bruger @USER_ID@
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 En ny session med ID @SESSION_ID@ er blevet lavet for brugeren @USER_ID@.
 
@@ -89,7 +74,7 @@ Den ledende process for sessionen er @LEADER@.
 Subject: Session @SESSION_ID@ er blevet lukket ned
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 En session med ID @SESSION_ID@ er blevet lukket ned.
 
@@ -97,7 +82,7 @@ En session med ID @SESSION_ID@ er blevet lukket ned.
 Subject: En ny arbejdsstation $SEAT_ID@ er nu tilgængelig
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 En ny arbejdsstation @SEAT_ID@ er blevet konfigureret og er nu tilgængelig.
 
@@ -105,7 +90,7 @@ En ny arbejdsstation @SEAT_ID@ er blevet konfigureret og er nu tilgængelig.
 Subject: Arbejdsstation @SEAT_ID@ er nu blevet fjernet
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 En arbejdsstation @SEAT_ID@ er blevet fjernet og er ikke længere tilgængelig.
 
@@ -174,7 +159,7 @@ Support: %SUPPORT_URL%
 
 Enhed @UNIT@ er færdig med at starte op.
 
-Resultat for opstart er @RESULT@.
+Resultat for opstart er @JOB_RESULT@.
 
 -- de5b426a63be47a7b6ac3eaac82e2f6f
 Subject: Enhed @UNIT@ har påbegyndt nedlukning
@@ -197,7 +182,7 @@ Support: %SUPPORT_URL%
 
 Enhed @UNIT@ har fejlet.
 
-Resultatet er @RESULT@
+Resultatet er @JOB_RESULT@
 
 -- d34d037fff1847e6ae669a370e694725
 Subject: Enhed @UNIT@ har påbegyndt genindlæsning af sin konfiguration
@@ -213,7 +198,7 @@ Support: %SUPPORT_URL%
 
 Enhed @UNIT@ er færdig med at genindlæse sin konfiguration
 
-Resultatet er: @RESULT@.
+Resultatet er: @JOB_RESULT@.
 
 -- 641257651c1b4ec9a8624d7a40a9e1e7
 Subject: Process @EXECUTABLE@ kunne ikke eksekveres

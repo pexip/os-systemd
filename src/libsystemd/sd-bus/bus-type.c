@@ -1,21 +1,8 @@
-/***
-  This file is part of systemd.
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
-  Copyright 2013 Lennart Poettering
+#include <errno.h>
 
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+#include "sd-bus.h"
 
 #include "bus-type.h"
 
@@ -37,32 +24,6 @@ bool bus_type_is_valid(char c) {
                 SD_BUS_TYPE_VARIANT,
                 SD_BUS_TYPE_STRUCT,
                 SD_BUS_TYPE_DICT_ENTRY,
-                SD_BUS_TYPE_UNIX_FD
-        };
-
-        return !!memchr(valid, c, sizeof(valid));
-}
-
-bool bus_type_is_valid_in_signature(char c) {
-        static const char valid[] = {
-                SD_BUS_TYPE_BYTE,
-                SD_BUS_TYPE_BOOLEAN,
-                SD_BUS_TYPE_INT16,
-                SD_BUS_TYPE_UINT16,
-                SD_BUS_TYPE_INT32,
-                SD_BUS_TYPE_UINT32,
-                SD_BUS_TYPE_INT64,
-                SD_BUS_TYPE_UINT64,
-                SD_BUS_TYPE_DOUBLE,
-                SD_BUS_TYPE_STRING,
-                SD_BUS_TYPE_OBJECT_PATH,
-                SD_BUS_TYPE_SIGNATURE,
-                SD_BUS_TYPE_ARRAY,
-                SD_BUS_TYPE_VARIANT,
-                SD_BUS_TYPE_STRUCT_BEGIN,
-                SD_BUS_TYPE_STRUCT_END,
-                SD_BUS_TYPE_DICT_ENTRY_BEGIN,
-                SD_BUS_TYPE_DICT_ENTRY_END,
                 SD_BUS_TYPE_UNIX_FD
         };
 

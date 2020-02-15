@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 typedef struct Seat Seat;
 
@@ -45,25 +27,27 @@ struct Seat {
         LIST_FIELDS(Seat, gc_queue);
 };
 
-Seat *seat_new(Manager *m, const char *id);
-void seat_free(Seat *s);
+int seat_new(Seat **ret, Manager *m, const char *id);
+Seat* seat_free(Seat *s);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(Seat *, seat_free);
 
 int seat_save(Seat *s);
 int seat_load(Seat *s);
 
 int seat_apply_acls(Seat *s, Session *old_active);
 int seat_set_active(Seat *s, Session *session);
-int seat_switch_to(Seat *s, unsigned int num);
+int seat_switch_to(Seat *s, unsigned num);
 int seat_switch_to_next(Seat *s);
 int seat_switch_to_previous(Seat *s);
-int seat_active_vt_changed(Seat *s, unsigned int vtnr);
+int seat_active_vt_changed(Seat *s, unsigned vtnr);
 int seat_read_active_vt(Seat *s);
 int seat_preallocate_vts(Seat *s);
 
 int seat_attach_session(Seat *s, Session *session);
 void seat_complete_switch(Seat *s);
 void seat_evict_position(Seat *s, Session *session);
-void seat_claim_position(Seat *s, Session *session, unsigned int pos);
+void seat_claim_position(Seat *s, Session *session, unsigned pos);
 
 bool seat_has_vts(Seat *s);
 bool seat_is_seat0(Seat *s);
@@ -78,7 +62,7 @@ int seat_start(Seat *s);
 int seat_stop(Seat *s, bool force);
 int seat_stop_sessions(Seat *s, bool force);
 
-bool seat_check_gc(Seat *s, bool drop_not_started);
+bool seat_may_gc(Seat *s, bool drop_not_started);
 void seat_add_to_gc_queue(Seat *s);
 
 bool seat_name_is_valid(const char *name);

@@ -1,20 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2016 Canonical Ltd.
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2016 Canonical Ltd.
 ***/
 
 #include <unistd.h>
@@ -23,12 +9,13 @@
 #include "clock-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "log.h"
 #include "macro.h"
+#include "tmpfile-util.h"
 
 static void test_clock_is_localtime(void) {
-        char adjtime[] = "/tmp/test-adjtime.XXXXXX";
-        int fd = -1;
+        _cleanup_(unlink_tempfilep) char adjtime[] = "/tmp/test-adjtime.XXXXXX";
         _cleanup_fclose_ FILE* f = NULL;
 
         static const struct scenario {
@@ -55,22 +42,17 @@ static void test_clock_is_localtime(void) {
         /* without an adjtime file we default to UTC */
         assert_se(clock_is_localtime("/nonexisting/adjtime") == 0);
 
-        fd = mkostemp_safe(adjtime);
-        assert_se(fd >= 0);
+        assert_se(fmkostemp_safe(adjtime, "w", &f) == 0);
         log_info("adjtime test file: %s", adjtime);
-        f = fdopen(fd, "w");
-        assert_se(f);
 
         for (size_t i = 0; i < ELEMENTSOF(scenarios); ++i) {
                 log_info("scenario #%zu:, expected result %i", i, scenarios[i].expected_result);
                 log_info("%s", scenarios[i].contents);
                 rewind(f);
-                ftruncate(fd, 0);
-                assert_se(write_string_stream(f, scenarios[i].contents, false) == 0);
+                ftruncate(fileno(f), 0);
+                assert_se(write_string_stream(f, scenarios[i].contents, WRITE_STRING_FILE_AVOID_NEWLINE) == 0);
                 assert_se(clock_is_localtime(adjtime) == scenarios[i].expected_result);
         }
-
-        unlink(adjtime);
 }
 
 /* Test with the real /etc/adjtime */
@@ -82,7 +64,7 @@ static void test_clock_is_localtime_system(void) {
                 log_info("/etc/adjtime exists, clock_is_localtime() == %i", r);
                 /* if /etc/adjtime exists we expect some answer, no error or
                  * crash */
-                assert_se(r == 0 || r == 1);
+                assert_se(IN_SET(r, 0, 1));
         } else
                 /* default is UTC if there is no /etc/adjtime */
                 assert_se(r == 0);

@@ -1,37 +1,18 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2012 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 typedef struct Inhibitor Inhibitor;
 
-
 typedef enum InhibitWhat {
-        INHIBIT_SHUTDOWN = 1,
-        INHIBIT_SLEEP = 2,
-        INHIBIT_IDLE = 4,
-        INHIBIT_HANDLE_POWER_KEY = 8,
-        INHIBIT_HANDLE_SUSPEND_KEY = 16,
-        INHIBIT_HANDLE_HIBERNATE_KEY = 32,
-        INHIBIT_HANDLE_LID_SWITCH = 64,
-        _INHIBIT_WHAT_MAX = 128,
-        _INHIBIT_WHAT_INVALID = -1
+        INHIBIT_SHUTDOWN             = 1 << 0,
+        INHIBIT_SLEEP                = 1 << 1,
+        INHIBIT_IDLE                 = 1 << 2,
+        INHIBIT_HANDLE_POWER_KEY     = 1 << 3,
+        INHIBIT_HANDLE_SUSPEND_KEY   = 1 << 4,
+        INHIBIT_HANDLE_HIBERNATE_KEY = 1 << 5,
+        INHIBIT_HANDLE_LID_SWITCH    = 1 << 6,
+        _INHIBIT_WHAT_MAX            = 1 << 7,
+        _INHIBIT_WHAT_INVALID        = -1
 } InhibitWhat;
 
 typedef enum InhibitMode {

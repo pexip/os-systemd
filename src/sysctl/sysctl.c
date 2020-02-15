@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <getopt.h>
@@ -31,15 +14,20 @@
 #include "fileio.h"
 #include "hashmap.h"
 #include "log.h"
+#include "main-func.h"
+#include "pager.h"
 #include "path-util.h"
+#include "pretty-print.h"
 #include "string-util.h"
 #include "strv.h"
 #include "sysctl-util.h"
 #include "util.h"
 
 static char **arg_prefixes = NULL;
+static bool arg_cat_config = false;
+static PagerFlags arg_pager_flags = 0;
 
-static const char conf_file_dirs[] = CONF_PATHS_NULSTR("sysctl.d");
+STATIC_DESTRUCTOR_REGISTER(arg_prefixes, strv_freep);
 
 static int apply_all(OrderedHashmap *sysctl_options) {
         char *property, *value;
@@ -95,7 +83,7 @@ static int parse_file(OrderedHashmap *sysctl_options, const char *path, bool ign
 
         assert(path);
 
-        r = search_and_fopen_nulstr(path, "re", NULL, conf_file_dirs, &f);
+        r = search_and_fopen(path, "re", NULL, (const char**) CONF_PATHS_STRV("sysctl.d"), &f);
         if (r < 0) {
                 if (ignore_enoent && r == -ENOENT)
                         return 0;
@@ -105,29 +93,29 @@ static int parse_file(OrderedHashmap *sysctl_options, const char *path, bool ign
 
         log_debug("Parsing %s", path);
         for (;;) {
-                char l[LINE_MAX], *p, *value, *new_value, *property, *existing;
+                char *p, *value, *new_value, *property, *existing;
+                _cleanup_free_ char *l = NULL;
                 void *v;
                 int k;
 
-                if (!fgets(l, sizeof(l), f)) {
-                        if (feof(f))
-                                break;
-
-                        return log_error_errno(errno, "Failed to read file '%s', ignoring: %m", path);
-                }
+                k = read_line(f, LONG_LINE_MAX, &l);
+                if (k == 0)
+                        break;
+                if (k < 0)
+                        return log_error_errno(k, "Failed to read file '%s', ignoring: %m", path);
 
                 c++;
 
                 p = strstrip(l);
-                if (!*p)
-                        continue;
 
+                if (isempty(p))
+                        continue;
                 if (strchr(COMMENTS "\n", *p))
                         continue;
 
                 value = strchr(p, '=');
                 if (!value) {
-                        log_error("Line is not an assignment at '%s:%u': %s", path, c, value);
+                        log_error("Line is not an assignment at '%s:%u': %s", path, c, p);
 
                         if (r == 0)
                                 r = -EINVAL;
@@ -175,26 +163,44 @@ static int parse_file(OrderedHashmap *sysctl_options, const char *path, bool ign
         return r;
 }
 
-static void help(void) {
+static int help(void) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        r = terminal_urlify_man("systemd-sysctl.service", "8", &link);
+        if (r < 0)
+                return log_oom();
+
         printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
                "Applies kernel sysctl settings.\n\n"
                "  -h --help             Show this help\n"
                "     --version          Show package version\n"
+               "     --cat-config       Show configuration files\n"
                "     --prefix=PATH      Only apply rules with the specified prefix\n"
-               , program_invocation_short_name);
+               "     --no-pager         Do not pipe output into a pager\n"
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , link
+        );
+
+        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
 
         enum {
                 ARG_VERSION = 0x100,
-                ARG_PREFIX
+                ARG_CAT_CONFIG,
+                ARG_PREFIX,
+                ARG_NO_PAGER,
         };
 
         static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                { "prefix",    required_argument, NULL, ARG_PREFIX    },
+                { "help",       no_argument,       NULL, 'h'            },
+                { "version",    no_argument,       NULL, ARG_VERSION    },
+                { "cat-config", no_argument,       NULL, ARG_CAT_CONFIG },
+                { "prefix",     required_argument, NULL, ARG_PREFIX     },
+                { "no-pager",   no_argument,       NULL, ARG_NO_PAGER   },
                 {}
         };
 
@@ -208,11 +214,14 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 case 'h':
-                        help();
-                        return 0;
+                        return help();
 
                 case ARG_VERSION:
                         return version();
+
+                case ARG_CAT_CONFIG:
+                        arg_cat_config = true;
+                        break;
 
                 case ARG_PREFIX: {
                         char *p;
@@ -223,7 +232,7 @@ static int parse_argv(int argc, char *argv[]) {
                          * sysctl name available. */
                         sysctl_normalize(optarg);
 
-                        if (startswith(optarg, "/proc/sys"))
+                        if (path_startswith(optarg, "/proc/sys"))
                                 p = strdup(optarg);
                         else
                                 p = strappend("/proc/sys/", optarg);
@@ -236,6 +245,10 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
+                case ARG_NO_PAGER:
+                        arg_pager_flags |= PAGER_DISABLE;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -243,28 +256,28 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option");
                 }
 
+        if (arg_cat_config && argc > optind)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Positional arguments are not allowed with --cat-config");
+
         return 1;
 }
 
-int main(int argc, char *argv[]) {
-        OrderedHashmap *sysctl_options = NULL;
-        int r = 0, k;
+static int run(int argc, char *argv[]) {
+        _cleanup_(ordered_hashmap_free_free_freep) OrderedHashmap *sysctl_options = NULL;
+        int r, k;
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return r;
 
-        log_set_target(LOG_TARGET_AUTO);
-        log_parse_environment();
-        log_open();
+        log_setup_service();
 
         umask(0022);
 
-        sysctl_options = ordered_hashmap_new(&string_hash_ops);
-        if (!sysctl_options) {
-                r = log_oom();
-                goto finish;
-        }
+        sysctl_options = ordered_hashmap_new(&path_hash_ops);
+        if (!sysctl_options)
+                return log_oom();
 
         r = 0;
 
@@ -280,10 +293,14 @@ int main(int argc, char *argv[]) {
                 _cleanup_strv_free_ char **files = NULL;
                 char **f;
 
-                r = conf_files_list_nulstr(&files, ".conf", NULL, conf_file_dirs);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to enumerate sysctl.d files: %m");
-                        goto finish;
+                r = conf_files_list_strv(&files, ".conf", NULL, 0, (const char**) CONF_PATHS_STRV("sysctl.d"));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to enumerate sysctl.d files: %m");
+
+                if (arg_cat_config) {
+                        (void) pager_open(arg_pager_flags);
+
+                        return cat_files(NULL, files, 0);
                 }
 
                 STRV_FOREACH(f, files) {
@@ -297,9 +314,7 @@ int main(int argc, char *argv[]) {
         if (k < 0 && r == 0)
                 r = k;
 
-finish:
-        ordered_hashmap_free_free_free(sysctl_options);
-        strv_free(arg_prefixes);
-
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return r;
 }
+
+DEFINE_MAIN_FUNCTION(run);

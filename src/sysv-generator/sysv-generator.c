@@ -1,23 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Thomas H.P. Andersen
-  Copyright 2010 Lennart Poettering
-  Copyright 2011 Michal Schmidt
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <stdio.h>
@@ -28,15 +9,18 @@
 #include "exit-status.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "generator.h"
 #include "hashmap.h"
 #include "hexdecoct.h"
 #include "install.h"
 #include "log.h"
+#include "main-func.h"
 #include "mkdir.h"
 #include "path-lookup.h"
 #include "path-util.h"
 #include "set.h"
 #include "special.h"
+#include "specifier.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -58,7 +42,7 @@ static const struct {
          * means they are shut down anyway at system power off if running. */
 };
 
-static const char *arg_dest = "/tmp";
+static const char *arg_dest = NULL;
 
 typedef struct SysvStub {
         char *name;
@@ -93,35 +77,7 @@ static void free_sysvstub(SysvStub *s) {
 DEFINE_TRIVIAL_CLEANUP_FUNC(SysvStub*, free_sysvstub);
 
 static void free_sysvstub_hashmapp(Hashmap **h) {
-        SysvStub *stub;
-
-        while ((stub = hashmap_steal_first(*h)))
-                free_sysvstub(stub);
-
-        hashmap_free(*h);
-}
-
-static int add_symlink(const char *service, const char *where) {
-        const char *from, *to;
-        int r;
-
-        assert(service);
-        assert(where);
-
-        from = strjoina(arg_dest, "/", service);
-        to = strjoina(arg_dest, "/", where, ".wants/", service);
-
-        mkdir_parents_label(to, 0755);
-
-        r = symlink(from, to);
-        if (r < 0) {
-                if (errno == EEXIST)
-                        return 0;
-
-                return -errno;
-        }
-
-        return 1;
+        hashmap_free_with_destructor(*h, free_sysvstub);
 }
 
 static int add_alias(const char *service, const char *alias) {
@@ -145,6 +101,7 @@ static int add_alias(const char *service, const char *alias) {
 }
 
 static int generate_unit_file(SysvStub *s) {
+        _cleanup_free_ char *path_escaped = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         const char *unit;
         char **p;
@@ -154,6 +111,10 @@ static int generate_unit_file(SysvStub *s) {
 
         if (!s->loaded)
                 return 0;
+
+        path_escaped = specifier_escape(s->path);
+        if (!path_escaped)
+                return log_oom();
 
         unit = strjoina(arg_dest, "/", s->name);
 
@@ -174,10 +135,17 @@ static int generate_unit_file(SysvStub *s) {
                 "[Unit]\n"
                 "Documentation=man:systemd-sysv-generator(8)\n"
                 "SourcePath=%s\n",
-                s->path);
+                path_escaped);
 
-        if (s->description)
-                fprintf(f, "Description=%s\n", s->description);
+        if (s->description) {
+                _cleanup_free_ char *t;
+
+                t = specifier_escape(s->description);
+                if (!t)
+                        return log_oom();
+
+                fprintf(f, "Description=%s\n", t);
+        }
 
         STRV_FOREACH(p, s->before)
                 fprintf(f, "Before=%s\n", *p);
@@ -197,8 +165,15 @@ static int generate_unit_file(SysvStub *s) {
                 "RemainAfterExit=%s\n",
                 yes_no(!s->pid_file));
 
-        if (s->pid_file)
-                fprintf(f, "PIDFile=%s\n", s->pid_file);
+        if (s->pid_file) {
+                _cleanup_free_ char *t;
+
+                t = specifier_escape(s->pid_file);
+                if (!t)
+                        return log_oom();
+
+                fprintf(f, "PIDFile=%s\n", t);
+        }
 
         /* Consider two special LSB exit codes a clean exit */
         if (s->has_lsb)
@@ -210,20 +185,17 @@ static int generate_unit_file(SysvStub *s) {
         fprintf(f,
                 "ExecStart=%s start\n"
                 "ExecStop=%s stop\n",
-                s->path, s->path);
+                path_escaped, path_escaped);
 
         if (s->reload)
-                fprintf(f, "ExecReload=%s reload\n", s->path);
+                fprintf(f, "ExecReload=%s reload\n", path_escaped);
 
         r = fflush_and_check(f);
         if (r < 0)
                 return log_error_errno(r, "Failed to write unit %s: %m", unit);
 
-        STRV_FOREACH(p, s->wanted_by) {
-                r = add_symlink(s->name, *p);
-                if (r < 0)
-                        log_warning_errno(r, "Failed to create 'Wants' symlink to %s, ignoring: %m", *p);
-        }
+        STRV_FOREACH(p, s->wanted_by)
+                (void) generator_add_symlink(arg_dest, *p, "wants", s->name);
 
         return 1;
 }
@@ -249,7 +221,7 @@ static char *sysv_translate_name(const char *name) {
         if (res)
                 *res = 0;
 
-        if (unit_name_mangle(c, UNIT_NAME_NOGLOB, &res) < 0)
+        if (unit_name_mangle(c, 0, &res) < 0)
                 return NULL;
 
         return res;
@@ -292,8 +264,10 @@ static int sysv_translate_facility(SysvStub *s, unsigned line, const char *name,
                 if (!streq(table[i], n))
                         continue;
 
-                if (!table[i+1])
+                if (!table[i+1]) {
+                        *ret = NULL;
                         return 0;
+                }
 
                 m = strdup(table[i+1]);
                 if (!m)
@@ -312,7 +286,7 @@ static int sysv_translate_facility(SysvStub *s, unsigned line, const char *name,
                 if (r < 0)
                         return log_error_errno(r, "[%s:%u] Could not build name for facility %s: %m", s->path, line, name);
 
-                return r;
+                return 1;
         }
 
         /* Strip ".sh" suffix from file name for comparison */
@@ -324,8 +298,10 @@ static int sysv_translate_facility(SysvStub *s, unsigned line, const char *name,
         }
 
         /* Names equaling the file name of the services are redundant */
-        if (streq_ptr(n, filename))
+        if (streq_ptr(n, filename)) {
+                *ret = NULL;
                 return 0;
+        }
 
         /* Everything else we assume to be normal service names */
         m = sysv_translate_name(n);
@@ -383,6 +359,9 @@ static int handle_provides(SysvStub *s, unsigned line, const char *full_text, co
 
                         if (streq(m, SPECIAL_NETWORK_ONLINE_TARGET)) {
                                 r = strv_extend(&s->before, SPECIAL_NETWORK_TARGET);
+                                if (r < 0)
+                                        return log_oom();
+                                r = strv_extend(&s->wants, SPECIAL_NETWORK_TARGET);
                                 if (r < 0)
                                         return log_oom();
                         }
@@ -454,7 +433,6 @@ static int load_sysv(SysvStub *s) {
         _cleanup_free_ char *short_description = NULL, *long_description = NULL, *chkconfig_description = NULL;
         char *description;
         bool supports_reload = false;
-        char l[LINE_MAX];
 
         assert(s);
 
@@ -468,8 +446,15 @@ static int load_sysv(SysvStub *s) {
 
         log_debug("Loading SysV script %s", s->path);
 
-        FOREACH_LINE(l, f, goto fail) {
+        for (;;) {
+                _cleanup_free_ char *l = NULL;
                 char *t;
+
+                r = read_line(f, LONG_LINE_MAX, &l);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read configuration file '%s': %m", s->path);
+                if (r == 0)
+                        break;
 
                 line++;
 
@@ -478,7 +463,7 @@ static int load_sysv(SysvStub *s) {
                         /* Try to figure out whether this init script supports
                          * the reload operation. This heuristic looks for
                          * "Usage" lines which include the reload option. */
-                        if ( state == USAGE_CONTINUATION ||
+                        if (state == USAGE_CONTINUATION ||
                             (state == NORMAL && strcasestr(t, "usage"))) {
                                 if (usage_contains_reload(t)) {
                                         supports_reload = true;
@@ -498,7 +483,7 @@ static int load_sysv(SysvStub *s) {
                         continue;
                 }
 
-                if ((state == LSB_DESCRIPTION || state == LSB) && streq(t, "### END INIT INFO")) {
+                if (IN_SET(state, LSB_DESCRIPTION, LSB) && streq(t, "### END INIT INFO")) {
                         state = NORMAL;
                         continue;
                 }
@@ -562,7 +547,7 @@ static int load_sysv(SysvStub *s) {
                                 char *d = NULL;
 
                                 if (chkconfig_description)
-                                        d = strjoin(chkconfig_description, " ", j, NULL);
+                                        d = strjoin(chkconfig_description, " ", j);
                                 else
                                         d = strdup(j);
                                 if (!d)
@@ -572,7 +557,7 @@ static int load_sysv(SysvStub *s) {
                                 chkconfig_description = d;
                         }
 
-                } else if (state == LSB || state == LSB_DESCRIPTION) {
+                } else if (IN_SET(state, LSB, LSB_DESCRIPTION)) {
 
                         if (startswith_no_case(t, "Provides:")) {
                                 state = LSB;
@@ -624,7 +609,7 @@ static int load_sysv(SysvStub *s) {
                                                 char *d = NULL;
 
                                                 if (long_description)
-                                                        d = strjoin(long_description, " ", t, NULL);
+                                                        d = strjoin(long_description, " ", t);
                                                 else
                                                         d = strdup(j);
                                                 if (!d)
@@ -666,9 +651,6 @@ static int load_sysv(SysvStub *s) {
 
         s->loaded = true;
         return 0;
-
-fail:
-        return log_error_errno(errno, "Failed to read configuration file '%s': %m", s->path);
 }
 
 static int fix_order(SysvStub *s, Hashmap *all_services) {
@@ -735,7 +717,7 @@ static int acquire_search_path(const char *def, const char *envvar, char ***ret)
         if (strv_isempty(l)) {
                 strv_free(l);
 
-                l = strv_new(def, NULL);
+                l = strv_new(def);
                 if (!l)
                         return log_oom();
         }
@@ -743,8 +725,7 @@ static int acquire_search_path(const char *def, const char *envvar, char ***ret)
         if (!path_strv_resolve_uniq(l, NULL))
                 return log_oom();
 
-        *ret = l;
-        l = NULL;
+        *ret = TAKE_PTR(l);
 
         return 0;
 }
@@ -803,7 +784,7 @@ static int enumerate_sysv(const LookupPaths *lp, Hashmap *all_services) {
                                 continue;
                         }
 
-                        fpath = strjoin(*path, "/", de->d_name, NULL);
+                        fpath = strjoin(*path, "/", de->d_name);
                         if (!fpath)
                                 return log_oom();
 
@@ -812,9 +793,8 @@ static int enumerate_sysv(const LookupPaths *lp, Hashmap *all_services) {
                                 return log_oom();
 
                         service->sysv_start_priority = -1;
-                        service->name = name;
-                        service->path = fpath;
-                        name = fpath = NULL;
+                        service->name = TAKE_PTR(name);
+                        service->path = TAKE_PTR(fpath);
 
                         r = hashmap_put(all_services, service->name, service);
                         if (r < 0)
@@ -849,7 +829,7 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
                         _cleanup_free_ char *path = NULL;
                         struct dirent *de;
 
-                        path = strjoin(*p, "/", rcnd_table[i].path, NULL);
+                        path = strjoin(*p, "/", rcnd_table[i].path);
                         if (!path) {
                                 r = log_oom();
                                 goto finish;
@@ -879,7 +859,7 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
                                 if (a < 0 || b < 0)
                                         continue;
 
-                                fpath = strjoin(*p, "/", de->d_name, NULL);
+                                fpath = strjoin(*p, "/", de->d_name);
                                 if (!fpath) {
                                         r = log_oom();
                                         goto finish;
@@ -937,46 +917,30 @@ finish:
         return r;
 }
 
-int main(int argc, char *argv[]) {
+static int run(const char *dest, const char *dest_early, const char *dest_late) {
         _cleanup_(free_sysvstub_hashmapp) Hashmap *all_services = NULL;
-        _cleanup_lookup_paths_free_ LookupPaths lp = {};
+        _cleanup_(lookup_paths_free) LookupPaths lp = {};
         SysvStub *service;
         Iterator j;
         int r;
 
-        if (argc > 1 && argc != 4) {
-                log_error("This program takes three or no arguments.");
-                return EXIT_FAILURE;
-        }
-
-        if (argc > 1)
-                arg_dest = argv[3];
-
-        log_set_target(LOG_TARGET_SAFE);
-        log_parse_environment();
-        log_open();
-
-        umask(0022);
+        assert_se(arg_dest = dest_late);
 
         r = lookup_paths_init(&lp, UNIT_FILE_SYSTEM, LOOKUP_PATHS_EXCLUDE_GENERATED, NULL);
-        if (r < 0) {
-                log_error_errno(r, "Failed to find lookup paths: %m");
-                goto finish;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to find lookup paths: %m");
 
         all_services = hashmap_new(&string_hash_ops);
-        if (!all_services) {
-                r = log_oom();
-                goto finish;
-        }
+        if (!all_services)
+                return log_oom();
 
         r = enumerate_sysv(&lp, all_services);
         if (r < 0)
-                goto finish;
+                return r;
 
         r = set_dependencies_from_rcnd(&lp, all_services);
         if (r < 0)
-                goto finish;
+                return r;
 
         HASHMAP_FOREACH(service, all_services, j)
                 (void) load_sysv(service);
@@ -986,8 +950,7 @@ int main(int argc, char *argv[]) {
                 (void) generate_unit_file(service);
         }
 
-        r = 0;
-
-finish:
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return 0;
 }
+
+DEFINE_MAIN_GENERATOR_FUNCTION(run);

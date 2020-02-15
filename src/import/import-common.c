@@ -1,32 +1,22 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "alloc-util.h"
 #include "btrfs-util.h"
 #include "capability-util.h"
+#include "dirent-util.h"
 #include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
 #include "import-common.h"
+#include "os-util.h"
+#include "process-util.h"
 #include "signal-util.h"
+#include "tmpfile-util.h"
 #include "util.h"
 
 int import_make_read_only_fd(int fd) {
@@ -37,7 +27,7 @@ int import_make_read_only_fd(int fd) {
         /* First, let's make this a read-only subvolume if it refers
          * to a subvolume */
         r = btrfs_subvol_set_read_only_fd(fd, true);
-        if (r == -ENOTTY || r == -ENOTDIR || r == -EINVAL) {
+        if (IN_SET(r, -ENOTTY, -ENOTDIR, -EINVAL)) {
                 struct stat st;
 
                 /* This doesn't refer to a subvolume, or the file
@@ -81,12 +71,10 @@ int import_fork_tar_x(const char *path, pid_t *ret) {
         if (pipe2(pipefd, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to create pipe for tar: %m");
 
-        pid = fork();
-        if (pid < 0)
-                return log_error_errno(errno, "Failed to fork off tar: %m");
-
-        if (pid == 0) {
-                int null_fd;
+        r = safe_fork("(tar)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
                 uint64_t retain =
                         (1ULL << CAP_CHOWN) |
                         (1ULL << CAP_FOWNER) |
@@ -97,35 +85,13 @@ int import_fork_tar_x(const char *path, pid_t *ret) {
 
                 /* Child */
 
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
-                assert_se(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
-
                 pipefd[1] = safe_close(pipefd[1]);
 
-                if (dup2(pipefd[0], STDIN_FILENO) != STDIN_FILENO) {
-                        log_error_errno(errno, "Failed to dup2() fd: %m");
+                r = rearrange_stdio(pipefd[0], -1, STDERR_FILENO);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to rearrange stdin/stdout: %m");
                         _exit(EXIT_FAILURE);
                 }
-
-                if (pipefd[0] != STDIN_FILENO)
-                        pipefd[0] = safe_close(pipefd[0]);
-
-                null_fd = open("/dev/null", O_WRONLY|O_NOCTTY);
-                if (null_fd < 0) {
-                        log_error_errno(errno, "Failed to open /dev/null: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (dup2(null_fd, STDOUT_FILENO) != STDOUT_FILENO) {
-                        log_error_errno(errno, "Failed to dup2() fd: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (null_fd != STDOUT_FILENO)
-                        null_fd = safe_close(null_fd);
-
-                stdio_unset_cloexec();
 
                 if (unshare(CLONE_NEWNET) < 0)
                         log_error_errno(errno, "Failed to lock tar into network namespace, ignoring: %m");
@@ -139,13 +105,9 @@ int import_fork_tar_x(const char *path, pid_t *ret) {
                 _exit(EXIT_FAILURE);
         }
 
-        pipefd[0] = safe_close(pipefd[0]);
-        r = pipefd[1];
-        pipefd[1] = -1;
-
         *ret = pid;
 
-        return r;
+        return TAKE_FD(pipefd[1]);
 }
 
 int import_fork_tar_c(const char *path, pid_t *ret) {
@@ -159,45 +121,21 @@ int import_fork_tar_c(const char *path, pid_t *ret) {
         if (pipe2(pipefd, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to create pipe for tar: %m");
 
-        pid = fork();
-        if (pid < 0)
-                return log_error_errno(errno, "Failed to fork off tar: %m");
-
-        if (pid == 0) {
-                int null_fd;
+        r = safe_fork("(tar)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
                 uint64_t retain = (1ULL << CAP_DAC_OVERRIDE);
 
                 /* Child */
 
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
-                assert_se(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
-
                 pipefd[0] = safe_close(pipefd[0]);
 
-                if (dup2(pipefd[1], STDOUT_FILENO) != STDOUT_FILENO) {
-                        log_error_errno(errno, "Failed to dup2() fd: %m");
+                r = rearrange_stdio(-1, pipefd[1], STDERR_FILENO);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to rearrange stdin/stdout: %m");
                         _exit(EXIT_FAILURE);
                 }
-
-                if (pipefd[1] != STDOUT_FILENO)
-                        pipefd[1] = safe_close(pipefd[1]);
-
-                null_fd = open("/dev/null", O_RDONLY|O_NOCTTY);
-                if (null_fd < 0) {
-                        log_error_errno(errno, "Failed to open /dev/null: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (dup2(null_fd, STDIN_FILENO) != STDIN_FILENO) {
-                        log_error_errno(errno, "Failed to dup2() fd: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (null_fd != STDIN_FILENO)
-                        null_fd = safe_close(null_fd);
-
-                stdio_unset_cloexec();
 
                 if (unshare(CLONE_NEWNET) < 0)
                         log_error_errno(errno, "Failed to lock tar into network namespace, ignoring: %m");
@@ -211,11 +149,111 @@ int import_fork_tar_c(const char *path, pid_t *ret) {
                 _exit(EXIT_FAILURE);
         }
 
-        pipefd[1] = safe_close(pipefd[1]);
-        r = pipefd[0];
-        pipefd[0] = -1;
-
         *ret = pid;
 
-        return r;
+        return TAKE_FD(pipefd[0]);
+}
+
+int import_mangle_os_tree(const char *path) {
+        _cleanup_closedir_ DIR *d = NULL, *cd = NULL;
+        _cleanup_free_ char *child = NULL, *t = NULL;
+        const char *joined;
+        struct dirent *de;
+        int r;
+
+        assert(path);
+
+        /* Some tarballs contain a single top-level directory that contains the actual OS directory tree. Try to
+         * recognize this, and move the tree one level up. */
+
+        r = path_is_os_tree(path);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine whether '%s' is an OS tree: %m", path);
+        if (r > 0) {
+                log_debug("Directory tree '%s' is a valid OS tree.", path);
+                return 0;
+        }
+
+        log_debug("Directory tree '%s' is not recognizable as OS tree, checking whether to rearrange it.", path);
+
+        d = opendir(path);
+        if (!d)
+                return log_error_errno(r, "Failed to open directory '%s': %m", path);
+
+        errno = 0;
+        de = readdir_no_dot(d);
+        if (!de) {
+                if (errno != 0)
+                        return log_error_errno(errno, "Failed to iterate through directory '%s': %m", path);
+
+                log_debug("Directory '%s' is empty, leaving it as it is.", path);
+                return 0;
+        }
+
+        child = strdup(de->d_name);
+        if (!child)
+                return log_oom();
+
+        errno = 0;
+        de = readdir_no_dot(d);
+        if (de) {
+                if (errno != 0)
+                        return log_error_errno(errno, "Failed to iterate through directory '%s': %m", path);
+
+                log_debug("Directory '%s' does not look like a directory tree, and has multiple children, leaving as it is.", path);
+                return 0;
+        }
+
+        joined = strjoina(path, "/", child);
+        r = path_is_os_tree(joined);
+        if (r == -ENOTDIR) {
+                log_debug("Directory '%s' does not look like a directory tree, and contains a single regular file only, leaving as it is.", path);
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine whether '%s' is an OS tree: %m", joined);
+        if (r == 0) {
+                log_debug("Neither '%s' nor '%s' is a valid OS tree, leaving them as they are.", path, joined);
+                return 0;
+        }
+
+        /* Nice, we have checked now:
+         *
+         * 1. The top-level directory does not qualify as OS tree
+         * 1. The top-level directory only contains one item
+         * 2. That item is a directory
+         * 3. And that directory qualifies as OS tree
+         *
+         * Let's now rearrange things, moving everything in the inner directory one level up */
+
+        cd = xopendirat(dirfd(d), child, O_NOFOLLOW);
+        if (!cd)
+                return log_error_errno(errno, "Can't open directory '%s': %m", joined);
+
+        log_info("Rearranging '%s', moving OS tree one directory up.", joined);
+
+        /* Let's rename the child to an unguessable name so that we can be sure all files contained in it can be
+         * safely moved up and won't collide with the name. */
+        r = tempfn_random(child, NULL, &t);
+        if (r < 0)
+                return log_oom();
+        r = rename_noreplace(dirfd(d), child, dirfd(d), t);
+        if (r < 0)
+                return log_error_errno(r, "Unable to rename '%s' to '%s/%s': %m", joined, path, t);
+
+        FOREACH_DIRENT_ALL(de, cd, return log_error_errno(errno, "Failed to iterate through directory '%s': %m", joined)) {
+                if (dot_or_dot_dot(de->d_name))
+                        continue;
+
+                r = rename_noreplace(dirfd(cd), de->d_name, dirfd(d), de->d_name);
+                if (r < 0)
+                        return log_error_errno(r, "Unable to move '%s/%s/%s' to '%s/%s': %m", path, t, de->d_name, path, de->d_name);
+        }
+
+        if (unlinkat(dirfd(d), t, AT_REMOVEDIR) < 0)
+                return log_error_errno(errno, "Failed to remove temporary directory '%s/%s': %m", path, t);
+
+        log_info("Successfully rearranged OS tree.");
+
+        return 0;
 }

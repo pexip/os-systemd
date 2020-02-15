@@ -1,23 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+#include "macro.h"
 
 /* The head of the linked list. Use this in the structure that shall
  * contain the head of the linked list */
@@ -31,8 +15,8 @@
 /* Initialize the list's head */
 #define LIST_HEAD_INIT(head)                                            \
         do {                                                            \
-                (head) = NULL; }                                        \
-        while (false)
+                (head) = NULL;                                          \
+        } while (false)
 
 /* Initialize a list item */
 #define LIST_INIT(name,item)                                            \
@@ -56,9 +40,9 @@
 /* Append an item to the list */
 #define LIST_APPEND(name,head,item)                                     \
         do {                                                            \
-                typeof(*(head)) *_tail;                                 \
-                LIST_FIND_TAIL(name,head,_tail);                        \
-                LIST_INSERT_AFTER(name,head,_tail,item);                \
+                typeof(*(head)) **_hhead = &(head), *_tail;             \
+                LIST_FIND_TAIL(name, *_hhead, _tail);                   \
+                LIST_INSERT_AFTER(name, *_hhead, _tail, item);          \
         } while (false)
 
 /* Remove an item from the list */
@@ -182,3 +166,6 @@
         for ((i) = (p)->name##_next ? (p)->name##_next : (head);        \
              (i) != (p);                                                \
              (i) = (i)->name##_next ? (i)->name##_next : (head))
+
+#define LIST_IS_EMPTY(head)                                             \
+        (!(head))

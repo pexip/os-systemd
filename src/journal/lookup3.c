@@ -48,6 +48,10 @@ on 1 byte), but shoehorning those bytes into integers efficiently is messy.
 # include <endian.h>    /* attempt to define endianness */
 #endif
 
+#if __GNUC__ >= 7
+_Pragma("GCC diagnostic ignored \"-Wimplicit-fallthrough\"")
+#endif
+
 /*
  * My best guess at if you are big-endian or little-endian.  This may
  * need adjustment.
@@ -210,7 +214,6 @@ uint32_t        initval)         /* the previous hash, or an arbitrary value */
   return c;
 }
 
-
 /*
 --------------------------------------------------------------------
 hashword2() -- same as hashword(), but take two seeds and return two
@@ -255,7 +258,6 @@ uint32_t       *pb)               /* IN: more seed OUT: secondary hash value */
   /*------------------------------------------------------ report the result */
   *pc=c; *pb=b;
 }
-
 
 /*
 -------------------------------------------------------------------------------
@@ -313,11 +315,11 @@ uint32_t jenkins_hashlittle( const void *key, size_t length, uint32_t initval)
      * then masks off the part it's not allowed to read.  Because the
      * string is aligned, the masked-off tail is in the same word as the
      * rest of the string.  Every machine with memory protection I've seen
-     * does it on word boundaries, so is OK with this.  But VALGRIND will
+     * does it on word boundaries, so is OK with this.  But valgrind will
      * still catch it and complain.  The masking trick does make the hash
      * noticeably faster for short strings (like English words).
      */
-#if !defined(VALGRIND) && !defined(__SANITIZE_ADDRESS__)
+#if !VALGRIND && !HAS_FEATURE_ADDRESS_SANITIZER
 
     switch(length)
     {
@@ -454,7 +456,6 @@ uint32_t jenkins_hashlittle( const void *key, size_t length, uint32_t initval)
   return c;
 }
 
-
 /*
  * hashlittle2: return 2 32-bit hash values
  *
@@ -499,11 +500,11 @@ void jenkins_hashlittle2(
      * then masks off the part it's not allowed to read.  Because the
      * string is aligned, the masked-off tail is in the same word as the
      * rest of the string.  Every machine with memory protection I've seen
-     * does it on word boundaries, so is OK with this.  But VALGRIND will
+     * does it on word boundaries, so is OK with this.  But valgrind will
      * still catch it and complain.  The masking trick does make the hash
      * noticeably faster for short strings (like English words).
      */
-#if !defined(VALGRIND) && !defined(__SANITIZE_ADDRESS__)
+#if !VALGRIND && !HAS_FEATURE_ADDRESS_SANITIZER
 
     switch(length)
     {
@@ -640,8 +641,6 @@ void jenkins_hashlittle2(
   *pc=c; *pb=b;
 }
 
-
-
 /*
  * hashbig():
  * This is the same as hashword() on big-endian machines.  It is different
@@ -677,11 +676,11 @@ uint32_t jenkins_hashbig( const void *key, size_t length, uint32_t initval)
      * then shifts out the part it's not allowed to read.  Because the
      * string is aligned, the illegal read is in the same word as the
      * rest of the string.  Every machine with memory protection I've seen
-     * does it on word boundaries, so is OK with this.  But VALGRIND will
+     * does it on word boundaries, so is OK with this.  But valgrind will
      * still catch it and complain.  The masking trick does make the hash
      * noticeably faster for short strings (like English words).
      */
-#if !defined(VALGRIND) && !defined(__SANITIZE_ADDRESS__)
+#if !VALGRIND && !HAS_FEATURE_ADDRESS_SANITIZER
 
     switch(length)
     {
@@ -770,7 +769,6 @@ uint32_t jenkins_hashbig( const void *key, size_t length, uint32_t initval)
   final(a,b,c);
   return c;
 }
-
 
 #ifdef SELF_TEST
 
@@ -963,7 +961,6 @@ void driver3()
   uint8_t buf[1];
   uint32_t h,i,state[HASHSTATE];
 
-
   buf[0] = ~0;
   for (i=0; i<HASHSTATE; ++i) state[i] = 1;
   printf("These should all be different\n");
@@ -994,7 +991,6 @@ void driver5()
   c = hashlittle("Four score and seven years ago", 30, 1);
   printf("hash is %.8lx\n", c);   /* cd628161 */
 }
-
 
 int main()
 {

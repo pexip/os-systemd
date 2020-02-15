@@ -1,38 +1,10 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
 #include "journal-file.h"
+#include "journal-importer.h"
 
 typedef struct RemoteServer RemoteServer;
-
-struct iovec_wrapper {
-        struct iovec *iovec;
-        size_t size_bytes;
-        size_t count;
-};
-
-int iovw_put(struct iovec_wrapper *iovw, void* data, size_t len);
-void iovw_free_contents(struct iovec_wrapper *iovw);
-size_t iovw_size(struct iovec_wrapper *iovw);
-void iovw_rebase(struct iovec_wrapper *iovw, char *old, char *new);
 
 typedef struct Writer {
         JournalFile *journal;
@@ -44,17 +16,14 @@ typedef struct Writer {
 
         uint64_t seqnum;
 
-        int n_ref;
+        unsigned n_ref;
 } Writer;
 
 Writer* writer_new(RemoteServer* server);
-Writer* writer_free(Writer *w);
-
 Writer* writer_ref(Writer *w);
 Writer* writer_unref(Writer *w);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Writer*, writer_unref);
-#define _cleanup_writer_unref_ _cleanup_(writer_unrefp)
 
 int writer_write(Writer *s,
                  struct iovec_wrapper *iovw,

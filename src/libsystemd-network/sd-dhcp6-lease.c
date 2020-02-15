@@ -1,21 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2014 Tom Gundersen
-  Copyright (C) 2014-2015 Intel Corporation. All rights reserved.
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2014-2015 Intel Corporation. All rights reserved.
 ***/
 
 #include <errno.h>
@@ -25,15 +10,6 @@
 #include "dhcp6-protocol.h"
 #include "strv.h"
 #include "util.h"
-
-int dhcp6_lease_clear_timers(DHCP6IA *ia) {
-        assert_return(ia, -EINVAL);
-
-        ia->timeout_t1 = sd_event_source_unref(ia->timeout_t1);
-        ia->timeout_t2 = sd_event_source_unref(ia->timeout_t2);
-
-        return 0;
-}
 
 int dhcp6_lease_ia_rebind_expire(const DHCP6IA *ia, uint32_t *expire) {
         DHCP6Address *addr;
@@ -48,7 +24,7 @@ int dhcp6_lease_ia_rebind_expire(const DHCP6IA *ia, uint32_t *expire) {
                         valid = t;
         }
 
-        t = be32toh(ia->lifetime_t2);
+        t = be32toh(ia->ia_na.lifetime_t2);
         if (t > valid)
                 return -EINVAL;
 
@@ -63,8 +39,6 @@ DHCP6IA *dhcp6_lease_free_ia(DHCP6IA *ia) {
         if (!ia)
                 return NULL;
 
-        dhcp6_lease_clear_timers(ia);
-
         while (ia->addresses) {
                 address = ia->addresses;
 
@@ -78,15 +52,16 @@ DHCP6IA *dhcp6_lease_free_ia(DHCP6IA *ia) {
 
 int dhcp6_lease_set_serverid(sd_dhcp6_lease *lease, const uint8_t *id,
                              size_t len) {
+        uint8_t *serverid;
+
         assert_return(lease, -EINVAL);
         assert_return(id, -EINVAL);
 
-        free(lease->serverid);
+        serverid = memdup(id, len);
+        if (!serverid)
+                return -ENOMEM;
 
-        lease->serverid = memdup(id, len);
-        if (!lease->serverid)
-                return -EINVAL;
-
+        free_and_replace(lease->serverid, serverid);
         lease->serverid_len = len;
 
         return 0;
@@ -94,11 +69,14 @@ int dhcp6_lease_set_serverid(sd_dhcp6_lease *lease, const uint8_t *id,
 
 int dhcp6_lease_get_serverid(sd_dhcp6_lease *lease, uint8_t **id, size_t *len) {
         assert_return(lease, -EINVAL);
-        assert_return(id, -EINVAL);
-        assert_return(len, -EINVAL);
 
-        *id = lease->serverid;
-        *len = lease->serverid_len;
+        if (!lease->serverid)
+                return -ENOMSG;
+
+        if (id)
+                *id = lease->serverid;
+        if (len)
+                *len = lease->serverid_len;
 
         return 0;
 }
@@ -143,7 +121,16 @@ int dhcp6_lease_get_iaid(sd_dhcp6_lease *lease, be32_t *iaid) {
         assert_return(lease, -EINVAL);
         assert_return(iaid, -EINVAL);
 
-        *iaid = lease->ia.id;
+        *iaid = lease->ia.ia_na.id;
+
+        return 0;
+}
+
+int dhcp6_lease_get_pd_iaid(sd_dhcp6_lease *lease, be32_t *iaid) {
+        assert_return(lease, -EINVAL);
+        assert_return(iaid, -EINVAL);
+
+        *iaid = lease->pd.ia_pd.id;
 
         return 0;
 }
@@ -173,6 +160,37 @@ int sd_dhcp6_lease_get_address(sd_dhcp6_lease *lease, struct in6_addr *addr,
 void sd_dhcp6_lease_reset_address_iter(sd_dhcp6_lease *lease) {
         if (lease)
                 lease->addr_iter = lease->ia.addresses;
+}
+
+int sd_dhcp6_lease_get_pd(sd_dhcp6_lease *lease, struct in6_addr *prefix,
+                          uint8_t *prefix_len,
+                          uint32_t *lifetime_preferred,
+                          uint32_t *lifetime_valid) {
+        assert_return(lease, -EINVAL);
+        assert_return(prefix, -EINVAL);
+        assert_return(prefix_len, -EINVAL);
+        assert_return(lifetime_preferred, -EINVAL);
+        assert_return(lifetime_valid, -EINVAL);
+
+        if (!lease->prefix_iter)
+                return -ENOMSG;
+
+        memcpy(prefix, &lease->prefix_iter->iapdprefix.address,
+               sizeof(struct in6_addr));
+        *prefix_len = lease->prefix_iter->iapdprefix.prefixlen;
+        *lifetime_preferred =
+                be32toh(lease->prefix_iter->iapdprefix.lifetime_preferred);
+        *lifetime_valid =
+                be32toh(lease->prefix_iter->iapdprefix.lifetime_valid);
+
+        lease->prefix_iter = lease->prefix_iter->addresses_next;
+
+        return 0;
+}
+
+void sd_dhcp6_lease_reset_pd_prefix_iter(sd_dhcp6_lease *lease) {
+        if (lease)
+                lease->prefix_iter = lease->pd.addresses;
 }
 
 int dhcp6_lease_set_dns(sd_dhcp6_lease *lease, uint8_t *optval, size_t optlen) {
@@ -226,8 +244,7 @@ int dhcp6_lease_set_domains(sd_dhcp6_lease *lease, uint8_t *optval,
         if (r < 0)
                 return 0;
 
-        free(lease->domains);
-        lease->domains = domains;
+        strv_free_and_replace(lease->domains, domains);
         lease->domains_count = r;
 
         return r;
@@ -286,8 +303,7 @@ int dhcp6_lease_set_ntp(sd_dhcp6_lease *lease, uint8_t *optval, size_t optlen) {
                         if (r < 0)
                                 return 0;
 
-                        lease->ntp_fqdn = strv_free(lease->ntp_fqdn);
-                        lease->ntp_fqdn = servers;
+                        strv_free_and_replace(lease->ntp_fqdn, servers);
                         lease->ntp_fqdn_count = r;
 
                         break;
@@ -357,30 +373,12 @@ int sd_dhcp6_lease_get_ntp_fqdn(sd_dhcp6_lease *lease, char ***ntp_fqdn) {
         return -ENOENT;
 }
 
-sd_dhcp6_lease *sd_dhcp6_lease_ref(sd_dhcp6_lease *lease) {
-
-        if (!lease)
-                return NULL;
-
-        assert(lease->n_ref >= 1);
-        lease->n_ref++;
-
-        return lease;
-}
-
-sd_dhcp6_lease *sd_dhcp6_lease_unref(sd_dhcp6_lease *lease) {
-
-        if (!lease)
-                return NULL;
-
-        assert(lease->n_ref >= 1);
-        lease->n_ref--;
-
-        if (lease->n_ref > 0)
-                return NULL;
+static sd_dhcp6_lease *dhcp6_lease_free(sd_dhcp6_lease *lease) {
+        assert(lease);
 
         free(lease->serverid);
         dhcp6_lease_free_ia(&lease->ia);
+        dhcp6_lease_free_ia(&lease->pd);
 
         free(lease->dns);
 
@@ -391,6 +389,8 @@ sd_dhcp6_lease *sd_dhcp6_lease_unref(sd_dhcp6_lease *lease) {
         lease->ntp_fqdn = strv_free(lease->ntp_fqdn);
         return mfree(lease);
 }
+
+DEFINE_TRIVIAL_REF_UNREF_FUNC(sd_dhcp6_lease, sd_dhcp6_lease, dhcp6_lease_free);
 
 int dhcp6_lease_new(sd_dhcp6_lease **ret) {
         sd_dhcp6_lease *lease;

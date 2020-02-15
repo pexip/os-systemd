@@ -3,22 +3,7 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 
 <refentry id="journald.conf"
@@ -26,15 +11,6 @@
   <refentryinfo>
     <title>journald.conf</title>
     <productname>systemd</productname>
-
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Lennart</firstname>
-        <surname>Poettering</surname>
-        <email>lennart@poettering.net</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -58,9 +34,11 @@
   <refsect1>
     <title>Description</title>
 
-    <para>These files configure various parameters of the systemd
-    journal service,
-    <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+    <para>These files configure various parameters of the systemd journal service,
+    <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+    See
+    <citerefentry><refentrytitle>systemd.syntax</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+    for a general description of the syntax.</para>
 
   </refsect1>
 
@@ -72,7 +50,7 @@
     <para>All options are configured in the
     <literal>[Journal]</literal> section:</para>
 
-    <variablelist>
+    <variablelist class='config-directives'>
 
       <varlistentry>
         <term><varname>Storage=</varname></term>
@@ -105,10 +83,13 @@
       <varlistentry>
         <term><varname>Compress=</varname></term>
 
-        <listitem><para>Takes a boolean value. If enabled (the
-        default), data objects that shall be stored in the journal and
-        are larger than a certain threshold are compressed before they
-        are written to the file system.</para></listitem>
+        <listitem><para>Can take a boolean value. If enabled (the
+        default), data objects that shall be stored in the journal
+        and are larger than the default threshold of 512 bytes are
+        compressed before they are written to the file system. It
+        can also be set to a number of bytes to specify the
+        compression threshold directly. Suffixes like K, M, and G
+        can be used to specify larger units.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -153,13 +134,19 @@
         interval is over. A message about the number of dropped
         messages is generated. This rate limiting is applied
         per-service, so that two services which log do not interfere
-        with each other's limits. Defaults to 1000 messages in 30s.
+        with each other's limits. Defaults to 10000 messages in 30s.
         The time specification for
         <varname>RateLimitIntervalSec=</varname> may be specified in the
         following units: <literal>s</literal>, <literal>min</literal>,
         <literal>h</literal>, <literal>ms</literal>,
         <literal>us</literal>. To turn off any kind of rate limiting,
-        set either value to 0.</para></listitem>
+        set either value to 0.</para>
+
+        <para>If a service provides rate limits for itself through
+        <varname>LogRateLimitIntervalSec=</varname> and/or <varname>LogRateLimitBurst=</varname>
+        in <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
+        those values will override the settings specified here.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -214,7 +201,11 @@
         subsequently something else causes the file system to fill up,
         journald will stop using more space, but it will not be
         removing existing files to reduce the footprint again,
-        either.</para>
+        either. Also note that only archived files are deleted to reduce the
+        space occupied by journal files. This means that, in effect, there might
+        still be more space used than <varname>SystemMaxUse=</varname> or
+        <varname>RuntimeMaxUse=</varname> limit after a vacuuming operation is
+        complete.</para>
 
         <para><varname>SystemMaxFileSize=</varname> and
         <varname>RuntimeMaxFileSize=</varname> control how large
@@ -227,7 +218,7 @@
         rotated journal files are kept as history.</para>
 
         <para>Specify values in bytes or use K, M, G, T, P, E as
-        units for the specified sizes (equal to 1024, 1024², ... bytes).
+        units for the specified sizes (equal to 1024, 1024², … bytes).
         Note that size limits are enforced synchronously when journal
         files are extended, and no explicit rotation step triggered by
         time is needed.</para>
@@ -267,7 +258,7 @@
 
         <listitem><para>The maximum time to store journal entries.
         This controls whether journal files containing entries older
-        then the specified time span are deleted. Normally, time-based
+        than the specified time span are deleted. Normally, time-based
         deletion of old journal files should not be required as
         size-based deletion with options such as
         <varname>SystemMaxUse=</varname> should be sufficient to
@@ -281,7 +272,6 @@
         m</literal> to override the default time unit of
         seconds.</para></listitem>
       </varlistentry>
-
 
       <varlistentry>
         <term><varname>SyncIntervalSec=</varname></term>
@@ -358,11 +348,37 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>ReadKMsg=</varname></term>
+
+        <listitem><para>Takes a boolean value. If enabled (the
+        default), journal reads <filename>/dev/kmsg</filename>
+        messages generated by the kernel.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>TTYPath=</varname></term>
 
         <listitem><para>Change the console TTY to use if
         <varname>ForwardToConsole=yes</varname> is used. Defaults to
         <filename>/dev/console</filename>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>LineMax=</varname></term>
+
+        <listitem><para>The maximum line length to permit when converting stream logs into record logs. When a systemd
+        unit's standard output/error are connected to the journal via a stream socket, the data read is split into
+        individual log records at newline (<literal>\n</literal>, ASCII 10) and NUL characters. If no such delimiter is
+        read for the specified number of bytes a hard log record boundary is artificially inserted, breaking up overly
+        long lines into multiple log records. Selecting overly large values increases the possible memory usage of the
+        Journal daemon for each stream client, as in the worst case the journal daemon needs to buffer the specified
+        number of bytes in memory before it can flush a new log record to disk. Also note that permitting overly large
+        line maximum line lengths affects compatibility with traditional log protocols as log records might not fit
+        anymore into a single <constant>AF_UNIX</constant> or <constant>AF_INET</constant> datagram. Takes a size in
+        bytes. If the value is suffixed with K, M, G or T, the specified size is parsed as Kilobytes, Megabytes,
+        Gigabytes, or Terabytes (with the base 1024), respectively. Defaults to 48K, which is relatively large but
+        still small enough so that log records likely fit into network datagrams along with extra room for
+        metadata. Note that values below 79 are not accepted and will be bumped to 79.</para></listitem>
       </varlistentry>
 
     </variablelist>

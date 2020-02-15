@@ -1,24 +1,9 @@
-<?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
+<?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 
 <refentry id="sd_notify"
@@ -27,15 +12,6 @@
   <refentryinfo>
     <title>sd_notify</title>
     <productname>systemd</productname>
-
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Lennart</firstname>
-        <surname>Poettering</surname>
-        <email>lennart@poettering.net</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -66,7 +42,7 @@
         <funcdef>int <function>sd_notifyf</function></funcdef>
         <paramdef>int <parameter>unset_environment</parameter></paramdef>
         <paramdef>const char *<parameter>format</parameter></paramdef>
-        <paramdef>...</paramdef>
+        <paramdef>…</paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -81,7 +57,7 @@
         <paramdef>pid_t <parameter>pid</parameter></paramdef>
         <paramdef>int <parameter>unset_environment</parameter></paramdef>
         <paramdef>const char *<parameter>format</parameter></paramdef>
-        <paramdef>...</paramdef>
+        <paramdef>…</paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -122,12 +98,10 @@
       <varlistentry>
         <term>READY=1</term>
 
-        <listitem><para>Tells the service manager that service startup
-        is finished. This is only used by systemd if the service
-        definition file has Type=notify set. Since there is little
-        value in signaling non-readiness, the only value services
-        should send is <literal>READY=1</literal> (i.e.
-        <literal>READY=0</literal> is not defined).</para></listitem>
+        <listitem><para>Tells the service manager that service startup is finished, or the service finished loading its
+        configuration. This is only used by systemd if the service definition file has <varname>Type=notify</varname>
+        set. Since there is little value in signaling non-readiness, the only value services should send is
+        <literal>READY=1</literal> (i.e.  <literal>READY=0</literal> is not defined).</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -139,7 +113,8 @@
         present it to the user. Note that a service that sends this
         notification must also send a <literal>READY=1</literal>
         notification when it completed reloading its
-        configuration.</para></listitem>
+        configuration. Reloads are propagated in the same way as they
+        are when initiated by the user.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -152,7 +127,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term>STATUS=...</term>
+        <term>STATUS=…</term>
 
         <listitem><para>Passes a single-line UTF-8 status string back
         to the service manager that describes the service state. This
@@ -160,11 +135,11 @@
         state feedback, fsck-like programs could pass completion
         percentages and failing programs could pass a human-readable
         error message. Example: <literal>STATUS=Completed 66% of file
-        system check...</literal></para></listitem>
+        system check…</literal></para></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term>ERRNO=...</term>
+        <term>ERRNO=…</term>
 
         <listitem><para>If a service fails, the errno-style error
         code, formatted as string. Example: <literal>ERRNO=2</literal>
@@ -172,7 +147,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term>BUSERROR=...</term>
+        <term>BUSERROR=…</term>
 
         <listitem><para>If a service fails, the D-Bus error-style
         error code. Example:
@@ -180,7 +155,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term>MAINPID=...</term>
+        <term>MAINPID=…</term>
 
         <listitem><para>The main process ID (PID) of the service, in
         case the service manager did not fork off the process itself.
@@ -201,59 +176,70 @@
         watchdog is enabled. </para></listitem>
       </varlistentry>
 
-
       <varlistentry>
-        <term>FDSTORE=1</term>
-
-        <listitem><para>Stores additional file descriptors in the service manager. File
-        descriptors sent this way will be maintained per-service by the service manager
-        and will be passed again using the usual file descriptor passing logic on the next
-        invocation of the service, see
-        <citerefentry><refentrytitle>sd_listen_fds</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
-        This is useful for implementing service restart schemes where services serialize
-        their state to <filename>/run</filename>, push their file descriptors to the
-        system manager, and are then restarted, retrieving their state again via socket
-        passing and <filename>/run</filename>. Note that the service manager will accept
-        messages for a service only if <varname>FileDescriptorStoreMax=</varname> is set
-        to non-zero for it (defaults to zero, see
-        <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>).
-        File descriptors must be pollable, see
-        <citerefentry><refentrytitle>epoll_ctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>.
-        Multiple arrays of file descriptors may be sent in separate messages, in which
-        case the arrays are combined.  Note that the service manager removes duplicate
-        file descriptors before passing them to the service. Use
-        <function>sd_pid_notify_with_fds()</function> to send messages with
-        <literal>FDSTORE=1</literal>, see below.</para></listitem>
-      </varlistentry>
-
-      <varlistentry>
-        <term>FDNAME=...</term>
-
-        <listitem><para>When used in combination with
-        <varname>FDSTORE=1</varname>, specifies a name for the
-        submitted file descriptors. This name is passed to the service
-        during activation, and may be queried using
-        <citerefentry><refentrytitle>sd_listen_fds_with_names</refentrytitle><manvolnum>3</manvolnum></citerefentry>. File
-        descriptors submitted without this field set, will implicitly
-        get the name <literal>stored</literal> assigned. Note that, if
-        multiple file descriptors are submitted at once, the specified
-        name will be assigned to all of them. In order to assign
-        different names to submitted file descriptors, submit them in
-        separate invocations of
-        <function>sd_pid_notify_with_fds()</function>. The name may
-        consist of any ASCII character, but must not contain control
-        characters or <literal>:</literal>. It may not be longer than
-        255 characters. If a submitted name does not follow these
-        restrictions, it is ignored.</para></listitem>
-      </varlistentry>
-
-      <varlistentry>
-        <term>WATCHDOG_USEC=...</term>
+        <term>WATCHDOG_USEC=…</term>
 
         <listitem><para>Reset <varname>watchdog_usec</varname> value during runtime.
         Notice that this is not available when using <function>sd_event_set_watchdog()</function>
         or <function>sd_watchdog_enabled()</function>.
         Example : <literal>WATCHDOG_USEC=20000000</literal></para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>EXTEND_TIMEOUT_USEC=…</term>
+
+        <listitem><para>Tells the service manager to extend the startup, runtime or shutdown service timeout
+        corresponding the current state. The value specified is a time in microseconds during which the service must
+        send a new message. A service timeout will occur if the message isn't received, but only if the runtime of the
+        current state is beyond the original maximium times of <varname>TimeoutStartSec=</varname>, <varname>RuntimeMaxSec=</varname>,
+        and <varname>TimeoutStopSec=</varname>.
+        See <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for effects on the service timeouts.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>FDSTORE=1</term>
+
+        <listitem><para>Stores additional file descriptors in the service manager. File descriptors sent this way will
+        be maintained per-service by the service manager and will later be handed back using the usual file descriptor
+        passing logic at the next invocation of the service, see
+        <citerefentry><refentrytitle>sd_listen_fds</refentrytitle><manvolnum>3</manvolnum></citerefentry>.  This is
+        useful for implementing services that can restart after an explicit request or a crash without losing
+        state. Any open sockets and other file descriptors which should not be closed during the restart may be stored
+        this way. Application state can either be serialized to a file in <filename>/run</filename>, or better, stored
+        in a <citerefentry><refentrytitle>memfd_create</refentrytitle><manvolnum>2</manvolnum></citerefentry> memory
+        file descriptor. Note that the service manager will accept messages for a service only if its
+        <varname>FileDescriptorStoreMax=</varname> setting is non-zero (defaults to zero, see
+        <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>). If file
+        descriptors sent are pollable (see
+        <citerefentry><refentrytitle>epoll_ctl</refentrytitle><manvolnum>2</manvolnum></citerefentry>), then any
+        <constant>EPOLLHUP</constant> or <constant>EPOLLERR</constant> event seen on them will result in their
+        automatic removal from the store. Multiple arrays of file descriptors may be sent in separate messages, in
+        which case the arrays are combined. Note that the service manager removes duplicate (pointing to the same
+        object) file descriptors before passing them to the service. Use <function>sd_pid_notify_with_fds()</function>
+        to send messages with <literal>FDSTORE=1</literal>, see below.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>FDSTOREREMOVE=1</term>
+
+        <listitem><para>Removes file descriptors from the file descriptor store. This field needs to be combined with
+        <varname>FDNAME=</varname> to specify the name of the file descriptors to remove.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>FDNAME=…</term>
+
+        <listitem><para>When used in combination with <varname>FDSTORE=1</varname>, specifies a name for the submitted
+        file descriptors. When used with <varname>FDSTOREREMOVE=1</varname>, specifies the name for the file
+        descriptors to remove. This name is passed to the service during activation, and may be queried using
+        <citerefentry><refentrytitle>sd_listen_fds_with_names</refentrytitle><manvolnum>3</manvolnum></citerefentry>. File
+        descriptors submitted without this field set, will implicitly get the name <literal>stored</literal>
+        assigned. Note that, if multiple file descriptors are submitted at once, the specified name will be assigned to
+        all of them. In order to assign different names to submitted file descriptors, submit them in separate
+        invocations of <function>sd_pid_notify_with_fds()</function>. The name may consist of arbitrary ASCII
+        characters except control characters or <literal>:</literal>. It may not be longer than 255 characters. If a
+        submitted name does not follow these restrictions, it is ignored.</para></listitem>
       </varlistentry>
 
     </variablelist>
@@ -267,6 +253,15 @@
     correctly set in the service definition file. See
     <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
     for details.</para>
+
+    <para>Note that <function>sd_notify()</function> notifications may be attributed to units correctly only if either
+    the sending process is still around at the time PID 1 processes the message, or if the sending process is
+    explicitly runtime-tracked by the service manager. The latter is the case if the service manager originally forked
+    off the process, i.e. on all processes that match <varname>NotifyAccess=</varname><option>main</option> or
+    <varname>NotifyAccess=</varname><option>exec</option>. Conversely, if an auxiliary process of the unit sends an
+    <function>sd_notify()</function> message and immediately exits, the service manager might not be able to properly
+    attribute the message to the unit, and thus will ignore it, even if
+    <varname>NotifyAccess=</varname><option>all</option> is set for it.</para>
 
     <para><function>sd_notifyf()</function> is similar to
     <function>sd_notify()</function> but takes a
@@ -303,13 +298,14 @@
   <refsect1>
     <title>Return Value</title>
 
-    <para>On failure, these calls return a negative errno-style error
-    code. If <varname>$NOTIFY_SOCKET</varname> was not set and hence
-    no status data could be sent, 0 is returned. If the status was
-    sent, these functions return with a positive return value. In
-    order to support both, init systems that implement this scheme and
-    those which do not, it is generally recommended to ignore the
-    return value of this call.</para>
+    <para>On failure, these calls return a negative errno-style error code. If <varname>$NOTIFY_SOCKET</varname> was
+    not set and hence no status message could be sent, 0 is returned. If the status was sent, these functions return a
+    positive value. In order to support both service managers that implement this scheme and those which do not, it is
+    generally recommended to ignore the return value of this call. Note that the return value simply indicates whether
+    the notification message was enqueued properly, it does not reflect whether the message could be processed
+    successfully. Specifically, no error is returned when a file descriptor is attempted to be stored using
+    <varname>FDSTORE=1</varname> but the service is not actually configured to permit storing of file descriptors (see
+    above).</para>
   </refsect1>
 
   <refsect1>
@@ -362,7 +358,7 @@
       initialization:</para>
 
       <programlisting>sd_notifyf(0, "READY=1\n"
-        "STATUS=Processing requests...\n"
+        "STATUS=Processing requests…\n"
         "MAINPID=%lu",
         (unsigned long) getpid());</programlisting>
     </example>

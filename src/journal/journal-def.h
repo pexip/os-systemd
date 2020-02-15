@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include "sd-id128.h"
 
@@ -28,7 +10,6 @@
  * If you change this file you probably should also change its documentation:
  *
  * http://www.freedesktop.org/wiki/Software/systemd/journal-files
- *
  */
 
 typedef struct Header Header;
@@ -78,16 +59,20 @@ struct ObjectHeader {
         uint8_t payload[];
 } _packed_;
 
-struct DataObject {
-        ObjectHeader object;
-        le64_t hash;
-        le64_t next_hash_offset;
-        le64_t next_field_offset;
-        le64_t entry_offset; /* the first array entry we store inline */
-        le64_t entry_array_offset;
-        le64_t n_entries;
-        uint8_t payload[];
-} _packed_;
+#define DataObject__contents {                                          \
+        ObjectHeader object;                                            \
+        le64_t hash;                                                    \
+        le64_t next_hash_offset;                                        \
+        le64_t next_field_offset;                                       \
+        le64_t entry_offset; /* the first array entry we store inline */ \
+        le64_t entry_array_offset;                                      \
+        le64_t n_entries;                                               \
+        uint8_t payload[];                                              \
+        }
+
+struct DataObject DataObject__contents;
+struct DataObject__packed DataObject__contents _packed_;
+assert_cc(sizeof(struct DataObject) == sizeof(struct DataObject__packed));
 
 struct FieldObject {
         ObjectHeader object;
@@ -102,15 +87,20 @@ struct EntryItem {
         le64_t hash;
 } _packed_;
 
-struct EntryObject {
-        ObjectHeader object;
-        le64_t seqnum;
-        le64_t realtime;
-        le64_t monotonic;
-        sd_id128_t boot_id;
-        le64_t xor_hash;
-        EntryItem items[];
-} _packed_;
+#define EntryObject__contents { \
+        ObjectHeader object;    \
+        le64_t seqnum;          \
+        le64_t realtime;        \
+        le64_t monotonic;       \
+        sd_id128_t boot_id;     \
+        le64_t xor_hash;        \
+        EntryItem items[];      \
+        }
+
+struct EntryObject EntryObject__contents;
+struct EntryObject__packed EntryObject__contents _packed_;
+assert_cc(sizeof(struct EntryObject) == sizeof(struct EntryObject__packed));
+
 
 struct HashItem {
         le64_t head_hash_offset;
@@ -162,11 +152,11 @@ enum {
 
 #define HEADER_INCOMPATIBLE_ANY (HEADER_INCOMPATIBLE_COMPRESSED_XZ|HEADER_INCOMPATIBLE_COMPRESSED_LZ4)
 
-#if defined(HAVE_XZ) && defined(HAVE_LZ4)
+#if HAVE_XZ && HAVE_LZ4
 #  define HEADER_INCOMPATIBLE_SUPPORTED HEADER_INCOMPATIBLE_ANY
-#elif defined(HAVE_XZ)
+#elif HAVE_XZ
 #  define HEADER_INCOMPATIBLE_SUPPORTED HEADER_INCOMPATIBLE_COMPRESSED_XZ
-#elif defined(HAVE_LZ4)
+#elif HAVE_LZ4
 #  define HEADER_INCOMPATIBLE_SUPPORTED HEADER_INCOMPATIBLE_COMPRESSED_LZ4
 #else
 #  define HEADER_INCOMPATIBLE_SUPPORTED 0
@@ -177,7 +167,7 @@ enum {
 };
 
 #define HEADER_COMPATIBLE_ANY HEADER_COMPATIBLE_SEALED
-#ifdef HAVE_GCRYPT
+#if HAVE_GCRYPT
 #  define HEADER_COMPATIBLE_SUPPORTED HEADER_COMPATIBLE_SEALED
 #else
 #  define HEADER_COMPATIBLE_SUPPORTED 0
@@ -185,40 +175,43 @@ enum {
 
 #define HEADER_SIGNATURE ((char[]) { 'L', 'P', 'K', 'S', 'H', 'H', 'R', 'H' })
 
-struct Header {
-        uint8_t signature[8]; /* "LPKSHHRH" */
-        le32_t compatible_flags;
-        le32_t incompatible_flags;
-        uint8_t state;
-        uint8_t reserved[7];
-        sd_id128_t file_id;
-        sd_id128_t machine_id;
-        sd_id128_t boot_id;    /* last writer */
-        sd_id128_t seqnum_id;
-        le64_t header_size;
-        le64_t arena_size;
-        le64_t data_hash_table_offset;
-        le64_t data_hash_table_size;
-        le64_t field_hash_table_offset;
-        le64_t field_hash_table_size;
-        le64_t tail_object_offset;
-        le64_t n_objects;
-        le64_t n_entries;
-        le64_t tail_entry_seqnum;
-        le64_t head_entry_seqnum;
-        le64_t entry_array_offset;
-        le64_t head_entry_realtime;
-        le64_t tail_entry_realtime;
-        le64_t tail_entry_monotonic;
-        /* Added in 187 */
-        le64_t n_data;
-        le64_t n_fields;
-        /* Added in 189 */
-        le64_t n_tags;
-        le64_t n_entry_arrays;
+#define struct_Header__contents {                       \
+        uint8_t signature[8]; /* "LPKSHHRH" */          \
+        le32_t compatible_flags;                        \
+        le32_t incompatible_flags;                      \
+        uint8_t state;                                  \
+        uint8_t reserved[7];                            \
+        sd_id128_t file_id;                             \
+        sd_id128_t machine_id;                          \
+        sd_id128_t boot_id;    /* last writer */        \
+        sd_id128_t seqnum_id;                           \
+        le64_t header_size;                             \
+        le64_t arena_size;                              \
+        le64_t data_hash_table_offset;                  \
+        le64_t data_hash_table_size;                    \
+        le64_t field_hash_table_offset;                 \
+        le64_t field_hash_table_size;                   \
+        le64_t tail_object_offset;                      \
+        le64_t n_objects;                               \
+        le64_t n_entries;                               \
+        le64_t tail_entry_seqnum;                       \
+        le64_t head_entry_seqnum;                       \
+        le64_t entry_array_offset;                      \
+        le64_t head_entry_realtime;                     \
+        le64_t tail_entry_realtime;                     \
+        le64_t tail_entry_monotonic;                    \
+        /* Added in 187 */                              \
+        le64_t n_data;                                  \
+        le64_t n_fields;                                \
+        /* Added in 189 */                              \
+        le64_t n_tags;                                  \
+        le64_t n_entry_arrays;                          \
+        }
 
-        /* Size: 240 */
-} _packed_;
+struct Header struct_Header__contents;
+struct Header__packed struct_Header__contents _packed_;
+assert_cc(sizeof(struct Header) == sizeof(struct Header__packed));
+assert_cc(sizeof(struct Header) == 240);
 
 #define FSS_HEADER_SIGNATURE ((char[]) { 'K', 'S', 'H', 'H', 'R', 'H', 'L', 'P' })
 

@@ -1,6 +1,7 @@
-/*
+/* SPDX-License-Identifier: LGPL-2.1+
+ *
  * fsprg v0.1  -  (seekable) forward-secure pseudorandom generator
- * Copyright (C) 2012 B. Poettering
+ * Copyright © 2012 B. Poettering
  * Contact: fsprg@point-at-infinity.org
  *
  * This library is free software; you can redistribute it and/or
@@ -39,6 +40,9 @@
 #define RND_GEN_P 0x01
 #define RND_GEN_Q 0x02
 #define RND_GEN_X 0x03
+
+#pragma GCC diagnostic ignored "-Wpointer-arith"
+/* TODO: remove void* arithmetic and this work-around */
 
 /******************************************************************************/
 

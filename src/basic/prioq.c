@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 /*
  * Priority Queue
@@ -49,11 +32,14 @@ struct Prioq {
 Prioq *prioq_new(compare_func_t compare_func) {
         Prioq *q;
 
-        q = new0(Prioq, 1);
+        q = new(Prioq, 1);
         if (!q)
                 return q;
 
-        q->compare_func = compare_func;
+        *q = (Prioq) {
+                .compare_func = compare_func,
+        };
+
         return q;
 }
 
@@ -79,9 +65,6 @@ int prioq_ensure_allocated(Prioq **q, compare_func_t compare_func) {
 }
 
 static void swap(Prioq *q, unsigned j, unsigned k) {
-        void *saved_data;
-        unsigned *saved_idx;
-
         assert(q);
         assert(j < q->n_items);
         assert(k < q->n_items);
@@ -89,12 +72,8 @@ static void swap(Prioq *q, unsigned j, unsigned k) {
         assert(!q->items[j].idx || *(q->items[j].idx) == j);
         assert(!q->items[k].idx || *(q->items[k].idx) == k);
 
-        saved_data = q->items[j].data;
-        saved_idx = q->items[j].idx;
-        q->items[j].data = q->items[k].data;
-        q->items[j].idx = q->items[k].idx;
-        q->items[k].data = saved_data;
-        q->items[k].idx = saved_idx;
+        SWAP_TWO(q->items[j].data, q->items[k].data);
+        SWAP_TWO(q->items[j].idx, q->items[k].idx);
 
         if (q->items[j].idx)
                 *q->items[j].idx = j;
@@ -105,6 +84,7 @@ static void swap(Prioq *q, unsigned j, unsigned k) {
 
 static unsigned shuffle_up(Prioq *q, unsigned idx) {
         assert(q);
+        assert(idx < q->n_items);
 
         while (idx > 0) {
                 unsigned k;
@@ -172,7 +152,7 @@ int prioq_put(Prioq *q, void *data, unsigned *idx) {
                 struct prioq_item *j;
 
                 n = MAX((q->n_items+1) * 2, 16u);
-                j = realloc(q->items, sizeof(struct prioq_item) * n);
+                j = reallocarray(q->items, n, sizeof(struct prioq_item));
                 if (!j)
                         return -ENOMEM;
 
@@ -228,9 +208,12 @@ _pure_ static struct prioq_item* find_item(Prioq *q, void *data, unsigned *idx) 
 
         assert(q);
 
+        if (q->n_items <= 0)
+                return NULL;
+
         if (idx) {
                 if (*idx == PRIOQ_IDX_NULL ||
-                    *idx > q->n_items)
+                    *idx >= q->n_items)
                         return NULL;
 
                 i = q->items + *idx;
@@ -276,15 +259,14 @@ int prioq_reshuffle(Prioq *q, void *data, unsigned *idx) {
         return 1;
 }
 
-void *prioq_peek(Prioq *q) {
-
+void *prioq_peek_by_index(Prioq *q, unsigned idx) {
         if (!q)
                 return NULL;
 
-        if (q->n_items <= 0)
+        if (idx >= q->n_items)
                 return NULL;
 
-        return q->items[0].data;
+        return q->items[idx].data;
 }
 
 void *prioq_pop(Prioq *q) {

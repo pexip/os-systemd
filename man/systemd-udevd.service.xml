@@ -1,6 +1,10 @@
-<?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
+<?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+
+<!--
+  SPDX-License-Identifier: LGPL-2.1+
+-->
 
 <refentry id="systemd-udevd.service"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -8,14 +12,6 @@
   <refentryinfo>
     <title>systemd-udevd.service</title>
     <productname>systemd</productname>
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Kay</firstname>
-        <surname>Sievers</surname>
-        <email>kay@vrfy.org</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -68,6 +64,7 @@
   <refsect1><title>Options</title>
     <variablelist>
       <varlistentry>
+        <term><option>-d</option></term>
         <term><option>--daemon</option></term>
         <listitem>
           <para>Detach and run in the background.</para>
@@ -75,6 +72,7 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>-D</option></term>
         <term><option>--debug</option></term>
         <listitem>
           <para>Print debug messages to standard error.</para>
@@ -82,6 +80,7 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>-c=</option></term>
         <term><option>--children-max=</option></term>
         <listitem>
           <para>Limit the number of events executed in parallel.</para>
@@ -89,6 +88,7 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>-e=</option></term>
         <term><option>--exec-delay=</option></term>
         <listitem>
           <para>Delay the execution of <varname>RUN</varname>
@@ -100,6 +100,7 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>-t=</option></term>
         <term><option>--event-timeout=</option></term>
         <listitem>
           <para>Set the number of seconds to wait for events to finish. After
@@ -108,6 +109,7 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>-N=</option></term>
         <term><option>--resolve-names=</option></term>
         <listitem>
           <para>Specify when systemd-udevd should resolve names of users and groups.
@@ -119,11 +121,7 @@
         </listitem>
       </varlistentry>
 
-      <varlistentry>
-        <term><option>--help</option></term>
-
-        <xi:include href="standard-options.xml" xpointer="help-text" />
-      </varlistentry>
+      <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
   </refsect1>
@@ -133,22 +131,22 @@
       <para>Parameters starting with "rd." will be read when
       <command>systemd-udevd</command> is used in an initrd.</para>
       <varlistentry>
-        <term><varname>udev.log-priority=</varname></term>
-        <term><varname>rd.udev.log-priority=</varname></term>
+        <term><varname>udev.log_priority=</varname></term>
+        <term><varname>rd.udev.log_priority=</varname></term>
         <listitem>
           <para>Set the log level.</para>
         </listitem>
       </varlistentry>
       <varlistentry>
-        <term><varname>udev.children-max=</varname></term>
-        <term><varname>rd.udev.children-max=</varname></term>
+        <term><varname>udev.children_max=</varname></term>
+        <term><varname>rd.udev.children_max=</varname></term>
         <listitem>
           <para>Limit the number of events executed in parallel.</para>
         </listitem>
       </varlistentry>
       <varlistentry>
-        <term><varname>udev.exec-delay=</varname></term>
-        <term><varname>rd.udev.exec-delay=</varname></term>
+        <term><varname>udev.exec_delay=</varname></term>
+        <term><varname>rd.udev.exec_delay=</varname></term>
         <listitem>
           <para>Delay the execution of <varname>RUN</varname> instructions by the given
           number of seconds. This option might be useful when
@@ -157,8 +155,8 @@
         </listitem>
       </varlistentry>
       <varlistentry>
-        <term><varname>udev.event-timeout=</varname></term>
-        <term><varname>rd.udev.event-timeout=</varname></term>
+        <term><varname>udev.event_timeout=</varname></term>
+        <term><varname>rd.udev.event_timeout=</varname></term>
         <listitem>
           <para>Wait for events to finish up to the given number
           of seconds. This option might be useful if events are
@@ -170,6 +168,26 @@
         <listitem>
           <para>Network interfaces are renamed to give them predictable names
           when possible. It is enabled by default; specifying 0 disables it.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>net.naming-scheme=</varname></term>
+        <listitem>
+          <para>Network interfaces are renamed to give them predictable names when possible (unless
+          <varname>net.ifnames=0</varname> is specified, see above). The names are derived from various
+          device metadata fields. Newer versions of <filename>systemd-udevd.service</filename> take more of
+          these fields into account, improving (and thus possibly changing) the names used for the same
+          devices. With this kernel command line option it is possible to pick a specific version of this
+          algorithm. It expects a naming scheme identifier as argument. Currently the following identifiers
+          are known: <literal>v238</literal>, <literal>v239</literal>, <literal>v240</literal> which each
+          implement the naming scheme that was the default in the indicated systemd version. In addition,
+          <literal>latest</literal> may be used to designate the latest scheme known (to this particular
+          version of <filename>systemd-udevd.service</filename>).</para>
+
+          <para>Note that selecting a specific scheme is not sufficient to fully stabilize interface naming:
+          the naming is generally derived from driver attributes exposed by the kernel. As the kernel is
+          updated, previously missing attributes <filename>systemd-udevd.service</filename> is checking might
+          appear, which affects older name derivation algorithms, too.</para>
         </listitem>
       </varlistentry>
     </variablelist>

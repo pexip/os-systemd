@@ -1,23 +1,8 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2014 Axis Communications AB. All rights reserved.
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2014 Axis Communications AB. All rights reserved.
 ***/
 
-#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +15,7 @@
 #include "arp-util.h"
 #include "fd-util.h"
 #include "socket-util.h"
+#include "tests.h"
 #include "util.h"
 
 static bool verbose = false;
@@ -72,10 +58,10 @@ int arp_send_probe(int fd, int ifindex,
                     be32_t pa, const struct ether_addr *ha) {
         struct ether_arp ea = {};
 
-        assert(fd >= 0);
-        assert(ifindex > 0);
-        assert(pa != 0);
-        assert(ha);
+        assert_se(fd >= 0);
+        assert_se(ifindex > 0);
+        assert_se(pa != 0);
+        assert_se(ha);
 
         return arp_network_send_raw_socket(fd, ifindex, &ea);
 }
@@ -84,16 +70,16 @@ int arp_send_announcement(int fd, int ifindex,
                           be32_t pa, const struct ether_addr *ha) {
         struct ether_arp ea = {};
 
-        assert(fd >= 0);
-        assert(ifindex > 0);
-        assert(pa != 0);
-        assert(ha);
+        assert_se(fd >= 0);
+        assert_se(ifindex > 0);
+        assert_se(pa != 0);
+        assert_se(ha);
 
         return arp_network_send_raw_socket(fd, ifindex, &ea);
 }
 
 int arp_network_bind_raw_socket(int index, be32_t address, const struct ether_addr *eth_mac) {
-        if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, test_fd) < 0)
+        if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, test_fd) < 0)
                 return -errno;
 
         return test_fd[0];
@@ -208,9 +194,7 @@ static void test_basic_request(sd_event *e) {
 int main(int argc, char *argv[]) {
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
 
-        log_set_max_level(LOG_DEBUG);
-        log_parse_environment();
-        log_open();
+        test_setup_logging(LOG_DEBUG);
 
         assert_se(sd_event_new(&e) >= 0);
 

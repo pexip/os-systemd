@@ -1,35 +1,19 @@
-/***
-  This file is part of systemd.
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
-  Copyright 2008-2012 Kay Sievers <kay@vrfy.org>
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
+#include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
-#include "libudev.h"
-
+#include "alloc-util.h"
+#include "build.h"
 #include "fd-util.h"
+#include "libudev-list-internal.h"
+#include "libudev-util.h"
 #include "log.h"
 #include "stdio-util.h"
 #include "string-util.h"
-#include "udev-util.h"
-#include "util.h"
 
 static void print_device(struct udev_device *device) {
         const char *str;
@@ -103,7 +87,7 @@ static void print_device(struct udev_device *device) {
 }
 
 static void test_device(struct udev *udev, const char *syspath) {
-        _cleanup_udev_device_unref_ struct udev_device *device;
+        _cleanup_(udev_device_unrefp) struct udev_device *device;
 
         log_info("looking at device: %s", syspath);
         device = udev_device_new_from_syspath(udev, syspath);
@@ -114,7 +98,7 @@ static void test_device(struct udev *udev, const char *syspath) {
 }
 
 static void test_device_parents(struct udev *udev, const char *syspath) {
-        _cleanup_udev_device_unref_ struct udev_device *device;
+        _cleanup_(udev_device_unrefp) struct udev_device *device;
         struct udev_device *device_parent;
 
         log_info("looking at device: %s", syspath);
@@ -139,7 +123,7 @@ static void test_device_parents(struct udev *udev, const char *syspath) {
 
 static void test_device_devnum(struct udev *udev) {
         dev_t devnum = makedev(1, 3);
-        _cleanup_udev_device_unref_ struct udev_device *device;
+        _cleanup_(udev_device_unrefp) struct udev_device *device;
 
         log_info("looking up device: %u:%u", major(devnum), minor(devnum));
         device = udev_device_new_from_devnum(udev, 'c', devnum);
@@ -150,7 +134,7 @@ static void test_device_devnum(struct udev *udev) {
 }
 
 static void test_device_subsys_name(struct udev *udev, const char *subsys, const char *dev) {
-        _cleanup_udev_device_unref_ struct udev_device *device;
+        _cleanup_(udev_device_unrefp) struct udev_device *device;
 
         log_info("looking up device: '%s:%s'", subsys, dev);
         device = udev_device_new_from_subsystem_sysname(udev, subsys, dev);
@@ -182,7 +166,7 @@ static int test_enumerate_print_list(struct udev_enumerate *enumerate) {
 }
 
 static void test_monitor(struct udev *udev) {
-        _cleanup_udev_monitor_unref_ struct udev_monitor *udev_monitor;
+        _cleanup_(udev_monitor_unrefp) struct udev_monitor *udev_monitor;
         _cleanup_close_ int fd_ep;
         int fd_udev;
         struct epoll_event ep_udev = {
@@ -348,8 +332,147 @@ static void test_hwdb(struct udev *udev, const char *modalias) {
         assert_se(hwdb == NULL);
 }
 
+static void test_util_replace_whitespace_one_len(const char *str, size_t len, const char *expected) {
+        _cleanup_free_ char *result = NULL;
+        int r;
+
+        result = new(char, len + 1);
+        assert_se(result);
+        r = util_replace_whitespace(str, result, len);
+        assert_se((size_t) r == strlen(expected));
+        assert_se(streq(result, expected));
+}
+
+static void test_util_replace_whitespace_one(const char *str, const char *expected) {
+        test_util_replace_whitespace_one_len(str, strlen(str), expected);
+}
+
+static void test_util_replace_whitespace(void) {
+        test_util_replace_whitespace_one("hogehoge", "hogehoge");
+        test_util_replace_whitespace_one("hoge  hoge", "hoge_hoge");
+        test_util_replace_whitespace_one("  hoge  hoge  ", "hoge_hoge");
+        test_util_replace_whitespace_one("     ", "");
+        test_util_replace_whitespace_one("hoge ", "hoge");
+
+        test_util_replace_whitespace_one_len("hoge hoge    ", 9, "hoge_hoge");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 8, "hoge_hog");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 7, "hoge_ho");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 6, "hoge_h");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 5, "hoge");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 4, "hoge");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 3, "hog");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 2, "ho");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 1, "h");
+        test_util_replace_whitespace_one_len("hoge hoge    ", 0, "");
+
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 16, "hoge_hoge");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 15, "hoge_hoge");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 14, "hoge_hog");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 13, "hoge_ho");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 12, "hoge_h");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 11, "hoge");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 10, "hoge");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 9, "hoge");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 8, "hoge");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 7, "hog");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 6, "ho");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 5, "h");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 4, "");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 3, "");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 2, "");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 1, "");
+        test_util_replace_whitespace_one_len("    hoge   hoge    ", 0, "");
+}
+
+static void test_util_resolve_subsys_kernel_one(const char *str, bool read_value, int retval, const char *expected) {
+        char result[UTIL_PATH_SIZE];
+        int r;
+
+        r = util_resolve_subsys_kernel(str, result, sizeof(result), read_value);
+        assert_se(r == retval);
+        if (r >= 0)
+                assert_se(streq(result, expected));
+}
+
+static void test_util_resolve_subsys_kernel(void) {
+        test_util_resolve_subsys_kernel_one("hoge", false, -EINVAL, NULL);
+        test_util_resolve_subsys_kernel_one("[hoge", false, -EINVAL, NULL);
+        test_util_resolve_subsys_kernel_one("[hoge/foo", false, -EINVAL, NULL);
+        test_util_resolve_subsys_kernel_one("[hoge/]", false, -ENODEV, NULL);
+
+        test_util_resolve_subsys_kernel_one("[net/lo]", false, 0, "/sys/devices/virtual/net/lo");
+        test_util_resolve_subsys_kernel_one("[net/lo]/", false, 0, "/sys/devices/virtual/net/lo");
+        test_util_resolve_subsys_kernel_one("[net/lo]hoge", false, 0, "/sys/devices/virtual/net/lo/hoge");
+        test_util_resolve_subsys_kernel_one("[net/lo]/hoge", false, 0, "/sys/devices/virtual/net/lo/hoge");
+
+        test_util_resolve_subsys_kernel_one("[net/lo]", true, -EINVAL, NULL);
+        test_util_resolve_subsys_kernel_one("[net/lo]/", true, -EINVAL, NULL);
+        test_util_resolve_subsys_kernel_one("[net/lo]hoge", true, 0, "");
+        test_util_resolve_subsys_kernel_one("[net/lo]/hoge", true, 0, "");
+        test_util_resolve_subsys_kernel_one("[net/lo]address", true, 0, "00:00:00:00:00:00");
+        test_util_resolve_subsys_kernel_one("[net/lo]/address", true, 0, "00:00:00:00:00:00");
+}
+
+static void test_list(void) {
+        struct udev_list list = {};
+        struct udev_list_entry *e;
+
+        /* empty list */
+        udev_list_init(&list, false);
+        assert_se(!udev_list_get_entry(&list));
+
+        /* unique == false */
+        udev_list_init(&list, false);
+        assert_se(udev_list_entry_add(&list, "aaa", "hoge"));
+        assert_se(udev_list_entry_add(&list, "aaa", "hogehoge"));
+        assert_se(udev_list_entry_add(&list, "bbb", "foo"));
+        e = udev_list_get_entry(&list);
+        assert_se(e);
+        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
+        assert_se(streq_ptr(udev_list_entry_get_value(e), "hoge"));
+        e = udev_list_entry_get_next(e);
+        assert_se(e);
+        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
+        assert_se(streq_ptr(udev_list_entry_get_value(e), "hogehoge"));
+        e = udev_list_entry_get_next(e);
+        assert_se(e);
+        assert_se(streq_ptr(udev_list_entry_get_name(e), "bbb"));
+        assert_se(streq_ptr(udev_list_entry_get_value(e), "foo"));
+        assert_se(!udev_list_entry_get_next(e));
+
+        assert_se(!udev_list_entry_get_by_name(e, "aaa"));
+        assert_se(!udev_list_entry_get_by_name(e, "bbb"));
+        assert_se(!udev_list_entry_get_by_name(e, "ccc"));
+        udev_list_cleanup(&list);
+
+        /* unique == true */
+        udev_list_init(&list, true);
+        assert_se(udev_list_entry_add(&list, "aaa", "hoge"));
+        assert_se(udev_list_entry_add(&list, "aaa", "hogehoge"));
+        assert_se(udev_list_entry_add(&list, "bbb", "foo"));
+        e = udev_list_get_entry(&list);
+        assert_se(e);
+        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
+        assert_se(streq_ptr(udev_list_entry_get_value(e), "hogehoge"));
+        e = udev_list_entry_get_next(e);
+        assert_se(streq_ptr(udev_list_entry_get_name(e), "bbb"));
+        assert_se(streq_ptr(udev_list_entry_get_value(e), "foo"));
+        assert_se(!udev_list_entry_get_next(e));
+
+        e = udev_list_entry_get_by_name(e, "bbb");
+        assert_se(e);
+        assert_se(streq_ptr(udev_list_entry_get_name(e), "bbb"));
+        assert_se(streq_ptr(udev_list_entry_get_value(e), "foo"));
+        e = udev_list_entry_get_by_name(e, "aaa");
+        assert_se(e);
+        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
+        assert_se(streq_ptr(udev_list_entry_get_value(e), "hogehoge"));
+        assert_se(!udev_list_entry_get_by_name(e, "ccc"));
+        udev_list_cleanup(&list);
+}
+
 int main(int argc, char *argv[]) {
-        _cleanup_udev_unref_ struct udev *udev = NULL;
+        _cleanup_(udev_unrefp) struct udev *udev = NULL;
         bool arg_monitor = false;
         static const struct option options[] = {
                 { "syspath",   required_argument, NULL, 'p' },
@@ -371,7 +494,7 @@ int main(int argc, char *argv[]) {
                 return 1;
         }
 
-        while ((c = getopt_long(argc, argv, "p:s:dhV", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "p:s:dhVm", options, NULL)) >= 0)
                 switch (c) {
 
                 case 'p':
@@ -392,7 +515,7 @@ int main(int argc, char *argv[]) {
                         return EXIT_SUCCESS;
 
                 case 'V':
-                        printf("%s\n", VERSION);
+                        printf("%s\n", GIT_VERSION);
                         return EXIT_SUCCESS;
 
                 case 'm':
@@ -406,7 +529,6 @@ int main(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option code.");
                 }
 
-
         /* add sys path if needed */
         if (!startswith(syspath, "/sys"))
                 syspath = strjoina("/sys/", syspath);
@@ -417,7 +539,6 @@ int main(int argc, char *argv[]) {
         test_device_subsys_name(udev, "subsystem", "pci");
         test_device_subsys_name(udev, "drivers", "scsi:sd");
         test_device_subsys_name(udev, "module", "printk");
-
         test_device_parents(udev, syspath);
 
         test_enumerate(udev, subsystem);
@@ -428,6 +549,11 @@ int main(int argc, char *argv[]) {
 
         if (arg_monitor)
                 test_monitor(udev);
+
+        test_util_replace_whitespace();
+        test_util_resolve_subsys_kernel();
+
+        test_list();
 
         return EXIT_SUCCESS;
 }

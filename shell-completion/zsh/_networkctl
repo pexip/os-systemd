@@ -1,11 +1,14 @@
 #compdef networkctl
+# SPDX-License-Identifier: LGPL-2.1+
 
-_networkctl_command(){
+(( $+functions[_networkctl_commands] )) ||
+_networkctl_commands(){
     local -a _networkctl_cmds
     _networkctl_cmds=(
             'list:List existing links'
 	    'status:Show information about the specified links'
 	    'lldp:Show Link Layer Discovery Protocol status'
+	    'label:Show address labels'
     )
     if (( CURRENT == 1 )); then
         _describe -t commands 'networkctl command' _networkctl_cmds
@@ -32,4 +35,4 @@ _arguments \
     '--no-legend[Do not print the column headers]' \
     {-h,--help}'[Show this help]' \
     '--version[Show package version]' \
-    '*::networkctl commands:_networkctl_command'
+    '*::networkctl commands:_networkctl_commands'

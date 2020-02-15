@@ -1,60 +1,10 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2012 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
 #include "journal-remote.h"
 
-int iovw_put(struct iovec_wrapper *iovw, void* data, size_t len) {
-        if (!GREEDY_REALLOC(iovw->iovec, iovw->size_bytes, iovw->count + 1))
-                return log_oom();
-
-        iovw->iovec[iovw->count++] = (struct iovec) {data, len};
-        return 0;
-}
-
-void iovw_free_contents(struct iovec_wrapper *iovw) {
-        iovw->iovec = mfree(iovw->iovec);
-        iovw->size_bytes = iovw->count = 0;
-}
-
-size_t iovw_size(struct iovec_wrapper *iovw) {
-        size_t n = 0, i;
-
-        for (i = 0; i < iovw->count; i++)
-                n += iovw->iovec[i].iov_len;
-
-        return n;
-}
-
-void iovw_rebase(struct iovec_wrapper *iovw, char *old, char *new) {
-        size_t i;
-
-        for (i = 0; i < iovw->count; i++)
-                iovw->iovec[i].iov_base = (char*) iovw->iovec[i].iov_base - old + new;
-}
-
-/**********************************************************************
- **********************************************************************
- **********************************************************************/
-
 static int do_rotate(JournalFile **f, bool compress, bool seal) {
-        int r = journal_file_rotate(f, compress, seal, NULL);
+        int r = journal_file_rotate(f, compress, (uint64_t) -1, seal, NULL);
         if (r < 0) {
                 if (*f)
                         log_error_errno(r, "Failed to rotate %s: %m", (*f)->path);
@@ -84,7 +34,7 @@ Writer* writer_new(RemoteServer *server) {
         return w;
 }
 
-Writer* writer_free(Writer *w) {
+static Writer* writer_free(Writer *w) {
         if (!w)
                 return NULL;
 
@@ -104,19 +54,7 @@ Writer* writer_free(Writer *w) {
         return mfree(w);
 }
 
-Writer* writer_unref(Writer *w) {
-        if (w && (-- w->n_ref <= 0))
-                writer_free(w);
-
-        return NULL;
-}
-
-Writer* writer_ref(Writer *w) {
-        if (w)
-                assert_se(++ w->n_ref >= 2);
-
-        return w;
-}
+DEFINE_TRIVIAL_REF_UNREF_FUNC(Writer, writer, writer_free);
 
 int writer_write(Writer *w,
                  struct iovec_wrapper *iovw,
@@ -137,13 +75,15 @@ int writer_write(Writer *w,
                         return r;
         }
 
-        r = journal_file_append_entry(w->journal, ts, iovw->iovec, iovw->count,
+        r = journal_file_append_entry(w->journal, ts, NULL,
+                                      iovw->iovec, iovw->count,
                                       &w->seqnum, NULL, NULL);
         if (r >= 0) {
                 if (w->server)
                         w->server->event_count += 1;
-                return 1;
-        }
+                return 0;
+        } else if (r == -EBADMSG)
+                return r;
 
         log_debug_errno(r, "%s: Write failed, rotating: %m", w->journal->path);
         r = do_rotate(&w->journal, compress, seal);
@@ -153,12 +93,13 @@ int writer_write(Writer *w,
                 log_debug("%s: Successfully rotated journal", w->journal->path);
 
         log_debug("Retrying write.");
-        r = journal_file_append_entry(w->journal, ts, iovw->iovec, iovw->count,
+        r = journal_file_append_entry(w->journal, ts, NULL,
+                                      iovw->iovec, iovw->count,
                                       &w->seqnum, NULL, NULL);
         if (r < 0)
                 return r;
 
         if (w->server)
                 w->server->event_count += 1;
-        return 1;
+        return 0;
 }

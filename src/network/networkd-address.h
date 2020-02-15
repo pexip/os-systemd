@@ -1,27 +1,10 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Tom Gundersen <teg@jklm.no>
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <inttypes.h>
 #include <stdbool.h>
 
+#include "conf-parser.h"
 #include "in-addr-util.h"
 
 typedef struct Address Address;
@@ -33,10 +16,11 @@ typedef struct Address Address;
 
 typedef struct Network Network;
 typedef struct Link Link;
+typedef struct NetworkConfigSection NetworkConfigSection;
 
 struct Address {
         Network *network;
-        unsigned section;
+        NetworkConfigSection *section;
 
         Link *link;
 
@@ -62,7 +46,7 @@ struct Address {
         LIST_FIELDS(Address, addresses);
 };
 
-int address_new_static(Network *network, unsigned section, Address **ret);
+int address_new_static(Network *network, const char *filename, unsigned section, Address **ret);
 int address_new(Address **ret);
 void address_free(Address *address);
 int address_add_foreign(Link *link, int family, const union in_addr_union *in_addr, unsigned char prefixlen, Address **ret);
@@ -70,16 +54,16 @@ int address_add(Link *link, int family, const union in_addr_union *in_addr, unsi
 int address_get(Link *link, int family, const union in_addr_union *in_addr, unsigned char prefixlen, Address **ret);
 int address_update(Address *address, unsigned char flags, unsigned char scope, const struct ifa_cacheinfo *cinfo);
 int address_drop(Address *address);
-int address_configure(Address *address, Link *link, sd_netlink_message_handler_t callback, bool update);
-int address_remove(Address *address, Link *link, sd_netlink_message_handler_t callback);
+int address_configure(Address *address, Link *link, link_netlink_message_handler_t callback, bool update);
+int address_remove(Address *address, Link *link, link_netlink_message_handler_t callback);
 bool address_equal(Address *a1, Address *a2);
 bool address_is_ready(const Address *a);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Address*, address_free);
-#define _cleanup_address_free_ _cleanup_(address_freep)
 
-int config_parse_address(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
-int config_parse_broadcast(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
-int config_parse_label(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
-int config_parse_lifetime(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
-int config_parse_address_flags(const char *unit, const char *filename, unsigned line, const char *section, unsigned section_line, const char *lvalue, int ltype, const char *rvalue, void *data, void *userdata);
+CONFIG_PARSER_PROTOTYPE(config_parse_address);
+CONFIG_PARSER_PROTOTYPE(config_parse_broadcast);
+CONFIG_PARSER_PROTOTYPE(config_parse_label);
+CONFIG_PARSER_PROTOTYPE(config_parse_lifetime);
+CONFIG_PARSER_PROTOTYPE(config_parse_address_flags);
+CONFIG_PARSER_PROTOTYPE(config_parse_address_scope);

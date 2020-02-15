@@ -1,42 +1,39 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
-/***
-  This file is part of systemd.
+#include <sys/timex.h>
 
-  Copyright 2014 Kay Sievers, Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
+#include "sd-bus.h"
 #include "sd-event.h"
 #include "sd-network.h"
 #include "sd-resolve.h"
 
 #include "list.h"
 #include "ratelimit.h"
+#include "time-util.h"
+#include "timesyncd-ntp-message.h"
 
 typedef struct Manager Manager;
 
 #include "timesyncd-server.h"
 
+/*
+ * "A client MUST NOT under any conditions use a poll interval less
+ * than 15 seconds."
+ */
+#define NTP_POLL_INTERVAL_MIN_USEC      (32 * USEC_PER_SEC)
+#define NTP_POLL_INTERVAL_MAX_USEC      (2048 * USEC_PER_SEC)
+
 struct Manager {
+        sd_bus *bus;
         sd_event *event;
         sd_resolve *resolve;
 
         LIST_HEAD(ServerName, system_servers);
         LIST_HEAD(ServerName, link_servers);
         LIST_HEAD(ServerName, fallback_servers);
+
+        bool have_fallbacks:1;
 
         RateLimit ratelimit;
         bool exhausted_servers;
@@ -65,6 +62,8 @@ struct Manager {
         /* poll timer */
         sd_event_source *event_timer;
         usec_t poll_interval_usec;
+        usec_t poll_interval_min_usec;
+        usec_t poll_interval_max_usec;
         bool poll_resync;
 
         /* history data */
@@ -72,13 +71,14 @@ struct Manager {
                 double offset;
                 double delay;
         } samples[8];
-        unsigned int samples_idx;
+        unsigned samples_idx;
         double samples_jitter;
+        usec_t max_root_distance_usec;
 
         /* last change */
         bool jumped;
         bool sync;
-        int drift_ppm;
+        int64_t drift_freq;
 
         /* watch for time changes */
         sd_event_source *event_clock_watch;
@@ -89,6 +89,11 @@ struct Manager {
 
         /* RTC runs in local time, leave it alone */
         bool rtc_local_time;
+
+        /* NTP response */
+        struct ntp_msg ntpmsg;
+        struct timespec origin_time, dest_time;
+        bool spike;
 };
 
 int manager_new(Manager **ret);

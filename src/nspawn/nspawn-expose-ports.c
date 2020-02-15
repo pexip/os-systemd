@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "sd-netlink.h"
 
@@ -58,17 +41,17 @@ int expose_port_parse(ExposePort **l, const char *s) {
                 memcpy(v, e, split - e);
                 v[split - e] = 0;
 
-                r = safe_atou16(v, &host_port);
-                if (r < 0 || host_port <= 0)
+                r = parse_ip_port(v, &host_port);
+                if (r < 0)
                         return -EINVAL;
 
-                r = safe_atou16(split + 1, &container_port);
+                r = parse_ip_port(split + 1, &container_port);
         } else {
-                r = safe_atou16(e, &container_port);
+                r = parse_ip_port(e, &container_port);
                 host_port = container_port;
         }
 
-        if (r < 0 || container_port <= 0)
+        if (r < 0)
                 return -EINVAL;
 
         LIST_FOREACH(ports, p, *l)
@@ -226,11 +209,11 @@ int expose_port_watch_rtnl(
                 return log_error_errno(r, "Failed to create rtnl object: %m");
         }
 
-        r = sd_netlink_add_match(rtnl, RTM_NEWADDR, handler, exposed);
+        r = sd_netlink_add_match(rtnl, NULL, RTM_NEWADDR, handler, NULL, exposed, "nspawn-NEWADDR");
         if (r < 0)
                 return log_error_errno(r, "Failed to subscribe to RTM_NEWADDR messages: %m");
 
-        r = sd_netlink_add_match(rtnl, RTM_DELADDR, handler, exposed);
+        r = sd_netlink_add_match(rtnl, NULL, RTM_DELADDR, handler, NULL, exposed, "nspawn-DELADDR");
         if (r < 0)
                 return log_error_errno(r, "Failed to subscribe to RTM_DELADDR messages: %m");
 
@@ -238,8 +221,7 @@ int expose_port_watch_rtnl(
         if (r < 0)
                 return log_error_errno(r, "Failed to add to even loop: %m");
 
-        *ret = rtnl;
-        rtnl = NULL;
+        *ret = TAKE_PTR(rtnl);
 
         return 0;
 }

@@ -1,28 +1,11 @@
-/***
-  This file is part of systemd.
-
-  Copyright (C) 2014 Tom Gundersen
-  Copyright (C) 2014 Susant Sahani
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <linux/filter.h>
 #include <netinet/if_ether.h>
 
 #include "fd-util.h"
 #include "lldp-network.h"
+#include "missing.h"
 #include "socket-util.h"
 
 int lldp_network_bind_raw_socket(int ifindex) {
@@ -47,6 +30,13 @@ int lldp_network_bind_raw_socket(int ifindex) {
                 .filter = (struct sock_filter*) filter,
         };
 
+        struct packet_mreq mreq = {
+                .mr_ifindex = ifindex,
+                .mr_type = PACKET_MR_MULTICAST,
+                .mr_alen = ETH_ALEN,
+                .mr_address = { 0x01, 0x80, 0xC2, 0x00, 0x00, 0x00 }
+        };
+
         union sockaddr_union saddrll = {
                 .ll.sll_family = AF_PACKET,
                 .ll.sll_ifindex = ifindex,
@@ -66,12 +56,23 @@ int lldp_network_bind_raw_socket(int ifindex) {
         if (r < 0)
                 return -errno;
 
+        r = setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+        if (r < 0)
+                return -errno;
+
+        mreq.mr_address[ETH_ALEN - 1] = 0x03;
+        r = setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+        if (r < 0)
+                return -errno;
+
+        mreq.mr_address[ETH_ALEN - 1] = 0x0E;
+        r = setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+        if (r < 0)
+                return -errno;
+
         r = bind(fd, &saddrll.sa, sizeof(saddrll.ll));
         if (r < 0)
                 return -errno;
 
-        r = fd;
-        fd = -1;
-
-        return r;
+        return TAKE_FD(fd);
 }

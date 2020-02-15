@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <dirent.h>
 #include <errno.h>
@@ -25,10 +8,13 @@
 #include <string.h>
 
 #include "alloc-util.h"
+#include "bus-error.h"
+#include "bus-util.h"
 #include "cgroup-show.h"
 #include "cgroup-util.h"
+#include "env-file.h"
 #include "fd-util.h"
-#include "formats-util.h"
+#include "format-util.h"
 #include "locale-util.h"
 #include "macro.h"
 #include "output-mode.h"
@@ -36,6 +22,7 @@
 #include "process-util.h"
 #include "string-util.h"
 #include "terminal-util.h"
+#include "unit-name.h"
 
 static void show_pid_array(
                 pid_t pids[],
@@ -51,7 +38,7 @@ static void show_pid_array(
         if (n_pids == 0)
                 return;
 
-        qsort(pids, n_pids, sizeof(pid_t), pid_compare_func);
+        typesafe_qsort(pids, n_pids, pid_compare_func);
 
         /* Filter duplicates */
         for (j = 0, i = 1; i < n_pids; i++) {
@@ -73,12 +60,12 @@ static void show_pid_array(
         for (i = 0; i < n_pids; i++) {
                 _cleanup_free_ char *t = NULL;
 
-                get_process_cmdline(pids[i], n_columns, true, &t);
+                (void) get_process_cmdline(pids[i], n_columns, true, &t);
 
                 if (extra)
-                        printf("%s%s ", prefix, special_glyph(TRIANGULAR_BULLET));
+                        printf("%s%s ", prefix, special_glyph(SPECIAL_GLYPH_TRIANGULAR_BULLET));
                 else
-                        printf("%s%s", prefix, special_glyph(((more || i < n_pids-1) ? TREE_BRANCH : TREE_RIGHT)));
+                        printf("%s%s", prefix, special_glyph(((more || i < n_pids-1) ? SPECIAL_GLYPH_TREE_BRANCH : SPECIAL_GLYPH_TREE_RIGHT)));
 
                 printf("%*"PID_PRI" %s\n", pid_width, pids[i], strna(t));
         }
@@ -158,7 +145,7 @@ int show_cgroup_by_path(
         while ((r = cg_read_subgroup(d, &gn)) > 0) {
                 _cleanup_free_ char *k = NULL;
 
-                k = strjoin(fn, "/", gn, NULL);
+                k = strjoin(fn, "/", gn);
                 free(gn);
                 if (!k)
                         return -ENOMEM;
@@ -172,10 +159,10 @@ int show_cgroup_by_path(
                 }
 
                 if (last) {
-                        printf("%s%s%s\n", prefix, special_glyph(TREE_BRANCH), cg_unescape(basename(last)));
+                        printf("%s%s%s\n", prefix, special_glyph(SPECIAL_GLYPH_TREE_BRANCH), cg_unescape(basename(last)));
 
                         if (!p1) {
-                                p1 = strappend(prefix, special_glyph(TREE_VERTICAL));
+                                p1 = strappend(prefix, special_glyph(SPECIAL_GLYPH_TREE_VERTICAL));
                                 if (!p1)
                                         return -ENOMEM;
                         }
@@ -184,8 +171,7 @@ int show_cgroup_by_path(
                         free(last);
                 }
 
-                last = k;
-                k = NULL;
+                last = TAKE_PTR(k);
         }
 
         if (r < 0)
@@ -195,7 +181,7 @@ int show_cgroup_by_path(
                 show_cgroup_one_by_path(path, prefix, n_columns, !!last, flags);
 
         if (last) {
-                printf("%s%s%s\n", prefix, special_glyph(TREE_RIGHT), cg_unescape(basename(last)));
+                printf("%s%s%s\n", prefix, special_glyph(SPECIAL_GLYPH_TREE_RIGHT), cg_unescape(basename(last)));
 
                 if (!p2) {
                         p2 = strappend(prefix, "  ");
@@ -291,22 +277,78 @@ int show_cgroup_and_extra(
         return show_extra_pids(controller, path, prefix, n_columns, extra_pids, n_extra_pids, flags);
 }
 
-int show_cgroup_and_extra_by_spec(
-                const char *spec,
-                const char *prefix,
-                unsigned n_columns,
-                const pid_t extra_pids[],
-                unsigned n_extra_pids,
-                OutputFlags flags) {
+int show_cgroup_get_unit_path_and_warn(
+                sd_bus *bus,
+                const char *unit,
+                char **ret) {
 
-        _cleanup_free_ char *controller = NULL, *path = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_free_ char *path = NULL;
         int r;
 
-        assert(spec);
+        path = unit_dbus_path_from_name(unit);
+        if (!path)
+                return log_oom();
 
-        r = cg_split_spec(spec, &controller, &path);
+        r = sd_bus_get_property_string(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        path,
+                        unit_dbus_interface_from_name(unit),
+                        "ControlGroup",
+                        &error,
+                        ret);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to query unit control group path: %s",
+                                       bus_error_message(&error, r));
 
-        return show_cgroup_and_extra(controller, path, prefix, n_columns, extra_pids, n_extra_pids, flags);
+        return 0;
+}
+
+int show_cgroup_get_path_and_warn(
+                const char *machine,
+                const char *prefix,
+                char **ret) {
+
+        int r;
+        _cleanup_free_ char *root = NULL;
+
+        if (machine) {
+                _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+                _cleanup_free_ char *unit = NULL;
+                const char *m;
+
+                m = strjoina("/run/systemd/machines/", machine);
+                r = parse_env_file(NULL, m, "SCOPE", &unit);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to load machine data: %m");
+
+                r = bus_connect_transport_systemd(BUS_TRANSPORT_LOCAL, NULL, false, &bus);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to create bus connection: %m");
+
+                r = show_cgroup_get_unit_path_and_warn(bus, unit, &root);
+                if (r < 0)
+                        return r;
+        } else {
+                r = cg_get_root_path(&root);
+                if (r == -ENOMEDIUM)
+                        return log_error_errno(r, "Failed to get root control group path.\n"
+                                                  "No cgroup filesystem mounted on /sys/fs/cgroup");
+                else if (r < 0)
+                        return log_error_errno(r, "Failed to get root control group path: %m");
+        }
+
+        if (prefix) {
+                char *t;
+
+                t = strjoin(root, prefix);
+                if (!t)
+                        return log_oom();
+
+                *ret = t;
+        } else
+                *ret = TAKE_PTR(root);
+
+        return 0;
 }
