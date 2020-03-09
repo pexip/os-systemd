@@ -1,15 +1,13 @@
-diff --git a/src/shared/install.c b/src/shared/install.c
-index 96fba6e..41832b7 100644
 --- a/src/shared/install.c
 +++ b/src/shared/install.c
-@@ -337,9 +337,8 @@ void unit_file_dump_changes(int r, const char *verb, const UnitFileChange *chang
+@@ -344,9 +344,8 @@
                  switch(changes[i].type) {
                  case UNIT_FILE_SYMLINK:
                          if (!quiet)
 -                                log_info("Created symlink %s %s %s.",
 +                                log_info("Created symlink %s -> %s.",
                                           changes[i].path,
--                                         special_glyph(ARROW),
+-                                         special_glyph(SPECIAL_GLYPH_ARROW),
                                           changes[i].source);
                          break;
                  case UNIT_FILE_UNLINK:

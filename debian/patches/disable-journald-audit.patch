@@ -1,32 +1,6 @@
-diff --git a/Makefile.am b/Makefile.am
-index f7652c2..bc45960 100644
---- a/Makefile.am
-+++ b/Makefile.am
-@@ -4431,8 +4431,7 @@ bin_PROGRAMS += \
- 
- dist_systemunit_DATA += \
- 	units/systemd-journald.socket \
--	units/systemd-journald-dev-log.socket \
--	units/systemd-journald-audit.socket
-+	units/systemd-journald-dev-log.socket
- 
- nodist_systemunit_DATA += \
- 	units/systemd-journald.service \
-@@ -4467,8 +4466,7 @@ catalog/%.catalog: catalog/%.catalog.in
- 
- SOCKETS_TARGET_WANTS += \
- 	systemd-journald.socket \
--	systemd-journald-dev-log.socket \
--	systemd-journald-audit.socket
-+	systemd-journald-dev-log.socket
- 
- SYSINIT_TARGET_WANTS += \
- 	systemd-journald.service \
-diff --git a/units/systemd-journald.service.in b/units/systemd-journald.service.in
-index 712ce55..63574d7 100644
 --- a/units/systemd-journald.service.in
 +++ b/units/systemd-journald.service.in
-@@ -10,12 +10,12 @@ Description=Journal Service
+@@ -12,7 +12,7 @@
  Documentation=man:systemd-journald.service(8) man:journald.conf(5)
  DefaultDependencies=no
  Requires=systemd-journald.socket
@@ -35,9 +9,23 @@ index 712ce55..63574d7 100644
  Before=sysinit.target
  
  [Service]
- Type=notify
+@@ -28,7 +28,7 @@
+ RestrictAddressFamilies=AF_UNIX AF_NETLINK
+ RestrictNamespaces=yes
+ RestrictRealtime=yes
 -Sockets=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald-audit.socket
 +Sockets=systemd-journald.socket systemd-journald-dev-log.socket
- ExecStart=@rootlibexecdir@/systemd-journald
- Restart=always
- RestartSec=0
+ StandardOutput=null
+ SystemCallArchitectures=native
+ SystemCallErrorNumber=EPERM
+--- a/units/meson.build
++++ b/units/meson.build
+@@ -92,8 +92,6 @@
+          'sockets.target.wants/'],
+         ['systemd-journal-gatewayd.socket',     'ENABLE_REMOTE HAVE_MICROHTTPD'],
+         ['systemd-journal-remote.socket',       'ENABLE_REMOTE HAVE_MICROHTTPD'],
+-        ['systemd-journald-audit.socket',       '',
+-         'sockets.target.wants/'],
+         ['systemd-journald-dev-log.socket',     '',
+          'sockets.target.wants/'],
+         ['systemd-journald.socket',             '',

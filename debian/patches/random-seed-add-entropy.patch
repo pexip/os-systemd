@@ -1,8 +1,6 @@
-diff --git a/src/random-seed/random-seed.c b/src/random-seed/random-seed.c
-index 6748bb9..62f1c1f 100644
 --- a/src/random-seed/random-seed.c
 +++ b/src/random-seed/random-seed.c
-@@ -19,7 +19,9 @@
+@@ -2,7 +2,9 @@
  
  #include <errno.h>
  #include <fcntl.h>
@@ -12,9 +10,9 @@ index 6748bb9..62f1c1f 100644
  #include <sys/stat.h>
  #include <unistd.h>
  
-@@ -33,9 +35,41 @@
- 
+@@ -20,10 +22,42 @@
  #define POOL_SIZE_MIN 512
+ #define POOL_SIZE_MAX (10*1024*1024)
  
 +static ssize_t read_entropy(int fd, struct rand_pool_info *info) {
 +        ssize_t k;
@@ -48,29 +46,30 @@ index 6748bb9..62f1c1f 100644
 +        return 0;
 +}
 +
- int main(int argc, char *argv[]) {
+ static int run(int argc, char *argv[]) {
          _cleanup_close_ int seed_fd = -1, random_fd = -1;
+         bool read_seed_file, write_seed_file;
 -        _cleanup_free_ void* buf = NULL;
-+        _cleanup_free_ struct rand_pool_info *buf = NULL;
++        _cleanup_free_ struct rand_pool_info* buf = NULL;
          size_t buf_size = 0;
+         struct stat st;
          ssize_t k;
-         int r, open_rw_error;
-@@ -66,11 +100,13 @@ int main(int argc, char *argv[]) {
-         if (buf_size <= POOL_SIZE_MIN)
-                 buf_size = POOL_SIZE_MIN;
+@@ -114,10 +148,13 @@
+         if ((uint64_t) st.st_size > buf_size)
+                 buf_size = MIN(st.st_size, POOL_SIZE_MAX);
  
 -        buf = malloc(buf_size);
 +        buf = malloc(buf_size + sizeof(struct rand_pool_info));
-         if (!buf) {
-                 r = log_oom();
-                 goto finish;
-         }
+         if (!buf)
+                 return log_oom();
+ 
 +        buf->buf_size = buf_size;
 +        buf_size += sizeof(struct rand_pool_info);
- 
-         r = mkdir_parents_label(RANDOM_SEED, 0755);
-         if (r < 0) {
-@@ -122,9 +158,14 @@ int main(int argc, char *argv[]) {
++
+         if (read_seed_file) {
+                 sd_id128_t mid;
+                 int z;
+@@ -131,9 +168,14 @@
                  } else {
                          (void) lseek(seed_fd, 0, SEEK_SET);
  
@@ -87,13 +86,13 @@ index 6748bb9..62f1c1f 100644
 +
                  }
  
-         } else if (streq(argv[1], "save")) {
-@@ -155,7 +196,7 @@ int main(int argc, char *argv[]) {
+                 /* Let's also write the machine ID into the random seed. Why? As an extra protection against "golden
+@@ -159,7 +201,7 @@
                  (void) fchmod(seed_fd, 0600);
                  (void) fchown(seed_fd, 0, 0);
  
 -                k = loop_read(random_fd, buf, buf_size, false);
 +                k = read_entropy(random_fd, buf);
-                 if (k < 0) {
-                         r = log_error_errno(k, "Failed to read new seed from /dev/urandom: %m");
-                         goto finish;
+                 if (k < 0)
+                         return log_error_errno(k, "Failed to read new seed from /dev/urandom: %m");
+                 if (k == 0)

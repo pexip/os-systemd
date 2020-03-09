@@ -1,8 +1,6 @@
-diff --git a/src/systemctl/systemctl.c b/src/systemctl/systemctl.c
-index 03720f4..95b4945 100644
 --- a/src/systemctl/systemctl.c
 +++ b/src/systemctl/systemctl.c
-@@ -6523,6 +6523,78 @@ static int talk_initctl(void) {
+@@ -8411,6 +8411,78 @@
  #endif
  }
  
@@ -79,9 +77,9 @@ index 03720f4..95b4945 100644
 +}
 +
  static int systemctl_main(int argc, char *argv[]) {
- 
          static const Verb verbs[] = {
-@@ -6754,6 +6826,10 @@ static int start_with_fallback(sd_bus *bus) {
+                 { "list-units",            VERB_ANY, VERB_ANY, VERB_DEFAULT|VERB_ONLINE_ONLY, list_units },
+@@ -8505,6 +8577,10 @@
          if (start_unit(0, NULL, NULL) >= 0)
                  return 0;
  

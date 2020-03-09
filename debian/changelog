@@ -1,3 +1,18 @@
+systemd (241-7~deb10u3pexip1) pexip; urgency=medium
+
+  * Migrate to Buster
+  * Remove patches applied upstream:
+    fstab-generator-add-x-systemd.before.patch
+    install-when-we-encounter-transient_generated.patch
+  * Refresh patches:
+    disable-journald-audit.patch
+    install-avoid-utf8.patch
+    systemctl-Don-t-forward-telinit-u-to-upstart.patch
+    systemctl-try-upstart.patch
+    random-seed-add-entropy.patch
+
+ -- Vincent Sanders <vince@pexip.com>  Mon, 09 Mar 2020 13:42:19 +0000
+
 systemd (241-7~deb10u3) buster; urgency=medium
 
   * core: set fs.file-max sysctl to LONG_MAX rather than ULONG_MAX.
