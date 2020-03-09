@@ -1,25 +1,9 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <getopt.h>
 
 #include "sd-event.h"
+#include "sd-id128.h"
 
 #include "alloc-util.h"
 #include "export-raw.h"
@@ -29,6 +13,7 @@
 #include "hostname-util.h"
 #include "import-util.h"
 #include "machine-image.h"
+#include "main-func.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "verbs.h"
@@ -80,13 +65,11 @@ static int export_tar(int argc, char *argv[], void *userdata) {
         int r, fd;
 
         if (machine_name_is_valid(argv[1])) {
-                r = image_find(argv[1], &image);
+                r = image_find(IMAGE_MACHINE, argv[1], &image);
+                if (r == -ENOENT)
+                        return log_error_errno(r, "Machine image %s not found.", argv[1]);
                 if (r < 0)
                         return log_error_errno(r, "Failed to look for machine %s: %m", argv[1]);
-                if (r == 0) {
-                        log_error("Machine image %s not found.", argv[1]);
-                        return -ENOENT;
-                }
 
                 local = image->path;
         } else
@@ -112,7 +95,7 @@ static int export_tar(int argc, char *argv[], void *userdata) {
 
                 fd = STDOUT_FILENO;
 
-                (void) readlink_malloc("/proc/self/fd/1", &pretty);
+                (void) fd_get_path(fd, &pretty);
                 log_info("Exporting '%s', saving to '%s' with compression '%s'.", local, strna(pretty), import_compress_type_to_string(arg_compress));
         }
 
@@ -159,13 +142,11 @@ static int export_raw(int argc, char *argv[], void *userdata) {
         int r, fd;
 
         if (machine_name_is_valid(argv[1])) {
-                r = image_find(argv[1], &image);
+                r = image_find(IMAGE_MACHINE, argv[1], &image);
+                if (r == -ENOENT)
+                        return log_error_errno(r, "Machine image %s not found.", argv[1]);
                 if (r < 0)
                         return log_error_errno(r, "Failed to look for machine %s: %m", argv[1]);
-                if (r == 0) {
-                        log_error("Machine image %s not found.", argv[1]);
-                        return -ENOENT;
-                }
 
                 local = image->path;
         } else
@@ -191,7 +172,7 @@ static int export_raw(int argc, char *argv[], void *userdata) {
 
                 fd = STDOUT_FILENO;
 
-                (void) readlink_malloc("/proc/self/fd/1", &pretty);
+                (void) fd_get_path(fd, &pretty);
                 log_info("Exporting '%s', saving to '%s' with compression '%s'.", local, strna(pretty), import_compress_type_to_string(arg_compress));
         }
 
@@ -272,10 +253,9 @@ static int parse_argv(int argc, char *argv[]) {
                                 arg_compress = IMPORT_COMPRESS_GZIP;
                         else if (streq(optarg, "bzip2"))
                                 arg_compress = IMPORT_COMPRESS_BZIP2;
-                        else {
-                                log_error("Unknown format: %s", optarg);
-                                return -EINVAL;
-                        }
+                        else
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Unknown format: %s", optarg);
                         break;
 
                 case '?':
@@ -289,7 +269,6 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int export_main(int argc, char *argv[]) {
-
         static const Verb verbs[] = {
                 { "help", VERB_ANY, VERB_ANY, 0, help       },
                 { "tar",  2,        3,        0, export_tar },
@@ -300,7 +279,7 @@ static int export_main(int argc, char *argv[]) {
         return dispatch_verb(argc, argv, verbs, NULL);
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
@@ -309,12 +288,11 @@ int main(int argc, char *argv[]) {
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return r;
 
         (void) ignore_signals(SIGPIPE, -1);
 
-        r = export_main(argc, argv);
-
-finish:
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return export_main(argc, argv);
 }
+
+DEFINE_MAIN_FUNCTION(run);

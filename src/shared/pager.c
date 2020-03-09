@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <signal.h>
@@ -29,11 +12,14 @@
 
 #include "copy.h"
 #include "fd-util.h"
+#include "fileio.h"
+#include "io-util.h"
 #include "locale-util.h"
 #include "log.h"
 #include "macro.h"
 #include "pager.h"
 #include "process-util.h"
+#include "rlimit-util.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -41,10 +27,15 @@
 
 static pid_t pager_pid = 0;
 
-noreturn static void pager_fallback(void) {
+static int stored_stdout = -1;
+static int stored_stderr = -1;
+static bool stdout_redirected = false;
+static bool stderr_redirected = false;
+
+_noreturn_ static void pager_fallback(void) {
         int r;
 
-        r = copy_bytes(STDIN_FILENO, STDOUT_FILENO, (uint64_t) -1, false);
+        r = copy_bytes(STDIN_FILENO, STDOUT_FILENO, (uint64_t) -1, 0);
         if (r < 0) {
                 log_error_errno(r, "Internal pager failed: %m");
                 _exit(EXIT_FAILURE);
@@ -53,12 +44,50 @@ noreturn static void pager_fallback(void) {
         _exit(EXIT_SUCCESS);
 }
 
-int pager_open(bool no_pager, bool jump_to_end) {
-        _cleanup_close_pair_ int fd[2] = { -1, -1 };
-        const char *pager;
-        pid_t parent_pid;
+static int no_quit_on_interrupt(int exe_name_fd, const char *less_opts) {
+        _cleanup_fclose_ FILE *file = NULL;
+        _cleanup_free_ char *line = NULL;
+        int r;
 
-        if (no_pager)
+        assert(exe_name_fd >= 0);
+        assert(less_opts);
+
+        /* This takes ownership of exe_name_fd */
+        file = fdopen(exe_name_fd, "r");
+        if (!file) {
+                safe_close(exe_name_fd);
+                return log_error_errno(errno, "Failed to create FILE object: %m");
+        }
+
+        /* Find the last line */
+        for (;;) {
+                _cleanup_free_ char *t = NULL;
+
+                r = read_line(file, LONG_LINE_MAX, &t);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read from socket: %m");
+                if (r == 0)
+                        break;
+
+                free_and_replace(line, t);
+        }
+
+        /* We only treat "less" specially.
+         * Return true whenever option K is *not* set. */
+        r = streq_ptr(line, "less") && !strchr(less_opts, 'K');
+
+        log_debug("Pager executable is \"%s\", options \"%s\", quit_on_interrupt: %s",
+                  strnull(line), less_opts, yes_no(!r));
+        return r;
+}
+
+int pager_open(PagerFlags flags) {
+        _cleanup_close_pair_ int fd[2] = { -1, -1 }, exe_name_pipe[2] = { -1, -1 };
+        _cleanup_strv_free_ char **pager_args = NULL;
+        const char *pager, *less_opts;
+        int r;
+
+        if (flags & PAGER_DISABLE)
                 return 0;
 
         if (pager_pid > 0)
@@ -67,44 +96,61 @@ int pager_open(bool no_pager, bool jump_to_end) {
         if (terminal_is_dumb())
                 return 0;
 
+        if (!is_main_thread())
+                return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Pager invoked from wrong thread.");
+
         pager = getenv("SYSTEMD_PAGER");
         if (!pager)
                 pager = getenv("PAGER");
 
-        /* If the pager is explicitly turned off, honour it */
-        if (pager && STR_IN_SET(pager, "", "cat"))
-                return 0;
+        if (pager) {
+                pager_args = strv_split(pager, WHITESPACE);
+                if (!pager_args)
+                        return log_oom();
 
-        /* Determine and cache number of columns before we spawn the
-         * pager so that we get the value from the actual tty */
+                /* If the pager is explicitly turned off, honour it */
+                if (strv_isempty(pager_args) || strv_equal(pager_args, STRV_MAKE("cat")))
+                        return 0;
+        }
+
+        /* Determine and cache number of columns/lines before we spawn the pager so that we get the value from the
+         * actual tty */
         (void) columns();
+        (void) lines();
 
-        if (pipe(fd) < 0)
+        if (pipe2(fd, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to create pager pipe: %m");
 
-        parent_pid = getpid();
+        /* This is a pipe to feed the name of the executed pager binary into the parent */
+        if (pipe2(exe_name_pipe, O_CLOEXEC) < 0)
+                return log_error_errno(errno, "Failed to create exe_name pipe: %m");
 
-        pager_pid = fork();
-        if (pager_pid < 0)
-                return log_error_errno(errno, "Failed to fork pager: %m");
+        /* Initialize a good set of less options */
+        less_opts = getenv("SYSTEMD_LESS");
+        if (!less_opts)
+                less_opts = "FRSXMK";
+        if (flags & PAGER_JUMP_TO_END)
+                less_opts = strjoina(less_opts, " +G");
 
-        /* In the child start the pager */
-        if (pager_pid == 0) {
-                const char* less_opts, *less_charset;
+        r = safe_fork("(pager)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pager_pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                const char *less_charset, *exe;
 
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
+                /* In the child start the pager */
 
-                (void) dup2(fd[0], STDIN_FILENO);
+                if (dup2(fd[0], STDIN_FILENO) < 0) {
+                        log_error_errno(errno, "Failed to duplicate file descriptor to STDIN: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
                 safe_close_pair(fd);
 
-                /* Initialize a good set of less options */
-                less_opts = getenv("SYSTEMD_LESS");
-                if (!less_opts)
-                        less_opts = "FRSXMK";
-                if (jump_to_end)
-                        less_opts = strjoina(less_opts, " +G");
-                setenv("LESS", less_opts, 1);
+                if (setenv("LESS", less_opts, 1) < 0) {
+                        log_error_errno(errno, "Failed to set environment variable LESS: %m");
+                        _exit(EXIT_FAILURE);
+                }
 
                 /* Initialize a good charset for less. This is
                  * particularly important if we output UTF-8
@@ -112,21 +158,22 @@ int pager_open(bool no_pager, bool jump_to_end) {
                 less_charset = getenv("SYSTEMD_LESSCHARSET");
                 if (!less_charset && is_locale_utf8())
                         less_charset = "utf-8";
-                if (less_charset)
-                        setenv("LESSCHARSET", less_charset, 1);
-
-                /* Make sure the pager goes away when the parent dies */
-                if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0)
+                if (less_charset &&
+                    setenv("LESSCHARSET", less_charset, 1) < 0) {
+                        log_error_errno(errno, "Failed to set environment variable LESSCHARSET: %m");
                         _exit(EXIT_FAILURE);
+                }
 
-                /* Check whether our parent died before we were able
-                 * to set the death signal */
-                if (getppid() != parent_pid)
-                        _exit(EXIT_SUCCESS);
+                if (pager_args) {
+                        r = loop_write(exe_name_pipe[1], pager_args[0], strlen(pager_args[0]) + 1, false);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to write pager name to socket: %m");
+                                _exit(EXIT_FAILURE);
+                        }
 
-                if (pager) {
-                        execlp(pager, pager, NULL);
-                        execl("/bin/sh", "sh", "-c", pager, NULL);
+                        execvp(pager_args[0], pager_args);
+                        log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,
+                                       "Failed to execute '%s', using fallback pagers: %m", pager_args[0]);
                 }
 
                 /* Debian's alternatives command for pagers is
@@ -135,20 +182,48 @@ int pager_open(bool no_pager, bool jump_to_end) {
                  * shell script that implements a logic that
                  * is similar to this one anyway, but is
                  * Debian-specific. */
-                execlp("pager", "pager", NULL);
+                FOREACH_STRING(exe, "pager", "less", "more") {
+                        r = loop_write(exe_name_pipe[1], exe, strlen(exe) + 1, false);
+                        if (r  < 0) {
+                                log_error_errno(r, "Failed to write pager name to socket: %m");
+                                _exit(EXIT_FAILURE);
+                        }
+                        execlp(exe, exe, NULL);
+                        log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,
+                                       "Failed to execute '%s', using next fallback pager: %m", exe);
+                }
 
-                execlp("less", "less", NULL);
-                execlp("more", "more", NULL);
-
+                r = loop_write(exe_name_pipe[1], "(built-in)", strlen("(built-in") + 1, false);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to write pager name to socket: %m");
+                        _exit(EXIT_FAILURE);
+                }
                 pager_fallback();
                 /* not reached */
         }
 
         /* Return in the parent */
-        if (dup2(fd[1], STDOUT_FILENO) < 0)
+        stored_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+        if (dup2(fd[1], STDOUT_FILENO) < 0) {
+                stored_stdout = safe_close(stored_stdout);
                 return log_error_errno(errno, "Failed to duplicate pager pipe: %m");
-        if (dup2(fd[1], STDERR_FILENO) < 0)
+        }
+        stdout_redirected = true;
+
+        stored_stderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+        if (dup2(fd[1], STDERR_FILENO) < 0) {
+                stored_stderr = safe_close(stored_stderr);
                 return log_error_errno(errno, "Failed to duplicate pager pipe: %m");
+        }
+        stderr_redirected = true;
+
+        exe_name_pipe[1] = safe_close(exe_name_pipe[1]);
+
+        r = no_quit_on_interrupt(TAKE_FD(exe_name_pipe[0]), less_opts);
+        if (r < 0)
+                return r;
+        if (r > 0)
+                (void) ignore_signals(SIGINT, -1);
 
         return 1;
 }
@@ -159,8 +234,17 @@ void pager_close(void) {
                 return;
 
         /* Inform pager that we are done */
-        stdout = safe_fclose(stdout);
-        stderr = safe_fclose(stderr);
+        (void) fflush(stdout);
+        if (stdout_redirected)
+                if (stored_stdout < 0 || dup2(stored_stdout, STDOUT_FILENO) < 0)
+                        (void) close(STDOUT_FILENO);
+        stored_stdout = safe_close(stored_stdout);
+        (void) fflush(stderr);
+        if (stderr_redirected)
+                if (stored_stderr < 0 || dup2(stored_stderr, STDERR_FILENO) < 0)
+                        (void) close(STDERR_FILENO);
+        stored_stderr = safe_close(stored_stderr);
+        stdout_redirected = stderr_redirected = false;
 
         (void) kill(pager_pid, SIGCONT);
         (void) wait_for_terminate(pager_pid, NULL);
@@ -177,7 +261,6 @@ int show_man_page(const char *desc, bool null_stdio) {
         pid_t pid;
         size_t k;
         int r;
-        siginfo_t status;
 
         k = strlen(desc);
 
@@ -195,33 +278,15 @@ int show_man_page(const char *desc, bool null_stdio) {
         } else
                 args[1] = desc;
 
-        pid = fork();
-        if (pid < 0)
-                return log_error_errno(errno, "Failed to fork: %m");
-
-        if (pid == 0) {
+        r = safe_fork("(man)", FORK_RESET_SIGNALS|FORK_DEATHSIG|(null_stdio ? FORK_NULL_STDIO : 0)|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
                 /* Child */
-
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
-
-                if (null_stdio) {
-                        r = make_null_stdio();
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to kill stdio: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-                }
-
                 execvp(args[0], (char**) args);
                 log_error_errno(errno, "Failed to execute man: %m");
                 _exit(EXIT_FAILURE);
         }
 
-        r = wait_for_terminate(pid, &status);
-        if (r < 0)
-                return r;
-
-        log_debug("Exit code %i status %i", status.si_code, status.si_status);
-        return status.si_status;
+        return wait_for_terminate_and_check(NULL, pid, 0);
 }

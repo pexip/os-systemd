@@ -1,24 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
 
 #include "sd-bus.h"
 
@@ -71,7 +52,6 @@ struct DnsQuery {
          * family */
         bool suppress_unroutable_family;
 
-
         /* If true, the RR TTLs of the answer will be clamped by their current left validity in the cache */
         bool clamp_ttl;
 
@@ -90,6 +70,7 @@ struct DnsQuery {
         int answer_family;
         DnsSearchDomain *answer_search_domain;
         int answer_errno; /* if state is DNS_TRANSACTION_ERRNO */
+        bool previous_redirect_unauthenticated;
 
         /* Bus client information */
         sd_bus_message *request;
@@ -102,6 +83,7 @@ struct DnsQuery {
         /* DNS stub information */
         DnsPacket *request_dns_packet;
         DnsStream *request_dns_stream;
+        DnsPacket *reply_dns_packet;
 
         /* Completion callback */
         void (*complete)(DnsQuery* q);
@@ -139,3 +121,5 @@ DnsQuestion* dns_query_question_for_protocol(DnsQuery *q, DnsProtocol protocol);
 const char *dns_query_string(DnsQuery *q);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(DnsQuery*, dns_query_free);
+
+bool dns_query_fully_authenticated(DnsQuery *q);

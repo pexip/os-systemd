@@ -1,26 +1,14 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <sys/mman.h>
 
+#if HAVE_VALGRIND_VALGRIND_H
+#  include <valgrind/valgrind.h>
+#endif
+
 #include "fd-util.h"
 #include "sigbus.h"
+#include "tests.h"
 #include "util.h"
 
 int main(int argc, char *argv[]) {
@@ -29,16 +17,23 @@ int main(int argc, char *argv[]) {
         void *addr = NULL;
         uint8_t *p;
 
-#ifdef __SANITIZE_ADDRESS__
-        return EXIT_TEST_SKIP;
+        test_setup_logging(LOG_INFO);
+
+#if HAS_FEATURE_ADDRESS_SANITIZER
+        return log_tests_skipped("address-sanitizer is enabled");
 #endif
+#if HAVE_VALGRIND_VALGRIND_H
+        if (RUNNING_ON_VALGRIND)
+                return log_tests_skipped("This test cannot run on valgrind");
+#endif
+
         sigbus_install();
 
         assert_se(sigbus_pop(&addr) == 0);
 
         assert_se((fd = mkostemp(template, O_RDWR|O_CREAT|O_EXCL)) >= 0);
         assert_se(unlink(template) >= 0);
-        assert_se(fallocate(fd, 0, 0, page_size() * 8) >= 0);
+        assert_se(posix_fallocate(fd, 0, page_size() * 8) >= 0);
 
         p = mmap(NULL, page_size() * 16, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
         assert_se(p != MAP_FAILED);

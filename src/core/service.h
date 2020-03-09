@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 typedef struct Service Service;
 typedef struct ServiceFDStore ServiceFDStore;
@@ -26,6 +8,8 @@ typedef struct ServiceFDStore ServiceFDStore;
 #include "kill.h"
 #include "path.h"
 #include "ratelimit.h"
+#include "socket.h"
+#include "unit.h"
 
 typedef enum ServiceRestart {
         SERVICE_RESTART_NO,
@@ -46,6 +30,7 @@ typedef enum ServiceType {
         SERVICE_DBUS,     /* we fork and wait until a specific D-Bus name appears on the bus */
         SERVICE_NOTIFY,   /* we fork and wait until a daemon sends us a ready message with sd_notify() */
         SERVICE_IDLE,     /* much like simple, but delay exec() until all jobs are dispatched. */
+        SERVICE_EXEC,     /* we fork and wait until we execute exec() (this means our own setup is waited for) */
         _SERVICE_TYPE_MAX,
         _SERVICE_TYPE_INVALID = -1
 } ServiceType;
@@ -61,14 +46,6 @@ typedef enum ServiceExecCommand {
         _SERVICE_EXEC_COMMAND_INVALID = -1
 } ServiceExecCommand;
 
-typedef enum NotifyAccess {
-        NOTIFY_NONE,
-        NOTIFY_ALL,
-        NOTIFY_MAIN,
-        _NOTIFY_ACCESS_MAX,
-        _NOTIFY_ACCESS_INVALID = -1
-} NotifyAccess;
-
 typedef enum NotifyState {
         NOTIFY_UNKNOWN,
         NOTIFY_READY,
@@ -78,9 +55,12 @@ typedef enum NotifyState {
         _NOTIFY_STATE_INVALID = -1
 } NotifyState;
 
+/* The values of this enum are referenced in man/systemd.exec.xml and src/shared/bus-unit-util.c.
+ * Update those sources for each change to this enum. */
 typedef enum ServiceResult {
         SERVICE_SUCCESS,
         SERVICE_FAILURE_RESOURCES, /* a bit of a misnomer, just our catch-all error for errnos we didn't expect */
+        SERVICE_FAILURE_PROTOCOL,
         SERVICE_FAILURE_TIMEOUT,
         SERVICE_FAILURE_EXIT_CODE,
         SERVICE_FAILURE_SIGNAL,
@@ -119,8 +99,9 @@ struct Service {
         usec_t runtime_max_usec;
 
         dual_timestamp watchdog_timestamp;
-        usec_t watchdog_usec;
-        usec_t watchdog_override_usec;
+        usec_t watchdog_usec;            /* the requested watchdog timeout in the unit file */
+        usec_t watchdog_original_usec;   /* the watchdog timeout that was in effect when the unit was started, i.e. the timeout the forked off processes currently see */
+        usec_t watchdog_override_usec;   /* the watchdog timeout requested by the service itself through sd_notify() */
         bool watchdog_override_enable;
         sd_event_source *watchdog_event_source;
 
@@ -168,17 +149,15 @@ struct Service {
         bool main_pid_alien:1;
         bool bus_name_good:1;
         bool forbid_restart:1;
+        /* Keep restart intention between UNIT_FAILED and UNIT_ACTIVATING */
+        bool will_auto_restart:1;
         bool start_timeout_defined:1;
-
-        bool reset_cpu_usage:1;
 
         char *bus_name;
         char *bus_name_owner; /* unique name of the current owner */
 
         char *status_text;
         int status_errno;
-
-        EmergencyAction emergency_action;
 
         UnitRef accept_socket;
 
@@ -188,9 +167,12 @@ struct Service {
         NotifyAccess notify_access;
         NotifyState notify_state;
 
+        sd_event_source *exec_fd_event_source;
+
         ServiceFDStore *fd_store;
-        unsigned n_fd_store;
+        size_t n_fd_store;
         unsigned n_fd_store_max;
+        unsigned n_keep_fd_store;
 
         char *usb_function_descriptors;
         char *usb_function_strings;
@@ -198,6 +180,10 @@ struct Service {
         int stdin_fd;
         int stdout_fd;
         int stderr_fd;
+
+        unsigned n_restarts;
+        bool flush_n_restarts;
+        bool exec_fd_hot;
 };
 
 extern const UnitVTable service_vtable;
@@ -214,11 +200,12 @@ ServiceType service_type_from_string(const char *s) _pure_;
 const char* service_exec_command_to_string(ServiceExecCommand i) _const_;
 ServiceExecCommand service_exec_command_from_string(const char *s) _pure_;
 
-const char* notify_access_to_string(NotifyAccess i) _const_;
-NotifyAccess notify_access_from_string(const char *s) _pure_;
-
 const char* notify_state_to_string(NotifyState i) _const_;
 NotifyState notify_state_from_string(const char *s) _pure_;
 
 const char* service_result_to_string(ServiceResult i) _const_;
 ServiceResult service_result_from_string(const char *s) _pure_;
+
+DEFINE_CAST(SERVICE, Service);
+
+#define STATUS_TEXT_MAX (16U*1024U)

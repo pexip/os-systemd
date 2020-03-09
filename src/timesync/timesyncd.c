@@ -1,34 +1,25 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Kay Sievers, Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
 #include "capability-util.h"
 #include "clock-util.h"
+#include "daemon-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
+#include "main-func.h"
+#include "mkdir.h"
 #include "network-util.h"
+#include "process-util.h"
 #include "signal-util.h"
+#include "timesyncd-bus.h"
 #include "timesyncd-conf.h"
 #include "timesyncd-manager.h"
 #include "user-util.h"
+
+#define STATE_DIR   "/var/lib/systemd/timesync"
+#define CLOCK_FILE  STATE_DIR "/clock"
 
 static int load_clock_timestamp(uid_t uid, gid_t gid) {
         _cleanup_close_ int fd = -1;
@@ -43,7 +34,7 @@ static int load_clock_timestamp(uid_t uid, gid_t gid) {
          * systems lacking a battery backed RTC. We also will adjust
          * the time to at least the build time of systemd. */
 
-        fd = open("/var/lib/systemd/clock", O_RDWR|O_CLOEXEC, 0644);
+        fd = open(CLOCK_FILE, O_RDWR|O_CLOEXEC, 0644);
         if (fd >= 0) {
                 struct stat st;
                 usec_t stamp;
@@ -56,15 +47,29 @@ static int load_clock_timestamp(uid_t uid, gid_t gid) {
                                 min = stamp;
                 }
 
-                /* Try to fix the access mode, so that we can still
-                   touch the file after dropping priviliges */
-                (void) fchmod(fd, 0644);
-                (void) fchown(fd, uid, gid);
+                if (geteuid() == 0) {
+                        /* Try to fix the access mode, so that we can still
+                           touch the file after dropping priviliges */
+                        r = fchmod_and_chown(fd, 0644, uid, gid);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to chmod or chown %s, ignoring: %m", CLOCK_FILE);
+                }
 
-        } else
+        } else {
+                r = mkdir_safe_label(STATE_DIR, 0755, uid, gid,
+                                     MKDIR_FOLLOW_SYMLINK | MKDIR_WARN_MODE);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to create state directory, ignoring: %m");
+                        goto settime;
+                }
+
                 /* create stamp file with the compiled-in date */
-                (void) touch_file("/var/lib/systemd/clock", true, min, uid, gid, 0644);
+                r = touch_file(CLOCK_FILE, false, min, uid, gid, 0644);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to create %s, ignoring: %m", CLOCK_FILE);
+        }
 
+settime:
         ct = now(CLOCK_REALTIME);
         if (ct < min) {
                 struct timespec ts;
@@ -74,57 +79,62 @@ static int load_clock_timestamp(uid_t uid, gid_t gid) {
                          format_timestamp(date, sizeof(date), min));
 
                 if (clock_settime(CLOCK_REALTIME, timespec_store(&ts, min)) < 0)
-                        log_error_errno(errno, "Failed to restore system clock: %m");
+                        log_error_errno(errno, "Failed to restore system clock, ignoring: %m");
         }
 
         return 0;
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
+        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_(manager_freep) Manager *m = NULL;
         const char *user = "systemd-timesync";
-        uid_t uid;
+        uid_t uid, uid_current;
         gid_t gid;
         int r;
 
-        log_set_target(LOG_TARGET_AUTO);
         log_set_facility(LOG_CRON);
-        log_parse_environment();
-        log_open();
+        log_setup_service();
 
         umask(0022);
 
-        if (argc != 1) {
-                log_error("This program does not take arguments.");
-                r = -EINVAL;
-                goto finish;
-        }
+        if (argc != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program does not take arguments.");
 
-        r = get_user_creds(&user, &uid, &gid, NULL, NULL);
-        if (r < 0) {
-                log_error_errno(r, "Cannot resolve user name %s: %m", user);
-                goto finish;
+        uid = uid_current = geteuid();
+        gid = getegid();
+
+        if (uid_current == 0) {
+                r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot resolve user name %s: %m", user);
         }
 
         r = load_clock_timestamp(uid, gid);
         if (r < 0)
-                goto finish;
+                return r;
 
-        r = drop_privileges(uid, gid, (1ULL << CAP_SYS_TIME));
-        if (r < 0)
-                goto finish;
+        /* Drop privileges, but only if we have been started as root. If we are not running as root we assume all
+         * privileges are already dropped. */
+        if (uid_current == 0) {
+                r = drop_privileges(uid, gid, (1ULL << CAP_SYS_TIME));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to drop privileges: %m");
+        }
 
         assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
 
         r = manager_new(&m);
-        if (r < 0) {
-                log_error_errno(r, "Failed to allocate manager: %m");
-                goto finish;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate manager: %m");
+
+        r = manager_connect_bus(m);
+        if (r < 0)
+                return log_error_errno(r, "Could not connect to bus: %m");
 
         if (clock_is_localtime(NULL) > 0) {
                 log_info("The system is configured to read the RTC time in the local time zone. "
-                         "This mode can not be fully supported. All system time to RTC updates are disabled.");
+                         "This mode cannot be fully supported. All system time to RTC updates are disabled.");
                 m->rtc_local_time = true;
         }
 
@@ -132,33 +142,34 @@ int main(int argc, char *argv[]) {
         if (r < 0)
                 log_warning_errno(r, "Failed to parse configuration file: %m");
 
-        log_debug("systemd-timesyncd running as pid " PID_FMT, getpid());
-        sd_notify(false,
-                  "READY=1\n"
-                  "STATUS=Daemon is running");
+        r = manager_parse_fallback_string(m, NTP_SERVERS);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse fallback server strings: %m");
+
+        log_debug("systemd-timesyncd running as pid " PID_FMT, getpid_cached());
+
+        notify_message = notify_start("READY=1\n"
+                                      "STATUS=Daemon is running",
+                                      NOTIFY_STOPPING);
 
         if (network_is_online()) {
                 r = manager_connect(m);
                 if (r < 0)
-                        goto finish;
+                        return r;
         }
 
         r = sd_event_loop(m->event);
-        if (r < 0) {
-                log_error_errno(r, "Failed to run event loop: %m");
-                goto finish;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to run event loop: %m");
 
         /* if we got an authoritative time, store it in the file system */
-        if (m->sync)
-                (void) touch("/var/lib/systemd/clock");
+        if (m->sync) {
+                r = touch(CLOCK_FILE);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to touch %s, ignoring: %m", CLOCK_FILE);
+        }
 
-        sd_event_get_exit_code(m->event, &r);
-
-finish:
-        sd_notify(false,
-                  "STOPPING=1\n"
-                  "STATUS=Shutting down...");
-
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return 0;
 }
+
+DEFINE_MAIN_FUNCTION(run);

@@ -1,54 +1,36 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2012 Kay Sievers <kay@vrfy.org>
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 
-#ifdef HAVE_LINUX_BTRFS_H
-#include <linux/btrfs.h>
-#endif
-
+#include "device-util.h"
 #include "fd-util.h"
 #include "missing.h"
 #include "string-util.h"
-#include "udev.h"
+#include "strxcpyx.h"
+#include "udev-builtin.h"
+#include "util.h"
 
-static int builtin_btrfs(struct udev_device *dev, int argc, char *argv[], bool test) {
+static int builtin_btrfs(sd_device *dev, int argc, char *argv[], bool test) {
         struct btrfs_ioctl_vol_args args = {};
         _cleanup_close_ int fd = -1;
-        int err;
+        int r;
 
         if (argc != 3 || !streq(argv[1], "ready"))
-                return EXIT_FAILURE;
+                return log_device_error_errno(dev, SYNTHETIC_ERRNO(EINVAL), "Invalid arguments");
 
         fd = open("/dev/btrfs-control", O_RDWR|O_CLOEXEC);
         if (fd < 0)
-                return EXIT_FAILURE;
+                return log_device_debug_errno(dev, errno, "Failed to open /dev/btrfs-control: %m");
 
         strscpy(args.name, sizeof(args.name), argv[2]);
-        err = ioctl(fd, BTRFS_IOC_DEVICES_READY, &args);
-        if (err < 0)
-                return EXIT_FAILURE;
+        r = ioctl(fd, BTRFS_IOC_DEVICES_READY, &args);
+        if (r < 0)
+                return log_device_debug_errno(dev, errno, "Failed to call BTRFS_IOC_DEVICES_READY: %m");
 
-        udev_builtin_add_property(dev, test, "ID_BTRFS_READY", one_zero(err == 0));
-        return EXIT_SUCCESS;
+        udev_builtin_add_property(dev, test, "ID_BTRFS_READY", one_zero(r == 0));
+        return 0;
 }
 
 const struct udev_builtin udev_builtin_btrfs = {

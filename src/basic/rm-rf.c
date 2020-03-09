@@ -1,23 +1,5 @@
-/***
-  This file is part of systemd.
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -26,12 +8,14 @@
 #include <sys/statfs.h>
 #include <unistd.h>
 
+#include "alloc-util.h"
 #include "btrfs-util.h"
 #include "cgroup-util.h"
+#include "dirent-util.h"
 #include "fd-util.h"
 #include "log.h"
 #include "macro.h"
-#include "mount-util.h"
+#include "mountpoint-util.h"
 #include "path-util.h"
 #include "rm-rf.h"
 #include "stat-util.h"
@@ -43,6 +27,7 @@ static bool is_physical_fs(const struct statfs *sfs) {
 
 int rm_rf_children(int fd, RemoveFlags flags, struct stat *root_dev) {
         _cleanup_closedir_ DIR *d = NULL;
+        struct dirent *de;
         int ret = 0, r;
         struct statfs sfs;
 
@@ -60,13 +45,15 @@ int rm_rf_children(int fd, RemoveFlags flags, struct stat *root_dev) {
                 }
 
                 if (is_physical_fs(&sfs)) {
-                        /* We refuse to clean physical file systems
-                         * with this call, unless explicitly
-                         * requested. This is extra paranoia just to
-                         * be sure we never ever remove non-state
-                         * data */
+                        /* We refuse to clean physical file systems with this call,
+                         * unless explicitly requested. This is extra paranoia just
+                         * to be sure we never ever remove non-state data. */
+                        _cleanup_free_ char *path = NULL;
 
-                        log_error("Attempted to remove disk file system, and we can't allow that.");
+                        (void) fd_get_path(fd, &path);
+                        log_error("Attempted to remove disk file system under \"%s\", and we can't allow that.",
+                                  strna(path));
+
                         safe_close(fd);
                         return -EPERM;
                 }
@@ -78,20 +65,11 @@ int rm_rf_children(int fd, RemoveFlags flags, struct stat *root_dev) {
                 return errno == ENOENT ? 0 : -errno;
         }
 
-        for (;;) {
-                struct dirent *de;
+        FOREACH_DIRENT_ALL(de, d, return -errno) {
                 bool is_dir;
                 struct stat st;
 
-                errno = 0;
-                de = readdir(d);
-                if (!de) {
-                        if (errno > 0 && ret == 0)
-                                ret = -errno;
-                        return ret;
-                }
-
-                if (streq(de->d_name, ".") || streq(de->d_name, ".."))
+                if (dot_or_dot_dot(de->d_name))
                         continue;
 
                 if (de->d_type == DT_UNKNOWN ||
@@ -140,7 +118,7 @@ int rm_rf_children(int fd, RemoveFlags flags, struct stat *root_dev) {
 
                                 r = btrfs_subvol_remove_fd(fd, de->d_name, BTRFS_REMOVE_RECURSIVE|BTRFS_REMOVE_QUOTA);
                                 if (r < 0) {
-                                        if (r != -ENOTTY && r != -EINVAL) {
+                                        if (!IN_SET(r, -ENOTTY, -EINVAL)) {
                                                 if (ret == 0)
                                                         ret = r;
 
@@ -178,6 +156,7 @@ int rm_rf_children(int fd, RemoveFlags flags, struct stat *root_dev) {
                         }
                 }
         }
+        return ret;
 }
 
 int rm_rf(const char *path, RemoveFlags flags) {
@@ -189,18 +168,18 @@ int rm_rf(const char *path, RemoveFlags flags) {
         /* We refuse to clean the root file system with this
          * call. This is extra paranoia to never cause a really
          * seriously broken system. */
-        if (path_equal(path, "/")) {
-                log_error("Attempted to remove entire root file system, and we can't allow that.");
-                return -EPERM;
-        }
+        if (path_equal_or_files_same(path, "/", AT_SYMLINK_NOFOLLOW))
+                return log_error_errno(SYNTHETIC_ERRNO(EPERM),
+                                       "Attempted to remove entire root file system (\"%s\"), and we can't allow that.",
+                                       path);
 
-        if ((flags & (REMOVE_SUBVOLUME|REMOVE_ROOT|REMOVE_PHYSICAL)) == (REMOVE_SUBVOLUME|REMOVE_ROOT|REMOVE_PHYSICAL)) {
+        if (FLAGS_SET(flags, REMOVE_SUBVOLUME | REMOVE_ROOT | REMOVE_PHYSICAL)) {
                 /* Try to remove as subvolume first */
                 r = btrfs_subvol_remove(path, BTRFS_REMOVE_RECURSIVE|BTRFS_REMOVE_QUOTA);
                 if (r >= 0)
                         return r;
 
-                if (r != -ENOTTY && r != -EINVAL && r != -ENOTDIR)
+                if (!IN_SET(r, -ENOTTY, -EINVAL, -ENOTDIR))
                         return r;
 
                 /* Not btrfs or not a subvolume */
@@ -208,18 +187,17 @@ int rm_rf(const char *path, RemoveFlags flags) {
 
         fd = open(path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME);
         if (fd < 0) {
-
-                if (errno != ENOTDIR && errno != ELOOP)
+                if (!IN_SET(errno, ENOTDIR, ELOOP))
                         return -errno;
 
                 if (!(flags & REMOVE_PHYSICAL)) {
                         if (statfs(path, &s) < 0)
                                 return -errno;
 
-                        if (is_physical_fs(&s)) {
-                                log_error("Attempted to remove disk file system, and we can't allow that.");
-                                return -EPERM;
-                        }
+                        if (is_physical_fs(&s))
+                                return log_error_errno(SYNTHETIC_ERRNO(EPERM),
+                                                       "Attempted to remove files from a disk file system under \"%s\", refusing.",
+                                                       path);
                 }
 
                 if ((flags & REMOVE_ROOT) && !(flags & REMOVE_ONLY_DIRECTORIES))

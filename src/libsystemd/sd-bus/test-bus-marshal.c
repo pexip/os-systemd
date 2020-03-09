@@ -1,30 +1,13 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <math.h>
 #include <stdlib.h>
 
-#ifdef HAVE_GLIB
+#if HAVE_GLIB
 #include <gio/gio.h>
 #endif
 
-#ifdef HAVE_DBUS
+#if HAVE_DBUS
 #include <dbus/dbus.h>
 #endif
 
@@ -35,9 +18,10 @@
 #include "bus-label.h"
 #include "bus-message.h"
 #include "bus-util.h"
+#include "escape.h"
 #include "fd-util.h"
-#include "hexdecoct.h"
 #include "log.h"
+#include "tests.h"
 #include "util.h"
 
 static void test_bus_path_encode_unique(void) {
@@ -127,7 +111,7 @@ int main(int argc, char *argv[]) {
         uint8_t u, v;
         void *buffer = NULL;
         size_t sz;
-        char *h;
+        _cleanup_free_ char *h = NULL;
         const int32_t integer_array[] = { -1, -2, 0, 1, 2 }, *return_array;
         char *s;
         _cleanup_free_ char *first = NULL, *second = NULL, *third = NULL;
@@ -137,9 +121,13 @@ int main(int argc, char *argv[]) {
         double dbl;
         uint64_t u64;
 
-        r = sd_bus_default_system(&bus);
+        test_setup_logging(LOG_INFO);
+
+        r = sd_bus_default_user(&bus);
         if (r < 0)
-                return EXIT_TEST_SKIP;
+                r = sd_bus_default_system(&bus);
+        if (r < 0)
+                return log_tests_skipped("Failed to connect to bus");
 
         r = sd_bus_message_new_method_call(bus, &m, "foobar.waldo", "/", "foobar.waldo", "Piep");
         assert_se(r >= 0);
@@ -166,7 +154,7 @@ int main(int argc, char *argv[]) {
         assert_se(r >= 0);
 
         r = sd_bus_message_append(m, "()");
-        assert_se(r >= 0);
+        assert_se(r == -EINVAL);
 
         r = sd_bus_message_append(m, "ba(ss)", 255, 3, "aaa", "1", "bbb", "2", "ccc", "3");
         assert_se(r >= 0);
@@ -196,7 +184,7 @@ int main(int argc, char *argv[]) {
         r = sd_bus_message_append(m, "a(stdo)", 1, "foo", 815ULL, 47.0, "/");
         assert_se(r >= 0);
 
-        r = bus_message_seal(m, 4711, 0);
+        r = sd_bus_message_seal(m, 4711, 0);
         assert_se(r >= 0);
 
         bus_message_dump(m, stdout, BUS_MESSAGE_DUMP_WITH_HEADER);
@@ -209,13 +197,12 @@ int main(int argc, char *argv[]) {
         r = bus_message_get_blob(m, &buffer, &sz);
         assert_se(r >= 0);
 
-        h = hexmem(buffer, sz);
+        h = cescape_length(buffer, sz);
         assert_se(h);
-
         log_info("message size = %zu, contents =\n%s", sz, h);
-        free(h);
 
-#ifdef HAVE_GLIB
+#if HAVE_GLIB
+#if !HAS_FEATURE_ADDRESS_SANITIZER
         {
                 GDBusMessage *g;
                 char *p;
@@ -231,8 +218,9 @@ int main(int argc, char *argv[]) {
                 g_object_unref(g);
         }
 #endif
+#endif
 
-#ifdef HAVE_DBUS
+#if HAVE_DBUS
         {
                 DBusMessage *w;
                 DBusError error;
@@ -308,7 +296,7 @@ int main(int argc, char *argv[]) {
         assert_se(v == 10);
 
         r = sd_bus_message_read(m, "()");
-        assert_se(r > 0);
+        assert_se(r < 0);
 
         r = sd_bus_message_read(m, "ba(ss)", &boolean, 3, &x, &y, &a, &b, &c, &d);
         assert_se(r > 0);
@@ -359,7 +347,7 @@ int main(int argc, char *argv[]) {
         r = sd_bus_message_copy(copy, m, true);
         assert_se(r >= 0);
 
-        r = bus_message_seal(copy, 4712, 0);
+        r = sd_bus_message_seal(copy, 4712, 0);
         assert_se(r >= 0);
 
         fclose(ms);
@@ -389,7 +377,7 @@ int main(int argc, char *argv[]) {
 
         assert_se(sd_bus_message_verify_type(m, 'a', "{yv}") > 0);
 
-        r = sd_bus_message_skip(m, "a{yv}y(ty)y(yt)y()");
+        r = sd_bus_message_skip(m, "a{yv}y(ty)y(yt)y");
         assert_se(r >= 0);
 
         assert_se(sd_bus_message_verify_type(m, 'b', NULL) > 0);

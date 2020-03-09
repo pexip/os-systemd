@@ -1,37 +1,33 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "alloc-util.h"
+#include "id128-util.h"
 #include "log.h"
 #include "machine-id-setup.h"
+#include "main-func.h"
 #include "path-util.h"
+#include "pretty-print.h"
 #include "util.h"
 
 static char *arg_root = NULL;
 static bool arg_commit = false;
 static bool arg_print = false;
 
-static void help(void) {
+STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+
+static int help(void) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        r = terminal_urlify_man("systemd-machine-id-setup", "1", &link);
+        if (r < 0)
+                return log_oom();
+
         printf("%s [OPTIONS...]\n\n"
                "Initialize /etc/machine-id from a random source.\n\n"
                "  -h --help             Show this help\n"
@@ -39,7 +35,12 @@ static void help(void) {
                "     --root=ROOT        Filesystem root\n"
                "     --commit           Commit transient ID\n"
                "     --print            Print used machine ID\n"
-               , program_invocation_short_name);
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , link
+        );
+
+        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -70,8 +71,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 case 'h':
-                        help();
-                        return 0;
+                        return help();
 
                 case ARG_VERSION:
                         return version();
@@ -97,15 +97,14 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option");
                 }
 
-        if (optind < argc) {
-                log_error("Extraneous arguments");
-                return -EINVAL;
-        }
+        if (optind < argc)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Extraneous arguments");
 
         return 1;
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
         char buf[SD_ID128_STRING_MAX];
         sd_id128_t id;
         int r;
@@ -115,28 +114,29 @@ int main(int argc, char *argv[]) {
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return r;
 
         if (arg_commit) {
+                const char *etc_machine_id;
+
                 r = machine_id_commit(arg_root);
                 if (r < 0)
-                        goto finish;
+                        return r;
 
-                r = sd_id128_get_machine(&id);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to read machine ID back: %m");
-                        goto finish;
-                }
+                etc_machine_id = prefix_roota(arg_root, "/etc/machine-id");
+                r = id128_read(etc_machine_id, ID128_PLAIN, &id);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read machine ID back: %m");
         } else {
                 r = machine_id_setup(arg_root, SD_ID128_NULL, &id);
                 if (r < 0)
-                        goto finish;
+                        return r;
         }
 
         if (arg_print)
                 puts(sd_id128_to_string(id, buf));
 
-finish:
-        free(arg_root);
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return 0;
 }
+
+DEFINE_MAIN_FUNCTION(run);

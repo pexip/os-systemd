@@ -1,24 +1,6 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <alloca.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -35,13 +17,17 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "btrfs-util.h"
 #include "build.h"
 #include "cgroup-util.h"
 #include "def.h"
+#include "device-nodes.h"
 #include "dirent-util.h"
+#include "env-file.h"
+#include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "formats-util.h"
+#include "format-util.h"
 #include "hashmap.h"
 #include "hostname-util.h"
 #include "log.h"
@@ -50,6 +36,7 @@
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "procfs-util.h"
 #include "set.h"
 #include "signal-util.h"
 #include "stat-util.h"
@@ -59,9 +46,7 @@
 #include "umask-util.h"
 #include "user-util.h"
 #include "util.h"
-
-/* Put this test here for a lack of better place */
-assert_cc(EAGAIN == EWOULDBLOCK);
+#include "virt.h"
 
 int saved_argc = 0;
 char **saved_argv = NULL;
@@ -81,146 +66,6 @@ size_t page_size(void) {
         return pgsz;
 }
 
-static int do_execute(char **directories, usec_t timeout, char *argv[]) {
-        _cleanup_hashmap_free_free_ Hashmap *pids = NULL;
-        _cleanup_set_free_free_ Set *seen = NULL;
-        char **directory;
-
-        /* We fork this all off from a child process so that we can
-         * somewhat cleanly make use of SIGALRM to set a time limit */
-
-        (void) reset_all_signal_handlers();
-        (void) reset_signal_mask();
-
-        assert_se(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
-
-        pids = hashmap_new(NULL);
-        if (!pids)
-                return log_oom();
-
-        seen = set_new(&string_hash_ops);
-        if (!seen)
-                return log_oom();
-
-        STRV_FOREACH(directory, directories) {
-                _cleanup_closedir_ DIR *d;
-                struct dirent *de;
-
-                d = opendir(*directory);
-                if (!d) {
-                        if (errno == ENOENT)
-                                continue;
-
-                        return log_error_errno(errno, "Failed to open directory %s: %m", *directory);
-                }
-
-                FOREACH_DIRENT(de, d, break) {
-                        _cleanup_free_ char *path = NULL;
-                        pid_t pid;
-                        int r;
-
-                        if (!dirent_is_file(de))
-                                continue;
-
-                        if (set_contains(seen, de->d_name)) {
-                                log_debug("%1$s/%2$s skipped (%2$s was already seen).", *directory, de->d_name);
-                                continue;
-                        }
-
-                        r = set_put_strdup(seen, de->d_name);
-                        if (r < 0)
-                                return log_oom();
-
-                        path = strjoin(*directory, "/", de->d_name, NULL);
-                        if (!path)
-                                return log_oom();
-
-                        if (null_or_empty_path(path)) {
-                                log_debug("%s is empty (a mask).", path);
-                                continue;
-                        }
-
-                        pid = fork();
-                        if (pid < 0) {
-                                log_error_errno(errno, "Failed to fork: %m");
-                                continue;
-                        } else if (pid == 0) {
-                                char *_argv[2];
-
-                                assert_se(prctl(PR_SET_PDEATHSIG, SIGTERM) == 0);
-
-                                if (!argv) {
-                                        _argv[0] = path;
-                                        _argv[1] = NULL;
-                                        argv = _argv;
-                                } else
-                                        argv[0] = path;
-
-                                execv(path, argv);
-                                return log_error_errno(errno, "Failed to execute %s: %m", path);
-                        }
-
-                        log_debug("Spawned %s as " PID_FMT ".", path, pid);
-
-                        r = hashmap_put(pids, PID_TO_PTR(pid), path);
-                        if (r < 0)
-                                return log_oom();
-                        path = NULL;
-                }
-        }
-
-        /* Abort execution of this process after the timout. We simply
-         * rely on SIGALRM as default action terminating the process,
-         * and turn on alarm(). */
-
-        if (timeout != USEC_INFINITY)
-                alarm((timeout + USEC_PER_SEC - 1) / USEC_PER_SEC);
-
-        while (!hashmap_isempty(pids)) {
-                _cleanup_free_ char *path = NULL;
-                pid_t pid;
-
-                pid = PTR_TO_PID(hashmap_first_key(pids));
-                assert(pid > 0);
-
-                path = hashmap_remove(pids, PID_TO_PTR(pid));
-                assert(path);
-
-                wait_for_terminate_and_warn(path, pid, true);
-        }
-
-        return 0;
-}
-
-void execute_directories(const char* const* directories, usec_t timeout, char *argv[]) {
-        pid_t executor_pid;
-        int r;
-        char *name;
-        char **dirs = (char**) directories;
-
-        assert(!strv_isempty(dirs));
-
-        name = basename(dirs[0]);
-        assert(!isempty(name));
-
-        /* Executes all binaries in the directories in parallel and waits
-         * for them to finish. Optionally a timeout is applied. If a file
-         * with the same name exists in more than one directory, the
-         * earliest one wins. */
-
-        executor_pid = fork();
-        if (executor_pid < 0) {
-                log_error_errno(errno, "Failed to fork: %m");
-                return;
-
-        } else if (executor_pid == 0) {
-                r = do_execute(dirs, timeout, argv);
-                _exit(r < 0 ? EXIT_FAILURE : EXIT_SUCCESS);
-        }
-
-        wait_for_terminate_and_warn(name, executor_pid, true);
-}
-
 bool plymouth_running(void) {
         return access("/run/plymouth/pid", F_OK) >= 0;
 }
@@ -234,101 +79,13 @@ bool display_is_local(const char *display) {
                 display[1] <= '9';
 }
 
-int socket_from_display(const char *display, char **path) {
-        size_t k;
-        char *f, *c;
-
-        assert(display);
-        assert(path);
-
-        if (!display_is_local(display))
-                return -EINVAL;
-
-        k = strspn(display+1, "0123456789");
-
-        f = new(char, strlen("/tmp/.X11-unix/X") + k + 1);
-        if (!f)
-                return -ENOMEM;
-
-        c = stpcpy(f, "/tmp/.X11-unix/X");
-        memcpy(c, display+1, k);
-        c[k] = 0;
-
-        *path = f;
-
-        return 0;
-}
-
-int block_get_whole_disk(dev_t d, dev_t *ret) {
-        char *p, *s;
-        int r;
-        unsigned n, m;
-
-        assert(ret);
-
-        /* If it has a queue this is good enough for us */
-        if (asprintf(&p, "/sys/dev/block/%u:%u/queue", major(d), minor(d)) < 0)
-                return -ENOMEM;
-
-        r = access(p, F_OK);
-        free(p);
-
-        if (r >= 0) {
-                *ret = d;
-                return 0;
-        }
-
-        /* If it is a partition find the originating device */
-        if (asprintf(&p, "/sys/dev/block/%u:%u/partition", major(d), minor(d)) < 0)
-                return -ENOMEM;
-
-        r = access(p, F_OK);
-        free(p);
-
-        if (r < 0)
-                return -ENOENT;
-
-        /* Get parent dev_t */
-        if (asprintf(&p, "/sys/dev/block/%u:%u/../dev", major(d), minor(d)) < 0)
-                return -ENOMEM;
-
-        r = read_one_line_file(p, &s);
-        free(p);
-
-        if (r < 0)
-                return r;
-
-        r = sscanf(s, "%u:%u", &m, &n);
-        free(s);
-
-        if (r != 2)
-                return -EINVAL;
-
-        /* Only return this if it is really good enough for us. */
-        if (asprintf(&p, "/sys/dev/block/%u:%u/queue", m, n) < 0)
-                return -ENOMEM;
-
-        r = access(p, F_OK);
-        free(p);
-
-        if (r >= 0) {
-                *ret = makedev(m, n);
-                return 0;
-        }
-
-        return -ENOENT;
-}
-
 bool kexec_loaded(void) {
-       bool loaded = false;
-       char *s;
+       _cleanup_free_ char *s = NULL;
 
-       if (read_one_line_file("/sys/kernel/kexec_loaded", &s) >= 0) {
-               if (s[0] == '1')
-                       loaded = true;
-               free(s);
-       }
-       return loaded;
+       if (read_one_line_file("/sys/kernel/kexec_loaded", &s) < 0)
+               return false;
+
+       return s[0] == '1';
 }
 
 int prot_from_flags(int flags) {
@@ -349,114 +106,9 @@ int prot_from_flags(int flags) {
         }
 }
 
-int fork_agent(pid_t *pid, const int except[], unsigned n_except, const char *path, ...) {
-        bool stdout_is_tty, stderr_is_tty;
-        pid_t parent_pid, agent_pid;
-        sigset_t ss, saved_ss;
-        unsigned n, i;
-        va_list ap;
-        char **l;
-
-        assert(pid);
-        assert(path);
-
-        /* Spawns a temporary TTY agent, making sure it goes away when
-         * we go away */
-
-        parent_pid = getpid();
-
-        /* First we temporarily block all signals, so that the new
-         * child has them blocked initially. This way, we can be sure
-         * that SIGTERMs are not lost we might send to the agent. */
-        assert_se(sigfillset(&ss) >= 0);
-        assert_se(sigprocmask(SIG_SETMASK, &ss, &saved_ss) >= 0);
-
-        agent_pid = fork();
-        if (agent_pid < 0) {
-                assert_se(sigprocmask(SIG_SETMASK, &saved_ss, NULL) >= 0);
-                return -errno;
-        }
-
-        if (agent_pid != 0) {
-                assert_se(sigprocmask(SIG_SETMASK, &saved_ss, NULL) >= 0);
-                *pid = agent_pid;
-                return 0;
-        }
-
-        /* In the child:
-         *
-         * Make sure the agent goes away when the parent dies */
-        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0)
-                _exit(EXIT_FAILURE);
-
-        /* Make sure we actually can kill the agent, if we need to, in
-         * case somebody invoked us from a shell script that trapped
-         * SIGTERM or so... */
-        (void) reset_all_signal_handlers();
-        (void) reset_signal_mask();
-
-        /* Check whether our parent died before we were able
-         * to set the death signal and unblock the signals */
-        if (getppid() != parent_pid)
-                _exit(EXIT_SUCCESS);
-
-        /* Don't leak fds to the agent */
-        close_all_fds(except, n_except);
-
-        stdout_is_tty = isatty(STDOUT_FILENO);
-        stderr_is_tty = isatty(STDERR_FILENO);
-
-        if (!stdout_is_tty || !stderr_is_tty) {
-                int fd;
-
-                /* Detach from stdout/stderr. and reopen
-                 * /dev/tty for them. This is important to
-                 * ensure that when systemctl is started via
-                 * popen() or a similar call that expects to
-                 * read EOF we actually do generate EOF and
-                 * not delay this indefinitely by because we
-                 * keep an unused copy of stdin around. */
-                fd = open("/dev/tty", O_WRONLY);
-                if (fd < 0) {
-                        log_error_errno(errno, "Failed to open /dev/tty: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (!stdout_is_tty && dup2(fd, STDOUT_FILENO) < 0) {
-                        log_error_errno(errno, "Failed to dup2 /dev/tty: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (!stderr_is_tty && dup2(fd, STDERR_FILENO) < 0) {
-                        log_error_errno(errno, "Failed to dup2 /dev/tty: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (fd > STDERR_FILENO)
-                        close(fd);
-        }
-
-        /* Count arguments */
-        va_start(ap, path);
-        for (n = 0; va_arg(ap, char*); n++)
-                ;
-        va_end(ap);
-
-        /* Allocate strv */
-        l = alloca(sizeof(char *) * (n + 1));
-
-        /* Fill in arguments */
-        va_start(ap, path);
-        for (i = 0; i <= n; i++)
-                l[i] = va_arg(ap, char*);
-        va_end(ap);
-
-        execv(path, l);
-        _exit(EXIT_FAILURE);
-}
-
 bool in_initrd(void) {
         struct statfs s;
+        int r;
 
         if (saved_in_initrd >= 0)
                 return saved_in_initrd;
@@ -471,9 +123,16 @@ bool in_initrd(void) {
          * emptying when transititioning to the main systemd.
          */
 
-        saved_in_initrd = access("/etc/initrd-release", F_OK) >= 0 &&
-                          statfs("/", &s) >= 0 &&
-                          is_temporary_fs(&s);
+        r = getenv_bool_secure("SYSTEMD_IN_INITRD");
+        if (r < 0 && r != -ENXIO)
+                log_debug_errno(r, "Failed to parse $SYSTEMD_IN_INITRD, ignoring: %m");
+
+        if (r >= 0)
+                saved_in_initrd = r > 0;
+        else
+                saved_in_initrd = access("/etc/initrd-release", F_OK) >= 0 &&
+                                  statfs("/", &s) >= 0 &&
+                                  is_temporary_fs(&s);
 
         return saved_in_initrd;
 }
@@ -484,16 +143,18 @@ void in_initrd_force(bool value) {
 
 /* hey glibc, APIs with callbacks without a user pointer are so useless */
 void *xbsearch_r(const void *key, const void *base, size_t nmemb, size_t size,
-                 int (*compar) (const void *, const void *, void *), void *arg) {
+                 __compar_d_fn_t compar, void *arg) {
         size_t l, u, idx;
         const void *p;
         int comparison;
+
+        assert(!size_multiply_overflow(nmemb, size));
 
         l = 0;
         u = nmemb;
         while (l < u) {
                 idx = (l + u) / 2;
-                p = (void *)(((const char *) base) + (idx * size));
+                p = (const uint8_t*) base + idx * size;
                 comparison = compar(key, p, arg);
                 if (comparison < 0)
                         u = idx;
@@ -505,34 +166,45 @@ void *xbsearch_r(const void *key, const void *base, size_t nmemb, size_t size,
         return NULL;
 }
 
+bool memeqzero(const void *data, size_t length) {
+        /* Does the buffer consist entirely of NULs?
+         * Copied from https://github.com/systemd/casync/, copied in turn from
+         * https://github.com/rustyrussell/ccan/blob/master/ccan/mem/mem.c#L92,
+         * which is licensed CC-0.
+         */
+
+        const uint8_t *p = data;
+        size_t i;
+
+        /* Check first 16 bytes manually */
+        for (i = 0; i < 16; i++, length--) {
+                if (length == 0)
+                        return true;
+                if (p[i])
+                        return false;
+        }
+
+        /* Now we know first 16 bytes are NUL, memcmp with self.  */
+        return memcmp(data, p + i, length) == 0;
+}
+
 int on_ac_power(void) {
         bool found_offline = false, found_online = false;
         _cleanup_closedir_ DIR *d = NULL;
+        struct dirent *de;
 
         d = opendir("/sys/class/power_supply");
         if (!d)
                 return errno == ENOENT ? true : -errno;
 
-        for (;;) {
-                struct dirent *de;
+        FOREACH_DIRENT(de, d, return -errno) {
                 _cleanup_close_ int fd = -1, device = -1;
                 char contents[6];
                 ssize_t n;
 
-                errno = 0;
-                de = readdir(d);
-                if (!de && errno > 0)
-                        return -errno;
-
-                if (!de)
-                        break;
-
-                if (hidden_or_backup_file(de->d_name))
-                        continue;
-
                 device = openat(dirfd(d), de->d_name, O_DIRECTORY|O_RDONLY|O_CLOEXEC|O_NOCTTY);
                 if (device < 0) {
-                        if (errno == ENOENT || errno == ENOTDIR)
+                        if (IN_SET(errno, ENOENT, ENOTDIR))
                                 continue;
 
                         return -errno;
@@ -590,11 +262,18 @@ int container_get_leader(const char *machine, pid_t *pid) {
         assert(machine);
         assert(pid);
 
+        if (streq(machine, ".host")) {
+                *pid = 1;
+                return 0;
+        }
+
         if (!machine_name_is_valid(machine))
                 return -EINVAL;
 
         p = strjoina("/run/systemd/machines/", machine);
-        r = parse_env_file(p, NEWLINE, "LEADER", &s, "CLASS", &class, NULL);
+        r = parse_env_file(NULL, p,
+                           "LEADER", &s,
+                           "CLASS", &class);
         if (r == -ENOENT)
                 return -EHOSTDOWN;
         if (r < 0)
@@ -696,7 +375,7 @@ int namespace_enter(int pidns_fd, int mntns_fd, int netns_fd, int userns_fd, int
                 if (asprintf(&userns_fd_path, "/proc/self/fd/%d", userns_fd) < 0)
                         return -ENOMEM;
 
-                r = files_same(userns_fd_path, "/proc/self/ns/user");
+                r = files_same(userns_fd_path, "/proc/self/ns/user", 0);
                 if (r < 0)
                         return r;
                 if (r)
@@ -735,6 +414,7 @@ uint64_t physical_memory(void) {
         uint64_t mem, lim;
         size_t ps;
         long sc;
+        int r;
 
         /* We return this as uint64_t in case we are running as 32bit process on a 64bit kernel with huge amounts of
          * memory.
@@ -748,13 +428,40 @@ uint64_t physical_memory(void) {
         ps = page_size();
         mem = (uint64_t) sc * (uint64_t) ps;
 
-        if (cg_get_root_path(&root) < 0)
+        r = cg_get_root_path(&root);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to determine root cgroup, ignoring cgroup memory limit: %m");
                 return mem;
+        }
 
-        if (cg_get_attribute("memory", root, "memory.limit_in_bytes", &value))
+        r = cg_all_unified();
+        if (r < 0) {
+                log_debug_errno(r, "Failed to determine root unified mode, ignoring cgroup memory limit: %m");
                 return mem;
+        }
+        if (r > 0) {
+                r = cg_get_attribute("memory", root, "memory.max", &value);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to read memory.max cgroup attribute, ignoring cgroup memory limit: %m");
+                        return mem;
+                }
 
-        if (safe_atou64(value, &lim) < 0)
+                if (streq(value, "max"))
+                        return mem;
+        } else {
+                r = cg_get_attribute("memory", root, "memory.limit_in_bytes", &value);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to read memory.limit_in_bytes cgroup attribute, ignoring cgroup memory limit: %m");
+                        return mem;
+                }
+        }
+
+        r = safe_atou64(value, &lim);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse cgroup memory limit '%s', ignoring: %m", value);
+                return mem;
+        }
+        if (lim == UINT64_MAX)
                 return mem;
 
         /* Make sure the limit is a multiple of our own page size */
@@ -793,34 +500,37 @@ uint64_t physical_memory_scale(uint64_t v, uint64_t max) {
 
 uint64_t system_tasks_max(void) {
 
-#if SIZEOF_PID_T == 4
-#define TASKS_MAX ((uint64_t) (INT32_MAX-1))
-#elif SIZEOF_PID_T == 2
-#define TASKS_MAX ((uint64_t) (INT16_MAX-1))
-#else
-#error "Unknown pid_t size"
-#endif
-
-        _cleanup_free_ char *value = NULL, *root = NULL;
         uint64_t a = TASKS_MAX, b = TASKS_MAX;
+        _cleanup_free_ char *root = NULL;
+        int r;
 
         /* Determine the maximum number of tasks that may run on this system. We check three sources to determine this
          * limit:
          *
-         * a) the maximum value for the pid_t type
+         * a) the maximum tasks value the kernel allows on this architecture
          * b) the cgroups pids_max attribute for the system
-         * c) the kernel's configure maximum PID value
+         * c) the kernel's configured maximum PID value
          *
          * And then pick the smallest of the three */
 
-        if (read_one_line_file("/proc/sys/kernel/pid_max", &value) >= 0)
-                (void) safe_atou64(value, &a);
+        r = procfs_tasks_get_limit(&a);
+        if (r < 0)
+                log_debug_errno(r, "Failed to read maximum number of tasks from /proc, ignoring: %m");
 
-        if (cg_get_root_path(&root) >= 0) {
-                value = mfree(value);
+        r = cg_get_root_path(&root);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine cgroup root path, ignoring: %m");
+        else {
+                _cleanup_free_ char *value = NULL;
 
-                if (cg_get_attribute("pids", root, "pids.max", &value) >= 0)
-                        (void) safe_atou64(value, &b);
+                r = cg_get_attribute("pids", root, "pids.max", &value);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to read pids.max attribute of cgroup root, ignoring: %m");
+                else if (!streq(value, "max")) {
+                        r = safe_atou64(value, &b);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to parse pids.max attribute of cgroup root, ignoring: %m");
+                }
         }
 
         return MIN3(TASKS_MAX,
@@ -846,31 +556,82 @@ uint64_t system_tasks_max_scale(uint64_t v, uint64_t max) {
         return m / max;
 }
 
-int update_reboot_parameter_and_warn(const char *param) {
-        int r;
-
-        if (isempty(param)) {
-                if (unlink("/run/systemd/reboot-param") < 0) {
-                        if (errno == ENOENT)
-                                return 0;
-
-                        return log_warning_errno(errno, "Failed to unlink reboot parameter file: %m");
-                }
-
-                return 0;
-        }
-
-        RUN_WITH_UMASK(0022) {
-                r = write_string_file("/run/systemd/reboot-param", param, WRITE_STRING_FILE_CREATE);
-                if (r < 0)
-                        return log_warning_errno(r, "Failed to write reboot parameter file: %m");
-        }
-
+int version(void) {
+        puts("systemd " STRINGIFY(PROJECT_VERSION) " (" GIT_VERSION ")\n"
+             SYSTEMD_FEATURES);
         return 0;
 }
 
-int version(void) {
-        puts(PACKAGE_STRING "\n"
-             SYSTEMD_FEATURES);
-        return 0;
+/* This is a direct translation of str_verscmp from boot.c */
+static bool is_digit(int c) {
+        return c >= '0' && c <= '9';
+}
+
+static int c_order(int c) {
+        if (c == 0 || is_digit(c))
+                return 0;
+
+        if ((c >= 'a') && (c <= 'z'))
+                return c;
+
+        return c + 0x10000;
+}
+
+int str_verscmp(const char *s1, const char *s2) {
+        const char *os1, *os2;
+
+        assert(s1);
+        assert(s2);
+
+        os1 = s1;
+        os2 = s2;
+
+        while (*s1 || *s2) {
+                int first;
+
+                while ((*s1 && !is_digit(*s1)) || (*s2 && !is_digit(*s2))) {
+                        int order;
+
+                        order = c_order(*s1) - c_order(*s2);
+                        if (order != 0)
+                                return order;
+                        s1++;
+                        s2++;
+                }
+
+                while (*s1 == '0')
+                        s1++;
+                while (*s2 == '0')
+                        s2++;
+
+                first = 0;
+                while (is_digit(*s1) && is_digit(*s2)) {
+                        if (first == 0)
+                                first = *s1 - *s2;
+                        s1++;
+                        s2++;
+                }
+
+                if (is_digit(*s1))
+                        return 1;
+                if (is_digit(*s2))
+                        return -1;
+
+                if (first != 0)
+                        return first;
+        }
+
+        return strcmp(os1, os2);
+}
+
+/* Turn off core dumps but only if we're running outside of a container. */
+void disable_coredumps(void) {
+        int r;
+
+        if (detect_container() > 0)
+                return;
+
+        r = write_string_file("/proc/sys/kernel/core_pattern", "|/bin/false", WRITE_STRING_FILE_DISABLE_BUFFER);
+        if (r < 0)
+                log_debug_errno(r, "Failed to turn off coredumps, ignoring: %m");
 }

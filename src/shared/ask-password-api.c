@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -43,12 +26,14 @@
 #include "ask-password-api.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "formats-util.h"
+#include "format-util.h"
+#include "fs-util.h"
 #include "io-util.h"
 #include "log.h"
 #include "macro.h"
 #include "missing.h"
 #include "mkdir.h"
+#include "process-util.h"
 #include "random-util.h"
 #include "signal-util.h"
 #include "socket-util.h"
@@ -56,6 +41,7 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "time-util.h"
+#include "tmpfile-util.h"
 #include "umask-util.h"
 #include "utf8.h"
 #include "util.h"
@@ -95,7 +81,7 @@ static int retrieve_key(key_serial_t serial, char ***ret) {
                 if (n < m)
                         break;
 
-                memory_erase(p, n);
+                explicit_bzero_safe(p, n);
                 free(p);
                 m *= 2;
         }
@@ -104,7 +90,7 @@ static int retrieve_key(key_serial_t serial, char ***ret) {
         if (!l)
                 return -ENOMEM;
 
-        memory_erase(p, n);
+        explicit_bzero_safe(p, n);
 
         *ret = l;
         return 0;
@@ -140,7 +126,7 @@ static int add_to_keyring(const char *keyname, AskPasswordFlags flags, char **pa
                 return r;
 
         serial = add_key("user", keyname, p, n, KEY_SPEC_USER_KEYRING);
-        memory_erase(p, n);
+        explicit_bzero_safe(p, n);
         if (serial == -1)
                 return -errno;
 
@@ -148,6 +134,9 @@ static int add_to_keyring(const char *keyname, AskPasswordFlags flags, char **pa
                    (unsigned long) serial,
                    (unsigned long) DIV_ROUND_UP(KEYRING_TIMEOUT_USEC, USEC_PER_SEC), 0, 0) < 0)
                 log_debug_errno(errno, "Failed to adjust timeout: %m");
+
+        /* Tell everyone to check the keyring */
+        (void) touch("/run/systemd/ask-password");
 
         log_debug("Added key to keyring as %" PRIi32 ".", serial);
 
@@ -167,7 +156,7 @@ static int add_to_keyring_and_log(const char *keyname, AskPasswordFlags flags, c
         return 0;
 }
 
-int ask_password_keyring(const char *keyname, AskPasswordFlags flags, char ***ret) {
+static int ask_password_keyring(const char *keyname, AskPasswordFlags flags, char ***ret) {
 
         key_serial_t serial;
         int r;
@@ -199,26 +188,50 @@ static void backspace_chars(int ttyfd, size_t p) {
         }
 }
 
+static void backspace_string(int ttyfd, const char *str) {
+        size_t m;
+
+        assert(str);
+
+        if (ttyfd < 0)
+                return;
+
+        /* Backspaces through enough characters to entirely undo printing of the specified string. */
+
+        m = utf8_n_codepoints(str);
+        if (m == (size_t) -1)
+                m = strlen(str); /* Not a valid UTF-8 string? If so, let's backspace the number of bytes output. Most
+                                  * likely this happened because we are not in an UTF-8 locale, and in that case that
+                                  * is the correct thing to do. And even if it's not, terminals tend to stop
+                                  * backspacing at the leftmost column, hence backspacing too much should be mostly
+                                  * OK. */
+
+        backspace_chars(ttyfd, m);
+}
+
 int ask_password_tty(
+                int ttyfd,
                 const char *message,
                 const char *keyname,
                 usec_t until,
                 AskPasswordFlags flags,
                 const char *flag_file,
-                char **ret) {
+                char ***ret) {
 
-        struct termios old_termios, new_termios;
-        char passphrase[LINE_MAX + 1] = {}, *x;
-        size_t p = 0, codepoint = 0;
-        int r;
-        _cleanup_close_ int ttyfd = -1, notify = -1;
-        struct pollfd pollfd[2];
-        bool reset_tty = false;
-        bool dirty = false;
         enum {
                 POLL_TTY,
-                POLL_INOTIFY
+                POLL_INOTIFY,
+                _POLL_MAX,
         };
+
+        bool reset_tty = false, dirty = false, use_color = false;
+        _cleanup_close_ int cttyfd = -1, notify = -1;
+        struct termios old_termios, new_termios;
+        char passphrase[LINE_MAX + 1] = {}, *x;
+        _cleanup_strv_free_erase_ char **l = NULL;
+        struct pollfd pollfd[_POLL_MAX];
+        size_t p = 0, codepoint = 0;
+        int r;
 
         assert(ret);
 
@@ -228,33 +241,47 @@ int ask_password_tty(
         if (!message)
                 message = "Password:";
 
-        if (flag_file) {
+        if (flag_file || ((flags & ASK_PASSWORD_ACCEPT_CACHED) && keyname)) {
                 notify = inotify_init1(IN_CLOEXEC|IN_NONBLOCK);
-                if (notify < 0) {
-                        r = -errno;
-                        goto finish;
-                }
+                if (notify < 0)
+                        return -errno;
+        }
+        if (flag_file) {
+                if (inotify_add_watch(notify, flag_file, IN_ATTRIB /* for the link count */) < 0)
+                        return -errno;
+        }
+        if ((flags & ASK_PASSWORD_ACCEPT_CACHED) && keyname) {
+                r = ask_password_keyring(keyname, flags, ret);
+                if (r >= 0)
+                        return 0;
+                else if (r != -ENOKEY)
+                        return r;
 
-                if (inotify_add_watch(notify, flag_file, IN_ATTRIB /* for the link count */) < 0) {
-                        r = -errno;
-                        goto finish;
-                }
+                if (inotify_add_watch(notify, "/run/systemd/ask-password", IN_ATTRIB /* for mtime */) < 0)
+                        return -errno;
         }
 
-        ttyfd = open("/dev/tty", O_RDWR|O_NOCTTY|O_CLOEXEC);
+        /* If the caller didn't specify a TTY, then use the controlling tty, if we can. */
+        if (ttyfd < 0)
+                ttyfd = cttyfd = open("/dev/tty", O_RDWR|O_NOCTTY|O_CLOEXEC);
+
         if (ttyfd >= 0) {
+                if (tcgetattr(ttyfd, &old_termios) < 0)
+                        return -errno;
 
-                if (tcgetattr(ttyfd, &old_termios) < 0) {
-                        r = -errno;
-                        goto finish;
-                }
+                if (flags & ASK_PASSWORD_CONSOLE_COLOR)
+                        use_color = dev_console_colors_enabled();
+                else
+                        use_color = colors_enabled();
 
-                if (colors_enabled())
-                        loop_write(ttyfd, ANSI_HIGHLIGHT, strlen(ANSI_HIGHLIGHT), false);
-                loop_write(ttyfd, message, strlen(message), false);
-                loop_write(ttyfd, " ", 1, false);
-                if (colors_enabled())
-                        loop_write(ttyfd, ANSI_NORMAL, strlen(ANSI_NORMAL), false);
+                if (use_color)
+                        (void) loop_write(ttyfd, ANSI_HIGHLIGHT, STRLEN(ANSI_HIGHLIGHT), false);
+
+                (void) loop_write(ttyfd, message, strlen(message), false);
+                (void) loop_write(ttyfd, " ", 1, false);
+
+                if (use_color)
+                        (void) loop_write(ttyfd, ANSI_NORMAL, STRLEN(ANSI_NORMAL), false);
 
                 new_termios = old_termios;
                 new_termios.c_lflag &= ~(ICANON|ECHO);
@@ -269,16 +296,19 @@ int ask_password_tty(
                 reset_tty = true;
         }
 
-        zero(pollfd);
-        pollfd[POLL_TTY].fd = ttyfd >= 0 ? ttyfd : STDIN_FILENO;
-        pollfd[POLL_TTY].events = POLLIN;
-        pollfd[POLL_INOTIFY].fd = notify;
-        pollfd[POLL_INOTIFY].events = POLLIN;
+        pollfd[POLL_TTY] = (struct pollfd) {
+                .fd = ttyfd >= 0 ? ttyfd : STDIN_FILENO,
+                .events = POLLIN,
+        };
+        pollfd[POLL_INOTIFY] = (struct pollfd) {
+                .fd = notify,
+                .events = POLLIN,
+        };
 
         for (;;) {
-                char c;
                 int sleep_for = -1, k;
                 ssize_t n;
+                char c;
 
                 if (until > 0) {
                         usec_t y;
@@ -290,7 +320,7 @@ int ask_password_tty(
                                 goto finish;
                         }
 
-                        sleep_for = (int) ((until - y) / USEC_PER_MSEC);
+                        sleep_for = (int) DIV_ROUND_UP(until - y, USEC_PER_MSEC);
                 }
 
                 if (flag_file)
@@ -311,141 +341,175 @@ int ask_password_tty(
                         goto finish;
                 }
 
-                if (notify >= 0 && pollfd[POLL_INOTIFY].revents != 0)
-                        flush_fd(notify);
+                if (notify >= 0 && pollfd[POLL_INOTIFY].revents != 0 && keyname) {
+                        (void) flush_fd(notify);
+
+                        r = ask_password_keyring(keyname, flags, ret);
+                        if (r >= 0) {
+                                r = 0;
+                                goto finish;
+                        } else if (r != -ENOKEY)
+                                goto finish;
+                }
 
                 if (pollfd[POLL_TTY].revents == 0)
                         continue;
 
                 n = read(ttyfd >= 0 ? ttyfd : STDIN_FILENO, &c, 1);
                 if (n < 0) {
-                        if (errno == EINTR || errno == EAGAIN)
+                        if (IN_SET(errno, EINTR, EAGAIN))
                                 continue;
 
                         r = -errno;
                         goto finish;
 
-                } else if (n == 0)
+                }
+
+                /* We treat EOF, newline and NUL byte all as valid end markers */
+                if (n == 0 || c == '\n' || c == 0)
                         break;
 
-                if (c == '\n')
-                        break;
-                else if (c == 21) { /* C-u */
+                if (c == 21) { /* C-u */
 
                         if (!(flags & ASK_PASSWORD_SILENT))
-                                backspace_chars(ttyfd, p);
-                        p = 0;
+                                backspace_string(ttyfd, passphrase);
 
-                } else if (c == '\b' || c == 127) {
+                        explicit_bzero_safe(passphrase, sizeof(passphrase));
+                        p = codepoint = 0;
+
+                } else if (IN_SET(c, '\b', 127)) {
 
                         if (p > 0) {
+                                size_t q;
 
                                 if (!(flags & ASK_PASSWORD_SILENT))
                                         backspace_chars(ttyfd, 1);
 
-                                p--;
+                                /* Remove a full UTF-8 codepoint from the end. For that, figure out where the last one
+                                 * begins */
+                                q = 0;
+                                for (;;) {
+                                        size_t z;
+
+                                        z = utf8_encoded_valid_unichar(passphrase + q);
+                                        if (z == 0) {
+                                                q = (size_t) -1; /* Invalid UTF8! */
+                                                break;
+                                        }
+
+                                        if (q + z >= p) /* This one brings us over the edge */
+                                                break;
+
+                                        q += z;
+                                }
+
+                                p = codepoint = q == (size_t) -1 ? p - 1 : q;
+                                explicit_bzero_safe(passphrase + p, sizeof(passphrase) - p);
+
                         } else if (!dirty && !(flags & ASK_PASSWORD_SILENT)) {
 
                                 flags |= ASK_PASSWORD_SILENT;
 
-                                /* There are two ways to enter silent
-                                 * mode. Either by pressing backspace
-                                 * as first key (and only as first
-                                 * key), or ... */
+                                /* There are two ways to enter silent mode. Either by pressing backspace as first key
+                                 * (and only as first key), or ... */
+
                                 if (ttyfd >= 0)
-                                        loop_write(ttyfd, "(no echo) ", 10, false);
+                                        (void) loop_write(ttyfd, "(no echo) ", 10, false);
 
                         } else if (ttyfd >= 0)
-                                loop_write(ttyfd, "\a", 1, false);
+                                (void) loop_write(ttyfd, "\a", 1, false);
 
                 } else if (c == '\t' && !(flags & ASK_PASSWORD_SILENT)) {
 
-                        backspace_chars(ttyfd, p);
+                        backspace_string(ttyfd, passphrase);
                         flags |= ASK_PASSWORD_SILENT;
 
                         /* ... or by pressing TAB at any time. */
 
                         if (ttyfd >= 0)
-                                loop_write(ttyfd, "(no echo) ", 10, false);
-                } else {
-                        if (p >= sizeof(passphrase)-1) {
-                                loop_write(ttyfd, "\a", 1, false);
-                                continue;
-                        }
+                                (void) loop_write(ttyfd, "(no echo) ", 10, false);
 
+                } else if (p >= sizeof(passphrase)-1) {
+
+                        /* Reached the size limit */
+                        if (ttyfd >= 0)
+                                (void) loop_write(ttyfd, "\a", 1, false);
+
+                } else {
                         passphrase[p++] = c;
 
                         if (!(flags & ASK_PASSWORD_SILENT) && ttyfd >= 0) {
+                                /* Check if we got a complete UTF-8 character now. If so, let's output one '*'. */
                                 n = utf8_encoded_valid_unichar(passphrase + codepoint);
                                 if (n >= 0) {
                                         codepoint = p;
-                                        loop_write(ttyfd, (flags & ASK_PASSWORD_ECHO) ? &c : "*", 1, false);
+                                        (void) loop_write(ttyfd, (flags & ASK_PASSWORD_ECHO) ? &c : "*", 1, false);
                                 }
                         }
 
                         dirty = true;
                 }
 
+                /* Let's forget this char, just to not keep needlessly copies of key material around */
                 c = 'x';
         }
 
         x = strndup(passphrase, p);
-        memory_erase(passphrase, p);
+        explicit_bzero_safe(passphrase, sizeof(passphrase));
         if (!x) {
                 r = -ENOMEM;
                 goto finish;
         }
 
-        if (keyname)
-                (void) add_to_keyring_and_log(keyname, flags, STRV_MAKE(x));
+        r = strv_consume(&l, x);
+        if (r < 0)
+                goto finish;
 
-        *ret = x;
+        if (keyname)
+                (void) add_to_keyring_and_log(keyname, flags, l);
+
+        *ret = TAKE_PTR(l);
         r = 0;
 
 finish:
         if (ttyfd >= 0 && reset_tty) {
-                loop_write(ttyfd, "\n", 1, false);
-                tcsetattr(ttyfd, TCSADRAIN, &old_termios);
+                (void) loop_write(ttyfd, "\n", 1, false);
+                (void) tcsetattr(ttyfd, TCSADRAIN, &old_termios);
         }
 
         return r;
 }
 
-static int create_socket(char **name) {
-        union sockaddr_union sa = {
-                .un.sun_family = AF_UNIX,
-        };
+static int create_socket(char **ret) {
+        _cleanup_free_ char *path = NULL;
+        union sockaddr_union sa = {};
         _cleanup_close_ int fd = -1;
-        static const int one = 1;
-        char *c;
-        int r;
+        int salen, r;
 
-        assert(name);
+        assert(ret);
 
         fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
         if (fd < 0)
                 return -errno;
 
-        snprintf(sa.un.sun_path, sizeof(sa.un.sun_path)-1, "/run/systemd/ask-password/sck.%" PRIx64, random_u64());
+        if (asprintf(&path, "/run/systemd/ask-password/sck.%" PRIx64, random_u64()) < 0)
+                return -ENOMEM;
+
+        salen = sockaddr_un_set_path(&sa.un, path);
+        if (salen < 0)
+                return salen;
 
         RUN_WITH_UMASK(0177) {
-                if (bind(fd, &sa.sa, SOCKADDR_UN_LEN(sa.un)) < 0)
+                if (bind(fd, &sa.sa, salen) < 0)
                         return -errno;
         }
 
-        if (setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) < 0)
-                return -errno;
+        r = setsockopt_int(fd, SOL_SOCKET, SO_PASSCRED, true);
+        if (r < 0)
+                return r;
 
-        c = strdup(sa.un.sun_path);
-        if (!c)
-                return -ENOMEM;
-
-        *name = c;
-
-        r = fd;
-        fd = -1;
-
-        return r;
+        *ret = TAKE_PTR(path);
+        return TAKE_FD(fd);
 }
 
 int ask_password_agent(
@@ -460,14 +524,15 @@ int ask_password_agent(
         enum {
                 FD_SOCKET,
                 FD_SIGNAL,
+                FD_INOTIFY,
                 _FD_MAX
         };
 
-        _cleanup_close_ int socket_fd = -1, signal_fd = -1, fd = -1;
+        _cleanup_close_ int socket_fd = -1, signal_fd = -1, notify = -1, fd = -1;
         char temp[] = "/run/systemd/ask-password/tmp.XXXXXX";
         char final[sizeof(temp)] = "";
         _cleanup_free_ char *socket_name = NULL;
-        _cleanup_strv_free_ char **l = NULL;
+        _cleanup_strv_free_erase_ char **l = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         struct pollfd pollfd[_FD_MAX];
         sigset_t mask, oldmask;
@@ -483,6 +548,25 @@ int ask_password_agent(
         assert_se(sigprocmask(SIG_BLOCK, &mask, &oldmask) >= 0);
 
         (void) mkdir_p_label("/run/systemd/ask-password", 0755);
+
+        if ((flags & ASK_PASSWORD_ACCEPT_CACHED) && keyname) {
+                r = ask_password_keyring(keyname, flags, ret);
+                if (r >= 0) {
+                        r = 0;
+                        goto finish;
+                } else if (r != -ENOKEY)
+                        goto finish;
+
+                notify = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
+                if (notify < 0) {
+                        r = -errno;
+                        goto finish;
+                }
+                if (inotify_add_watch(notify, "/run/systemd/ask-password", IN_ATTRIB /* for mtime */) < 0) {
+                        r = -errno;
+                        goto finish;
+                }
+        }
 
         fd = mkostemp_safe(temp);
         if (fd < 0) {
@@ -519,7 +603,7 @@ int ask_password_agent(
                 "AcceptCached=%i\n"
                 "Echo=%i\n"
                 "NotAfter="USEC_FMT"\n",
-                getpid(),
+                getpid_cached(),
                 socket_name,
                 (flags & ASK_PASSWORD_ACCEPT_CACHED) ? 1 : 0,
                 (flags & ASK_PASSWORD_ECHO) ? 1 : 0,
@@ -554,6 +638,8 @@ int ask_password_agent(
         pollfd[FD_SOCKET].events = POLLIN;
         pollfd[FD_SIGNAL].fd = signal_fd;
         pollfd[FD_SIGNAL].events = POLLIN;
+        pollfd[FD_INOTIFY].fd = notify;
+        pollfd[FD_INOTIFY].events = POLLIN;
 
         for (;;) {
                 char passphrase[LINE_MAX+1];
@@ -575,7 +661,7 @@ int ask_password_agent(
                         goto finish;
                 }
 
-                k = poll(pollfd, _FD_MAX, until > 0 ? (int) ((until-t)/USEC_PER_MSEC) : -1);
+                k = poll(pollfd, notify >= 0 ? _FD_MAX : _FD_MAX - 1, until > 0 ? (int) ((until-t)/USEC_PER_MSEC) : -1);
                 if (k < 0) {
                         if (errno == EINTR)
                                 continue;
@@ -594,14 +680,26 @@ int ask_password_agent(
                         goto finish;
                 }
 
+                if (notify >= 0 && pollfd[FD_INOTIFY].revents != 0) {
+                        (void) flush_fd(notify);
+
+                        r = ask_password_keyring(keyname, flags, ret);
+                        if (r >= 0) {
+                                r = 0;
+                                goto finish;
+                        } else if (r != -ENOKEY)
+                                goto finish;
+                }
+
+                if (pollfd[FD_SOCKET].revents == 0)
+                        continue;
+
                 if (pollfd[FD_SOCKET].revents != POLLIN) {
                         r = -EIO;
                         goto finish;
                 }
 
-                zero(iovec);
-                iovec.iov_base = passphrase;
-                iovec.iov_len = sizeof(passphrase);
+                iovec = IOVEC_MAKE(passphrase, sizeof(passphrase));
 
                 zero(control);
                 zero(msghdr);
@@ -612,8 +710,7 @@ int ask_password_agent(
 
                 n = recvmsg(socket_fd, &msghdr, 0);
                 if (n < 0) {
-                        if (errno == EAGAIN ||
-                            errno == EINTR)
+                        if (IN_SET(errno, EAGAIN, EINTR))
                                 continue;
 
                         r = -errno;
@@ -644,16 +741,16 @@ int ask_password_agent(
                 if (passphrase[0] == '+') {
                         /* An empty message refers to the empty password */
                         if (n == 1)
-                                l = strv_new("", NULL);
+                                l = strv_new("");
                         else
                                 l = strv_parse_nulstr(passphrase+1, n-1);
-                        memory_erase(passphrase, n);
+                        explicit_bzero_safe(passphrase, n);
                         if (!l) {
                                 r = -ENOMEM;
                                 goto finish;
                         }
 
-                        if (strv_length(l) <= 0) {
+                        if (strv_isempty(l)) {
                                 l = strv_free(l);
                                 log_debug("Invalid packet");
                                 continue;
@@ -673,8 +770,7 @@ int ask_password_agent(
         if (keyname)
                 (void) add_to_keyring_and_log(keyname, flags, l);
 
-        *ret = l;
-        l = NULL;
+        *ret = TAKE_PTR(l);
         r = 0;
 
 finish:
@@ -703,29 +799,17 @@ int ask_password_auto(
 
         assert(ret);
 
-        if ((flags & ASK_PASSWORD_ACCEPT_CACHED) && keyname) {
+        if ((flags & ASK_PASSWORD_ACCEPT_CACHED) &&
+            keyname &&
+            ((flags & ASK_PASSWORD_NO_TTY) || !isatty(STDIN_FILENO)) &&
+            (flags & ASK_PASSWORD_NO_AGENT)) {
                 r = ask_password_keyring(keyname, flags, ret);
                 if (r != -ENOKEY)
                         return r;
         }
 
-        if (!(flags & ASK_PASSWORD_NO_TTY) && isatty(STDIN_FILENO)) {
-                char *s = NULL, **l = NULL;
-
-                r = ask_password_tty(message, keyname, until, flags, NULL, &s);
-                if (r < 0)
-                        return r;
-
-                r = strv_push(&l, s);
-                if (r < 0) {
-                        string_erase(s);
-                        free(s);
-                        return -ENOMEM;
-                }
-
-                *ret = l;
-                return 0;
-        }
+        if (!(flags & ASK_PASSWORD_NO_TTY) && isatty(STDIN_FILENO))
+                return ask_password_tty(-1, message, keyname, until, flags, NULL, ret);
 
         if (!(flags & ASK_PASSWORD_NO_AGENT))
                 return ask_password_agent(message, icon, id, keyname, until, flags, ret);

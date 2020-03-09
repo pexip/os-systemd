@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 
 # udev test
 #
@@ -14,8 +14,7 @@
 # After creation and removal the result is checked against the
 # expected value and the result is printed.
 #
-# Copyright (C) 2004-2012 Kay Sievers <kay@vrfy.org>
-# Copyright (C) 2004 Leann Ogasawara <ogasawara@osdl.org>
+# Copyright © 2004 Leann Ogasawara <ogasawara@osdl.org>
 
 use warnings;
 use strict;
@@ -333,6 +332,30 @@ SUBSYSTEMS=="scsi", PROGRAM=="/bin/echo -n 'foo3 foo4'   'foo5   foo6   foo7 foo
 EOF
         },
         {
+                desc            => "program arguments combined with escaped double quotes, part 1",
+                devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda5",
+                exp_name        => "foo2" ,
+                rules           => <<EOF
+SUBSYSTEMS=="scsi", PROGRAM=="/bin/sh -c 'printf %%s \\\"foo1 foo2\\\" | grep \\\"foo1 foo2\\\"'", KERNEL=="sda5", SYMLINK+="%c{2}"
+EOF
+        },
+        {
+                desc            => "program arguments combined with escaped double quotes, part 2",
+                devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda5",
+                exp_name        => "foo2" ,
+                rules           => <<EOF
+SUBSYSTEMS=="scsi", PROGRAM=="/bin/sh -c \\\"printf %%s 'foo1 foo2' | grep 'foo1 foo2'\\\"", KERNEL=="sda5", SYMLINK+="%c{2}"
+EOF
+        },
+        {
+                desc            => "program arguments combined with escaped double quotes, part 3",
+                devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda5",
+                exp_name        => "foo2" ,
+                rules           => <<EOF
+SUBSYSTEMS=="scsi", PROGRAM=="/bin/sh -c 'printf \\\"%%s %%s\\\" \\\"foo1 foo2\\\" \\\"foo3\\\"| grep \\\"foo1 foo2\\\"'", KERNEL=="sda5", SYMLINK+="%c{2}"
+EOF
+        },
+        {
                 desc            => "characters before the %c{N} substitution",
                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda5",
                 exp_name        => "my-foo9" ,
@@ -582,9 +605,9 @@ EOF
                 desc            => "textual user id",
                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
                 exp_name        => "node",
-                exp_perms       => "nobody::0600",
+                exp_perms       => "daemon::0600",
                 rules           => <<EOF
-SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", OWNER="nobody"
+SUBSYSTEMS=="scsi", KERNEL=="sda", SYMLINK+="node", OWNER="daemon"
 EOF
         },
         {
@@ -738,6 +761,86 @@ EOF
                 not_exp_name        => " ",
                 rules           => <<EOF
 KERNEL=="ttyACM[0-9]*", SYMLINK="  one     two        "
+EOF
+        },
+        {
+                desc            => "symlink with spaces in substituted variable",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "name-one_two_three-end",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="one two three"
+SYMLINK="name-\$env{WITH_WS}-end"
+EOF
+        },
+        {
+                desc            => "symlink with leading space in substituted variable",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "name-one_two_three-end",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="   one two three"
+SYMLINK="name-\$env{WITH_WS}-end"
+EOF
+        },
+        {
+                desc            => "symlink with trailing space in substituted variable",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "name-one_two_three-end",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="one two three   "
+SYMLINK="name-\$env{WITH_WS}-end"
+EOF
+        },
+        {
+                desc            => "symlink with lots of space in substituted variable",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "name-one_two_three-end",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="   one two three   "
+SYMLINK="name-\$env{WITH_WS}-end"
+EOF
+        },
+        {
+                desc            => "symlink with multiple spaces in substituted variable",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "name-one_two_three-end",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="   one  two  three   "
+SYMLINK="name-\$env{WITH_WS}-end"
+EOF
+        },
+        {
+                desc            => "symlink with space and var with space, part 1",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "first",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="   one  two  three   "
+SYMLINK="  first  name-\$env{WITH_WS}-end another_symlink a b c "
+EOF
+        },
+        {
+                desc            => "symlink with space and var with space, part 2",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "name-one_two_three-end",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="   one  two  three   "
+SYMLINK="  first  name-\$env{WITH_WS}-end another_symlink a b c "
+EOF
+        },
+        {
+                desc            => "symlink with space and var with space, part 3",
+                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                exp_name        => "another_symlink",
+                not_exp_name    => " ",
+                rules           => <<EOF
+ENV{WITH_WS}="   one  two  three   "
+SYMLINK="  first  name-\$env{WITH_WS}-end another_symlink a b c "
 EOF
         },
         {
@@ -1434,7 +1537,11 @@ sub udev_setup {
         system("umount", $udev_tmpfs);
         rmdir($udev_tmpfs);
         mkdir($udev_tmpfs) || die "unable to create udev_tmpfs: $udev_tmpfs\n";
-        system("mount", "-o", "rw,mode=755,nosuid,noexec,nodev", "-t", "tmpfs", "tmpfs", $udev_tmpfs) && die "unable to mount tmpfs";
+
+        if (system("mount", "-o", "rw,mode=755,nosuid,noexec", "-t", "tmpfs", "tmpfs", $udev_tmpfs)) {
+                warn "unable to mount tmpfs";
+                return 0;
+        }
 
         mkdir($udev_dev) || die "unable to create udev_dev: $udev_dev\n";
         # setting group and mode of udev_dev ensures the tests work
@@ -1442,9 +1549,29 @@ sub udev_setup {
         chown (0, 0, $udev_dev) || die "unable to chown $udev_dev\n";
         chmod (0755, $udev_dev) || die "unable to chmod $udev_dev\n";
 
+        if (system("mknod", $udev_dev . "/null", "c", "1", "3")) {
+                warn "unable to create $udev_dev/null";
+                return 0;
+        }
+
+        # check if we are permitted to create block device nodes
+        my $block_device_filename = $udev_dev . "/sda";
+        if (system("mknod", $block_device_filename, "b", "8", "0")) {
+                warn "unable to create $block_device_filename";
+                return 0;
+        }
+        unlink $block_device_filename;
+
         system("cp", "-r", "test/sys/", $udev_sys) && die "unable to copy test/sys";
 
         system("rm", "-rf", "$udev_run");
+
+        if (!mkdir($udev_run)) {
+                warn "unable to create directory $udev_run";
+                return 0;
+        }
+
+        return 1;
 }
 
 sub run_test {
@@ -1542,14 +1669,15 @@ if ($? >> 8 == 0) {
         exit($EXIT_TEST_SKIP);
 }
 
-# skip the test when running in a container
-system("systemd-detect-virt", "-c", "-q");
-if ($? >> 8 == 0) {
-        print "Running in a container, skipping the test.\n";
+if (!udev_setup()) {
+        warn "Failed to set up the environment, skipping the test";
         exit($EXIT_TEST_SKIP);
 }
 
-udev_setup();
+if (system($udev_bin, "check")) {
+        warn "$udev_bin failed to set up the environment, skipping the test";
+        exit($EXIT_TEST_SKIP);
+}
 
 my $test_num = 1;
 my @list;

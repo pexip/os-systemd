@@ -1,26 +1,12 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-  Copyright 2016 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <string.h>
 
 #include "env-util.h"
+#include "fd-util.h"
+#include "fileio.h"
+#include "fs-util.h"
+#include "serialize.h"
 #include "string-util.h"
 #include "strv.h"
 #include "util.h"
@@ -28,13 +14,13 @@
 static void test_strv_env_delete(void) {
         _cleanup_strv_free_ char **a = NULL, **b = NULL, **c = NULL, **d = NULL;
 
-        a = strv_new("FOO=BAR", "WALDO=WALDO", "WALDO=", "PIEP", "SCHLUMPF=SMURF", NULL);
+        a = strv_new("FOO=BAR", "WALDO=WALDO", "WALDO=", "PIEP", "SCHLUMPF=SMURF");
         assert_se(a);
 
-        b = strv_new("PIEP", "FOO", NULL);
+        b = strv_new("PIEP", "FOO");
         assert_se(b);
 
-        c = strv_new("SCHLUMPF", NULL);
+        c = strv_new("SCHLUMPF");
         assert_se(c);
 
         d = strv_env_delete(a, 2, b, c);
@@ -45,10 +31,20 @@ static void test_strv_env_delete(void) {
         assert_se(strv_length(d) == 2);
 }
 
+static void test_strv_env_get(void) {
+        char **l;
+
+        l = STRV_MAKE("ONE_OR_TWO=1", "THREE=3", "ONE_OR_TWO=2", "FOUR=4");
+
+        assert_se(streq(strv_env_get(l, "ONE_OR_TWO"), "2"));
+        assert_se(streq(strv_env_get(l, "THREE"), "3"));
+        assert_se(streq(strv_env_get(l, "FOUR"), "4"));
+}
+
 static void test_strv_env_unset(void) {
         _cleanup_strv_free_ char **l = NULL;
 
-        l = strv_new("PIEP", "SCHLUMPF=SMURFF", "NANANANA=YES", NULL);
+        l = strv_new("PIEP", "SCHLUMPF=SMURFF", "NANANANA=YES");
         assert_se(l);
 
         assert_se(strv_env_unset(l, "SCHLUMPF") == l);
@@ -61,7 +57,7 @@ static void test_strv_env_unset(void) {
 static void test_strv_env_set(void) {
         _cleanup_strv_free_ char **l = NULL, **r = NULL;
 
-        l = strv_new("PIEP", "SCHLUMPF=SMURFF", "NANANANA=YES", NULL);
+        l = strv_new("PIEP", "SCHLUMPF=SMURFF", "NANANANA=YES");
         assert_se(l);
 
         r = strv_env_set(l, "WALDO=WALDO");
@@ -77,10 +73,10 @@ static void test_strv_env_set(void) {
 static void test_strv_env_merge(void) {
         _cleanup_strv_free_ char **a = NULL, **b = NULL, **r = NULL;
 
-        a = strv_new("FOO=BAR", "WALDO=WALDO", "WALDO=", "PIEP", "SCHLUMPF=SMURF", NULL);
+        a = strv_new("FOO=BAR", "WALDO=WALDO", "WALDO=", "PIEP", "SCHLUMPF=SMURF");
         assert_se(a);
 
-        b = strv_new("FOO=KKK", "FOO=", "PIEP=", "SCHLUMPF=SMURFF", "NANANANA=YES", NULL);
+        b = strv_new("FOO=KKK", "FOO=", "PIEP=", "SCHLUMPF=SMURFF", "NANANANA=YES");
         assert_se(b);
 
         r = strv_env_merge(2, a, b);
@@ -102,7 +98,90 @@ static void test_strv_env_merge(void) {
         assert_se(strv_length(r) == 5);
 }
 
-static void test_replace_env_arg(void) {
+static void test_env_strv_get_n(void) {
+        const char *_env[] = {
+                "FOO=NO NO NO",
+                "FOO=BAR BAR",
+                "BAR=waldo",
+                "PATH=unset",
+                NULL
+        };
+        char **env = (char**) _env;
+
+        assert_se(streq(strv_env_get_n(env, "FOO__", 3, 0), "BAR BAR"));
+        assert_se(streq(strv_env_get_n(env, "FOO__", 3, REPLACE_ENV_USE_ENVIRONMENT), "BAR BAR"));
+        assert_se(streq(strv_env_get_n(env, "FOO", 3, 0), "BAR BAR"));
+        assert_se(streq(strv_env_get_n(env, "FOO", 3, REPLACE_ENV_USE_ENVIRONMENT), "BAR BAR"));
+
+        assert_se(streq(strv_env_get_n(env, "PATH__", 4, 0), "unset"));
+        assert_se(streq(strv_env_get_n(env, "PATH", 4, 0), "unset"));
+        assert_se(streq(strv_env_get_n(env, "PATH__", 4, REPLACE_ENV_USE_ENVIRONMENT), "unset"));
+        assert_se(streq(strv_env_get_n(env, "PATH", 4, REPLACE_ENV_USE_ENVIRONMENT), "unset"));
+
+        env[3] = NULL; /* kill our $PATH */
+
+        assert_se(!strv_env_get_n(env, "PATH__", 4, 0));
+        assert_se(!strv_env_get_n(env, "PATH", 4, 0));
+        assert_se(streq(strv_env_get_n(env, "PATH__", 4, REPLACE_ENV_USE_ENVIRONMENT),
+                        getenv("PATH")));
+        assert_se(streq(strv_env_get_n(env, "PATH", 4, REPLACE_ENV_USE_ENVIRONMENT),
+                        getenv("PATH")));
+}
+
+static void test_replace_env(bool braceless) {
+        const char *env[] = {
+                "FOO=BAR BAR",
+                "BAR=waldo",
+                NULL
+        };
+        _cleanup_free_ char *t = NULL, *s = NULL, *q = NULL, *r = NULL, *p = NULL;
+        unsigned flags = REPLACE_ENV_ALLOW_BRACELESS*braceless;
+
+        t = replace_env("FOO=$FOO=${FOO}", (char**) env, flags);
+        assert_se(streq(t, braceless ? "FOO=BAR BAR=BAR BAR" : "FOO=$FOO=BAR BAR"));
+
+        s = replace_env("BAR=$BAR=${BAR}", (char**) env, flags);
+        assert_se(streq(s, braceless ? "BAR=waldo=waldo" : "BAR=$BAR=waldo"));
+
+        q = replace_env("BARBAR=$BARBAR=${BARBAR}", (char**) env, flags);
+        assert_se(streq(q, braceless ? "BARBAR==" : "BARBAR=$BARBAR="));
+
+        r = replace_env("BAR=$BAR$BAR${BAR}${BAR}", (char**) env, flags);
+        assert_se(streq(r, braceless ? "BAR=waldowaldowaldowaldo" : "BAR=$BAR$BARwaldowaldo"));
+
+        p = replace_env("${BAR}$BAR$BAR", (char**) env, flags);
+        assert_se(streq(p, braceless ? "waldowaldowaldo" : "waldo$BAR$BAR"));
+}
+
+static void test_replace_env2(bool extended) {
+        const char *env[] = {
+                "FOO=foo",
+                "BAR=bar",
+                NULL
+        };
+        _cleanup_free_ char *t = NULL, *s = NULL, *q = NULL, *r = NULL, *p = NULL, *x = NULL;
+        unsigned flags = REPLACE_ENV_ALLOW_EXTENDED*extended;
+
+        t = replace_env("FOO=${FOO:-${BAR}}", (char**) env, flags);
+        assert_se(streq(t, extended ? "FOO=foo" : "FOO=${FOO:-bar}"));
+
+        s = replace_env("BAR=${XXX:-${BAR}}", (char**) env, flags);
+        assert_se(streq(s, extended ? "BAR=bar" : "BAR=${XXX:-bar}"));
+
+        q = replace_env("XXX=${XXX:+${BAR}}", (char**) env, flags);
+        assert_se(streq(q, extended ? "XXX=" : "XXX=${XXX:+bar}"));
+
+        r = replace_env("FOO=${FOO:+${BAR}}", (char**) env, flags);
+        assert_se(streq(r, extended ? "FOO=bar" : "FOO=${FOO:+bar}"));
+
+        p = replace_env("FOO=${FOO:-${BAR}post}", (char**) env, flags);
+        assert_se(streq(p, extended ? "FOO=foo" : "FOO=${FOO:-barpost}"));
+
+        x = replace_env("XXX=${XXX:+${BAR}post}", (char**) env, flags);
+        assert_se(streq(x, extended ? "XXX=" : "XXX=${XXX:+barpost}"));
+}
+
+static void test_replace_env_argv(void) {
         const char *env[] = {
                 "FOO=BAR BAR",
                 "BAR=waldo",
@@ -120,6 +199,12 @@ static void test_replace_env_arg(void) {
                 "${FOO",
                 "FOO$$${FOO}",
                 "$$FOO${FOO}",
+                "${FOO:-${BAR}}",
+                "${QUUX:-${FOO}}",
+                "${FOO:+${BAR}}",
+                "${QUUX:+${BAR}}",
+                "${FOO:+|${BAR}|}}",
+                "${FOO:+|${BAR}{|}",
                 NULL
         };
         _cleanup_strv_free_ char **r = NULL;
@@ -137,7 +222,13 @@ static void test_replace_env_arg(void) {
         assert_se(streq(r[8], "${FOO"));
         assert_se(streq(r[9], "FOO$BAR BAR"));
         assert_se(streq(r[10], "$FOOBAR BAR"));
-        assert_se(strv_length(r) == 11);
+        assert_se(streq(r[11], "${FOO:-waldo}"));
+        assert_se(streq(r[12], "${QUUX:-BAR BAR}"));
+        assert_se(streq(r[13], "${FOO:+waldo}"));
+        assert_se(streq(r[14], "${QUUX:+waldo}"));
+        assert_se(streq(r[15], "${FOO:+|waldo|}}"));
+        assert_se(streq(r[16], "${FOO:+|waldo{|}"));
+        assert_se(strv_length(r) == 17);
 }
 
 static void test_env_clean(void) {
@@ -158,8 +249,7 @@ static void test_env_clean(void) {
                      "xyz\n=xyz",
                      "xyz=xyz\n",
                      "another=one",
-                     "another=final one",
-                     NULL);
+                     "another=final one");
         assert_se(e);
         assert_se(!strv_env_is_valid(e));
         assert_se(strv_env_clean(e) == e);
@@ -169,8 +259,9 @@ static void test_env_clean(void) {
         assert_se(streq(e[1], "X="));
         assert_se(streq(e[2], "F=F"));
         assert_se(streq(e[3], "abcd=äöüß"));
-        assert_se(streq(e[4], "another=final one"));
-        assert_se(e[5] == NULL);
+        assert_se(streq(e[4], "xyz=xyz\n"));
+        assert_se(streq(e[5], "another=final one"));
+        assert_se(e[6] == NULL);
 }
 
 static void test_env_name_is_valid(void) {
@@ -189,6 +280,8 @@ static void test_env_value_is_valid(void) {
         assert_se(env_value_is_valid(""));
         assert_se(env_value_is_valid("głąb kapuściany"));
         assert_se(env_value_is_valid("printf \"\\x1b]0;<mock-chroot>\\x07<mock-chroot>\""));
+        assert_se(env_value_is_valid("tab\tcharacter"));
+        assert_se(env_value_is_valid("new\nline"));
 }
 
 static void test_env_assignment_is_valid(void) {
@@ -196,6 +289,8 @@ static void test_env_assignment_is_valid(void) {
         assert_se(env_assignment_is_valid("b=głąb kapuściany"));
         assert_se(env_assignment_is_valid("c=\\007\\009\\011"));
         assert_se(env_assignment_is_valid("e=printf \"\\x1b]0;<mock-chroot>\\x07<mock-chroot>\""));
+        assert_se(env_assignment_is_valid("f=tab\tcharacter"));
+        assert_se(env_assignment_is_valid("g=new\nline"));
 
         assert_se(!env_assignment_is_valid("="));
         assert_se(!env_assignment_is_valid("a b="));
@@ -211,10 +306,16 @@ static void test_env_assignment_is_valid(void) {
 
 int main(int argc, char *argv[]) {
         test_strv_env_delete();
+        test_strv_env_get();
         test_strv_env_unset();
         test_strv_env_set();
         test_strv_env_merge();
-        test_replace_env_arg();
+        test_env_strv_get_n();
+        test_replace_env(false);
+        test_replace_env(true);
+        test_replace_env2(false);
+        test_replace_env2(true);
+        test_replace_env_argv();
         test_env_clean();
         test_env_name_is_valid();
         test_env_value_is_valid();

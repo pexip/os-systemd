@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <getopt.h>
 #include <sys/epoll.h>
@@ -31,10 +14,13 @@
 #include "fd-util.h"
 #include "log.h"
 #include "macro.h"
+#include "pretty-print.h"
+#include "process-util.h"
 #include "signal-util.h"
 #include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "terminal-util.h"
 
 static char** arg_listen = NULL;
 static bool arg_accept = false;
@@ -46,16 +32,14 @@ static bool arg_inetd = false;
 
 static int add_epoll(int epoll_fd, int fd) {
         struct epoll_event ev = {
-                .events = EPOLLIN
+                .events = EPOLLIN,
+                .data.fd = fd,
         };
-        int r;
 
         assert(epoll_fd >= 0);
         assert(fd >= 0);
 
-        ev.data.fd = fd;
-        r = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-        if (r < 0)
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0)
                 return log_error_errno(errno, "Failed to add event on epoll fd:%d for fd:%d: %m", epoll_fd, fd);
 
         return 0;
@@ -129,19 +113,18 @@ static int open_sockets(int *epoll_fd, bool accept) {
         return count;
 }
 
-static int exec_process(const char* name, char **argv, char **env, int start_fd, int n_fds) {
+static int exec_process(const char* name, char **argv, char **env, int start_fd, size_t n_fds) {
 
         _cleanup_strv_free_ char **envp = NULL;
         _cleanup_free_ char *joined = NULL;
-        unsigned n_env = 0, length;
+        size_t n_env = 0, length;
         const char *tocopy;
         char **s;
         int r;
 
-        if (arg_inetd && n_fds != 1) {
-                log_error("--inetd only supported for single file descriptors.");
-                return -EINVAL;
-        }
+        if (arg_inetd && n_fds != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "--inetd only supported for single file descriptors.");
 
         length = strv_length(arg_setenv);
 
@@ -197,49 +180,43 @@ static int exec_process(const char* name, char **argv, char **env, int start_fd,
         if (arg_inetd) {
                 assert(n_fds == 1);
 
-                r = dup2(start_fd, STDIN_FILENO);
+                r = rearrange_stdio(start_fd, start_fd, STDERR_FILENO); /* invalidates start_fd on success + error */
                 if (r < 0)
-                        return log_error_errno(errno, "Failed to dup connection to stdin: %m");
+                        return log_error_errno(r, "Failed to move fd to stdin+stdout: %m");
 
-                r = dup2(start_fd, STDOUT_FILENO);
-                if (r < 0)
-                        return log_error_errno(errno, "Failed to dup connection to stdout: %m");
-
-                start_fd = safe_close(start_fd);
         } else {
                 if (start_fd != SD_LISTEN_FDS_START) {
                         assert(n_fds == 1);
 
-                        r = dup2(start_fd, SD_LISTEN_FDS_START);
-                        if (r < 0)
+                        if (dup2(start_fd, SD_LISTEN_FDS_START) < 0)
                                 return log_error_errno(errno, "Failed to dup connection: %m");
 
                         safe_close(start_fd);
                         start_fd = SD_LISTEN_FDS_START;
                 }
 
-                if (asprintf((char**)(envp + n_env++), "LISTEN_FDS=%i", n_fds) < 0)
+                if (asprintf((char**)(envp + n_env++), "LISTEN_FDS=%zu", n_fds) < 0)
                         return log_oom();
 
-                if (asprintf((char**)(envp + n_env++), "LISTEN_PID=" PID_FMT, getpid()) < 0)
+                if (asprintf((char**)(envp + n_env++), "LISTEN_PID=" PID_FMT, getpid_cached()) < 0)
                         return log_oom();
 
                 if (arg_fdnames) {
                         _cleanup_free_ char *names = NULL;
                         size_t len;
                         char *e;
-                        int i;
 
                         len = strv_length(arg_fdnames);
-                        if (len == 1)
+                        if (len == 1) {
+                                size_t i;
+
                                 for (i = 1; i < n_fds; i++) {
                                         r = strv_extend(&arg_fdnames, arg_fdnames[0]);
                                         if (r < 0)
                                                 return log_error_errno(r, "Failed to extend strv: %m");
                                 }
-                        else if (len != (unsigned) n_fds)
-                                log_warning("The number of fd names is different than number of fds: %zu vs %d",
-                                            len, n_fds);
+                        } else if (len != n_fds)
+                                log_warning("The number of fd names is different than number of fds: %zu vs %zu", len, n_fds);
 
                         names = strv_join(arg_fdnames, ":");
                         if (!names)
@@ -265,38 +242,23 @@ static int exec_process(const char* name, char **argv, char **env, int start_fd,
 
 static int fork_and_exec_process(const char* child, char** argv, char **env, int fd) {
         _cleanup_free_ char *joined = NULL;
-        pid_t parent_pid, child_pid;
+        pid_t child_pid;
+        int r;
 
         joined = strv_join(argv, " ");
         if (!joined)
                 return log_oom();
 
-        parent_pid = getpid();
-
-        child_pid = fork();
-        if (child_pid < 0)
-                return log_error_errno(errno, "Failed to fork: %m");
-
-        /* In the child */
-        if (child_pid == 0) {
-
-                (void) reset_all_signal_handlers();
-                (void) reset_signal_mask();
-
-                /* Make sure the child goes away when the parent dies */
-                if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0)
-                        _exit(EXIT_FAILURE);
-
-                /* Check whether our parent died before we were able
-                 * to set the death signal */
-                if (getppid() != parent_pid)
-                        _exit(EXIT_SUCCESS);
-
+        r = safe_fork("(activate)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &child_pid);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                /* In the child */
                 exec_process(child, argv, env, fd, 1);
                 _exit(EXIT_FAILURE);
         }
 
-        log_info("Spawned %s (%s) as PID %d", child, joined, child_pid);
+        log_info("Spawned %s (%s) as PID " PID_FMT ".", child, joined, child_pid);
         return 0;
 }
 
@@ -339,20 +301,24 @@ static void sigchld_hdl(int sig) {
 
 static int install_chld_handler(void) {
         static const struct sigaction act = {
-                .sa_flags = SA_NOCLDSTOP,
+                .sa_flags = SA_NOCLDSTOP|SA_RESTART,
                 .sa_handler = sigchld_hdl,
         };
 
-        int r;
-
-        r = sigaction(SIGCHLD, &act, 0);
-        if (r < 0)
+        if (sigaction(SIGCHLD, &act, 0) < 0)
                 return log_error_errno(errno, "Failed to install SIGCHLD handler: %m");
 
         return 0;
 }
 
-static void help(void) {
+static int help(void) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        r = terminal_urlify_man("systemd-socket-activate", "1", &link);
+        if (r < 0)
+                return log_oom();
+
         printf("%s [OPTIONS...]\n\n"
                "Listen on sockets and launch child on connection.\n\n"
                "Options:\n"
@@ -365,9 +331,13 @@ static void help(void) {
                "  -E --setenv=NAME[=VALUE]   Pass an environment variable to children\n"
                "     --fdname=NAME[:NAME...] Specify names for file descriptors\n"
                "     --inetd                 Enable inetd file descriptor passing protocol\n"
-               "\n"
-               "Note: file descriptors from sd_listen_fds() will be passed through.\n"
-               , program_invocation_short_name);
+               "\nNote: file descriptors from sd_listen_fds() will be passed through.\n"
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , link
+        );
+
+        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -400,8 +370,7 @@ static int parse_argv(int argc, char *argv[]) {
         while ((c = getopt_long(argc, argv, "+hl:aE:d", options, NULL)) >= 0)
                 switch(c) {
                 case 'h':
-                        help();
-                        return 0;
+                        return help();
 
                 case ARG_VERSION:
                         return version();
@@ -414,19 +383,17 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'd':
-                        if (arg_socket_type == SOCK_SEQPACKET) {
-                                log_error("--datagram may not be combined with --seqpacket.");
-                                return -EINVAL;
-                        }
+                        if (arg_socket_type == SOCK_SEQPACKET)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "--datagram may not be combined with --seqpacket.");
 
                         arg_socket_type = SOCK_DGRAM;
                         break;
 
                 case ARG_SEQPACKET:
-                        if (arg_socket_type == SOCK_DGRAM) {
-                                log_error("--seqpacket may not be combined with --datagram.");
-                                return -EINVAL;
-                        }
+                        if (arg_socket_type == SOCK_DGRAM)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "--seqpacket may not be combined with --datagram.");
 
                         arg_socket_type = SOCK_SEQPACKET;
                         break;
@@ -478,17 +445,15 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option");
                 }
 
-        if (optind == argc) {
-                log_error("%s: command to execute is missing.",
-                          program_invocation_short_name);
-                return -EINVAL;
-        }
+        if (optind == argc)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "%s: command to execute is missing.",
+                                       program_invocation_short_name);
 
-        if (arg_socket_type == SOCK_DGRAM && arg_accept) {
-                log_error("Datagram sockets do not accept connections. "
-                          "The --datagram and --accept options may not be combined.");
-                return -EINVAL;
-        }
+        if (arg_socket_type == SOCK_DGRAM && arg_accept)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Datagram sockets do not accept connections. "
+                                       "The --datagram and --accept options may not be combined.");
 
         arg_args = argv + optind;
 
@@ -521,8 +486,7 @@ int main(int argc, char **argv, char **envp) {
         for (;;) {
                 struct epoll_event event;
 
-                r = epoll_wait(epoll_fd, &event, 1, -1);
-                if (r < 0) {
+                if (epoll_wait(epoll_fd, &event, 1, -1) < 0) {
                         if (errno == EINTR)
                                 continue;
 
@@ -539,7 +503,7 @@ int main(int argc, char **argv, char **envp) {
                         break;
         }
 
-        exec_process(argv[optind], argv + optind, envp, SD_LISTEN_FDS_START, n);
+        exec_process(argv[optind], argv + optind, envp, SD_LISTEN_FDS_START, (size_t) n);
 
         return EXIT_SUCCESS;
 }

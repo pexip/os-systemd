@@ -1,12 +1,9 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #ifndef foosddhcpleasehfoo
 #define foosddhcpleasehfoo
 
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2013 Intel Corporation. All rights reserved.
-  Copyright (C) 2014 Tom Gundersen
-
+  Copyright © 2013 Intel Corporation. All rights reserved.
   systemd is free software; you can redistribute it and/or modify it
   under the terms of the GNU Lesser General Public License as published by
   the Free Software Foundation; either version 2.1 of the License, or
@@ -49,6 +46,7 @@ int sd_dhcp_lease_get_dns(sd_dhcp_lease *lease, const struct in_addr **addr);
 int sd_dhcp_lease_get_ntp(sd_dhcp_lease *lease, const struct in_addr **addr);
 int sd_dhcp_lease_get_mtu(sd_dhcp_lease *lease, uint16_t *mtu);
 int sd_dhcp_lease_get_domainname(sd_dhcp_lease *lease, const char **domainname);
+int sd_dhcp_lease_get_search_domains(sd_dhcp_lease *lease, char ***domains);
 int sd_dhcp_lease_get_hostname(sd_dhcp_lease *lease, const char **hostname);
 int sd_dhcp_lease_get_root_path(sd_dhcp_lease *lease, const char **root_path);
 int sd_dhcp_lease_get_routes(sd_dhcp_lease *lease, sd_dhcp_route ***routes);
@@ -59,6 +57,7 @@ int sd_dhcp_lease_get_timezone(sd_dhcp_lease *lease, const char **timezone);
 int sd_dhcp_route_get_destination(sd_dhcp_route *route, struct in_addr *destination);
 int sd_dhcp_route_get_destination_prefix_length(sd_dhcp_route *route, uint8_t *length);
 int sd_dhcp_route_get_gateway(sd_dhcp_route *route, struct in_addr *gateway);
+int sd_dhcp_route_get_option(sd_dhcp_route *route);
 
 _SD_DEFINE_POINTER_CLEANUP_FUNC(sd_dhcp_lease, sd_dhcp_lease_unref);
 

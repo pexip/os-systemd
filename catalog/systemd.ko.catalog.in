@@ -1,25 +1,10 @@
-#  This file is part of systemd.
-#
-#  Copyright 2012 Lennart Poettering
-#
-#  systemd is free software; you can redistribute it and/or modify it
-#  under the terms of the GNU Lesser General Public License as published by
-#  the Free Software Foundation; either version 2.1 of the License, or
-#  (at your option) any later version.
-#
-#  systemd is distributed in the hope that it will be useful, but
-#  WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-#  Lesser General Public License for more details.
-#
-#  You should have received a copy of the GNU Lesser General Public License
-#  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: LGPL-2.1+
 
 # Message catalog for systemd's own messages
 # Korean translation
 
 # The catalog format is documented on
-# http://www.freedesktop.org/wiki/Software/systemd/catalog
+# https://www.freedesktop.org/wiki/Software/systemd/catalog
 
 # For an explanation why we do all this, see https://xkcd.com/1024/
 #
@@ -101,7 +86,7 @@ Documentation: man:core(5)
 Subject: @USER_ID@ 사용자의 새 @SESSION_ID@ 세션 만듦
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 @USER_ID@ 사용자의 새 @SESSION_ID@ 세션을 만들었습니다.
 
@@ -111,7 +96,7 @@ Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
 Subject: @SESSION_ID@ 세션 마침
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 @SESSION_ID@ 세션을 끝냈습니다.
 
@@ -119,7 +104,7 @@ Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
 Subject: 새 @SEAT_ID@ 시트 사용할 수 있음
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 새 @SEAT_ID@ 시트를 설정했고 사용할 수 있습니다.
 
@@ -127,7 +112,7 @@ Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
 Subject: @SEAT_ID@ 시트 제거함
 Defined-By: systemd
 Support: %SUPPORT_URL%
-Documentation: http://www.freedesktop.org/wiki/Software/systemd/multiseat
+Documentation: https://www.freedesktop.org/wiki/Software/systemd/multiseat
 
 @SEAT_ID@ 시트를 제거했으며 더이상 사용할 수 없습니다.
 
@@ -197,7 +182,7 @@ Support: %SUPPORT_URL%
 
 @UNIT@ 유닛 시동을 마쳤습니다.
 
-시동 결과는 @RESULT@ 입니다.
+시동 결과는 @JOB_RESULT@ 입니다.
 
 -- de5b426a63be47a7b6ac3eaac82e2f6f
 Subject: @UNIT@ 유닛 끝내기 동작 시작
@@ -220,7 +205,7 @@ Support: %SUPPORT_URL%
 
 @UNIT@ 유닛 동작에 실패했습니다.
 
-결과는 @RESULT@ 입니다.
+결과는 @JOB_RESULT@ 입니다.
 
 -- d34d037fff1847e6ae669a370e694725
 Subject: @UNIT@ 유닛 설정 다시 읽기 시작
@@ -236,7 +221,7 @@ Support: %SUPPORT_URL%
 
 @UNIT@ 유닛의 설정 다시 읽기 동작을 끝냈습니다.
 
-결과는 @RESULT@ 입니다.
+결과는 @JOB_RESULT@ 입니다.
 
 -- 641257651c1b4ec9a8624d7a40a9e1e7
 Subject: @EXECUTABLE@ 프로세스 시작할 수 없음

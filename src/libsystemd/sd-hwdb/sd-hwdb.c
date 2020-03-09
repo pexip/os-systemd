@@ -1,22 +1,6 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright 2012 Kay Sievers <kay@vrfy.org>
-  Copyright 2008 Alan Jenkins <alan.christopher.jenkins@googlemail.com>
-  Copyright 2014 Tom Gundersen <teg@jklm.no>
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2008 Alan Jenkins <alan.christopher.jenkins@googlemail.com>
 ***/
 
 #include <errno.h>
@@ -36,10 +20,10 @@
 #include "hwdb-util.h"
 #include "refcnt.h"
 #include "string-util.h"
+#include "util.h"
 
 struct sd_hwdb {
         RefCount n_ref;
-        int refcount;
 
         FILE *f;
         struct stat st;
@@ -47,8 +31,6 @@ struct sd_hwdb {
                 struct trie_header_f *head;
                 const char *map;
         };
-
-        char *modalias;
 
         OrderedHashmap *properties;
         Iterator properties_iterator;
@@ -164,10 +146,37 @@ static int hwdb_add_property(sd_hwdb *hwdb, const struct trie_value_entry_f *ent
                 entry2 = (const struct trie_value_entry2_f *)entry;
                 old = ordered_hashmap_get(hwdb->properties, key);
                 if (old) {
-                        /* on duplicates, we order by filename and line-number */
-                        r = strcmp(trie_string(hwdb, entry2->filename_off), trie_string(hwdb, old->filename_off));
-                        if (r < 0 ||
-                            (r == 0 && entry2->line_number < old->line_number))
+                        /* On duplicates, we order by filename priority and line-number.
+                         *
+                         * v2 of the format had 64 bits for the line number.
+                         * v3 reuses top 32 bits of line_number to store the priority.
+                         * We check the top bits — if they are zero we have v2 format.
+                         * This means that v2 clients will print wrong line numbers with
+                         * v3 data.
+                         *
+                         * For v3 data: we compare the priority (of the source file)
+                         * and the line number.
+                         *
+                         * For v2 data: we rely on the fact that the filenames in the hwdb
+                         * are added in the order of priority (higher later), because they
+                         * are *processed* in the order of priority. So we compare the
+                         * indices to determine which file had higher priority. Comparing
+                         * the strings alphabetically would be useless, because those are
+                         * full paths, and e.g. /usr/lib would sort after /etc, even
+                         * though it has lower priority. This is not reliable because of
+                         * suffix compression, but should work for the most common case of
+                         * /usr/lib/udev/hwbd.d and /etc/udev/hwdb.d, and is better than
+                         * not doing the comparison at all.
+                         */
+                        bool lower;
+
+                        if (entry2->file_priority == 0)
+                                lower = entry2->filename_off < old->filename_off ||
+                                        (entry2->filename_off == old->filename_off && entry2->line_number < old->line_number);
+                        else
+                                lower = entry2->file_priority < old->file_priority ||
+                                        (entry2->file_priority == old->file_priority && entry2->line_number < old->line_number);
+                        if (lower)
                                 return 0;
                 }
         }
@@ -231,10 +240,10 @@ static int trie_search_f(sd_hwdb *hwdb, const char *search) {
                 size_t p = 0;
 
                 if (node->prefix_off) {
-                        uint8_t c;
+                        char c;
 
                         for (; (c = trie_string(hwdb, node->prefix_off)[p]); p++) {
-                                if (c == '*' || c == '?' || c == '[')
+                                if (IN_SET(c, '*', '?', '['))
                                         return trie_fnmatch_f(hwdb, node, p, &buf, search + i + p);
                                 if (c != search[i + p])
                                         return 0;
@@ -291,7 +300,7 @@ static const char hwdb_bin_paths[] =
         "/etc/systemd/hwdb/hwdb.bin\0"
         "/etc/udev/hwdb.bin\0"
         "/usr/lib/systemd/hwdb/hwdb.bin\0"
-#ifdef HAVE_SPLIT_USR
+#if HAVE_SPLIT_USR
         "/lib/systemd/hwdb/hwdb.bin\0"
 #endif
         UDEVLIBEXECDIR "/hwdb.bin\0";
@@ -317,25 +326,25 @@ _public_ int sd_hwdb_new(sd_hwdb **ret) {
                 else if (errno == ENOENT)
                         continue;
                 else
-                        return log_debug_errno(errno, "error reading %s: %m", hwdb_bin_path);
+                        return log_debug_errno(errno, "Failed to open %s: %m", hwdb_bin_path);
         }
 
         if (!hwdb->f) {
-                log_debug("hwdb.bin does not exist, please run udevadm hwdb --update");
+                log_debug("hwdb.bin does not exist, please run 'systemd-hwdb update'");
                 return -ENOENT;
         }
 
         if (fstat(fileno(hwdb->f), &hwdb->st) < 0 ||
-            (size_t)hwdb->st.st_size < offsetof(struct trie_header_f, strings_len) + 8)
-                return log_debug_errno(errno, "error reading %s: %m", hwdb_bin_path);
+            (size_t) hwdb->st.st_size < offsetof(struct trie_header_f, strings_len) + 8)
+                return log_debug_errno(errno, "Failed to read %s: %m", hwdb_bin_path);
 
         hwdb->map = mmap(0, hwdb->st.st_size, PROT_READ, MAP_SHARED, fileno(hwdb->f), 0);
         if (hwdb->map == MAP_FAILED)
-                return log_debug_errno(errno, "error mapping %s: %m", hwdb_bin_path);
+                return log_debug_errno(errno, "Failed to map %s: %m", hwdb_bin_path);
 
         if (memcmp(hwdb->map, sig, sizeof(hwdb->head->signature)) != 0 ||
-            (size_t)hwdb->st.st_size != le64toh(hwdb->head->file_size)) {
-                log_debug("error recognizing the format of %s", hwdb_bin_path);
+            (size_t) hwdb->st.st_size != le64toh(hwdb->head->file_size)) {
+                log_debug("Failed to recognize the format of %s", hwdb_bin_path);
                 return -EINVAL;
         }
 
@@ -346,32 +355,22 @@ _public_ int sd_hwdb_new(sd_hwdb **ret) {
         log_debug("strings           %8"PRIu64" bytes", le64toh(hwdb->head->strings_len));
         log_debug("nodes             %8"PRIu64" bytes", le64toh(hwdb->head->nodes_len));
 
-        *ret = hwdb;
-        hwdb = NULL;
+        *ret = TAKE_PTR(hwdb);
 
         return 0;
 }
 
-_public_ sd_hwdb *sd_hwdb_ref(sd_hwdb *hwdb) {
-        assert_return(hwdb, NULL);
+static sd_hwdb *hwdb_free(sd_hwdb *hwdb) {
+        assert(hwdb);
 
-        assert_se(REFCNT_INC(hwdb->n_ref) >= 2);
-
-        return hwdb;
+        if (hwdb->map)
+                munmap((void *)hwdb->map, hwdb->st.st_size);
+        safe_fclose(hwdb->f);
+        ordered_hashmap_free(hwdb->properties);
+        return mfree(hwdb);
 }
 
-_public_ sd_hwdb *sd_hwdb_unref(sd_hwdb *hwdb) {
-        if (hwdb && REFCNT_DEC(hwdb->n_ref) == 0) {
-                if (hwdb->map)
-                        munmap((void *)hwdb->map, hwdb->st.st_size);
-                safe_fclose(hwdb->f);
-                free(hwdb->modalias);
-                ordered_hashmap_free(hwdb->properties);
-                free(hwdb);
-        }
-
-        return NULL;
-}
+DEFINE_PUBLIC_ATOMIC_REF_UNREF_FUNC(sd_hwdb, sd_hwdb, hwdb_free)
 
 bool hwdb_validate(sd_hwdb *hwdb) {
         bool found = false;
@@ -399,32 +398,13 @@ bool hwdb_validate(sd_hwdb *hwdb) {
 }
 
 static int properties_prepare(sd_hwdb *hwdb, const char *modalias) {
-        _cleanup_free_ char *mod = NULL;
-        int r;
-
         assert(hwdb);
         assert(modalias);
 
-        if (streq_ptr(modalias, hwdb->modalias))
-                return 0;
-
-        mod = strdup(modalias);
-        if (!mod)
-                return -ENOMEM;
-
         ordered_hashmap_clear(hwdb->properties);
-
         hwdb->properties_modified = true;
 
-        r = trie_search_f(hwdb, modalias);
-        if (r < 0)
-                return r;
-
-        free(hwdb->modalias);
-        hwdb->modalias = mod;
-        mod = NULL;
-
-        return 0;
+        return trie_search_f(hwdb, modalias);
 }
 
 _public_ int sd_hwdb_get(sd_hwdb *hwdb, const char *modalias, const char *key, const char **_value) {

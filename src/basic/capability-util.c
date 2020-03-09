@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <grp.h>
@@ -30,6 +13,7 @@
 #include "fileio.h"
 #include "log.h"
 #include "macro.h"
+#include "missing_prctl.h"
 #include "parse-util.h"
 #include "user-util.h"
 #include "util.h"
@@ -151,7 +135,7 @@ int capability_ambient_set_apply(uint64_t set, bool also_inherit) {
 }
 
 int capability_bounding_set_drop(uint64_t keep, bool right_now) {
-        _cleanup_cap_free_ cap_t after_cap = NULL;
+        _cleanup_cap_free_ cap_t before_cap = NULL, after_cap = NULL;
         cap_flag_value_t fv;
         unsigned long i;
         int r;
@@ -161,62 +145,68 @@ int capability_bounding_set_drop(uint64_t keep, bool right_now) {
          * executing init!), so get it back temporarily so that we can
          * call PR_CAPBSET_DROP. */
 
-        after_cap = cap_get_proc();
-        if (!after_cap)
+        before_cap = cap_get_proc();
+        if (!before_cap)
                 return -errno;
 
-        if (cap_get_flag(after_cap, CAP_SETPCAP, CAP_EFFECTIVE, &fv) < 0)
+        if (cap_get_flag(before_cap, CAP_SETPCAP, CAP_EFFECTIVE, &fv) < 0)
                 return -errno;
 
         if (fv != CAP_SET) {
                 _cleanup_cap_free_ cap_t temp_cap = NULL;
                 static const cap_value_t v = CAP_SETPCAP;
 
-                temp_cap = cap_dup(after_cap);
-                if (!temp_cap) {
-                        r = -errno;
-                        goto finish;
-                }
+                temp_cap = cap_dup(before_cap);
+                if (!temp_cap)
+                        return -errno;
 
-                if (cap_set_flag(temp_cap, CAP_EFFECTIVE, 1, &v, CAP_SET) < 0) {
-                        r = -errno;
-                        goto finish;
-                }
+                if (cap_set_flag(temp_cap, CAP_EFFECTIVE, 1, &v, CAP_SET) < 0)
+                        return -errno;
 
-                if (cap_set_proc(temp_cap) < 0) {
-                        r = -errno;
-                        goto finish;
-                }
+                if (cap_set_proc(temp_cap) < 0)
+                        log_debug_errno(errno, "Can't acquire effective CAP_SETPCAP bit, ignoring: %m");
+
+                /* If we didn't manage to acquire the CAP_SETPCAP bit, we continue anyway, after all this just means
+                 * we'll fail later, when we actually intend to drop some capabilities. */
         }
 
+        after_cap = cap_dup(before_cap);
+        if (!after_cap)
+                return -errno;
+
         for (i = 0; i <= cap_last_cap(); i++) {
+                cap_value_t v;
 
-                if (!(keep & (UINT64_C(1) << i))) {
-                        cap_value_t v;
+                if ((keep & (UINT64_C(1) << i)))
+                        continue;
 
-                        /* Drop it from the bounding set */
-                        if (prctl(PR_CAPBSET_DROP, i) < 0) {
+                /* Drop it from the bounding set */
+                if (prctl(PR_CAPBSET_DROP, i) < 0) {
+                        r = -errno;
+
+                        /* If dropping the capability failed, let's see if we didn't have it in the first place. If so,
+                         * continue anyway, as dropping a capability we didn't have in the first place doesn't really
+                         * matter anyway. */
+                        if (prctl(PR_CAPBSET_READ, i) != 0)
+                                goto finish;
+                }
+                v = (cap_value_t) i;
+
+                /* Also drop it from the inheritable set, so
+                 * that anything we exec() loses the
+                 * capability for good. */
+                if (cap_set_flag(after_cap, CAP_INHERITABLE, 1, &v, CAP_CLEAR) < 0) {
+                        r = -errno;
+                        goto finish;
+                }
+
+                /* If we shall apply this right now drop it
+                 * also from our own capability sets. */
+                if (right_now) {
+                        if (cap_set_flag(after_cap, CAP_PERMITTED, 1, &v, CAP_CLEAR) < 0 ||
+                            cap_set_flag(after_cap, CAP_EFFECTIVE, 1, &v, CAP_CLEAR) < 0) {
                                 r = -errno;
                                 goto finish;
-                        }
-                        v = (cap_value_t) i;
-
-                        /* Also drop it from the inheritable set, so
-                         * that anything we exec() loses the
-                         * capability for good. */
-                        if (cap_set_flag(after_cap, CAP_INHERITABLE, 1, &v, CAP_CLEAR) < 0) {
-                                r = -errno;
-                                goto finish;
-                        }
-
-                        /* If we shall apply this right now drop it
-                         * also from our own capability sets. */
-                        if (right_now) {
-                                if (cap_set_flag(after_cap, CAP_PERMITTED, 1, &v, CAP_CLEAR) < 0 ||
-                                    cap_set_flag(after_cap, CAP_EFFECTIVE, 1, &v, CAP_CLEAR) < 0) {
-                                        r = -errno;
-                                        goto finish;
-                                }
                         }
                 }
         }
@@ -224,17 +214,20 @@ int capability_bounding_set_drop(uint64_t keep, bool right_now) {
         r = 0;
 
 finish:
-        if (cap_set_proc(after_cap) < 0)
-                return -errno;
+        if (cap_set_proc(after_cap) < 0) {
+                /* If there are no actual changes anyway then let's ignore this error. */
+                if (cap_compare(before_cap, after_cap) != 0)
+                        r = -errno;
+        }
 
         return r;
 }
 
 static int drop_from_file(const char *fn, uint64_t keep) {
-        int r, k;
-        uint32_t hi, lo;
+        _cleanup_free_ char *p = NULL;
         uint64_t current, after;
-        char *p;
+        uint32_t hi, lo;
+        int r, k;
 
         r = read_one_line_file(fn, &p);
         if (r < 0)
@@ -244,8 +237,6 @@ static int drop_from_file(const char *fn, uint64_t keep) {
         assert_cc(sizeof(lo) == sizeof(unsigned));
 
         k = sscanf(p, "%u %u", &lo, &hi);
-        free(p);
-
         if (k != 2)
                 return -EIO;
 
@@ -258,13 +249,7 @@ static int drop_from_file(const char *fn, uint64_t keep) {
         lo = (unsigned) (after & 0xFFFFFFFFULL);
         hi = (unsigned) ((after >> 32ULL) & 0xFFFFFFFFULL);
 
-        if (asprintf(&p, "%u %u", lo, hi) < 0)
-                return -ENOMEM;
-
-        r = write_string_file(fn, p, WRITE_STRING_FILE_CREATE);
-        free(p);
-
-        return r;
+        return write_string_filef(fn, WRITE_STRING_FILE_CREATE, "%u %u", lo, hi);
 }
 
 int capability_bounding_set_drop_usermode(uint64_t keep) {
@@ -304,8 +289,7 @@ int drop_privileges(uid_t uid, gid_t gid, uint64_t keep_capabilities) {
         if (prctl(PR_SET_KEEPCAPS, 1) < 0)
                 return log_error_errno(errno, "Failed to enable keep capabilities flag: %m");
 
-        r = setresuid(uid, uid, uid);
-        if (r < 0)
+        if (setresuid(uid, uid, uid) < 0)
                 return log_error_errno(errno, "Failed to change user ID: %m");
 
         if (prctl(PR_SET_KEEPCAPS, 0) < 0)
@@ -358,6 +342,146 @@ int drop_capability(cap_value_t cv) {
 
         if (cap_set_proc(tmp_cap) < 0)
                 return -errno;
+
+        return 0;
+}
+
+bool ambient_capabilities_supported(void) {
+        static int cache = -1;
+
+        if (cache >= 0)
+                return cache;
+
+        /* If PR_CAP_AMBIENT returns something valid, or an unexpected error code we assume that ambient caps are
+         * available. */
+
+        cache = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_KILL, 0, 0) >= 0 ||
+                !IN_SET(errno, EINVAL, EOPNOTSUPP, ENOSYS);
+
+        return cache;
+}
+
+int capability_quintet_enforce(const CapabilityQuintet *q) {
+        _cleanup_cap_free_ cap_t c = NULL;
+        int r;
+
+        if (q->ambient != (uint64_t) -1) {
+                unsigned long i;
+                bool changed = false;
+
+                c = cap_get_proc();
+                if (!c)
+                        return -errno;
+
+                /* In order to raise the ambient caps set we first need to raise the matching inheritable + permitted
+                 * cap */
+                for (i = 0; i <= cap_last_cap(); i++) {
+                        uint64_t m = UINT64_C(1) << i;
+                        cap_value_t cv = (cap_value_t) i;
+                        cap_flag_value_t old_value_inheritable, old_value_permitted;
+
+                        if ((q->ambient & m) == 0)
+                                continue;
+
+                        if (cap_get_flag(c, cv, CAP_INHERITABLE, &old_value_inheritable) < 0)
+                                return -errno;
+                        if (cap_get_flag(c, cv, CAP_PERMITTED, &old_value_permitted) < 0)
+                                return -errno;
+
+                        if (old_value_inheritable == CAP_SET && old_value_permitted == CAP_SET)
+                                continue;
+
+                        if (cap_set_flag(c, CAP_INHERITABLE, 1, &cv, CAP_SET) < 0)
+                                return -errno;
+
+                        if (cap_set_flag(c, CAP_PERMITTED, 1, &cv, CAP_SET) < 0)
+                                return -errno;
+
+                        changed = true;
+                }
+
+                if (changed)
+                        if (cap_set_proc(c) < 0)
+                                return -errno;
+
+                r = capability_ambient_set_apply(q->ambient, false);
+                if (r < 0)
+                        return r;
+        }
+
+        if (q->inheritable != (uint64_t) -1 || q->permitted != (uint64_t) -1 || q->effective != (uint64_t) -1) {
+                bool changed = false;
+                unsigned long i;
+
+                if (!c) {
+                        c = cap_get_proc();
+                        if (!c)
+                                return -errno;
+                }
+
+                for (i = 0; i <= cap_last_cap(); i++) {
+                        uint64_t m = UINT64_C(1) << i;
+                        cap_value_t cv = (cap_value_t) i;
+
+                        if (q->inheritable != (uint64_t) -1) {
+                                cap_flag_value_t old_value, new_value;
+
+                                if (cap_get_flag(c, cv, CAP_INHERITABLE, &old_value) < 0)
+                                        return -errno;
+
+                                new_value = (q->inheritable & m) ? CAP_SET : CAP_CLEAR;
+
+                                if (old_value != new_value) {
+                                        changed = true;
+
+                                        if (cap_set_flag(c, CAP_INHERITABLE, 1, &cv, new_value) < 0)
+                                                return -errno;
+                                }
+                        }
+
+                        if (q->permitted != (uint64_t) -1) {
+                                cap_flag_value_t old_value, new_value;
+
+                                if (cap_get_flag(c, cv, CAP_PERMITTED, &old_value) < 0)
+                                        return -errno;
+
+                                new_value = (q->permitted & m) ? CAP_SET : CAP_CLEAR;
+
+                                if (old_value != new_value) {
+                                        changed = true;
+
+                                        if (cap_set_flag(c, CAP_PERMITTED, 1, &cv, new_value) < 0)
+                                                return -errno;
+                                }
+                        }
+
+                        if (q->effective != (uint64_t) -1) {
+                                cap_flag_value_t old_value, new_value;
+
+                                if (cap_get_flag(c, cv, CAP_EFFECTIVE, &old_value) < 0)
+                                        return -errno;
+
+                                new_value = (q->effective & m) ? CAP_SET : CAP_CLEAR;
+
+                                if (old_value != new_value) {
+                                        changed = true;
+
+                                        if (cap_set_flag(c, CAP_EFFECTIVE, 1, &cv, new_value) < 0)
+                                                return -errno;
+                                }
+                        }
+                }
+
+                if (changed)
+                        if (cap_set_proc(c) < 0)
+                                return -errno;
+        }
+
+        if (q->bounding != (uint64_t) -1) {
+                r = capability_bounding_set_drop(q->bounding, false);
+                if (r < 0)
+                        return r;
+        }
 
         return 0;
 }

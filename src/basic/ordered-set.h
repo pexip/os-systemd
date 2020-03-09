@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include "hashmap.h"
 
@@ -39,13 +21,11 @@ static inline int ordered_set_ensure_allocated(OrderedSet **s, const struct hash
 }
 
 static inline OrderedSet* ordered_set_free(OrderedSet *s) {
-        ordered_hashmap_free((OrderedHashmap*) s);
-        return NULL;
+        return (OrderedSet*) ordered_hashmap_free((OrderedHashmap*) s);
 }
 
 static inline OrderedSet* ordered_set_free_free(OrderedSet *s) {
-        ordered_hashmap_free_free((OrderedHashmap*) s);
-        return NULL;
+        return (OrderedSet*) ordered_hashmap_free_free((OrderedHashmap*) s);
 }
 
 static inline int ordered_set_put(OrderedSet *s, void *p) {
@@ -58,6 +38,14 @@ static inline bool ordered_set_isempty(OrderedSet *s) {
 
 static inline bool ordered_set_iterate(OrderedSet *s, Iterator *i, void **value) {
         return ordered_hashmap_iterate((OrderedHashmap*) s, i, value, NULL);
+}
+
+static inline void* ordered_set_remove(OrderedSet *s, void *p) {
+        return ordered_hashmap_remove((OrderedHashmap*) s, p);
+}
+
+static inline void* ordered_set_steal_first(OrderedSet *s) {
+        return ordered_hashmap_steal_first((OrderedHashmap*) s);
 }
 
 int ordered_set_consume(OrderedSet *s, void *p);

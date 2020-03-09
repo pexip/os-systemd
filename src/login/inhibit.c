@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2012 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -29,7 +12,11 @@
 #include "bus-error.h"
 #include "bus-util.h"
 #include "fd-util.h"
-#include "formats-util.h"
+#include "format-table.h"
+#include "format-util.h"
+#include "main-func.h"
+#include "pager.h"
+#include "pretty-print.h"
 #include "process-util.h"
 #include "signal-util.h"
 #include "strv.h"
@@ -40,6 +27,8 @@ static const char* arg_what = "idle:sleep:shutdown";
 static const char* arg_who = NULL;
 static const char* arg_why = "Unknown reason";
 static const char* arg_mode = NULL;
+static PagerFlags arg_pager_flags = 0;
+static bool arg_legend = true;
 
 static enum {
         ACTION_INHIBIT,
@@ -74,12 +63,13 @@ static int inhibit(sd_bus *bus, sd_bus_error *error) {
         return r;
 }
 
-static int print_inhibitors(sd_bus *bus, sd_bus_error *error) {
+static int print_inhibitors(sd_bus *bus) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        const char *what, *who, *why, *mode;
-        unsigned int uid, pid;
-        unsigned n = 0;
+        _cleanup_(table_unrefp) Table *table = NULL;
         int r;
+
+        (void) pager_open(arg_pager_flags);
 
         r = sd_bus_call_method(
                         bus,
@@ -87,52 +77,93 @@ static int print_inhibitors(sd_bus *bus, sd_bus_error *error) {
                         "/org/freedesktop/login1",
                         "org.freedesktop.login1.Manager",
                         "ListInhibitors",
-                        error,
+                        &error,
                         &reply,
                         "");
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Could not get active inhibitors: %s", bus_error_message(&error, r));
+
+        table = table_new("who", "uid", "user", "pid", "comm", "what", "why", "mode");
+        if (!table)
+                return log_oom();
+
+        /* If there's not enough space, shorten the "WHY" column, as it's little more than an explaining comment. */
+        (void) table_set_weight(table, TABLE_HEADER_CELL(6), 20);
 
         r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "(ssssuu)");
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        while ((r = sd_bus_message_read(reply, "(ssssuu)", &what, &who, &why, &mode, &uid, &pid)) > 0) {
+        for (;;) {
                 _cleanup_free_ char *comm = NULL, *u = NULL;
+                const char *what, *who, *why, *mode;
+                uint32_t uid, pid;
+
+                r = sd_bus_message_read(reply, "(ssssuu)", &what, &who, &why, &mode, &uid, &pid);
+                if (r < 0)
+                        return bus_log_parse_error(r);
+                if (r == 0)
+                        break;
 
                 if (arg_mode && !streq(mode, arg_mode))
                         continue;
 
-                get_process_comm(pid, &comm);
+                (void) get_process_comm(pid, &comm);
                 u = uid_to_name(uid);
 
-                printf("     Who: %s (UID "UID_FMT"/%s, PID "PID_FMT"/%s)\n"
-                       "    What: %s\n"
-                       "     Why: %s\n"
-                       "    Mode: %s\n\n",
-                       who, uid, strna(u), pid, strna(comm),
-                       what,
-                       why,
-                       mode);
-
-                n++;
+                r = table_add_many(table,
+                                   TABLE_STRING, who,
+                                   TABLE_UINT32, uid,
+                                   TABLE_STRING, strna(u),
+                                   TABLE_UINT32, pid,
+                                   TABLE_STRING, strna(comm),
+                                   TABLE_STRING, what,
+                                   TABLE_STRING, why,
+                                   TABLE_STRING, mode);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add table row: %m");
         }
-        if (r < 0)
-                return bus_log_parse_error(r);
 
         r = sd_bus_message_exit_container(reply);
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        printf("%u inhibitors listed.\n", n);
+        if (table_get_rows(table) > 1) {
+                r = table_set_sort(table, (size_t) 1, (size_t) 0, (size_t) 5, (size_t) 6, (size_t) -1);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to sort table: %m");
+
+                table_set_header(table, arg_legend);
+
+                r = table_print(table, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to show table: %m");
+        }
+
+        if (arg_legend) {
+                if (table_get_rows(table) > 1)
+                        printf("\n%zu inhibitors listed.\n", table_get_rows(table) - 1);
+                else
+                        printf("No inhibitors.\n");
+        }
+
         return 0;
 }
 
-static void help(void) {
+static int help(void) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        r = terminal_urlify_man("systemd-inhibit", "1", &link);
+        if (r < 0)
+                return log_oom();
+
         printf("%s [OPTIONS...] {COMMAND} ...\n\n"
                "Execute a process while inhibiting shutdown/sleep/idle.\n\n"
                "  -h --help               Show this help\n"
                "     --version            Show package version\n"
+               "     --no-pager           Do not pipe output into a pager\n"
+               "     --no-legend          Do not show the headers and footers\n"
                "     --what=WHAT          Operations to inhibit, colon separated list of:\n"
                "                          shutdown, sleep, idle, handle-power-key,\n"
                "                          handle-suspend-key, handle-hibernate-key,\n"
@@ -141,7 +172,12 @@ static void help(void) {
                "     --why=STRING         A descriptive string why is being inhibited\n"
                "     --mode=MODE          One of block or delay\n"
                "     --list               List active inhibitors\n"
-               , program_invocation_short_name);
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , link
+        );
+
+        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -153,6 +189,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_WHY,
                 ARG_MODE,
                 ARG_LIST,
+                ARG_NO_PAGER,
+                ARG_NO_LEGEND,
         };
 
         static const struct option options[] = {
@@ -163,6 +201,8 @@ static int parse_argv(int argc, char *argv[]) {
                 { "why",          required_argument, NULL, ARG_WHY          },
                 { "mode",         required_argument, NULL, ARG_MODE         },
                 { "list",         no_argument,       NULL, ARG_LIST         },
+                { "no-pager",     no_argument,       NULL, ARG_NO_PAGER     },
+                { "no-legend",    no_argument,       NULL, ARG_NO_LEGEND       },
                 {}
         };
 
@@ -176,8 +216,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 case 'h':
-                        help();
-                        return 0;
+                        return help();
 
                 case ARG_VERSION:
                         return version();
@@ -202,6 +241,14 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_action = ACTION_LIST;
                         break;
 
+                case ARG_NO_PAGER:
+                        arg_pager_flags |= PAGER_DISABLE;
+                        break;
+
+                case ARG_NO_LEGEND:
+                        arg_legend = false;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -212,16 +259,14 @@ static int parse_argv(int argc, char *argv[]) {
         if (arg_action == ACTION_INHIBIT && optind == argc)
                 arg_action = ACTION_LIST;
 
-        else if (arg_action == ACTION_INHIBIT && optind >= argc) {
-                log_error("Missing command line to execute.");
-                return -EINVAL;
-        }
+        else if (arg_action == ACTION_INHIBIT && optind >= argc)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Missing command line to execute.");
 
         return 1;
 }
 
-int main(int argc, char *argv[]) {
-        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+static int run(int argc, char *argv[]) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
@@ -229,29 +274,24 @@ int main(int argc, char *argv[]) {
         log_open();
 
         r = parse_argv(argc, argv);
-        if (r < 0)
-                return EXIT_FAILURE;
-        if (r == 0)
-                return EXIT_SUCCESS;
+        if (r <= 0)
+                return r;
 
         r = sd_bus_default_system(&bus);
-        if (r < 0) {
-                log_error_errno(r, "Failed to connect to bus: %m");
-                return EXIT_FAILURE;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to connect to bus: %m");
 
-        if (arg_action == ACTION_LIST) {
+        if (arg_action == ACTION_LIST)
+                return print_inhibitors(bus);
 
-                r = print_inhibitors(bus, &error);
-                if (r < 0) {
-                        log_error("Failed to list inhibitors: %s", bus_error_message(&error, -r));
-                        return EXIT_FAILURE;
-                }
-
-        } else {
+        else {
+                _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_close_ int fd = -1;
                 _cleanup_free_ char *w = NULL;
                 pid_t pid;
+
+                /* Ignore SIGINT and allow the forked process to receive it */
+                (void) ignore_signals(SIGINT, -1);
 
                 if (!arg_who)
                         arg_who = w = strv_join(argv + optind, " ");
@@ -260,33 +300,22 @@ int main(int argc, char *argv[]) {
                         arg_mode = "block";
 
                 fd = inhibit(bus, &error);
-                if (fd < 0) {
-                        log_error("Failed to inhibit: %s", bus_error_message(&error, fd));
-                        return EXIT_FAILURE;
-                }
+                if (fd < 0)
+                        return log_error_errno(fd, "Failed to inhibit: %s", bus_error_message(&error, fd));
 
-                pid = fork();
-                if (pid < 0) {
-                        log_error_errno(errno, "Failed to fork: %m");
-                        return EXIT_FAILURE;
-                }
-
-                if (pid == 0) {
+                r = safe_fork("(inhibit)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
+                if (r < 0)
+                        return r;
+                if (r == 0) {
                         /* Child */
-
-                        (void) reset_all_signal_handlers();
-                        (void) reset_signal_mask();
-
-                        close_all_fds(NULL, 0);
-
                         execvp(argv[optind], argv + optind);
+                        log_open();
                         log_error_errno(errno, "Failed to execute %s: %m", argv[optind]);
                         _exit(EXIT_FAILURE);
                 }
 
-                r = wait_for_terminate_and_warn(argv[optind], pid, true);
-                return r < 0 ? EXIT_FAILURE : r;
+                return wait_for_terminate_and_check(argv[optind], pid, WAIT_LOG);
         }
-
-        return 0;
 }
+
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

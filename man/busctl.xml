@@ -1,24 +1,9 @@
-<?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
+<?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
 "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-  This file is part of systemd.
-
-  Copyright 2014 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 
 <refentry id="busctl"
@@ -27,15 +12,6 @@
   <refentryinfo>
     <title>busctl</title>
     <productname>systemd</productname>
-
-    <authorgroup>
-      <author>
-        <contrib>A monkey with a typewriter</contrib>
-        <firstname>Zbigniew</firstname>
-        <surname>Jędrzejewski-Szmek</surname>
-        <email>zbyszek@in.waw.pl</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -145,6 +121,7 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>-q</option></term>
         <term><option>--quiet</option></term>
 
         <listitem>
@@ -163,6 +140,28 @@
           <para>When used with the <command>call</command> or
           <command>get-property</command> command, shows output in a
           more verbose format.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--json=</option><replaceable>MODE</replaceable></term>
+
+        <listitem>
+          <para>When used with the <command>call</command> or <command>get-property</command> command, shows output
+          formatted as JSON. Expects one of <literal>short</literal> (for the shortest possible output without any
+          redundant whitespace or line breaks) or <literal>pretty</literal> (for a pretty version of the same, with
+          indentation and line breaks). Note that transformation from D-Bus marshalling to JSON is done in a loss-less
+          way, which means type information is embedded into the JSON object tree.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-j</option></term>
+
+        <listitem>
+          <para>Equivalent to <option>--json=pretty</option> when invoked interactively from a terminal. Otherwise
+          equivalent to <option>--json=short</option>, in particular when the output is piped to some other
+          program.</para>
         </listitem>
       </varlistentry>
 
@@ -238,6 +237,16 @@
         </listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><option>--watch-bind=</option><replaceable>BOOL</replaceable></term>
+
+        <listitem>
+          <para>Controls whether to wait for the specified <constant>AF_UNIX</constant> bus socket to appear in the
+          file system before connecting to it. Defaults to off. When enabled, the tool will watch the file system until
+          the socket is created and then connect to it.</para>
+        </listitem>
+      </varlistentry>
+
       <xi:include href="user-system-options.xml" xpointer="user" />
       <xi:include href="user-system-options.xml" xpointer="system" />
       <xi:include href="user-system-options.xml" xpointer="host" />
@@ -282,8 +291,9 @@
         <listitem><para>Dump messages being exchanged. If
         <replaceable>SERVICE</replaceable> is specified, show messages
         to or from this peer, identified by its well-known or unique
-        name. Otherwise, show all messages on the bus. Use Ctrl-C to
-        terminate the dump.</para></listitem>
+        name. Otherwise, show all messages on the bus. Use
+        <keycombo><keycap>Ctrl</keycap><keycap>C</keycap></keycombo>
+        to terminate the dump.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -291,11 +301,11 @@
 
         <listitem><para>Similar to <command>monitor</command> but
         writes the output in pcap format (for details, see the <ulink
-        url="http://wiki.wireshark.org/Development/LibpcapFileFormat">Libpcap
-        File Format</ulink> description. Make sure to redirect the
-        output to STDOUT to a file. Tools like
+        url="https://wiki.wireshark.org/Development/LibpcapFileFormat">Libpcap
+        File Format</ulink> description). Make sure to redirect
+        standard output to a file. Tools like
         <citerefentry project='die-net'><refentrytitle>wireshark</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-        may be used to dissect and view the generated
+        may be used to dissect and view the resulting
         files.</para></listitem>
       </varlistentry>
 
@@ -472,7 +482,7 @@ o "/org/freedesktop/systemd1/job/42684"</programlisting>
 
     <para>
       <citerefentry project='dbus'><refentrytitle>dbus-daemon</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <ulink url="http://freedesktop.org/wiki/Software/dbus">D-Bus</ulink>,
+      <ulink url="https://www.freedesktop.org/wiki/Software/dbus">D-Bus</ulink>,
       <citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>machinectl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,

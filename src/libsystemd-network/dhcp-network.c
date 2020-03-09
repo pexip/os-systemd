@@ -1,24 +1,11 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2013 Intel Corporation. All rights reserved.
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
 #include <errno.h>
 #include <net/ethernet.h>
+#include <net/if.h>
 #include <net/if_arp.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,13 +17,15 @@
 #include "dhcp-internal.h"
 #include "fd-util.h"
 #include "socket-util.h"
+#include "unaligned.h"
 
 static int _bind_raw_socket(int ifindex, union sockaddr_union *link,
                             uint32_t xid, const uint8_t *mac_addr,
                             size_t mac_addr_len,
                             const uint8_t *bcast_addr,
                             const struct ether_addr *eth_mac,
-                            uint16_t arp_type, uint8_t dhcp_hlen) {
+                            uint16_t arp_type, uint8_t dhcp_hlen,
+                            uint16_t port) {
         struct sock_filter filter[] = {
                 BPF_STMT(BPF_LD + BPF_W + BPF_LEN, 0),                                 /* A <- packet length */
                 BPF_JUMP(BPF_JMP + BPF_JGE + BPF_K, sizeof(DHCPPacket), 1, 0),         /* packet >= DHCPPacket ? */
@@ -53,7 +42,7 @@ static int _bind_raw_socket(int ifindex, union sockaddr_union *link,
                 BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 0, 1, 0),                          /* A == 0 ? */
                 BPF_STMT(BPF_RET + BPF_K, 0),                                          /* ignore */
                 BPF_STMT(BPF_LD + BPF_H + BPF_ABS, offsetof(DHCPPacket, udp.dest)),    /* A <- UDP destination port */
-                BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, DHCP_PORT_CLIENT, 1, 0),           /* UDP destination port == DHCP client port ? */
+                BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, port, 1, 0),                       /* UDP destination port == DHCP client port ? */
                 BPF_STMT(BPF_RET + BPF_K, 0),                                          /* ignore */
                 BPF_STMT(BPF_LD + BPF_B + BPF_ABS, offsetof(DHCPPacket, dhcp.op)),     /* A <- DHCP op */
                 BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, BOOTREPLY, 1, 0),                  /* op == BOOTREPLY ? */
@@ -67,13 +56,13 @@ static int _bind_raw_socket(int ifindex, union sockaddr_union *link,
                 BPF_STMT(BPF_LD + BPF_W + BPF_ABS, offsetof(DHCPPacket, dhcp.xid)),    /* A <- client identifier */
                 BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, xid, 1, 0),                        /* client identifier == xid ? */
                 BPF_STMT(BPF_RET + BPF_K, 0),                                          /* ignore */
-                BPF_STMT(BPF_LD + BPF_IMM, htobe32(*((unsigned int *) eth_mac))),                     /* A <- 4 bytes of client's MAC */
+                BPF_STMT(BPF_LD + BPF_IMM, unaligned_read_be32(&eth_mac->ether_addr_octet[0])),        /* A <- 4 bytes of client's MAC */
                 BPF_STMT(BPF_MISC + BPF_TAX, 0),                                                       /* X <- A */
                 BPF_STMT(BPF_LD + BPF_W + BPF_ABS, offsetof(DHCPPacket, dhcp.chaddr)),                 /* A <- 4 bytes of MAC from dhcp.chaddr */
                 BPF_STMT(BPF_ALU + BPF_XOR + BPF_X, 0),                                                /* A xor X */
                 BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 0, 1, 0),                                          /* A == 0 ? */
                 BPF_STMT(BPF_RET + BPF_K, 0),                                                          /* ignore */
-                BPF_STMT(BPF_LD + BPF_IMM, htobe16(*((unsigned short *) (((char *) eth_mac) + 4)))),   /* A <- remainder of client's MAC */
+                BPF_STMT(BPF_LD + BPF_IMM, unaligned_read_be16(&eth_mac->ether_addr_octet[4])),        /* A <- remainder of client's MAC */
                 BPF_STMT(BPF_MISC + BPF_TAX, 0),                                                       /* X <- A */
                 BPF_STMT(BPF_LD + BPF_H + BPF_ABS, offsetof(DHCPPacket, dhcp.chaddr) + 4),             /* A <- remainder of MAC from dhcp.chaddr */
                 BPF_STMT(BPF_ALU + BPF_XOR + BPF_X, 0),                                                /* A xor X */
@@ -89,7 +78,7 @@ static int _bind_raw_socket(int ifindex, union sockaddr_union *link,
                 .filter = filter
         };
         _cleanup_close_ int s = -1;
-        int r, on = 1;
+        int r;
 
         assert(ifindex > 0);
         assert(link);
@@ -98,34 +87,34 @@ static int _bind_raw_socket(int ifindex, union sockaddr_union *link,
         if (s < 0)
                 return -errno;
 
-        r = setsockopt(s, SOL_PACKET, PACKET_AUXDATA, &on, sizeof(on));
+        r = setsockopt_int(s, SOL_PACKET, PACKET_AUXDATA, true);
         if (r < 0)
-                return -errno;
+                return r;
 
         r = setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &fprog, sizeof(fprog));
         if (r < 0)
                 return -errno;
 
-        link->ll.sll_family = AF_PACKET;
-        link->ll.sll_protocol = htobe16(ETH_P_IP);
-        link->ll.sll_ifindex = ifindex;
-        link->ll.sll_hatype = htobe16(arp_type);
-        link->ll.sll_halen = mac_addr_len;
+        link->ll = (struct sockaddr_ll) {
+                .sll_family = AF_PACKET,
+                .sll_protocol = htobe16(ETH_P_IP),
+                .sll_ifindex = ifindex,
+                .sll_hatype = htobe16(arp_type),
+                .sll_halen = mac_addr_len,
+        };
         memcpy(link->ll.sll_addr, bcast_addr, mac_addr_len);
 
-        r = bind(s, &link->sa, sizeof(link->ll));
+        r = bind(s, &link->sa, SOCKADDR_LL_LEN(link->ll));
         if (r < 0)
                 return -errno;
 
-        r = s;
-        s = -1;
-
-        return r;
+        return TAKE_FD(s);
 }
 
 int dhcp_network_bind_raw_socket(int ifindex, union sockaddr_union *link,
                                  uint32_t xid, const uint8_t *mac_addr,
-                                 size_t mac_addr_len, uint16_t arp_type) {
+                                 size_t mac_addr_len, uint16_t arp_type,
+                                 uint16_t port) {
         static const uint8_t eth_bcast[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
         /* Default broadcast address for IPoIB */
         static const uint8_t ib_bcast[] = {
@@ -136,8 +125,6 @@ int dhcp_network_bind_raw_socket(int ifindex, union sockaddr_union *link,
         struct ether_addr eth_mac = { { 0, 0, 0, 0, 0, 0 } };
         const uint8_t *bcast_addr = NULL;
         uint8_t dhcp_hlen = 0;
-
-        assert_return(mac_addr_len > 0, -EINVAL);
 
         if (arp_type == ARPHRD_ETHER) {
                 assert_return(mac_addr_len == ETH_ALEN, -EINVAL);
@@ -151,52 +138,60 @@ int dhcp_network_bind_raw_socket(int ifindex, union sockaddr_union *link,
                 return -EINVAL;
 
         return _bind_raw_socket(ifindex, link, xid, mac_addr, mac_addr_len,
-                                bcast_addr, &eth_mac, arp_type, dhcp_hlen);
+                                bcast_addr, &eth_mac, arp_type, dhcp_hlen, port);
 }
 
-int dhcp_network_bind_udp_socket(be32_t address, uint16_t port) {
+int dhcp_network_bind_udp_socket(int ifindex, be32_t address, uint16_t port) {
         union sockaddr_union src = {
                 .in.sin_family = AF_INET,
                 .in.sin_port = htobe16(port),
                 .in.sin_addr.s_addr = address,
         };
         _cleanup_close_ int s = -1;
-        int r, on = 1, tos = IPTOS_CLASS_CS6;
+        char ifname[IF_NAMESIZE] = "";
+        int r;
 
         s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (s < 0)
                 return -errno;
 
-        r = setsockopt(s, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+        r = setsockopt_int(s, IPPROTO_IP, IP_TOS, IPTOS_CLASS_CS6);
         if (r < 0)
-                return -errno;
+                return r;
 
-        r = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        r = setsockopt_int(s, SOL_SOCKET, SO_REUSEADDR, true);
         if (r < 0)
-                return -errno;
+                return r;
+
+        if (ifindex > 0) {
+                if (if_indextoname(ifindex, ifname) == 0)
+                        return -errno;
+
+                r = setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
+                if (r < 0)
+                        return -errno;
+        }
 
         if (address == INADDR_ANY) {
-                r = setsockopt(s, IPPROTO_IP, IP_PKTINFO, &on, sizeof(on));
+                r = setsockopt_int(s, IPPROTO_IP, IP_PKTINFO, true);
                 if (r < 0)
-                        return -errno;
+                        return r;
 
-                r = setsockopt(s, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+                r = setsockopt_int(s, SOL_SOCKET, SO_BROADCAST, true);
                 if (r < 0)
-                        return -errno;
+                        return r;
+
         } else {
-                r = setsockopt(s, IPPROTO_IP, IP_FREEBIND, &on, sizeof(on));
+                r = setsockopt_int(s, IPPROTO_IP, IP_FREEBIND, true);
                 if (r < 0)
-                        return -errno;
+                        return r;
         }
 
         r = bind(s, &src.sa, sizeof(src.in));
         if (r < 0)
                 return -errno;
 
-        r = s;
-        s = -1;
-
-        return r;
+        return TAKE_FD(s);
 }
 
 int dhcp_network_send_raw_socket(int s, const union sockaddr_union *link,
@@ -207,7 +202,7 @@ int dhcp_network_send_raw_socket(int s, const union sockaddr_union *link,
         assert(packet);
         assert(len);
 
-        r = sendto(s, packet, len, 0, &link->sa, sizeof(link->ll));
+        r = sendto(s, packet, len, 0, &link->sa, SOCKADDR_LL_LEN(link->ll));
         if (r < 0)
                 return -errno;
 

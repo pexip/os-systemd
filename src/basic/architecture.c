@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <sys/utsname.h>
 
@@ -123,7 +106,8 @@ int uname_architecture(void) {
                 { "crisv32",    ARCHITECTURE_CRIS     },
 #elif defined(__nios2__)
                 { "nios2",      ARCHITECTURE_NIOS2    },
-#elif defined(__riscv__)
+#elif defined(__riscv__) || defined(__riscv)
+        /* __riscv__ is obsolete, remove in 2018 */
                 { "riscv32",    ARCHITECTURE_RISCV32  },
                 { "riscv64",    ARCHITECTURE_RISCV64  },
 #  if __SIZEOF_POINTER__ == 4
@@ -131,6 +115,9 @@ int uname_architecture(void) {
 #  elif __SIZEOF_POINTER__ == 8
                 { "riscv",      ARCHITECTURE_RISCV64  },
 #  endif
+#elif defined(__arc__)
+                { "arc",        ARCHITECTURE_ARC      },
+                { "arceb",      ARCHITECTURE_ARC_BE   },
 #else
 #error "Please register your architecture here!"
 #endif
@@ -184,6 +171,8 @@ static const char *const architecture_table[_ARCHITECTURE_MAX] = {
         [ARCHITECTURE_NIOS2] = "nios2",
         [ARCHITECTURE_RISCV32] = "riscv32",
         [ARCHITECTURE_RISCV64] = "riscv64",
+        [ARCHITECTURE_ARC] = "arc",
+        [ARCHITECTURE_ARC_BE] = "arc-be",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(architecture, int);

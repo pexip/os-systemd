@@ -1,30 +1,14 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
 
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
+#include "json.h"
 #include "macro.h"
 
 typedef enum OutputMode {
         OUTPUT_SHORT,
         OUTPUT_SHORT_FULL,
         OUTPUT_SHORT_ISO,
+        OUTPUT_SHORT_ISO_PRECISE,
         OUTPUT_SHORT_PRECISE,
         OUTPUT_SHORT_MONOTONIC,
         OUTPUT_SHORT_UNIX,
@@ -33,10 +17,16 @@ typedef enum OutputMode {
         OUTPUT_JSON,
         OUTPUT_JSON_PRETTY,
         OUTPUT_JSON_SSE,
+        OUTPUT_JSON_SEQ,
         OUTPUT_CAT,
+        OUTPUT_WITH_UNIT,
         _OUTPUT_MODE_MAX,
         _OUTPUT_MODE_INVALID = -1
 } OutputMode;
+
+static inline bool OUTPUT_MODE_IS_JSON(OutputMode m) {
+        return IN_SET(m, OUTPUT_JSON, OUTPUT_JSON_PRETTY, OUTPUT_JSON_SSE, OUTPUT_JSON_SEQ);
+}
 
 /* The output flags definitions are shared by the logs and process tree output. Some apply to both, some only to the
  * logs output, others only to the process tree output. */
@@ -53,6 +43,8 @@ typedef enum OutputFlags {
         OUTPUT_KERNEL_THREADS = 1 << 8,
         OUTPUT_NO_HOSTNAME    = 1 << 9,
 } OutputFlags;
+
+JsonFormatFlags output_mode_to_json_format_flags(OutputMode m);
 
 const char* output_mode_to_string(OutputMode m) _const_;
 OutputMode output_mode_from_string(const char *s) _pure_;

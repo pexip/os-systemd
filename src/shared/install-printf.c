@@ -1,28 +1,11 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
-#include "formats-util.h"
+#include "format-util.h"
 #include "install-printf.h"
 #include "install.h"
 #include "macro.h"
@@ -31,7 +14,7 @@
 #include "unit-name.h"
 #include "user-util.h"
 
-static int specifier_prefix_and_instance(char specifier, void *data, void *userdata, char **ret) {
+static int specifier_prefix_and_instance(char specifier, const void *data, const void *userdata, char **ret) {
         const UnitFileInstallInfo *i = userdata;
         _cleanup_free_ char *prefix = NULL;
         int r;
@@ -45,19 +28,17 @@ static int specifier_prefix_and_instance(char specifier, void *data, void *userd
         if (endswith(prefix, "@") && i->default_instance) {
                 char *ans;
 
-                ans = strjoin(prefix, i->default_instance, NULL);
+                ans = strjoin(prefix, i->default_instance);
                 if (!ans)
                         return -ENOMEM;
                 *ret = ans;
-        } else {
-                *ret = prefix;
-                prefix = NULL;
-        }
+        } else
+                *ret = TAKE_PTR(prefix);
 
         return 0;
 }
 
-static int specifier_name(char specifier, void *data, void *userdata, char **ret) {
+static int specifier_name(char specifier, const void *data, const void *userdata, char **ret) {
         const UnitFileInstallInfo *i = userdata;
         char *ans;
 
@@ -73,7 +54,7 @@ static int specifier_name(char specifier, void *data, void *userdata, char **ret
         return 0;
 }
 
-static int specifier_prefix(char specifier, void *data, void *userdata, char **ret) {
+static int specifier_prefix(char specifier, const void *data, const void *userdata, char **ret) {
         const UnitFileInstallInfo *i = userdata;
 
         assert(i);
@@ -81,7 +62,7 @@ static int specifier_prefix(char specifier, void *data, void *userdata, char **r
         return unit_name_to_prefix(i->name, ret);
 }
 
-static int specifier_instance(char specifier, void *data, void *userdata, char **ret) {
+static int specifier_instance(char specifier, const void *data, const void *userdata, char **ret) {
         const UnitFileInstallInfo *i = userdata;
         char *instance;
         int r;
@@ -93,45 +74,37 @@ static int specifier_instance(char specifier, void *data, void *userdata, char *
                 return r;
 
         if (isempty(instance)) {
-                instance = strdup(i->default_instance ?: "");
-                if (!instance)
-                        return -ENOMEM;
+                r = free_and_strdup(&instance, strempty(i->default_instance));
+                if (r < 0)
+                        return r;
         }
 
         *ret = instance;
         return 0;
 }
 
-static int specifier_user_name(char specifier, void *data, void *userdata, char **ret) {
-        char *t;
+static int specifier_last_component(char specifier, const void *data, const void *userdata, char **ret) {
+        _cleanup_free_ char *prefix = NULL;
+        char *dash;
+        int r;
 
-        /* If we are UID 0 (root), this will not result in NSS,
-         * otherwise it might. This is good, as we want to be able to
-         * run this in PID 1, where our user ID is 0, but where NSS
-         * lookups are not allowed.
+        r = specifier_prefix(specifier, data, userdata, &prefix);
+        if (r < 0)
+                return r;
 
-         * We don't user getusername_malloc() here, because we don't want to look
-         * at $USER, to remain consistent with specifer_user_id() below.
-         */
-
-        t = uid_to_name(getuid());
-        if (!t)
-                return -ENOMEM;
-
-        *ret = t;
-        return 0;
-}
-
-static int specifier_user_id(char specifier, void *data, void *userdata, char **ret) {
-
-        if (asprintf(ret, UID_FMT, getuid()) < 0)
-                return -ENOMEM;
+        dash = strrchr(prefix, '-');
+        if (dash) {
+                dash = strdup(dash + 1);
+                if (!dash)
+                        return -ENOMEM;
+                *ret = dash;
+        } else
+                *ret = TAKE_PTR(prefix);
 
         return 0;
 }
 
-int install_full_printf(UnitFileInstallInfo *i, const char *format, char **ret) {
-
+int install_full_printf(const UnitFileInstallInfo *i, const char *format, char **ret) {
         /* This is similar to unit_full_printf() but does not support
          * anything path-related.
          *
@@ -153,7 +126,10 @@ int install_full_printf(UnitFileInstallInfo *i, const char *format, char **ret) 
                 { 'N', specifier_prefix_and_instance, NULL },
                 { 'p', specifier_prefix,              NULL },
                 { 'i', specifier_instance,            NULL },
+                { 'j', specifier_last_component,      NULL },
 
+                { 'g', specifier_group_name,          NULL },
+                { 'G', specifier_group_id,            NULL },
                 { 'U', specifier_user_id,             NULL },
                 { 'u', specifier_user_name,           NULL },
 

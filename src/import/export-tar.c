@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "sd-daemon.h"
 
@@ -23,11 +6,11 @@
 #include "btrfs-util.h"
 #include "export-tar.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "import-common.h"
 #include "process-util.h"
 #include "ratelimit.h"
 #include "string-util.h"
+#include "tmpfile-util.h"
 #include "util.h"
 
 #define COPY_BUFFER_SIZE (16*1024)
@@ -105,17 +88,20 @@ int tar_export_new(
 
         assert(ret);
 
-        e = new0(TarExport, 1);
+        e = new(TarExport, 1);
         if (!e)
                 return -ENOMEM;
 
-        e->output_fd = e->tar_fd = -1;
-        e->on_finished = on_finished;
-        e->userdata = userdata;
-        e->quota_referenced = (uint64_t) -1;
+        *e = (TarExport) {
+                .output_fd = -1,
+                .tar_fd = -1,
+                .on_finished = on_finished,
+                .userdata = userdata,
+                .quota_referenced = (uint64_t) -1,
+                .last_percent = (unsigned) -1,
+        };
 
         RATELIMIT_INIT(e->progress_rate_limit, 100 * USEC_PER_MSEC, 1);
-        e->last_percent = (unsigned) -1;
 
         if (event)
                 e->event = sd_event_ref(event);
@@ -125,8 +111,7 @@ int tar_export_new(
                         return r;
         }
 
-        *ret = e;
-        e = NULL;
+        *ret = TAKE_PTR(e);
 
         return 0;
 }
@@ -147,13 +132,33 @@ static void tar_export_report_progress(TarExport *e) {
         if (percent == e->last_percent)
                 return;
 
-        if (!ratelimit_test(&e->progress_rate_limit))
+        if (!ratelimit_below(&e->progress_rate_limit))
                 return;
 
         sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
         log_info("Exported %u%%.", percent);
 
         e->last_percent = percent;
+}
+
+static int tar_export_finish(TarExport *e) {
+        int r;
+
+        assert(e);
+        assert(e->tar_fd >= 0);
+
+        if (e->tar_pid > 0) {
+                r = wait_for_terminate_and_check("tar", e->tar_pid, WAIT_LOG);
+                e->tar_pid = 0;
+                if (r < 0)
+                        return r;
+                if (r != EXIT_SUCCESS)
+                        return -EPROTO;
+        }
+
+        e->tar_fd = safe_close(e->tar_fd);
+
+        return 0;
 }
 
 static int tar_export_process(TarExport *e) {
@@ -171,7 +176,7 @@ static int tar_export_process(TarExport *e) {
 
                         e->tried_splice = true;
                 } else if (l == 0) {
-                        r = 0;
+                        r = tar_export_finish(e);
                         goto finish;
                 } else {
                         e->written_uncompressed += l;
@@ -187,7 +192,7 @@ static int tar_export_process(TarExport *e) {
                 uint8_t input[COPY_BUFFER_SIZE];
 
                 if (e->eof) {
-                        r = 0;
+                        r = tar_export_finish(e);
                         goto finish;
                 }
 

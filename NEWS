@@ -1,6 +1,2420 @@
 systemd System and Service Manager
 
+CHANGES WITH 241:
+
+        * The default locale can now be configured at compile time. Otherwise,
+          a suitable default will be selected automatically (one of C.UTF-8,
+          en_US.UTF-8, and C).
+
+        * The version string shown by systemd and other tools now includes the
+          git commit hash when built from git. An override may be specified
+          during compilation, which is intended to be used by distributions to
+          include the package release information.
+
+        * systemd-cat can now filter standard input and standard error streams
+          for different syslog priorities using the new --stderr-priority=
+          option.
+
+        * systemd-journald and systemd-journal-remote reject entries which
+          contain too many fields (CVE-2018-16865) and set limits on the
+          process' command line length (CVE-2018-16864).
+
+        * $DBUS_SESSION_BUS_ADDRESS environment variable is set by pam_systemd
+          again.
+
+        * A new network device NamePolicy "keep" is implemented for link files,
+          and used by default in 99-default.link (the fallback configuration
+          provided by systemd). With this policy, if the network device name
+          was already set by userspace, the device will not be renamed again.
+          This matches the naming scheme that was implemented before
+          systemd-240. If naming-scheme < 240 is specified, the "keep" policy
+          is also enabled by default, even if not specified. Effectively, this
+          means that if naming-scheme >= 240 is specified, network devices will
+          be renamed according to the configuration, even if they have been
+          renamed already, if "keep" is not specified as the naming policy in
+          the .link file. The 99-default.link file provided by systemd includes
+          "keep" for backwards compatibility, but it is recommended for user
+          installed .link files to *not* include it.
+
+          The "kernel" policy, which keeps kernel names declared to be
+          "persistent", now works again as documented.
+
+        * kernel-install script now optionally takes the paths to one or more
+          initrd files, and passes them to all plugins.
+
+        * The mincore() system call has been dropped from the @system-service
+          system call filter group, as it is pretty exotic and may potentially
+          used for side-channel attacks.
+
+        * -fPIE is dropped from compiler and linker options. Please specify
+          -Db_pie=true option to meson to build position-independent
+          executables. Note that the meson option is supported since meson-0.49.
+
+        * The fs.protected_regular and fs.protected_fifos sysctls, which were
+          added in Linux 4.19 to make some data spoofing attacks harder, are
+          now enabled by default. While this will hopefully improve the
+          security of most installations, it is technically a backwards
+          incompatible change; to disable these sysctls again, place the
+          following lines in /etc/sysctl.d/60-protected.conf or a similar file:
+
+              fs.protected_regular = 0
+              fs.protected_fifos = 0
+
+          Note that the similar hardlink and symlink protection has been
+          enabled since v199, and may be disabled likewise.
+
+        * The files read from the EnvironmentFile= setting in unit files now
+          parse backslashes inside quotes literally, matching the behaviour of
+          POSIX shells.
+
+        * udevadm trigger, udevadm control, udevadm settle and udevadm monitor
+          now automatically become NOPs when run in a chroot() environment.
+
+        * The tmpfiles.d/ "C" line type will now copy directory trees not only
+          when the destination is so far missing, but also if it already exists
+          as a directory and is empty. This is useful to cater for systems
+          where directory trees are put together from multiple separate mount
+          points but otherwise empty.
+
+        * A new function sd_bus_close_unref() (and the associated
+          sd_bus_close_unrefp()) has been added to libsystemd, that combines
+          sd_bus_close() and sd_bus_unref() in one.
+
+        * udevadm control learnt a new option for --ping for testing whether a
+          systemd-udevd instance is running and reacting.
+
+        Contributions from: Aaron Plattner, Alberts Muktupāvels, Alex Mayer,
+        Ayman Bagabas, Beniamino Galvani, Burt P, Chris Down, Chris Lamb, Chris
+        Morin, Christian Hesse, Claudius Ellsel, dana, Daniel Axtens, Daniele
+        Medri, Dave Reisner, David Santamaría Rogado, Diego Canuhe, Dimitri
+        John Ledkov, Evgeny Vereshchagin, Fabrice Fontaine, Filipe
+        Brandenburger, Franck Bui, Frantisek Sumsal, govwin, Hans de Goede,
+        James Hilliard, Jan Engelhardt, Jani Uusitalo, Jan Janssen, Jan
+        Synacek, Jonathan McDowell, Jonathan Roemer, Jonathon Kowalski, Joost
+        Heitbrink, Jörg Thalheim, Lance, Lennart Poettering, Louis Taylor,
+        Lucas Werkmeister, Mantas Mikulėnas, Marc-Antoine Perennou,
+        marvelousblack, Michael Biebl, Michael Sloan, Michal Sekletar, Mike
+        Auty, Mike Gilbert, Mikhail Kasimov, Neil Brown, Niklas Hambüchen,
+        Patrick Williams, Paul Seyfert, Peter Hutterer, Philip Withnall, Roger
+        James, Ronnie P. Thomas, Ryan Gonzalez, Sam Morris, Stephan Edel,
+        Stephan Gerhold, Susant Sahani, Taro Yamada, Thomas Haller, Topi
+        Miettinen, YiFei Zhu, YmrDtnJu, YunQiang Su, Yu Watanabe, Zbigniew
+        Jędrzejewski-Szmek, zsergeant77, Дамјан Георгиевски
+
+        — Berlin, 2018-02-14
+
+CHANGES WITH 240:
+
+        * NoNewPrivileges=yes has been set for all long-running services
+          implemented by systemd. Previously, this was problematic due to
+          SELinux (as this would also prohibit the transition from PID1's label
+          to the service's label). This restriction has since been lifted, but
+          an SELinux policy update is required.
+          (See e.g. https://github.com/fedora-selinux/selinux-policy/pull/234.)
+
+        * DynamicUser=yes is dropped from systemd-networkd.service,
+          systemd-resolved.service and systemd-timesyncd.service, which was
+          enabled in v239 for systemd-networkd.service and systemd-resolved.service,
+          and since v236 for systemd-timesyncd.service. The users and groups
+          systemd-network, systemd-resolve and systemd-timesync are created
+          by systemd-sysusers again. Distributors or system administrators
+          may need to create these users and groups if they not exist (or need
+          to re-enable DynamicUser= for those units) while upgrading systemd.
+          Also, the clock file for systemd-timesyncd may need to move from
+          /var/lib/private/systemd/timesync/clock to /var/lib/systemd/timesync/clock.
+
+        * When unit files are loaded from disk, previously systemd would
+          sometimes (depending on the unit loading order) load units from the
+          target path of symlinks in .wants/ or .requires/ directories of other
+          units. This meant that unit could be loaded from different paths
+          depending on whether the unit was requested explicitly or as a
+          dependency of another unit, not honouring the priority of directories
+          in search path. It also meant that it was possible to successfully
+          load and start units which are not found in the unit search path, as
+          long as they were requested as a dependency and linked to from
+          .wants/ or .requires/. The target paths of those symlinks are not
+          used for loading units anymore and the unit file must be found in
+          the search path.
+
+        * A new service type has been added: Type=exec. It's very similar to
+          Type=simple but ensures the service manager will wait for both fork()
+          and execve() of the main service binary to complete before proceeding
+          with follow-up units. This is primarily useful so that the manager
+          propagates any errors in the preparation phase of service execution
+          back to the job that requested the unit to be started. For example,
+          consider a service that has ExecStart= set to a file system binary
+          that doesn't exist. With Type=simple starting the unit would be
+          considered instantly successful, as only fork() has to complete
+          successfully and the manager does not wait for execve(), and hence
+          its failure is seen "too late". With the new Type=exec service type
+          starting the unit will fail, as the manager will wait for the
+          execve() and notice its failure, which is then propagated back to the
+          start job.
+
+          NOTE: with the next release 241 of systemd we intend to change the
+          systemd-run tool to default to Type=exec for transient services
+          started by it. This should be mostly safe, but in specific corner
+          cases might result in problems, as the systemd-run tool will then
+          block on NSS calls (such as user name look-ups due to User=) done
+          between the fork() and execve(), which under specific circumstances
+          might cause problems. It is recommended to specify "-p Type=simple"
+          explicitly in the few cases where this applies. For regular,
+          non-transient services (i.e. those defined with unit files on disk)
+          we will continue to default to Type=simple.
+
+        * The Linux kernel's current default RLIMIT_NOFILE resource limit for
+          userspace processes is set to 1024 (soft) and 4096
+          (hard). Previously, systemd passed this on unmodified to all
+          processes it forked off. With this systemd release the hard limit
+          systemd passes on is increased to 512K, overriding the kernel's
+          defaults and substantially increasing the number of simultaneous file
+          descriptors unprivileged userspace processes can allocate. Note that
+          the soft limit remains at 1024 for compatibility reasons: the
+          traditional UNIX select() call cannot deal with file descriptors >=
+          1024 and increasing the soft limit globally might thus result in
+          programs unexpectedly allocating a high file descriptor and thus
+          failing abnormally when attempting to use it with select() (of
+          course, programs shouldn't use select() anymore, and prefer
+          poll()/epoll, but the call unfortunately remains undeservedly popular
+          at this time). This change reflects the fact that file descriptor
+          handling in the Linux kernel has been optimized in more recent
+          kernels and allocating large numbers of them should be much cheaper
+          both in memory and in performance than it used to be. Programs that
+          want to take benefit of the increased limit have to "opt-in" into
+          high file descriptors explicitly by raising their soft limit. Of
+          course, when they do that they must acknowledge that they cannot use
+          select() anymore (and neither can any shared library they use — or
+          any shared library used by any shared library they use and so on).
+          Which default hard limit is most appropriate is of course hard to
+          decide. However, given reports that ~300K file descriptors are used
+          in real-life applications we believe 512K is sufficiently high as new
+          default for now. Note that there are also reports that using very
+          high hard limits (e.g. 1G) is problematic: some software allocates
+          large arrays with one element for each potential file descriptor
+          (Java, …) — a high hard limit thus triggers excessively large memory
+          allocations in these applications. Hopefully, the new default of 512K
+          is a good middle ground: higher than what real-life applications
+          currently need, and low enough for avoid triggering excessively large
+          allocations in problematic software. (And yes, somebody should fix
+          Java.)
+
+        * The fs.nr_open and fs.file-max sysctls are now automatically bumped
+          to the highest possible values, as separate accounting of file
+          descriptors is no longer necessary, as memcg tracks them correctly as
+          part of the memory accounting anyway. Thus, from the four limits on
+          file descriptors currently enforced (fs.file-max, fs.nr_open,
+          RLIMIT_NOFILE hard, RLIMIT_NOFILE soft) we turn off the first two,
+          and keep only the latter two. A set of build-time options
+          (-Dbump-proc-sys-fs-file-max=false and -Dbump-proc-sys-fs-nr-open=false)
+          has been added to revert this change in behaviour, which might be
+          an option for systems that turn off memcg in the kernel.
+
+        * When no /etc/locale.conf file exists (and hence no locale settings
+          are in place), systemd will now use the "C.UTF-8" locale by default,
+          and set LANG= to it. This locale is supported by various
+          distributions including Fedora, with clear indications that upstream
+          glibc is going to make it available too. This locale enables UTF-8
+          mode by default, which appears appropriate for 2018.
+
+        * The "net.ipv4.conf.all.rp_filter" sysctl will now be set to 2 by
+          default. This effectively switches the RFC3704 Reverse Path filtering
+          from Strict mode to Loose mode. This is more appropriate for hosts
+          that have multiple links with routes to the same networks (e.g.
+          a client with a Wi-Fi and Ethernet both connected to the internet).
+
+          Consult the kernel documentation for details on this sysctl:
+          https://www.kernel.org/doc/Documentation/networking/ip-sysctl.txt
+
+        * CPUAccounting=yes no longer enables the CPU controller when using
+          kernel 4.15+ and the unified cgroup hierarchy, as required accounting
+          statistics are now provided independently from the CPU controller.
+
+        * Support for disabling a particular cgroup controller within a sub-tree
+          has been added through the DisableControllers= directive.
+
+        * cgroup_no_v1=all on the kernel command line now also implies
+          using the unified cgroup hierarchy, unless one explicitly passes
+          systemd.unified_cgroup_hierarchy=0 on the kernel command line.
+
+        * The new "MemoryMin=" unit file property may now be used to set the
+          memory usage protection limit of processes invoked by the unit. This
+          controls the cgroup v2 memory.min attribute. Similarly, the new
+          "IODeviceLatencyTargetSec=" property has been added, wrapping the new
+          cgroup v2 io.latency cgroup property for configuring per-service I/O
+          latency.
+
+        * systemd now supports the cgroup v2 devices BPF logic, as counterpart
+          to the cgroup v1 "devices" cgroup controller.
+
+        * systemd-escape now is able to combine --unescape with --template. It
+          also learnt a new option --instance for extracting and unescaping the
+          instance part of a unit name.
+
+        * sd-bus now provides the sd_bus_message_readv() which is similar to
+          sd_bus_message_read() but takes a va_list object. The pair
+          sd_bus_set_method_call_timeout() and sd_bus_get_method_call_timeout()
+          has been added for configuring the default method call timeout to
+          use. sd_bus_error_move() may be used to efficiently move the contents
+          from one sd_bus_error structure to another, invalidating the
+          source. sd_bus_set_close_on_exit() and sd_bus_get_close_on_exit() may
+          be used to control whether a bus connection object is automatically
+          flushed when an sd-event loop is exited.
+
+        * When processing classic BSD syslog log messages, journald will now
+          save the original time-stamp string supplied in the new
+          SYSLOG_TIMESTAMP= journal field. This permits consumers to
+          reconstruct the original BSD syslog message more correctly.
+
+        * StandardOutput=/StandardError= in service files gained support for
+          new "append:…" parameters, for connecting STDOUT/STDERR of a service
+          to a file, and appending to it.
+
+        * The signal to use as last step of killing of unit processes is now
+          configurable. Previously it was hard-coded to SIGKILL, which may now
+          be overridden with the new KillSignal= setting. Note that this is the
+          signal used when regular termination (i.e. SIGTERM) does not suffice.
+          Similarly, the signal used when aborting a program in case of a
+          watchdog timeout may now be configured too (WatchdogSignal=).
+
+        * The XDG_SESSION_DESKTOP environment variable may now be configured in
+          the pam_systemd argument line, using the new desktop= switch. This is
+          useful to initialize it properly from a display manager without
+          having to touch C code.
+
+        * Most configuration options that previously accepted percentage values
+          now also accept permille values with the '‰' suffix (instead of '%').
+
+        * systemd-resolved may now optionally use OpenSSL instead of GnuTLS for
+          DNS-over-TLS.
+
+        * systemd-resolved's configuration file resolved.conf gained a new
+          option ReadEtcHosts= which may be used to turn off processing and
+          honoring /etc/hosts entries.
+
+        * The "--wait" switch may now be passed to "systemctl
+          is-system-running", in which case the tool will synchronously wait
+          until the system finished start-up.
+
+        * hostnamed gained a new bus call to determine the DMI product UUID.
+
+        * On x86-64 systemd will now prefer using the RDRAND processor
+          instruction over /dev/urandom whenever it requires randomness that
+          neither has to be crypto-grade nor should be reproducible. This
+          should substantially reduce the amount of entropy systemd requests
+          from the kernel during initialization on such systems, though not
+          reduce it to zero. (Why not zero? systemd still needs to allocate
+          UUIDs and such uniquely, which require high-quality randomness.)
+
+        * networkd gained support for Foo-Over-UDP, ERSPAN and ISATAP
+          tunnels. It also gained a new option ForceDHCPv6PDOtherInformation=
+          for forcing the "Other Information" bit in IPv6 RA messages. The
+          bonding logic gained four new options AdActorSystemPriority=,
+          AdUserPortKey=, AdActorSystem= for configuring various 802.3ad
+          aspects, and DynamicTransmitLoadBalancing= for enabling dynamic
+          shuffling of flows. The tunnel logic gained a new
+          IPv6RapidDeploymentPrefix= option for configuring IPv6 Rapid
+          Deployment. The policy rule logic gained four new options IPProtocol=,
+          SourcePort= and DestinationPort=, InvertRule=. The bridge logic gained
+          support for the MulticastToUnicast= option. networkd also gained
+          support for configuring static IPv4 ARP or IPv6 neighbor entries.
+
+        * .preset files (as read by 'systemctl preset') may now be used to
+          instantiate services.
+
+        * /etc/crypttab now understands the sector-size= option to configure
+          the sector size for an encrypted partition.
+
+        * Key material for encrypted disks may now be placed on a formatted
+          medium, and referenced from /etc/crypttab by the UUID of the file
+          system, followed by "=" suffixed by the path to the key file.
+
+        * The "collect" udev component has been removed without replacement, as
+          it is neither used nor maintained.
+
+        * When the RuntimeDirectory=, StateDirectory=, CacheDirectory=,
+          LogsDirectory=, ConfigurationDirectory= settings are used in a
+          service the executed processes will now receive a set of environment
+          variables containing the full paths of these directories.
+          Specifically, RUNTIME_DIRECTORY=, STATE_DIRECTORY, CACHE_DIRECTORY,
+          LOGS_DIRECTORY, CONFIGURATION_DIRECTORY are now set if these options
+          are used. Note that these options may be used multiple times per
+          service in which case the resulting paths will be concatenated and
+          separated by colons.
+
+        * Predictable interface naming has been extended to cover InfiniBand
+          NICs. They will be exposed with an "ib" prefix.
+
+        * tmpfiles.d/ line types may now be suffixed with a '-' character, in
+          which case the respective line failing is ignored.
+
+        * .link files may now be used to configure the equivalent to the
+          "ethtool advertise" commands.
+
+        * The sd-device.h and sd-hwdb.h APIs are now exported, as an
+          alternative to libudev.h. Previously, the latter was just an internal
+          wrapper around the former, but now these two APIs are exposed
+          directly.
+
+        * sd-id128.h gained a new function sd_id128_get_boot_app_specific()
+          which calculates an app-specific boot ID similar to how
+          sd_id128_get_machine_app_specific() generates an app-specific machine
+          ID.
+
+        * A new tool systemd-id128 has been added that can be used to determine
+          and generate various 128bit IDs.
+
+        * /etc/os-release gained two new standardized fields DOCUMENTATION_URL=
+          and LOGO=.
+
+        * systemd-hibernate-resume-generator will now honor the "noresume"
+          kernel command line option, in which case it will bypass resuming
+          from any hibernated image.
+
+        * The systemd-sleep.conf configuration file gained new options
+          AllowSuspend=, AllowHibernation=, AllowSuspendThenHibernate=,
+          AllowHybridSleep= for prohibiting specific sleep modes even if the
+          kernel exports them.
+
+        * portablectl is now officially supported and has thus moved to
+          /usr/bin/.
+
+        * bootctl learnt the two new commands "set-default" and "set-oneshot"
+          for setting the default boot loader item to boot to (either
+          persistently or only for the next boot). This is currently only
+          compatible with sd-boot, but may be implemented on other boot loaders
+          too, that follow the boot loader interface. The updated interface is
+          now documented here:
+
+          https://systemd.io/BOOT_LOADER_INTERFACE
+
+        * A new kernel command line option systemd.early_core_pattern= is now
+          understood which may be used to influence the core_pattern PID 1
+          installs during early boot.
+
+        * busctl learnt two new options -j and --json= for outputting method
+          call replies, properties and monitoring output in JSON.
+
+        * journalctl's JSON output now supports simple ANSI coloring as well as
+          a new "json-seq" mode for generating RFC7464 output.
+
+        * Unit files now support the %g/%G specifiers that resolve to the UNIX
+          group/GID of the service manager runs as, similar to the existing
+          %u/%U specifiers that resolve to the UNIX user/UID.
+
+        * systemd-logind learnt a new global configuration option
+          UserStopDelaySec= that may be set in logind.conf. It specifies how
+          long the systemd --user instance shall remain started after a user
+          logs out. This is useful to speed up repetitive re-connections of the
+          same user, as it means the user's service manager doesn't have to be
+          stopped/restarted on each iteration, but can be reused between
+          subsequent options. This setting defaults to 10s. systemd-logind also
+          exports two new properties on its Manager D-Bus objects indicating
+          whether the system's lid is currently closed, and whether the system
+          is on AC power.
+
+        * systemd gained support for a generic boot counting logic, which
+          generically permits automatic reverting to older boot loader entries
+          if newer updated ones don't work. The boot loader side is implemented
+          in sd-boot, but is kept open for other boot loaders too. For details
+          see:
+
+          https://systemd.io/AUTOMATIC_BOOT_ASSESSMENT
+
+        * The SuccessAction=/FailureAction= unit file settings now learnt two
+          new parameters: "exit" and "exit-force", which result in immediate
+          exiting of the service manager, and are only useful in systemd --user
+          and container environments.
+
+        * Unit files gained support for a pair of options
+          FailureActionExitStatus=/SuccessActionExitStatus= for configuring the
+          exit status to use as service manager exit status when
+          SuccessAction=/FailureAction= is set to exit or exit-force.
+
+        * A pair of LogRateLimitIntervalSec=/LogRateLimitBurst= per-service
+          options may now be used to configure the log rate limiting applied by
+          journald per-service.
+
+        * systemd-analyze gained a new verb "timespan" for parsing and
+          normalizing time span values (i.e. strings like "5min 7s 8us").
+
+        * systemd-analyze also gained a new verb "security" for analyzing the
+          security and sand-boxing settings of services in order to determine an
+          "exposure level" for them, indicating whether a service would benefit
+          from more sand-boxing options turned on for them.
+
+        * "systemd-analyze syscall-filter" will now also show system calls
+          supported by the local kernel but not included in any of the defined
+          groups.
+
+        * .nspawn files now understand the Ephemeral= setting, matching the
+          --ephemeral command line switch.
+
+        * sd-event gained the new APIs sd_event_source_get_floating() and
+          sd_event_source_set_floating() for controlling whether a specific
+          event source is "floating", i.e. destroyed along with the even loop
+          object itself.
+
+        * Unit objects on D-Bus gained a new "Refs" property that lists all
+          clients that currently have a reference on the unit (to ensure it is
+          not unloaded).
+
+        * The JoinControllers= option in system.conf is no longer supported, as
+          it didn't work correctly, is hard to support properly, is legacy (as
+          the concept only exists on cgroup v1) and apparently wasn't used.
+
+        * Journal messages that are generated whenever a unit enters the failed
+          state are now tagged with a unique MESSAGE_ID. Similarly, messages
+          generated whenever a service process exits are now made recognizable,
+          too. A taged message is also emitted whenever a unit enters the
+          "dead" state on success.
+
+        * systemd-run gained a new switch --working-directory= for configuring
+          the working directory of the service to start. A shortcut -d is
+          equivalent, setting the working directory of the service to the
+          current working directory of the invoking program. The new --shell
+          (or just -S) option has been added for invoking the $SHELL of the
+          caller as a service, and implies --pty --same-dir --wait --collect
+          --service-type=exec. Or in other words, "systemd-run -S" is now the
+          quickest way to quickly get an interactive in a fully clean and
+          well-defined system service context.
+
+        * machinectl gained a new verb "import-fs" for importing an OS tree
+          from a directory. Moreover, when a directory or tarball is imported
+          and single top-level directory found with the OS itself below the OS
+          tree is automatically mangled and moved one level up.
+
+        * systemd-importd will no longer set up an implicit btrfs loop-back
+          file system on /var/lib/machines. If one is already set up, it will
+          continue to be used.
+
+        * A new generator "systemd-run-generator" has been added. It will
+          synthesize a unit from one or more program command lines included in
+          the kernel command line. This is very useful in container managers
+          for example:
+
+          # systemd-nspawn -i someimage.raw -b systemd.run='"some command line"'
+
+          This will run "systemd-nspawn" on an image, invoke the specified
+          command line and immediately shut down the container again, returning
+          the command line's exit code.
+
+        * The block device locking logic is now documented:
+
+          https://systemd.io/BLOCK_DEVICE_LOCKING
+
+        * loginctl and machinectl now optionally output the various tables in
+          JSON using the --output= switch. It is our intention to add similar
+          support to systemctl and all other commands.
+
+        * udevadm's query and trigger verb now optionally take a .device unit
+          name as argument.
+
+        * systemd-udevd's network naming logic now understands a new
+          net.naming-scheme= kernel command line switch, which may be used to
+          pick a specific version of the naming scheme. This helps stabilizing
+          interface names even as systemd/udev are updated and the naming logic
+          is improved.
+
+        * sd-id128.h learnt two new auxiliary helpers: sd_id128_is_allf() and
+          SD_ID128_ALLF to test if a 128bit ID is set to all 0xFF bytes, and to
+          initialize one to all 0xFF.
+
+        * After loading the SELinux policy systemd will now recursively relabel
+          all files and directories listed in
+          /run/systemd/relabel-extra.d/*.relabel (which should be simple
+          newline separated lists of paths) in addition to the ones it already
+          implicitly relabels in /run, /dev and /sys. After the relabelling is
+          completed the *.relabel files (and /run/systemd/relabel-extra.d/) are
+          removed. This is useful to permit initrds (i.e. code running before
+          the SELinux policy is in effect) to generate files in the host
+          filesystem safely and ensure that the correct label is applied during
+          the transition to the host OS.
+
+        * KERNEL API BREAKAGE: Linux kernel 4.18 changed behaviour regarding
+          mknod() handling in user namespaces. Previously mknod() would always
+          fail with EPERM in user namespaces. Since 4.18 mknod() will succeed
+          but device nodes generated that way cannot be opened, and attempts to
+          open them result in EPERM. This breaks the "graceful fallback" logic
+          in systemd's PrivateDevices= sand-boxing option. This option is
+          implemented defensively, so that when systemd detects it runs in a
+          restricted environment (such as a user namespace, or an environment
+          where mknod() is blocked through seccomp or absence of CAP_SYS_MKNOD)
+          where device nodes cannot be created the effect of PrivateDevices= is
+          bypassed (following the logic that 2nd-level sand-boxing is not
+          essential if the system systemd runs in is itself already sand-boxed
+          as a whole). This logic breaks with 4.18 in container managers where
+          user namespacing is used: suddenly PrivateDevices= succeeds setting
+          up a private /dev/ file system containing devices nodes — but when
+          these are opened they don't work.
+
+          At this point is is recommended that container managers utilizing
+          user namespaces that intend to run systemd in the payload explicitly
+          block mknod() with seccomp or similar, so that the graceful fallback
+          logic works again.
+
+          We are very sorry for the breakage and the requirement to change
+          container configurations for newer kernels. It's purely caused by an
+          incompatible kernel change. The relevant kernel developers have been
+          notified about this userspace breakage quickly, but they chose to
+          ignore it.
+
+        * PermissionsStartOnly= setting is deprecated (but is still supported
+          for backwards compatibility). The same functionality is provided by
+          the more flexible "+", "!", and "!!" prefixes to ExecStart= and other
+          commands.
+
+        * $DBUS_SESSION_BUS_ADDRESS environment variable is not set by
+          pam_systemd anymore.
+
+        * The naming scheme for network devices was changed to always rename
+          devices, even if they were already renamed by userspace. The "kernel"
+          policy was changed to only apply as a fallback, if no other naming
+          policy took effect.
+
+        * The requirements to build systemd is bumped to meson-0.46 and
+          python-3.5.
+
+        Contributions from: afg, Alan Jenkins, Aleksei Timofeyev, Alexander
+        Filippov, Alexander Kurtz, Alexey Bogdanenko, Andreas Henriksson,
+        Andrew Jorgensen, Anita Zhang, apnix-uk, Arkan49, Arseny Maslennikov,
+        asavah, Asbjørn Apeland, aszlig, Bastien Nocera, Ben Boeckel, Benedikt
+        Morbach, Benjamin Berg, Bruce Zhang, Carlo Caione, Cedric Viou, Chen
+        Qi, Chris Chiu, Chris Down, Chris Morin, Christian Rebischke, Claudius
+        Ellsel, Colin Guthrie, dana, Daniel, Daniele Medri, Daniel Kahn
+        Gillmor, Daniel Rusek, Daniel van Vugt, Dariusz Gadomski, Dave Reisner,
+        David Anderson, Davide Cavalca, David Leeds, David Malcolm, David
+        Strauss, David Tardon, Dimitri John Ledkov, Dmitry Torokhov, dj-kaktus,
+        Dongsu Park, Elias Probst, Emil Soleyman, Erik Kooistra, Ervin Peters,
+        Evgeni Golov, Evgeny Vereshchagin, Fabrice Fontaine, Faheel Ahmad,
+        Faizal Luthfi, Felix Yan, Filipe Brandenburger, Franck Bui, Frank
+        Schaefer, Frantisek Sumsal, Gautier Husson, Gianluca Boiano, Giuseppe
+        Scrivano, glitsj16, Hans de Goede, Harald Hoyer, Harry Mallon, Harshit
+        Jain, Helmut Grohne, Henry Tung, Hui Yiqun, imayoda, Insun Pyo, Iwan
+        Timmer, Jan Janssen, Jan Pokorný, Jan Synacek, Jason A. Donenfeld,
+        javitoom, Jérémy Nouhaud, Jeremy Su, Jiuyang Liu, João Paulo Rechi
+        Vita, Joe Hershberger, Joe Rayhawk, Joerg Behrmann, Joerg Steffens,
+        Jonas Dorel, Jon Ringle, Josh Soref, Julian Andres Klode, Jun Bo Bi,
+        Jürg Billeter, Keith Busch, Khem Raj, Kirill Marinushkin, Larry
+        Bernstone, Lennart Poettering, Lion Yang, Li Song, Lorenz
+        Hübschle-Schneider, Lubomir Rintel, Lucas Werkmeister, Ludwin Janvier,
+        Lukáš Nykrýn, Luke Shumaker, mal, Marc-Antoine Perennou, Marcin
+        Skarbek, Marco Trevisan (Treviño), Marian Cepok, Mario Hros, Marko
+        Myllynen, Markus Grimm, Martin Pitt, Martin Sobotka, Martin Wilck,
+        Mathieu Trudel-Lapierre, Matthew Leeds, Michael Biebl, Michael Olbrich,
+        Michael 'pbone' Pobega, Michael Scherer, Michal Koutný, Michal
+        Sekletar, Michal Soltys, Mike Gilbert, Mike Palmer, Muhammet Kara, Neal
+        Gompa, Neil Brown, Network Silence, Niklas Tibbling, Nikolas Nyby,
+        Nogisaka Sadata, Oliver Smith, Patrik Flykt, Pavel Hrdina, Paweł
+        Szewczyk, Peter Hutterer, Piotr Drąg, Ray Strode, Reinhold Mueller,
+        Renaud Métrich, Roman Gushchin, Ronny Chevalier, Rubén Suárez Alvarez,
+        Ruixin Bao, RussianNeuroMancer, Ryutaroh Matsumoto, Saleem Rashid, Sam
+        Morris, Samuel Morris, Sandy Carter, scootergrisen, Sébastien Bacher,
+        Sergey Ptashnick, Shawn Landden, Shengyao Xue, Shih-Yuan Lee
+        (FourDollars), Silvio Knizek, Sjoerd Simons, Stasiek Michalski, Stephen
+        Gallagher, Steven Allen, Steve Ramage, Susant Sahani, Sven Joachim,
+        Sylvain Plantefève, Tanu Kaskinen, Tejun Heo, Thiago Macieira, Thomas
+        Blume, Thomas Haller, Thomas H. P. Andersen, Tim Ruffing, TJ, Tobias
+        Jungel, Todd Walton, Tommi Rantala, Tomsod M, Tony Novak, Tore
+        Anderson, Trevonn, Victor Laskurain, Victor Tapia, Violet Halo, Vojtech
+        Trefny, welaq, William A. Kennington III, William Douglas, Wyatt Ward,
+        Xiang Fan, Xi Ruoyao, Xuanwo, Yann E. Morin, YmrDtnJu, Yu Watanabe,
+        Zbigniew Jędrzejewski-Szmek, Zhang Xianwei, Zsolt Dollenstein
+
+        — Warsaw, 2018-12-21
+
+CHANGES WITH 239:
+
+        * NETWORK INTERFACE DEVICE NAMING CHANGES: systemd-udevd's "net_id"
+          builtin will name network interfaces differently than in previous
+          versions for virtual network interfaces created with SR-IOV and NPAR
+          and for devices where the PCI network controller device does not have
+          a slot number associated.
+
+          SR-IOV virtual devices are now named based on the name of the parent
+          interface, with a suffix of "v<N>", where <N> is the virtual device
+          number. Previously those virtual devices were named as if completely
+          independent.
+
+          The ninth and later NPAR virtual devices will be named following the
+          scheme used for the first eight NPAR partitions. Previously those
+          devices were not renamed and the kernel default (eth<n>) was used.
+
+          "net_id" will also generate names for PCI devices where the PCI
+          network controller device does not have an associated slot number
+          itself, but one of its parents does. Previously those devices were
+          not renamed and the kernel default (eth<n>) was used.
+
+        * AF_INET and AF_INET6 are dropped from RestrictAddressFamilies= in
+          systemd-logind.service. Since v235, IPAddressDeny=any has been set to
+          the unit. So, it is expected that the default behavior of
+          systemd-logind is not changed. However, if distribution packagers or
+          administrators disabled or modified IPAddressDeny= setting by a
+          drop-in config file, then it may be necessary to update the file to
+          re-enable AF_INET and AF_INET6 to support network user name services,
+          e.g. NIS.
+
+        * When the RestrictNamespaces= unit property is specified multiple
+          times, then the specified types are merged now. Previously, only the
+          last assignment was used. So, if distribution packagers or
+          administrators modified the setting by a drop-in config file, then it
+          may be necessary to update the file.
+
+        * When OnFailure= is used in combination with Restart= on a service
+          unit, then the specified units will no longer be triggered on
+          failures that result in restarting. Previously, the specified units
+          would be activated each time the unit failed, even when the unit was
+          going to be restarted automatically. This behaviour contradicted the
+          documentation. With this release the code is adjusted to match the
+          documentation.
+
+        * systemd-tmpfiles will now print a notice whenever it encounters
+          tmpfiles.d/ lines referencing the /var/run/ directory. It will
+          recommend reworking them to use the /run/ directory instead (for
+          which /var/run/ is simply a symlinked compatibility alias). This way
+          systemd-tmpfiles can properly detect line conflicts and merge lines
+          referencing the same file by two paths, without having to access
+          them.
+
+        * systemctl disable/unmask/preset/preset-all cannot be used with
+          --runtime. Previously this was allowed, but resulted in unintuitive
+          behaviour that wasn't useful. systemctl disable/unmask will now undo
+          both runtime and persistent enablement/masking, i.e. it will remove
+          any relevant symlinks both in /run and /etc.
+
+        * Note that all long-running system services shipped with systemd will
+          now default to a system call whitelist (rather than a blacklist, as
+          before). In particular, systemd-udevd will now enforce one too. For
+          most cases this should be safe, however downstream distributions
+          which disabled sandboxing of systemd-udevd (specifically the
+          MountFlags= setting), might want to disable this security feature
+          too, as the default whitelisting will prohibit all mount, swap,
+          reboot and clock changing operations from udev rules.
+
+        * sd-boot acquired new loader configuration settings to optionally turn
+          off Windows and MacOS boot partition discovery as well as
+          reboot-into-firmware menu items. It is also able to pick a better
+          screen resolution for HiDPI systems, and now provides loader
+          configuration settings to change the resolution explicitly.
+
+        * systemd-resolved now supports DNS-over-TLS. It's still
+          turned off by default, use DNSOverTLS=opportunistic to turn it on in
+          resolved.conf. We intend to make this the default as soon as couple
+          of additional techniques for optimizing the initial latency caused by
+          establishing a TLS/TCP connection are implemented.
+
+        * systemd-resolved.service and systemd-networkd.service now set
+          DynamicUser=yes. The users systemd-resolve and systemd-network are
+          not created by systemd-sysusers anymore.
+
+          NOTE: This has a chance of breaking nss-ldap and similar NSS modules
+          that embedd a network facing module into any process using getpwuid()
+          or related call: the dynamic allocation of the user ID for
+          systemd-resolved.service means the service manager has to check NSS
+          if the user name is already taken when forking off the service. Since
+          the user in the common case won't be defined in /etc/passwd the
+          lookup is likely to trigger nss-ldap which in turn might use NSS to
+          ask systemd-resolved for hostname lookups. This will hence result in
+          a deadlock: a user name lookup in order to start
+          systemd-resolved.service will result in a host name lookup for which
+          systemd-resolved.service needs to be started already. There are
+          multiple ways to work around this problem: pre-allocate the
+          "systemd-resolve" user on such systems, so that nss-ldap won't be
+          triggered; or use a different NSS package that doesn't do networking
+          in-process but provides a local asynchronous name cache; or configure
+          the NSS package to avoid lookups for UIDs in the range `pkg-config
+          systemd --variable=dynamicuidmin` … `pkg-config systemd
+          --variable=dynamicuidmax`, so that it does not consider itself
+          authoritative for the same UID range systemd allocates dynamic users
+          from.
+
+        * The systemd-resolve tool has been renamed to resolvectl (it also
+          remains available under the old name, for compatibility), and its
+          interface is now verb-based, similar in style to the other <xyz>ctl
+          tools, such as systemctl or loginctl.
+
+        * The resolvectl/systemd-resolve tool also provides 'resolvconf'
+          compatibility. It may be symlinked under the 'resolvconf' name, in
+          which case it will take arguments and input compatible with the
+          Debian and FreeBSD resolvconf tool.
+
+        * Support for suspend-then-hibernate has been added, i.e. a sleep mode
+          where the system initially suspends, and after a timeout resumes and
+          hibernates again.
+
+        * networkd's ClientIdentifier= now accepts a new option "duid-only". If
+          set the client will only send a DUID as client identifier.
+
+        * The nss-systemd glibc NSS module will now enumerate dynamic users and
+          groups in effect. Previously, it could resolve UIDs/GIDs to user
+          names/groups and vice versa, but did not support enumeration.
+
+        * journald's Compress= configuration setting now optionally accepts a
+          byte threshold value. All journal objects larger than this threshold
+          will be compressed, smaller ones will not. Previously this threshold
+          was not configurable and set to 512.
+
+        * A new system.conf setting NoNewPrivileges= is now available which may
+          be used to turn off acquisition of new privileges system-wide
+          (i.e. set Linux' PR_SET_NO_NEW_PRIVS for PID 1 itself, and thus also
+          for all its children). Note that turning this option on means setuid
+          binaries and file system capabilities lose their special powers.
+          While turning on this option is a big step towards a more secure
+          system, doing so is likely to break numerous pre-existing UNIX tools,
+          in particular su and sudo.
+
+        * A new service systemd-time-sync-wait.service has been added. If
+          enabled it will delay the time-sync.target unit at boot until time
+          synchronization has been received from the network. This
+          functionality is useful on systems lacking a local RTC or where it is
+          acceptable that the boot process shall be delayed by external network
+          services.
+
+        * When hibernating, systemd will now inform the kernel of the image
+          write offset, on kernels new enough to support this. This means swap
+          files should work for hibernation now.
+
+        * When loading unit files, systemd will now look for drop-in unit files
+          extensions in additional places. Previously, for a unit file name
+          "foo-bar-baz.service" it would look for dropin files in
+          "foo-bar-baz.service.d/*.conf". Now, it will also look in
+          "foo-bar-.service.d/*.conf" and "foo-.service.d/", i.e. at the
+          service name truncated after all inner dashes. This scheme allows
+          writing drop-ins easily that apply to a whole set of unit files at
+          once. It's particularly useful for mount and slice units (as their
+          naming is prefix based), but is also useful for service and other
+          units, for packages that install multiple unit files at once,
+          following a strict naming regime of beginning the unit file name with
+          the package's name. Two new specifiers are now supported in unit
+          files to match this: %j and %J are replaced by the part of the unit
+          name following the last dash.
+
+        * Unit files and other configuration files that support specifier
+          expansion now understand another three new specifiers: %T and %V will
+          resolve to /tmp and /var/tmp respectively, or whatever temporary
+          directory has been set for the calling user. %E will expand to either
+          /etc (for system units) or $XDG_CONFIG_HOME (for user units).
+
+        * The ExecStart= lines of unit files are no longer required to
+          reference absolute paths. If non-absolute paths are specified the
+          specified binary name is searched within the service manager's
+          built-in $PATH, which may be queried with 'systemd-path
+          search-binaries-default'. It's generally recommended to continue to
+          use absolute paths for all binaries specified in unit files.
+
+        * Units gained a new load state "bad-setting", which is used when a
+          unit file was loaded, but contained fatal errors which prevent it
+          from being started (for example, a service unit has been defined
+          lacking both ExecStart= and ExecStop= lines).
+
+        * coredumpctl's "gdb" verb has been renamed to "debug", in order to
+          support alternative debuggers, for example lldb. The old name
+          continues to be available however, for compatibility reasons. Use the
+          new --debugger= switch or the $SYSTEMD_DEBUGGER environment variable
+          to pick an alternative debugger instead of the default gdb.
+
+        * systemctl and the other tools will now output escape sequences that
+          generate proper clickable hyperlinks in various terminal emulators
+          where useful (for example, in the "systemctl status" output you can
+          now click on the unit file name to quickly open it in the
+          editor/viewer of your choice). Note that not all terminal emulators
+          support this functionality yet, but many do. Unfortunately, the
+          "less" pager doesn't support this yet, hence this functionality is
+          currently automatically turned off when a pager is started (which
+          happens quite often due to auto-paging). We hope to remove this
+          limitation as soon as "less" learns these escape sequences. This new
+          behaviour may also be turned off explicitly with the $SYSTEMD_URLIFY
+          environment variable. For details on these escape sequences see:
+          https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda
+
+        * networkd's .network files now support a new IPv6MTUBytes= option for
+          setting the MTU used by IPv6 explicitly as well as a new MTUBytes=
+          option in the [Route] section to configure the MTU to use for
+          specific routes. It also gained support for configuration of the DHCP
+          "UserClass" option through the new UserClass= setting. It gained
+          three new options in the new [CAN] section for configuring CAN
+          networks. The MULTICAST and ALLMULTI interface flags may now be
+          controlled explicitly with the new Multicast= and AllMulticast=
+          settings.
+
+        * networkd will now automatically make use of the kernel's route
+          expiration feature, if it is available.
+
+        * udevd's .link files now support setting the number of receive and
+          transmit channels, using the RxChannels=, TxChannels=,
+          OtherChannels=, CombinedChannels= settings.
+
+        * Support for UDPSegmentationOffload= has been removed, given its
+          limited support in hardware, and waning software support.
+
+        * networkd's .netdev files now support creating "netdevsim" interfaces.
+
+        * PID 1 learnt a new bus call GetUnitByControlGroup() which may be used
+          to query the unit belonging to a specific kernel control group.
+
+        * systemd-analyze gained a new verb "cat-config", which may be used to
+          dump the contents of any configuration file, with all its matching
+          drop-in files added in, and honouring the usual search and masking
+          logic applied to systemd configuration files. For example use
+          "systemd-analyze cat-config systemd/system.conf" to get the complete
+          system configuration file of systemd how it would be loaded by PID 1
+          itself. Similar to this, various tools such as systemd-tmpfiles or
+          systemd-sysusers, gained a new option "--cat-config", which does the
+          corresponding operation for their own configuration settings. For
+          example, "systemd-tmpfiles --cat-config" will now output the full
+          list of tmpfiles.d/ lines in place.
+
+        * timedatectl gained three new verbs: "show" shows bus properties of
+          systemd-timedated, "timesync-status" shows the current NTP
+          synchronization state of systemd-timesyncd, and "show-timesync"
+          shows bus properties of systemd-timesyncd.
+
+        * systemd-timesyncd gained a bus interface on which it exposes details
+          about its state.
+
+        * A new environment variable $SYSTEMD_TIMEDATED_NTP_SERVICES is now
+          understood by systemd-timedated. It takes a colon-separated list of
+          unit names of NTP client services. The list is used by
+          "timedatectl set-ntp".
+
+        * systemd-nspawn gained a new --rlimit= switch for setting initial
+          resource limits for the container payload. There's a new switch
+          --hostname= to explicitly override the container's hostname. A new
+          --no-new-privileges= switch may be used to control the
+          PR_SET_NO_NEW_PRIVS flag for the container payload. A new
+          --oom-score-adjust= switch controls the OOM scoring adjustment value
+          for the payload. The new --cpu-affinity= switch controls the CPU
+          affinity of the container payload. The new --resolv-conf= switch
+          allows more detailed control of /etc/resolv.conf handling of the
+          container. Similarly, the new --timezone= switch allows more detailed
+          control of /etc/localtime handling of the container.
+
+        * systemd-detect-virt gained a new --list switch, which will print a
+          list of all currently known VM and container environments.
+
+        * Support for "Portable Services" has been added, see
+          doc/PORTABLE_SERVICES.md for details. Currently, the support is still
+          experimental, but this is expected to change soon. Reflecting this
+          experimental state, the "portablectl" binary is not installed into
+          /usr/bin yet. The binary has to be called with the full path
+          /usr/lib/systemd/portablectl instead.
+
+        * journalctl's and systemctl's -o switch now knows a new log output
+          mode "with-unit". The output it generates is very similar to the
+          regular "short" mode, but displays the unit name instead of the
+          syslog tag for each log line. Also, the date is shown with timezone
+          information. This mode is probably more useful than the classic
+          "short" output mode for most purposes, except where pixel-perfect
+          compatibility with classic /var/log/messages formatting is required.
+
+        * A new --dump-bus-properties switch has been added to the systemd
+          binary, which may be used to dump all supported D-Bus properties.
+          (Options which are still supported, but are deprecated, are *not*
+          shown.)
+
+        * sd-bus gained a set of new calls:
+          sd_bus_slot_set_floating()/sd_bus_slot_get_floating() may be used to
+          enable/disable the "floating" state of a bus slot object,
+          i.e. whether the slot object pins the bus it is allocated for into
+          memory or if the bus slot object gets disconnected when the bus goes
+          away. sd_bus_open_with_description(),
+          sd_bus_open_user_with_description(),
+          sd_bus_open_system_with_description() may be used to allocate bus
+          objects and set their description string already during allocation.
+
+        * sd-event gained support for watching inotify events from the event
+          loop, in an efficient way, sharing inotify handles between multiple
+          users. For this a new function sd_event_add_inotify() has been added.
+
+        * sd-event and sd-bus gained support for calling special user-supplied
+          destructor functions for userdata pointers associated with
+          sd_event_source, sd_bus_slot, and sd_bus_track objects. For this new
+          functions sd_bus_slot_set_destroy_callback,
+          sd_bus_slot_get_destroy_callback, sd_bus_track_set_destroy_callback,
+          sd_bus_track_get_destroy_callback,
+          sd_event_source_set_destroy_callback,
+          sd_event_source_get_destroy_callback have been added.
+
+        * The "net.ipv4.tcp_ecn" sysctl will now be turned on by default.
+
+        * PID 1 will now automatically reschedule .timer units whenever the
+          local timezone changes. (They previously got rescheduled
+          automatically when the system clock changed.)
+
+        * New documentation has been added to document cgroups delegation,
+          portable services and the various code quality tools we have set up:
+
+          https://github.com/systemd/systemd/blob/master/docs/CGROUP_DELEGATION.md
+          https://github.com/systemd/systemd/blob/master/docs/PORTABLE_SERVICES.md
+          https://github.com/systemd/systemd/blob/master/docs/CODE_QUALITY.md
+
+        * The Boot Loader Specification has been added to the source tree.
+
+          https://github.com/systemd/systemd/blob/master/docs/BOOT_LOADER_SPECIFICATION.md
+
+          While moving it into our source tree we have updated it and further
+          changes are now accepted through the usual github PR workflow.
+
+        * pam_systemd will now look for PAM userdata fields systemd.memory_max,
+          systemd.tasks_max, systemd.cpu_weight, systemd.io_weight set by
+          earlier PAM modules. The data in these fields is used to initialize
+          the session scope's resource properties. Thus external PAM modules
+          may now configure per-session limits, for example sourced from
+          external user databases.
+
+        * socket units with Accept=yes will now maintain a "refused" counter in
+          addition to the existing "accepted" counter, counting connections
+          refused due to the enforced limits.
+
+        * The "systemd-path search-binaries-default" command may now be use to
+          query the default, built-in $PATH PID 1 will pass to the services it
+          manages.
+
+        * A new unit file setting PrivateMounts= has been added. It's a boolean
+          option. If enabled the unit's processes are invoked in their own file
+          system namespace. Note that this behaviour is also implied if any
+          other file system namespacing options (such as PrivateTmp=,
+          PrivateDevices=, ProtectSystem=, …) are used. This option is hence
+          primarily useful for services that do not use any of the other file
+          system namespacing options. One such service is systemd-udevd.service
+          wher this is now used by default.
+
+        * ConditionSecurity= gained a new value "uefi-secureboot" that is true
+          when the system is booted in UEFI "secure mode".
+
+        * A new unit "system-update-pre.target" is added, which defines an
+          optional synchronization point for offline system updates, as
+          implemented by the pre-existing "system-update.target" unit. It
+          allows ordering services before the service that executes the actual
+          update process in a generic way.
+
+        * Systemd now emits warnings whenever .include syntax is used.
+
+        Contributions from: Adam Duskett, Alan Jenkins, Alessandro Casale,
+        Alexander Kurtz, Alex Gartrell, Anssi Hannula, Arnaud Rebillout, Brian
+        J. Murrell, Bruno Vernay, Chris Lamb, Chris Lesiak, Christian Brauner,
+        Christian Hesse, Christian Rebischke, Colin Guthrie, Daniel Dao, Daniel
+        Lin, Danylo Korostil, Davide Cavalca, David Tardon, Dimitri John
+        Ledkov, Dmitriy Geels, Douglas Christman, Elia Geretto, emelenas, Emil
+        Velikov, Evgeny Vereshchagin, Felipe Sateler, Feng Sun, Filipe
+        Brandenburger, Franck Bui, futpib, Giuseppe Scrivano, Guillem Jover,
+        guixxx, Hannes Reinecke, Hans de Goede, Harald Hoyer, Henrique Dante de
+        Almeida, Hiram van Paassen, Ian Miell, Igor Gnatenko, Ivan Shapovalov,
+        Iwan Timmer, James Cowgill, Jan Janssen, Jan Synacek, Jared Kazimir,
+        Jérémy Rosen, João Paulo Rechi Vita, Joost Heitbrink, Jui-Chi Ricky
+        Liang, Jürg Billeter, Kai-Heng Feng, Karol Augustin, Kay Sievers,
+        Krzysztof Nowicki, Lauri Tirkkonen, Lennart Poettering, Leonard König,
+        Long Li, Luca Boccassi, Lucas Werkmeister, Marcel Hoppe, Marc
+        Kleine-Budde, Mario Limonciello, Martin Jansa, Martin Wilck, Mathieu
+        Malaterre, Matteo F. Vescovi, Matthew McGinn, Matthias-Christian Ott,
+        Michael Biebl, Michael Olbrich, Michael Prokop, Michal Koutný, Michal
+        Sekletar, Mike Gilbert, Mikhail Kasimov, Milan Broz, Milan Pässler,
+        Mladen Pejaković, Muhammet Kara, Nicolas Boichat, Omer Katz, Paride
+        Legovini, Paul Menzel, Paul Milliken, Pavel Hrdina, Peter A. Bigot,
+        Peter D'Hoye, Peter Hutterer, Peter Jones, Philip Sequeira, Philip
+        Withnall, Piotr Drąg, Radostin Stoyanov, Ricardo Salveti de Araujo,
+        Ronny Chevalier, Rosen Penev, Rubén Suárez Alvarez, Ryan Gonzalez,
+        Salvo Tomaselli, Sebastian Reichel, Sergey Ptashnick, Sergio Lindo
+        Mansilla, Stefan Schweter, Stephen Hemminger, Stuart Hayes, Susant
+        Sahani, Sylvain Plantefève, Thomas H. P. Andersen, Tobias Jungel,
+        Tomasz Torcz, Vito Caputo, Will Dietz, Will Thompson, Wim van Mourik,
+        Yu Watanabe, Zbigniew Jędrzejewski-Szmek
+
+        — Berlin, 2018-06-22
+
+CHANGES WITH 238:
+
+        * The MemoryAccounting= unit property now defaults to on. After
+          discussions with the upstream control group maintainers we learnt
+          that the negative impact of cgroup memory accounting on current
+          kernels is finally relatively minimal, so that it should be safe to
+          enable this by default without affecting system performance. Besides
+          memory accounting only task accounting is turned on by default, all
+          other forms of resource accounting (CPU, IO, IP) remain off for now,
+          because it's not clear yet that their impact is small enough to move
+          from opt-in to opt-out. We recommend downstreams to leave memory
+          accounting on by default if kernel 4.14 or higher is primarily
+          used. On very resource constrained systems or when support for old
+          kernels is a necessity, -Dmemory-accounting-default=false can be used
+          to revert this change.
+
+        * rpm scriptlets to update the udev hwdb and rules (%udev_hwdb_update,
+          %udev_rules_update) and the journal catalog (%journal_catalog_update)
+          from the upgrade scriptlets of individual packages now do nothing.
+          Transfiletriggers have been added which will perform those updates
+          once at the end of the transaction.
+
+          Similar transfiletriggers have been added to execute any sysctl.d
+          and binfmt.d rules. Thus, it should be unnecessary to provide any
+          scriptlets to execute this configuration from package installation
+          scripts.
+
+        * systemd-sysusers gained a mode where the configuration to execute is
+          specified on the command line, but this configuration is not executed
+          directly, but instead it is merged with the configuration on disk,
+          and the result is executed. This is useful for package installation
+          scripts which want to create the user before installing any files on
+          disk (in case some of those files are owned by that user), while
+          still allowing local admin overrides.
+
+          This functionality is exposed to rpm scriptlets through a new
+          %sysusers_create_package macro. Old %sysusers_create and
+          %sysusers_create_inline macros are deprecated.
+
+          A transfiletrigger for sysusers.d configuration is now installed,
+          which means that it should be unnecessary to call systemd-sysusers from
+          package installation scripts, unless the package installs any files
+          owned by those newly-created users, in which case
+          %sysusers_create_package should be used.
+
+        * Analogous change has been done for systemd-tmpfiles: it gained a mode
+          where the command-line configuration is merged with the configuration
+          on disk. This is exposed as the new %tmpfiles_create_package macro,
+          and %tmpfiles_create is deprecated. A transfiletrigger is installed
+          for tmpfiles.d, hence it should be unnecessary to call systemd-tmpfiles
+          from package installation scripts.
+
+        * sysusers.d configuration for a user may now also specify the group
+          number, in addition to the user number ("u username 123:456"), or
+          without the user number ("u username -:456").
+
+        * Configution items for systemd-sysusers can now be specified as
+          positional arguments when the new --inline switch is used.
+
+        * The login shell of users created through sysusers.d may now be
+          specified (previously, it was always /bin/sh for root and
+          /sbin/nologin for other users).
+
+        * systemd-analyze gained a new --global switch to look at global user
+          configuration. It also gained a unit-paths verb to list the unit load
+          paths that are compiled into systemd (which can be used with
+          --systemd, --user, or --global).
+
+        * udevadm trigger gained a new --settle/-w option to wait for any
+          triggered events to finish (but just those, and not any other events
+          which are triggered meanwhile).
+
+        * The action that systemd-logind takes when the lid is closed and the
+          machine is connected to external power can now be configured using
+          HandleLidSwitchExternalPower= in logind.conf. Previously, this action
+          was determined by HandleLidSwitch=, and, for backwards compatibility,
+          is still is, if HandleLidSwitchExternalPower= is not explicitly set.
+
+        * journalctl will periodically call sd_journal_process() to make it
+          resilient against inotify queue overruns when journal files are
+          rotated very quickly.
+
+        * Two new functions in libsystemd — sd_bus_get_n_queued_read and
+          sd_bus_get_n_queued_write — may be used to check the number of
+          pending bus messages.
+
+        * systemd gained a new
+          org.freedesktop.systemd1.Manager.AttachProcessesToUnit dbus call
+          which can be used to migrate foreign processes to scope and service
+          units. The primary user for this new API is systemd itself: the
+          systemd --user instance uses this call of the systemd --system
+          instance to migrate processes if it itself gets the request to
+          migrate processes and the kernel refuses this due to access
+          restrictions.  Thanks to this "systemd-run --scope --user …" works
+          again in pure cgroup v2 environments when invoked from the user
+          session scope.
+
+        * A new TemporaryFileSystem= setting can be used to mask out part of
+          the real file system tree with tmpfs mounts. This may be combined
+          with BindPaths= and BindReadOnlyPaths= to hide files or directories
+          not relevant to the unit, while still allowing some paths lower in
+          the tree to be accessed.
+
+          ProtectHome=tmpfs may now be used to hide user home and runtime
+          directories from units, in a way that is mostly equivalent to
+          "TemporaryFileSystem=/home /run/user /root".
+
+        * Non-service units are now started with KeyringMode=shared by default.
+          This means that mount and swapon and other mount tools have access
+          to keys in the main keyring.
+
+        * /sys/fs/bpf is now mounted automatically.
+
+        * QNX virtualization is now detected by systemd-detect-virt and may
+          be used in ConditionVirtualization=.
+
+        * IPAccounting= may now be enabled also for slice units.
+
+        * A new -Dsplit-bin= build configuration switch may be used to specify
+          whether bin and sbin directories are merged, or if they should be
+          included separately in $PATH and various listings of executable
+          directories. The build configuration scripts will try to autodetect
+          the proper values of -Dsplit-usr= and -Dsplit-bin= based on build
+          system, but distributions are encouraged to configure this
+          explicitly.
+
+        * A new -Dok-color= build configuration switch may be used to change
+          the colour of "OK" status messages.
+
+        * UPGRADE ISSUE: serialization of units using JoinsNamespaceOf= with
+          PrivateNetwork=yes was buggy in previous versions of systemd. This
+          means that after the upgrade and daemon-reexec, any such units must
+          be restarted.
+
+        * INCOMPATIBILITY: as announced in the NEWS for 237, systemd-tmpfiles
+          will not exclude read-only files owned by root from cleanup.
+
+        Contributions from: Alan Jenkins, Alexander F Rødseth, Alexis Jeandet,
+        Andika Triwidada, Andrei Gherzan, Ansgar Burchardt, antizealot1337,
+        Batuhan Osman Taşkaya, Beniamino Galvani, Bill Yodlowsky, Caio Marcelo
+        de Oliveira Filho, CuBiC, Daniele Medri, Daniel Mouritzen, Daniel
+        Rusek, Davide Cavalca, Dimitri John Ledkov, Douglas Christman, Evgeny
+        Vereshchagin, Faalagorn, Filipe Brandenburger, Franck Bui, futpib,
+        Giacomo Longo, Gunnar Hjalmarsson, Hans de Goede, Hermann Gausterer,
+        Iago López Galeiras, Jakub Filak, Jan Synacek, Jason A. Donenfeld,
+        Javier Martinez Canillas, Jérémy Rosen, Lennart Poettering, Lucas
+        Werkmeister, Mao Huang, Marco Gulino, Michael Biebl, Michael Vogt,
+        MilhouseVH, Neal Gompa (ニール・ゴンパ), Oleander Reis, Olof Mogren,
+        Patrick Uiterwijk, Peter Hutterer, Peter Portante, Piotr Drąg, Robert
+        Antoni Buj Gelonch, Sergey Ptashnick, Shawn Landden, Shuang Liu, Simon
+        Fowler, SjonHortensius, snorreflorre, Susant Sahani, Sylvain
+        Plantefève, Thomas Blume, Thomas Haller, Vito Caputo, Yu Watanabe,
+        Zbigniew Jędrzejewski-Szmek, Марко М. Костић (Marko M. Kostić)
+
+        — Warsaw, 2018-03-05
+
+CHANGES WITH 237:
+
+        * Some keyboards come with a zoom see-saw or rocker which until now got
+          mapped to the Linux "zoomin/out" keys in hwdb. However, these
+          keycodes are not recognized by any major desktop. They now produce
+          Up/Down key events so that they can be used for scrolling.
+
+        * INCOMPATIBILITY: systemd-tmpfiles' "f" lines changed behaviour
+          slightly: previously, if an argument was specified for lines of this
+          type (i.e. the right-most column was set) this string was appended to
+          existing files each time systemd-tmpfiles was run. This behaviour was
+          different from what the documentation said, and not particularly
+          useful, as repeated systemd-tmpfiles invocations would not be
+          idempotent and grow such files without bounds. With this release
+          behaviour has been altered to match what the documentation says:
+          lines of this type only have an effect if the indicated files don't
+          exist yet, and only then the argument string is written to the file.
+
+        * FUTURE INCOMPATIBILITY: In systemd v238 we intend to slightly change
+          systemd-tmpfiles behaviour: previously, read-only files owned by root
+          were always excluded from the file "aging" algorithm (i.e. the
+          automatic clean-up of directories like /tmp based on
+          atime/mtime/ctime). We intend to drop this restriction, and age files
+          by default even when owned by root and read-only. This behaviour was
+          inherited from older tools, but there have been requests to remove
+          it, and it's not obvious why this restriction was made in the first
+          place. Please speak up now, if you are aware of software that reqires
+          this behaviour, otherwise we'll remove the restriction in v238.
+
+        * A new environment variable $SYSTEMD_OFFLINE is now understood by
+          systemctl. It takes a boolean argument. If on, systemctl assumes it
+          operates on an "offline" OS tree, and will not attempt to talk to the
+          service manager. Previously, this mode was implicitly enabled if a
+          chroot() environment was detected, and this new environment variable
+          now provides explicit control.
+
+        * .path and .socket units may now be created transiently, too.
+          Previously only service, mount, automount and timer units were
+          supported as transient units. The systemd-run tool has been updated
+          to expose this new functionality, you may hence use it now to bind
+          arbitrary commands to path or socket activation on-the-fly from the
+          command line. Moreover, almost all properties are now exposed for the
+          unit types that already supported transient operation.
+
+        * The systemd-mount command gained support for a new --owner= parameter
+          which takes a user name, which is then resolved and included in uid=
+          and gid= mount options string of the file system to mount.
+
+        * A new unit condition ConditionControlGroupController= has been added
+          that checks whether a specific cgroup controller is available.
+
+        * Unit files, udev's .link files, and systemd-networkd's .netdev and
+          .network files all gained support for a new condition
+          ConditionKernelVersion= for checking against specific kernel
+          versions.
+
+        * In systemd-networkd, the [IPVLAN] section in .netdev files gained
+          support for configuring device flags in the Flags= setting. In the
+          same files, the [Tunnel] section gained support for configuring
+          AllowLocalRemote=.  The [Route] section in .network files gained
+          support for configuring InitialCongestionWindow=,
+          InitialAdvertisedReceiveWindow= and QuickAck=. The [DHCP] section now
+          understands RapidCommit=.
+
+        * systemd-networkd's DHCPv6 support gained support for Prefix
+          Delegation.
+
+        * sd-bus gained support for a new "watch-bind" feature. When this
+          feature is enabled, an sd_bus connection may be set up to connect to
+          an AF_UNIX socket in the file system as soon as it is created. This
+          functionality is useful for writing early-boot services that
+          automatically connect to the system bus as soon as it is started,
+          without ugly time-based polling. systemd-networkd and
+          systemd-resolved have been updated to make use of this
+          functionality. busctl exposes this functionality in a new
+          --watch-bind= command line switch.
+
+        * sd-bus will now optionally synthesize a local "Connected" signal as
+          soon as a D-Bus connection is set up fully. This message mirrors the
+          already existing "Disconnected" signal which is synthesized when the
+          connection is terminated. This signal is generally useful but
+          particularly handy in combination with the "watch-bind" feature
+          described above. Synthesizing of this message has to be requested
+          explicitly through the new API call sd_bus_set_connected_signal(). In
+          addition a new call sd_bus_is_ready() has been added that checks
+          whether a connection is fully set up (i.e. between the "Connected" and
+          "Disconnected" signals).
+
+        * sd-bus gained two new calls sd_bus_request_name_async() and
+          sd_bus_release_name_async() for asynchronously registering bus
+          names. Similar, there is now sd_bus_add_match_async() for installing
+          a signal match asynchronously. All of systemd's own services have
+          been updated to make use of these calls. Doing these operations
+          asynchronously has two benefits: it reduces the risk of deadlocks in
+          case of cyclic dependencies between bus services, and it speeds up
+          service initialization since synchronization points for bus
+          round-trips are removed.
+
+        * sd-bus gained two new calls sd_bus_match_signal() and
+          sd_bus_match_signal_async(), which are similar to sd_bus_add_match()
+          and sd_bus_add_match_async() but instead of taking a D-Bus match
+          string take match fields as normal function parameters.
+
+        * sd-bus gained two new calls sd_bus_set_sender() and
+          sd_bus_message_set_sender() for setting the sender name of outgoing
+          messages (either for all outgoing messages or for just one specific
+          one). These calls are only useful in direct connections as on
+          brokered connections the broker fills in the sender anyway,
+          overwriting whatever the client filled in.
+
+        * sd-event gained a new pseudo-handle that may be specified on all API
+          calls where an "sd_event*" object is expected: SD_EVENT_DEFAULT. When
+          used this refers to the default event loop object of the calling
+          thread. Note however that this does not implicitly allocate one —
+          which has to be done prior by using sd_event_default(). Similarly
+          sd-bus gained three new pseudo-handles SD_BUS_DEFAULT,
+          SD_BUS_DEFAULT_USER, SD_BUS_DEFAULT_SYSTEM that may be used to refer
+          to the default bus of the specified type of the calling thread. Here
+          too this does not implicitly allocate bus connection objects, this
+          has to be done prior with sd_bus_default() and friends.
+
+        * sd-event gained a new call pair
+          sd_event_source_{get|set}_io_fd_own(). This may be used to request
+          automatic closure of the file descriptor an IO event source watches
+          when the event source is destroyed.
+
+        * systemd-networkd gained support for natively configuring WireGuard
+          connections.
+
+        * In previous versions systemd synthesized user records both for the
+          "nobody" (UID 65534) and "root" (UID 0) users in nss-systemd and
+          internally. In order to simplify distribution-wide renames of the
+          "nobody" user (like it is planned in Fedora: nfsnobody → nobody), a
+          new transitional flag file has been added: if
+          /etc/systemd/dont-synthesize-nobody exists synthesizing of the 65534
+          user and group record within the systemd codebase is disabled.
+
+        * systemd-notify gained a new --uid= option for selecting the source
+          user/UID to use for notification messages sent to the service
+          manager.
+
+        * journalctl gained a new --grep= option to list only entries in which
+          the message matches a certain pattern. By default matching is case
+          insensitive if the pattern is lowercase, and case sensitive
+          otherwise. Option --case-sensitive=yes|no can be used to override
+          this an specify case sensitivity or case insensitivity.
+
+        * There's now a "systemd-analyze service-watchdogs" command for printing
+          the current state of the service runtime watchdog, and optionally
+          enabling or disabling the per-service watchdogs system-wide if given a
+          boolean argument (i.e. the concept you configure in WatchdogSec=), for
+          debugging purposes. There's also a kernel command line option
+          systemd.service_watchdogs= for controlling the same.
+
+        * Two new "log-level" and "log-target" options for systemd-analyze were
+          added that merge the now deprecated get-log-level, set-log-level and
+          get-log-target, set-log-target pairs. The deprecated options are still
+          understood for backwards compatibility. The two new options print the
+          current value when no arguments are given, and set them when a
+          level/target is given as an argument.
+
+        * sysusers.d's "u" lines now optionally accept both a UID and a GID
+          specification, separated by a ":" character, in order to create users
+          where UID and GID do not match.
+
+        Contributions from: Adam Duskett, Alan Jenkins, Alexander Kuleshov,
+        Alexis Deruelle, Andrew Jeddeloh, Armin Widegreen, Batuhan Osman
+        Taşkaya, Björn Esser, bleep_blop, Bruce A. Johnson, Chris Down, Clinton
+        Roy, Colin Walters, Daniel Rusek, Dimitri John Ledkov, Dmitry Rozhkov,
+        Evgeny Vereshchagin, Ewout van Mansom, Felipe Sateler, Franck Bui,
+        Frantisek Sumsal, George Gaydarov, Gianluca Boiano, Hans-Christian
+        Noren Egtvedt, Hans de Goede, Henrik Grindal Bakken, Jan Alexander
+        Steffens, Jan Klötzke, Jason A. Donenfeld, jdkbx, Jérémy Rosen,
+        Jerónimo Borque, John Lin, John Paul Herold, Jonathan Rudenberg, Jörg
+        Thalheim, Ken (Bitsko) MacLeod, Larry Bernstone, Lennart Poettering,
+        Lucas Werkmeister, Maciej S. Szmigiero, Marek Čermák, Martin Pitt,
+        Mathieu Malaterre, Matthew Thode, Matthias-Christian Ott, Max Harmathy,
+        Michael Biebl, Michael Vogt, Michal Koutný, Michal Sekletar, Michał
+        Szczepański, Mike Gilbert, Nathaniel McCallum, Nicolas Chauvet, Olaf
+        Hering, Olivier Schwander, Patrik Flykt, Paul Cercueil, Peter Hutterer,
+        Piotr Drąg, Raphael Vogelgsang, Reverend Homer, Robert Kolchmeyer,
+        Samuel Dionne-Riel, Sergey Ptashnick, Shawn Landden, Susant Sahani,
+        Sylvain Plantefève, Thomas H. P. Andersen, Thomas Huth, Tomasz
+        Bachorski, Vladislav Vishnyakov, Wieland Hoffmann, Yu Watanabe, Zachary
+        Winnerman, Zbigniew Jędrzejewski-Szmek, Дамјан Георгиевски, Дилян
+        Палаузов
+
+        — Brno, 2018-01-28
+
+CHANGES WITH 236:
+
+        * The modprobe.d/ drop-in for the bonding.ko kernel module introduced
+          in v235 has been extended to also set the dummy.ko module option
+          numdummies=0, preventing the kernel from automatically creating
+          dummy0. All dummy interfaces must now be explicitly created.
+
+        * Unknown '%' specifiers in configuration files are now rejected. This
+          applies to units and tmpfiles.d configuration. Any percent characters
+          that are followed by a letter or digit that are not supposed to be
+          interpreted as the beginning of a specifier should be escaped by
+          doubling ("%%").  (So "size=5%" is still accepted, as well as
+          "size=5%,foo=bar", but not "LABEL=x%y%z" since %y and %z are not
+          valid specifiers today.)
+
+        * systemd-resolved now maintains a new dynamic
+          /run/systemd/resolve/stub-resolv.conf compatibility file. It is
+          recommended to make /etc/resolv.conf a symlink to it. This file
+          points at the systemd-resolved stub DNS 127.0.0.53 resolver and
+          includes dynamically acquired search domains, achieving more correct
+          DNS resolution by software that bypasses local DNS APIs such as NSS.
+
+        * The "uaccess" udev tag has been dropped from /dev/kvm and
+          /dev/dri/renderD*.  These devices now have the 0666 permissions by
+          default (but this may be changed at build-time). /dev/dri/renderD*
+          will now be owned by the "render" group along with /dev/kfd.
+
+        * "DynamicUser=yes" has been enabled for systemd-timesyncd.service,
+          systemd-journal-gatewayd.service and
+          systemd-journal-upload.service. This means "nss-systemd" must be
+          enabled in /etc/nsswitch.conf to ensure the UIDs assigned to these
+          services are resolved properly.
+
+        * In /etc/fstab two new mount options are now understood:
+          x-systemd.makefs and x-systemd.growfs. The former has the effect that
+          the configured file system is formatted before it is mounted, the
+          latter that the file system is resized to the full block device size
+          after it is mounted (i.e. if the file system is smaller than the
+          partition it resides on, it's grown). This is similar to the fsck
+          logic in /etc/fstab, and pulls in systemd-makefs@.service and
+          systemd-growfs@.service as necessary, similar to
+          systemd-fsck@.service. Resizing is currently only supported on ext4
+          and btrfs.
+
+        * In systemd-networkd, the IPv6 RA logic now optionally may announce
+          DNS server and domain information.
+
+        * Support for the LUKS2 on-disk format for encrypted partitions has
+          been added. This requires libcryptsetup2 during compilation and
+          runtime.
+
+        * The systemd --user instance will now signal "readiness" when its
+          basic.target unit has been reached, instead of when the run queue ran
+          empty for the first time.
+
+        * Tmpfiles.d with user configuration are now also supported.
+          systemd-tmpfiles gained a new --user switch, and snippets placed in
+          ~/.config/user-tmpfiles.d/ and corresponding directories will be
+          executed by systemd-tmpfiles --user running in the new
+          systemd-tmpfiles-setup.service and systemd-tmpfiles-clean.service
+          running in the user session.
+
+        * Unit files and tmpfiles.d snippets learnt three new % specifiers:
+          %S resolves to the top-level state directory (/var/lib for the system
+          instance, $XDG_CONFIG_HOME for the user instance), %C resolves to the
+          top-level cache directory (/var/cache for the system instance,
+          $XDG_CACHE_HOME for the user instance), %L resolves to the top-level
+          logs directory (/var/log for the system instance,
+          $XDG_CONFIG_HOME/log/ for the user instance). This matches the
+          existing %t specifier, that resolves to the top-level runtime
+          directory (/run for the system instance, and $XDG_RUNTIME_DIR for the
+          user instance).
+
+        * journalctl learnt a new parameter --output-fields= for limiting the
+          set of journal fields to output in verbose and JSON output modes.
+
+        * systemd-timesyncd's configuration file gained a new option
+          RootDistanceMaxSec= for setting the maximum root distance of servers
+          it'll use, as well as the new options PollIntervalMinSec= and
+          PollIntervalMaxSec= to tweak the minimum and maximum poll interval.
+
+        * bootctl gained a new command "list" for listing all available boot
+          menu items on systems that follow the boot loader specification.
+
+        * systemctl gained a new --dry-run switch that shows what would be done
+          instead of doing it, and is currently supported by the shutdown and
+          sleep verbs.
+
+        * ConditionSecurity= can now detect the TOMOYO security module.
+
+        * Unit file [Install] sections are now also respected in unit drop-in
+          files. This is intended to be used by drop-ins under /usr/lib/.
+
+        * systemd-firstboot may now also set the initial keyboard mapping.
+
+        * Udev "changed" events for devices which are exposed as systemd
+          .device units are now propagated to units specified in
+          ReloadPropagatedFrom= as reload requests.
+
+        * If a udev device has a SYSTEMD_WANTS= property containing a systemd
+          unit template name (i.e. a name in the form of 'foobar@.service',
+          without the instance component between the '@' and - the '.'), then
+          the escaped sysfs path of the device is automatically used as the
+          instance.
+
+        * SystemCallFilter= in unit files has been extended so that an "errno"
+          can be specified individually for each system call. Example:
+          SystemCallFilter=~uname:EILSEQ.
+
+        * The cgroup delegation logic has been substantially updated. Delegate=
+          now optionally takes a list of controllers (instead of a boolean, as
+          before), which lists the controllers to delegate at least.
+
+        * The networkd DHCPv6 client now implements the FQDN option (RFC 4704).
+
+        * A new LogLevelMax= setting configures the maximum log level any
+          process of the service may log at (i.e. anything with a lesser
+          priority than what is specified is automatically dropped). A new
+          LogExtraFields= setting allows configuration of additional journal
+          fields to attach to all log records generated by any of the unit's
+          processes.
+
+        * New StandardInputData= and StandardInputText= settings along with the
+          new option StandardInput=data may be used to configure textual or
+          binary data that shall be passed to the executed service process via
+          standard input, encoded in-line in the unit file.
+
+        * StandardInput=, StandardOutput= and StandardError= may now be used to
+          connect stdin/stdout/stderr of executed processes directly with a
+          file or AF_UNIX socket in the file system, using the new "file:" option.
+
+        * A new unit file option CollectMode= has been added, that allows
+          tweaking the garbage collection logic for units. It may be used to
+          tell systemd to garbage collect units that have failed automatically
+          (normally it only GCs units that exited successfully). systemd-run
+          and systemd-mount expose this new functionality with a new -G option.
+
+        * "machinectl bind" may now be used to bind mount non-directories
+          (i.e. regularfiles, devices, fifos, sockets).
+
+        * systemd-analyze gained a new verb "calendar" for validating and
+          testing calendar time specifications to use for OnCalendar= in timer
+          units. Besides validating the expression it will calculate the next
+          time the specified expression would elapse.
+
+        * In addition to the pre-existing FailureAction= unit file setting
+          there's now SuccessAction=, for configuring a shutdown action to
+          execute when a unit completes successfully. This is useful in
+          particular inside containers that shall terminate after some workload
+          has been completed. Also, both options are now supported for all unit
+          types, not just services.
+
+        * networkds's IP rule support gained two new options
+          IncomingInterface= and OutgoingInterface= for configuring the incoming
+          and outgoing interfaces of configured rules. systemd-networkd also
+          gained support for "vxcan" network devices.
+
+        * networkd gained a new setting RequiredForOnline=, taking a
+          boolean. If set, systemd-wait-online will take it into consideration
+          when determining that the system is up, otherwise it will ignore the
+          interface for this purpose.
+
+        * The sd_notify() protocol gained support for a new operation: with
+          FDSTOREREMOVE=1 file descriptors may be removed from the per-service
+          store again, ahead of POLLHUP or POLLERR when they are removed
+          anyway.
+
+        * A new document doc/UIDS-GIDS.md has been added to the source tree,
+          that documents the UID/GID range and assignment assumptions and
+          requirements of systemd.
+
+        * The watchdog device PID 1 will ping may now be configured through the
+          WatchdogDevice= configuration file setting, or by setting the
+          systemd.watchdog_service= kernel commandline option.
+
+        * systemd-resolved's gained support for registering DNS-SD services on
+          the local network using MulticastDNS. Services may either be
+          registered by dropping in a .dnssd file in /etc/systemd/dnssd/ (or
+          the same dir below /run, /usr/lib), or through its D-Bus API.
+
+        * The sd_notify() protocol can now with EXTEND_TIMEOUT_USEC=microsecond
+          extend the effective start, runtime, and stop time. The service must
+          continue to send EXTEND_TIMEOUT_USEC within the period specified to
+          prevent the service manager from making the service as timedout.
+
+        * systemd-resolved's DNSSEC support gained support for RFC 8080
+          (Ed25519 keys and signatures).
+
+        * The systemd-resolve command line tool gained a new set of options
+          --set-dns=, --set-domain=, --set-llmnr=, --set-mdns=, --set-dnssec=,
+          --set-nta= and --revert to configure per-interface DNS configuration
+          dynamically during runtime. It's useful for pushing DNS information
+          into systemd-resolved from DNS hook scripts that various interface
+          managing software supports (such as pppd).
+
+        * systemd-nspawn gained a new --network-namespace-path= command line
+          option, which may be used to make a container join an existing
+          network namespace, by specifying a path to a "netns" file.
+
+        Contributions from: Alan Jenkins, Alan Robertson, Alessandro Ghedini,
+        Andrew Jeddeloh, Antonio Rojas, Ari, asavah, bleep_blop, Carsten
+        Strotmann, Christian Brauner, Christian Hesse, Clinton Roy, Collin
+        Eggert, Cong Wang, Daniel Black, Daniel Lockyer, Daniel Rusek, Dimitri
+        John Ledkov, Dmitry Rozhkov, Dongsu Park, Edward A. James, Evgeny
+        Vereshchagin, Florian Klink, Franck Bui, Gwendal Grignou, Hans de
+        Goede, Harald Hoyer, Hristo Venev, Iago López Galeiras, Ikey Doherty,
+        Jakub Wilk, Jérémy Rosen, Jiahui Xie, John Lin, José Bollo, Josef
+        Andersson, juga0, Krzysztof Nowicki, Kyle Walker, Lars Karlitski, Lars
+        Kellogg-Stedman, Lauri Tirkkonen, Lennart Poettering, Lubomir Rintel,
+        Luca Bruno, Lucas Werkmeister, Lukáš Nykrýn, Lukáš Říha, Lukasz
+        Rubaszewski, Maciej S. Szmigiero, Mantas Mikulėnas, Marcus Folkesson,
+        Martin Steuer, Mathieu Trudel-Lapierre, Matija Skala,
+        Matthias-Christian Ott, Max Resch, Michael Biebl, Michael Vogt, Michal
+        Koutný, Michal Sekletar, Mike Gilbert, Muhammet Kara, Neil Brown, Olaf
+        Hering, Ondrej Kozina, Patrik Flykt, Patryk Kocielnik, Peter Hutterer,
+        Piotr Drąg, Razvan Cojocaru, Robin McCorkell, Roland Hieber, Saran
+        Tunyasuvunakool, Sergey Ptashnick, Shawn Landden, Shuang Liu, Simon
+        Arlott, Simon Peeters, Stanislav Angelovič, Stefan Agner, Susant
+        Sahani, Sylvain Plantefève, Thomas Blume, Thomas Haller, Tiago Salem
+        Herrmann, Tinu Weber, Tom Stellard, Topi Miettinen, Torsten Hilbrich,
+        Vito Caputo, Vladislav Vishnyakov, WaLyong Cho, Yu Watanabe, Zbigniew
+        Jędrzejewski-Szmek, Zeal Jagannatha
+
+        — Berlin, 2017-12-14
+
+CHANGES WITH 235:
+
+        * INCOMPATIBILITY: systemd-logind.service and other long-running
+          services now run inside an IPv4/IPv6 sandbox, prohibiting them any IP
+          communication with the outside. This generally improves security of
+          the system, and is in almost all cases a safe and good choice, as
+          these services do not and should not provide any network-facing
+          functionality. However, systemd-logind uses the glibc NSS API to
+          query the user database. This creates problems on systems where NSS
+          is set up to directly consult network services for user database
+          lookups. In particular, this creates incompatibilities with the
+          "nss-nis" module, which attempts to directly contact the NIS/YP
+          network servers it is configured for, and will now consistently
+          fail. In such cases, it is possible to turn off IP sandboxing for
+          systemd-logind.service (set IPAddressDeny= in its [Service] section
+          to the empty string, via a .d/ unit file drop-in). Downstream
+          distributions might want to update their nss-nis packaging to include
+          such a drop-in snippet, accordingly, to hide this incompatibility
+          from the user. Another option is to make use of glibc's nscd service
+          to proxy such network requests through a privilege-separated, minimal
+          local caching daemon, or to switch to more modern technologies such
+          sssd, whose NSS hook-ups generally do not involve direct network
+          access. In general, we think it's definitely time to question the
+          implementation choices of nss-nis, i.e. whether it's a good idea
+          today to embed a network-facing loadable module into all local
+          processes that need to query the user database, including the most
+          trivial and benign ones, such as "ls". For more details about
+          IPAddressDeny= see below.
+
+        * A new modprobe.d drop-in is now shipped by default that sets the
+          bonding module option max_bonds=0. This overrides the kernel default,
+          to avoid conflicts and ambiguity as to whether or not bond0 should be
+          managed by systemd-networkd or not. This resolves multiple issues
+          with bond0 properties not being applied, when bond0 is configured
+          with systemd-networkd. Distributors may choose to not package this,
+          however in that case users will be prevented from correctly managing
+          bond0 interface using systemd-networkd.
+
+        * systemd-analyze gained new verbs "get-log-level" and "get-log-target"
+          which print the logging level and target of the system manager. They
+          complement the existing "set-log-level" and "set-log-target" verbs
+          used to change those values.
+
+        * journald.conf gained a new boolean setting ReadKMsg= which defaults
+          to on. If turned off kernel log messages will not be read by
+          systemd-journald or included in the logs. It also gained a new
+          setting LineMax= for configuring the maximum line length in
+          STDOUT/STDERR log streams. The new default for this value is 48K, up
+          from the previous hardcoded 2048.
+
+        * A new unit setting RuntimeDirectoryPreserve= has been added, which
+          allows more detailed control of what to do with a runtime directory
+          configured with RuntimeDirectory= (i.e. a directory below /run or
+          $XDG_RUNTIME_DIR) after a unit is stopped.
+
+        * The RuntimeDirectory= setting for units gained support for creating
+          deeper subdirectories below /run or $XDG_RUNTIME_DIR, instead of just
+          one top-level directory.
+
+        * Units gained new options StateDirectory=, CacheDirectory=,
+          LogsDirectory= and ConfigurationDirectory= which are closely related
+          to RuntimeDirectory= but manage per-service directories below
+          /var/lib, /var/cache, /var/log and /etc. By making use of them it is
+          possible to write unit files which when activated automatically gain
+          properly owned service specific directories in these locations, thus
+          making unit files self-contained and increasing compatibility with
+          stateless systems and factory reset where /etc or /var are
+          unpopulated at boot. Matching these new settings there's also
+          StateDirectoryMode=, CacheDirectoryMode=, LogsDirectoryMode=,
+          ConfigurationDirectoryMode= for configuring the access mode of these
+          directories. These settings are particularly useful in combination
+          with DynamicUser=yes as they provide secure, properly-owned,
+          writable, and stateful locations for storage, excluded from the
+          sandbox that such services live in otherwise.
+
+        * Automake support has been removed from this release. systemd is now
+          Meson-only.
+
+        * systemd-journald will now aggressively cache client metadata during
+          runtime, speeding up log write performance under pressure. This comes
+          at a small price though: as much of the metadata is read
+          asynchronously from /proc/ (and isn't implicitly attached to log
+          datagrams by the kernel, like UID/GID/PID/SELinux are) this means the
+          metadata stored alongside a log entry might be slightly
+          out-of-date. Previously it could only be slightly newer than the log
+          message. The time window is small however, and given that the kernel
+          is unlikely to be improved anytime soon in this regard, this appears
+          acceptable to us.
+
+        * nss-myhostname/systemd-resolved will now by default synthesize an
+          A/AAAA resource record for the "_gateway" hostname, pointing to the
+          current default IP gateway. Previously it did that for the "gateway"
+          name, hampering adoption, as some distributions wanted to leave that
+          host name open for local use. The old behaviour may still be
+          requested at build time.
+
+        * systemd-networkd's [Address] section in .network files gained a new
+          Scope= setting for configuring the IP address scope. The [Network]
+          section gained a new boolean setting ConfigureWithoutCarrier= that
+          tells systemd-networkd to ignore link sensing when configuring the
+          device. The [DHCP] section gained a new Anonymize= boolean option for
+          turning on a number of options suggested in RFC 7844. A new
+          [RoutingPolicyRule] section has been added for configuring the IP
+          routing policy. The [Route] section has gained support for a new
+          Type= setting which permits configuring
+          blackhole/unreachable/prohibit routes.
+
+        * The [VRF] section in .netdev files gained a new Table= setting for
+          configuring the routing table to use. The [Tunnel] section gained a
+          new Independent= boolean field for configuring tunnels independent of
+          an underlying network interface. The [Bridge] section gained a new
+          GroupForwardMask= option for configuration of propagation of link
+          local frames between bridge ports.
+
+        * The WakeOnLan= setting in .link files gained support for a number of
+          new modes. A new TCP6SegmentationOffload= setting has been added for
+          configuring TCP/IPv6 hardware segmentation offload.
+
+        * The IPv6 RA sender implementation may now optionally send out RDNSS
+          and RDNSSL records to supply DNS configuration to peers.
+
+        * systemd-nspawn gained support for a new --system-call-filter= command
+          line option for adding and removing entries in the default system
+          call filter it applies. Moreover systemd-nspawn has been changed to
+          implement a system call whitelist instead of a blacklist.
+
+        * systemd-run gained support for a new --pipe command line option. If
+          used the STDIN/STDOUT/STDERR file descriptors passed to systemd-run
+          are directly passed on to the activated transient service
+          executable. This allows invoking arbitrary processes as systemd
+          services (for example to take benefit of dependency management,
+          accounting management, resource management or log management that is
+          done automatically for services) — while still allowing them to be
+          integrated in a classic UNIX shell pipeline.
+
+        * When a service sends RELOAD=1 via sd_notify() and reload propagation
+          using ReloadPropagationTo= is configured, a reload is now propagated
+          to configured units. (Previously this was only done on explicitly
+          requested reloads, using "systemctl reload" or an equivalent
+          command.)
+
+        * For each service unit a restart counter is now kept: it is increased
+          each time the service is restarted due to Restart=, and may be
+          queried using "systemctl show -p NRestarts …".
+
+        * New system call filter groups @aio, @sync, @chown, @setuid, @memlock,
+          @signal and @timer have been added, for usage with SystemCallFilter=
+          in unit files and the new --system-call-filter= command line option
+          of systemd-nspawn (see above).
+
+        * ExecStart= lines in unit files gained two new modifiers: when a
+          command line is prefixed with "!" the command will be executed as
+          configured, except for the credentials applied by
+          setuid()/setgid()/setgroups(). It is very similar to the pre-existing
+          "+", but does still apply namespacing options unlike "+". There's
+          also "!!" now, which is mostly identical, but becomes a NOP on
+          systems that support ambient capabilities. This is useful to write
+          unit files that work with ambient capabilities where possible but
+          automatically fall back to traditional privilege dropping mechanisms
+          on systems where this is not supported.
+
+        * ListenNetlink= settings in socket units now support RDMA netlink
+          sockets.
+
+        * A new unit file setting LockPersonality= has been added which permits
+          locking down the chosen execution domain ("personality") of a service
+          during runtime.
+
+        * A new special target "getty-pre.target" has been added, which is
+          ordered before all text logins, and may be used to order services
+          before textual logins acquire access to the console.
+
+        * systemd will now attempt to load the virtio-rng.ko kernel module very
+          early on if a VM environment supporting this is detected. This should
+          improve entropy during early boot in virtualized environments.
+
+        * A _netdev option is now supported in /etc/crypttab that operates in a
+          similar way as the same option in /etc/fstab: it permits configuring
+          encrypted devices that need to be ordered after the network is up.
+          Following this logic, two new special targets
+          remote-cryptsetup-pre.target and remote-cryptsetup.target have been
+          added that are to cryptsetup.target what remote-fs.target and
+          remote-fs-pre.target are to local-fs.target.
+
+        * Service units gained a new UnsetEnvironment= setting which permits
+          unsetting specific environment variables for services that are
+          normally passed to it (for example in order to mask out locale
+          settings for specific services that can't deal with it).
+
+        * Units acquired a new boolean option IPAccounting=. When turned on, IP
+          traffic accounting (packet count as well as byte count) is done for
+          the service, and shown as part of "systemctl status" or "systemd-run
+          --wait".
+
+        * Service units acquired two new options IPAddressAllow= and
+          IPAddressDeny=, taking a list of IPv4 or IPv6 addresses and masks,
+          for configuring a simple IP access control list for all sockets of
+          the unit. These options are available also on .slice and .socket
+          units, permitting flexible access list configuration for individual
+          services as well as groups of services (as defined by a slice unit),
+          including system-wide. Note that IP ACLs configured this way are
+          enforced on every single IPv4 and IPv6 socket created by any process
+          of the service unit, and apply to ingress as well as egress traffic.
+
+        * If CPUAccounting= or IPAccounting= is turned on for a unit a new
+          structured log message is generated each time the unit is stopped,
+          containing information about the consumed resources of this
+          invocation.
+
+        * A new setting KeyringMode= has been added to unit files, which may be
+          used to control how the kernel keyring is set up for executed
+          processes.
+
+        * "systemctl poweroff", "systemctl reboot", "systemctl halt",
+          "systemctl kexec" and "systemctl exit" are now always asynchronous in
+          behaviour (that is: these commands return immediately after the
+          operation was enqueued instead of waiting for the operation to
+          complete). Previously, "systemctl poweroff" and "systemctl reboot"
+          were asynchronous on systems using systemd-logind (i.e. almost
+          always, and like they were on sysvinit), and the other three commands
+          were unconditionally synchronous. With this release this is cleaned
+          up, and callers will see the same asynchronous behaviour on all
+          systems for all five operations.
+
+        * systemd-logind gained new Halt() and CanHalt() bus calls for halting
+          the system.
+
+        * .timer units now accept calendar specifications in other timezones
+          than UTC or the local timezone.
+
+        * The tmpfiles snippet var.conf has been changed to create
+          /var/log/btmp with access mode 0660 instead of 0600. It was owned by
+          the "utmp" group already, and it appears to be generally understood
+          that members of "utmp" can modify/flush the utmp/wtmp/lastlog/btmp
+          databases. Previously this was implemented correctly for all these
+          databases excepts btmp, which has been opened up like this now
+          too. Note that while the other databases are world-readable
+          (i.e. 0644), btmp is not and remains more restrictive.
+
+        * The systemd-resolve tool gained a new --reset-server-features
+          switch. When invoked like this systemd-resolved will forget
+          everything it learnt about the features supported by the configured
+          upstream DNS servers, and restarts the feature probing logic on the
+          next resolver look-up for them at the highest feature level
+          again.
+
+        * The status dump systemd-resolved sends to the logs upon receiving
+          SIGUSR1 now also includes information about all DNS servers it is
+          configured to use, and the features levels it probed for them.
+
+        Contributions from: Abdó Roig-Maranges, Alan Jenkins, Alexander
+        Kuleshov, Andreas Rammhold, Andrew Jeddeloh, Andrew Soutar, Ansgar
+        Burchardt, Beniamino Galvani, Benjamin Berg, Benjamin Robin, Charles
+        Huber, Christian Hesse, Daniel Berrange, Daniel Kahn Gillmor, Daniel
+        Mack, Daniel Rusek, Daniel Șerbănescu, Davide Cavalca, Dimitri John
+        Ledkov, Diogo Pereira, Djalal Harouni, Dmitriy Geels, Dmitry Torokhov,
+        ettavolt, Evgeny Vereshchagin, Fabio Kung, Felipe Sateler, Franck Bui,
+        Hans de Goede, Harald Hoyer, Insun Pyo, Ivan Kurnosov, Ivan Shapovalov,
+        Jakub Wilk, Jan Synacek, Jason Gunthorpe, Jeremy Bicha, Jérémy Rosen,
+        John Lin, jonasBoss, Jonathan Lebon, Jonathan Teh, Jon Ringle, Jörg
+        Thalheim, Jouke Witteveen, juga0, Justin Capella, Justin Michaud,
+        Kai-Heng Feng, Lennart Poettering, Lion Yang, Luca Bruno, Lucas
+        Werkmeister, Lukáš Nykrýn, Marcel Hollerbach, Marcus Lundblad, Martin
+        Pitt, Michael Biebl, Michael Grzeschik, Michal Sekletar, Mike Gilbert,
+        Neil Brown, Nicolas Iooss, Patrik Flykt, pEJipE, Piotr Drąg, Russell
+        Stuart, S. Fan, Shengyao Xue, Stefan Pietsch, Susant Sahani, Tejun Heo,
+        Thomas Miller, Thomas Sailer, Tobias Hunger, Tomasz Pala, Tom
+        Gundersen, Tommi Rantala, Topi Miettinen, Torstein Husebø, userwithuid,
+        Vasilis Liaskovitis, Vito Caputo, WaLyong Cho, William Douglas, Xiang
+        Fan, Yu Watanabe, Zbigniew Jędrzejewski-Szmek
+
+        — Berlin, 2017-10-06
+
+CHANGES WITH 234:
+
+        * Meson is now supported as build system in addition to Automake. It is
+          our plan to remove Automake in one of our next releases, so that
+          Meson becomes our exclusive build system. Hence, please start using
+          the Meson build system in your downstream packaging. There's plenty
+          of documentation around how to use Meson, the extremely brief
+          summary:
+
+              ./autogen.sh && ./configure && make && sudo make install
+
+          becomes:
+
+              meson build && ninja -C build && sudo ninja -C build install
+
+        * Unit files gained support for a new JobRunningTimeoutUSec= setting,
+          which permits configuring a timeout on the time a job is
+          running. This is particularly useful for setting timeouts on jobs for
+          .device units.
+
+        * Unit files gained two new options ConditionUser= and ConditionGroup=
+          for conditionalizing units based on the identity of the user/group
+          running a systemd user instance.
+
+        * systemd-networkd now understands a new FlowLabel= setting in the
+          [VXLAN] section of .network files, as well as a Priority= in
+          [Bridge], GVRP= + MVRP= + LooseBinding= + ReorderHeader= in [VLAN]
+          and GatewayOnlink= + IPv6Preference= + Protocol= in [Route]. It also
+          gained support for configuration of GENEVE links, and IPv6 address
+          labels. The [Network] section gained the new IPv6ProxyNDP= setting.
+
+        * .link files now understand a new Port= setting.
+
+        * systemd-networkd's DHCP support gained support for DHCP option 119
+          (domain search list).
+
+        * systemd-networkd gained support for serving IPv6 address ranges using
+          the Router Advertisement protocol. The new .network configuration
+          section [IPv6Prefix] may be used to configure the ranges to
+          serve. This is implemented based on a new, minimal, native server
+          implementation of RA.
+
+        * journalctl's --output= switch gained support for a new parameter
+          "short-iso-precise" for a mode where timestamps are shown as precise
+          ISO date values.
+
+        * systemd-udevd's "net_id" builtin may now generate stable network
+          interface names from IBM PowerVM VIO devices as well as ACPI platform
+          devices.
+
+        * MulticastDNS support in systemd-resolved may now be explicitly
+          enabled/disabled using the new MulticastDNS= configuration file
+          option.
+
+        * systemd-resolved may now optionally use libidn2 instead of the libidn
+          for processing internationalized domain names. Support for libidn2
+          should be considered experimental and should not be enabled by
+          default yet.
+
+        * "machinectl pull-tar" and related call may now do verification of
+          downloaded images using SUSE-style .sha256 checksum files in addition
+          to the already existing support for validating using Ubuntu-style
+          SHA256SUMS files.
+
+        * sd-bus gained support for a new sd_bus_message_appendv() call which
+          is va_list equivalent of sd_bus_message_append().
+
+        * sd-boot gained support for validating images using SHIM/MOK.
+
+        * The SMACK code learnt support for "onlycap".
+
+        * systemd-mount --umount is now much smarter in figuring out how to
+          properly unmount a device given its mount or device path.
+
+        * The code to call libnss_dns as a fallback from libnss_resolve when
+          the communication with systemd-resolved fails was removed. This
+          fallback was redundant and interfered with the [!UNAVAIL=return]
+          suffix. See nss-resolve(8) for the recommended configuration.
+
+        * systemd-logind may now be restarted without losing state. It stores
+          the file descriptors for devices it manages in the system manager
+          using the FDSTORE= mechanism. Please note that further changes in
+          other components may be required to make use of this (for example
+          Xorg has code to listen for stops of systemd-logind and terminate
+          itself when logind is stopped or restarted, in order to avoid using
+          stale file descriptors for graphical devices, which is now
+          counterproductive and must be reverted in order for restarts of
+          systemd-logind to be safe. See
+          https://cgit.freedesktop.org/xorg/xserver/commit/?id=dc48bd653c7e101.)
+
+        * All kernel install plugins are called with the environment variable
+          KERNEL_INSTALL_MACHINE_ID which is set to the machine ID given by
+          /etc/machine-id. If the file is missing or empty, the variable is
+          empty and BOOT_DIR_ABS is the path of a temporary directory which is
+          removed after all the plugins exit. So, if KERNEL_INSTALL_MACHINE_ID
+          is empty, all plugins should not put anything in BOOT_DIR_ABS.
+
+        Contributions from: Adrian Heine né Lang, Aggelos Avgerinos, Alexander
+        Kurtz, Alexandros Frantzis, Alexey Brodkin, Alex Lu, Amir Pakdel, Amir
+        Yalon, Anchor Cat, Anthony Parsons, Bastien Nocera, Benjamin Gilbert,
+        Benjamin Robin, Boucman, Charles Plessy, Chris Chiu, Chris Lamb,
+        Christian Brauner, Christian Hesse, Colin Walters, Daniel Drake,
+        Danielle Church, Daniel Molkentin, Daniel Rusek, Daniel Wang, Davide
+        Cavalca, David Herrmann, David Michael, Dax Kelson, Dimitri John
+        Ledkov, Djalal Harouni, Dušan Kazik, Elias Probst, Evgeny Vereshchagin,
+        Federico Di Pierro, Felipe Sateler, Felix Zhang, Franck Bui, Gary
+        Tierney, George McCollister, Giedrius Statkevičius, Hans de Goede,
+        hecke, Hendrik Westerberg, Hristo Venev, Ian Wienand, Insun Pyo, Ivan
+        Shapovalov, James Cowgill, James Hemsing, Janne Heß, Jan Synacek, Jason
+        Reeder, João Paulo Rechi Vita, John Paul Adrian Glaubitz, Jörg
+        Thalheim, Josef Andersson, Josef Gajdusek, Julian Mehne, Kai Krakow,
+        Krzysztof Jackiewicz, Lars Karlitski, Lennart Poettering, Lluís Gili,
+        Lucas Werkmeister, Lukáš Nykrýn, Łukasz Stelmach, Mantas Mikulėnas,
+        Marcin Bachry, Marcus Cooper, Mark Stosberg, Martin Pitt, Matija Skala,
+        Matt Clarkson, Matthew Garrett, Matthias Greiner, Matthijs van Duin,
+        Max Resch, Michael Biebl, Michal Koutný, Michal Sekletar, Michal
+        Soltys, Michal Suchanek, Mike Gilbert, Nate Clark, Nathaniel R. Lewis,
+        Neil Brown, Nikolai Kondrashov, Pascal S. de Kloe, Pat Riehecky, Patrik
+        Flykt, Paul Kocialkowski, Peter Hutterer, Philip Withnall, Piotr
+        Szydełko, Rafael Fontenelle, Ray Strode, Richard Maw, Roelf Wichertjes,
+        Ronny Chevalier, Sarang S. Dalal, Sjoerd Simons, slodki, Stefan
+        Schweter, Susant Sahani, Ted Wood, Thomas Blume, Thomas Haller, Thomas
+        H. P. Andersen, Timothée Ravier, Tobias Jungel, Tobias Stoeckmann, Tom
+        Gundersen, Tom Yan, Torstein Husebø, Umut Tezduyar Lindskog,
+        userwithuid, Vito Caputo, Waldemar Brodkorb, WaLyong Cho, Yu, Li-Yu,
+        Yusuke Nojima, Yu Watanabe, Zbigniew Jędrzejewski-Szmek, Дамјан
+        Георгиевски
+
+        — Berlin, 2017-07-12
+
+CHANGES WITH 233:
+
+        * The "hybrid" control group mode has been modified to improve
+          compatibility with "legacy" cgroups-v1 setups. Specifically, the
+          "hybrid" setup of /sys/fs/cgroup is now pretty much identical to
+          "legacy" (including /sys/fs/cgroup/systemd as "name=systemd" named
+          cgroups-v1 hierarchy), the only externally visible change being that
+          the cgroups-v2 hierarchy is also mounted, to
+          /sys/fs/cgroup/unified. This should provide a large degree of
+          compatibility with "legacy" cgroups-v1, while taking benefit of the
+          better management capabilities of cgroups-v2.
+
+        * The default control group setup mode may be selected both a boot-time
+          via a set of kernel command line parameters (specifically:
+          systemd.unified_cgroup_hierarchy= and
+          systemd.legacy_systemd_cgroup_controller=), as well as a compile-time
+          default selected on the configure command line
+          (--with-default-hierarchy=). The upstream default is "hybrid"
+          (i.e. the cgroups-v1 + cgroups-v2 mixture discussed above) now, but
+          this will change in a future systemd version to be "unified" (pure
+          cgroups-v2 mode). The third option for the compile time option is
+          "legacy", to enter pure cgroups-v1 mode. We recommend downstream
+          distributions to default to "hybrid" mode for release distributions,
+          starting with v233. We recommend "unified" for development
+          distributions (specifically: distributions such as Fedora's rawhide)
+          as that's where things are headed in the long run. Use "legacy" for
+          greatest stability and compatibility only.
+
+        * Note one current limitation of "unified" and "hybrid" control group
+          setup modes: the kernel currently does not permit the systemd --user
+          instance (i.e. unprivileged code) to migrate processes between two
+          disconnected cgroup subtrees, even if both are managed and owned by
+          the user. This effectively means "systemd-run --user --scope" doesn't
+          work when invoked from outside of any "systemd --user" service or
+          scope. Specifically, it is not supported from session scopes. We are
+          working on fixing this in a future systemd version. (See #3388 for
+          further details about this.)
+
+        * DBus policy files are now installed into /usr rather than /etc. Make
+          sure your system has dbus >= 1.9.18 running before upgrading to this
+          version, or override the install path with --with-dbuspolicydir= .
+
+        * All python scripts shipped with systemd (specifically: the various
+          tests written in Python) now require Python 3.
+
+        * systemd unit tests can now run standalone (without the source or
+          build directories), and can be installed into /usr/lib/systemd/tests/
+          with 'make install-tests'.
+
+        * Note that from this version on, CONFIG_CRYPTO_USER_API_HASH,
+          CONFIG_CRYPTO_HMAC and CONFIG_CRYPTO_SHA256 need to be enabled in the
+          kernel.
+
+        * Support for the %c, %r, %R specifiers in unit files has been
+          removed. Specifiers are not supposed to be dependent on configuration
+          in the unit file itself (so that they resolve the same regardless
+          where used in the unit files), but these specifiers were influenced
+          by the Slice= option.
+
+        * The shell invoked by debug-shell.service now defaults to /bin/sh in
+          all cases. If distributions want to use a different shell for this
+          purpose (for example Fedora's /sbin/sushell) they need to specify
+          this explicitly at configure time using --with-debug-shell=.
+
+        * The confirmation spawn prompt has been reworked to offer the
+          following choices:
+
+           (c)ontinue, proceed without asking anymore
+           (D)ump, show the state of the unit
+           (f)ail, don't execute the command and pretend it failed
+           (h)elp
+           (i)nfo, show a short summary of the unit
+           (j)obs, show jobs that are in progress
+           (s)kip, don't execute the command and pretend it succeeded
+           (y)es, execute the command
+
+          The 'n' choice for the confirmation spawn prompt has been removed,
+          because its meaning was confusing.
+
+          The prompt may now also be redirected to an alternative console by
+          specifying the console as parameter to systemd.confirm_spawn=.
+
+        * Services of Type=notify require a READY=1 notification to be sent
+          during startup. If no such message is sent, the service now fails,
+          even if the main process exited with a successful exit code.
+
+        * Services that fail to start up correctly now always have their
+          ExecStopPost= commands executed. Previously, they'd enter "failed"
+          state directly, without executing these commands.
+
+        * The option MulticastDNS= of network configuration files has acquired
+          an actual implementation. With MulticastDNS=yes a host can resolve
+          names of remote hosts and reply to mDNS A and AAAA requests.
+
+        * When units are about to be started an additional check is now done to
+          ensure that all dependencies of type BindsTo= (when used in
+          combination with After=) have been started.
+
+        * systemd-analyze gained a new verb "syscall-filter" which shows which
+          system call groups are defined for the SystemCallFilter= unit file
+          setting, and which system calls they contain.
+
+        * A new system call filter group "@filesystem" has been added,
+          consisting of various file system related system calls. Group
+          "@reboot" has been added, covering reboot, kexec and shutdown related
+          calls. Finally, group "@swap" has been added covering swap
+          configuration related calls.
+
+        * A new unit file option RestrictNamespaces= has been added that may be
+          used to restrict access to the various process namespace types the
+          Linux kernel provides. Specifically, it may be used to take away the
+          right for a service unit to create additional file system, network,
+          user, and other namespaces. This sandboxing option is particularly
+          relevant due to the high amount of recently discovered namespacing
+          related vulnerabilities in the kernel.
+
+        * systemd-udev's .link files gained support for a new AutoNegotiation=
+          setting for configuring Ethernet auto-negotiation.
+
+        * systemd-networkd's .network files gained support for a new
+          ListenPort= setting in the [DHCP] section to explicitly configure the
+          UDP client port the DHCP client shall listen on.
+
+        * .network files gained a new Unmanaged= boolean setting for explicitly
+          excluding one or more interfaces from management by systemd-networkd.
+
+        * The systemd-networkd ProxyARP= option has been renamed to
+          IPV4ProxyARP=. Similarly, VXLAN-specific option ARPProxy= has been
+          renamed to ReduceARPProxy=. The old names continue to be available
+          for compatibility.
+
+        * systemd-networkd gained support for configuring IPv6 Proxy NDP
+          addresses via the new IPv6ProxyNDPAddress= .network file setting.
+
+        * systemd-networkd's bonding device support gained support for two new
+          configuration options ActiveSlave= and PrimarySlave=.
+
+        * The various options in the [Match] section of .network files gained
+          support for negative matching.
+
+        * New systemd-specific mount options are now understood in /etc/fstab:
+
+          x-systemd.mount-timeout= may be used to configure the maximum
+          permitted runtime of the mount command.
+
+          x-systemd.device-bound may be set to bind a mount point to its
+          backing device unit, in order to automatically remove a mount point
+          if its backing device is unplugged. This option may also be
+          configured through the new SYSTEMD_MOUNT_DEVICE_BOUND udev property
+          on the block device, which is now automatically set for all CDROM
+          drives, so that mounted CDs are automatically unmounted when they are
+          removed from the drive.
+
+          x-systemd.after= and x-systemd.before= may be used to explicitly
+          order a mount after or before another unit or mount point.
+
+        * Enqueued start jobs for device units are now automatically garbage
+          collected if there are no jobs waiting for them anymore.
+
+        * systemctl list-jobs gained two new switches: with --after, for every
+          queued job the jobs it's waiting for are shown; with --before the
+          jobs which it's blocking are shown.
+
+        * systemd-nspawn gained support for ephemeral boots from disk images
+          (or in other words: --ephemeral and --image= may now be
+          combined). Moreover, ephemeral boots are now supported for normal
+          directories, even if the backing file system is not btrfs. Of course,
+          if the file system does not support file system snapshots or
+          reflinks, the initial copy operation will be relatively expensive, but
+          this should still be suitable for many use cases.
+
+        * Calendar time specifications in .timer units now support
+          specifications relative to the end of a month by using "~" instead of
+          "-" as separator between month and day. For example, "*-02~03" means
+          "the third last day in February". In addition a new syntax for
+          repeated events has been added using the "/" character. For example,
+          "9..17/2:00" means "every two hours from 9am to 5pm".
+
+        * systemd-socket-proxyd gained a new parameter --connections-max= for
+          configuring the maximum number of concurrent connections.
+
+        * sd-id128 gained a new API for generating unique IDs for the host in a
+          way that does not leak the machine ID. Specifically,
+          sd_id128_get_machine_app_specific() derives an ID based on the
+          machine ID a in well-defined, non-reversible, stable way. This is
+          useful whenever an identifier for the host is needed but where the
+          identifier shall not be useful to identify the system beyond the
+          scope of the application itself. (Internally this uses HMAC-SHA256 as
+          keyed hash function using the machine ID as input.)
+
+        * NotifyAccess= gained a new supported value "exec". When set
+          notifications are accepted from all processes systemd itself invoked,
+          including all control processes.
+
+        * .nspawn files gained support for defining overlay mounts using the
+          Overlay= and OverlayReadOnly= options. Previously this functionality
+          was only available on the systemd-nspawn command line.
+
+        * systemd-nspawn's --bind= and --overlay= options gained support for
+          bind/overlay mounts whose source lies within the container tree by
+          prefixing the source path with "+".
+
+        * systemd-nspawn's --bind= and --overlay= options gained support for
+          automatically allocating a temporary source directory in /var/tmp
+          that is removed when the container dies. Specifically, if the source
+          directory is specified as empty string this mechanism is selected. An
+          example usage is --overlay=+/var::/var, which creates an overlay
+          mount based on the original /var contained in the image, overlayed
+          with a temporary directory in the host's /var/tmp. This way changes
+          to /var are automatically flushed when the container shuts down.
+
+        * systemd-nspawn --image= option does now permit raw file system block
+          devices (in addition to images containing partition tables, as
+          before).
+
+        * The disk image dissection logic in systemd-nspawn gained support for
+          automatically setting up LUKS encrypted as well as Verity protected
+          partitions. When a container is booted from an encrypted image the
+          passphrase is queried at start-up time. When a container with Verity
+          data is started, the root hash is search in a ".roothash" file
+          accompanying the disk image (alternatively, pass the root hash via
+          the new --root-hash= command line option).
+
+        * A new tool /usr/lib/systemd/systemd-dissect has been added that may
+          be used to dissect disk images the same way as systemd-nspawn does
+          it, following the Bootable Partition Specification. It may even be
+          used to mount disk images with complex partition setups (including
+          LUKS and Verity partitions) to a local host directory, in order to
+          inspect them. This tool is not considered public API (yet), and is
+          thus not installed into /usr/bin. Please do not rely on its
+          existence, since it might go away or be changed in later systemd
+          versions.
+
+        * A new generator "systemd-verity-generator" has been added, similar in
+          style to "systemd-cryptsetup-generator", permitting automatic setup of
+          Verity root partitions when systemd boots up. In order to make use of
+          this your partition setup should follow the Discoverable Partitions
+          Specification, and the GPT partition ID of the root file system
+          partition should be identical to the upper 128bit of the Verity root
+          hash. The GPT partition ID of the Verity partition protecting it
+          should be the lower 128bit of the Verity root hash. If the partition
+          image follows this model it is sufficient to specify a single
+          "roothash=" kernel command line argument to both configure which root
+          image and verity partition to use as well as the root hash for
+          it. Note that systemd-nspawn's Verity support follows the same
+          semantics, meaning that disk images with proper Verity data in place
+          may be booted in containers with systemd-nspawn as well as on
+          physical systems via the verity generator. Also note that the "mkosi"
+          tool available at https://github.com/systemd/mkosi has been updated
+          to generate Verity protected disk images following this scheme. In
+          fact, it has been updated to generate disk images that optionally
+          implement a complete UEFI SecureBoot trust chain, involving a signed
+          kernel and initrd image that incorporates such a root hash as well as
+          a Verity-enabled root partition.
+
+        * The hardware database (hwdb) udev supports has been updated to carry
+          accelerometer quirks.
+
+        * All system services are now run with a fresh kernel keyring set up
+          for them. The invocation ID is stored by default in it, thus
+          providing a safe, non-overridable way to determine the invocation
+          ID of each service.
+
+        * Service unit files gained new BindPaths= and BindReadOnlyPaths=
+          options for bind mounting arbitrary paths in a service-specific
+          way. When these options are used, arbitrary host or service files and
+          directories may be mounted to arbitrary locations in the service's
+          view.
+
+        * Documentation has been added that lists all of systemd's low-level
+          environment variables:
+
+          https://github.com/systemd/systemd/blob/master/docs/ENVIRONMENT.md
+
+        * sd-daemon gained a new API sd_is_socket_sockaddr() for determining
+          whether a specific socket file descriptor matches a specified socket
+          address.
+
+        * systemd-firstboot has been updated to check for the
+          systemd.firstboot= kernel command line option. It accepts a boolean
+          and when set to false the first boot questions are skipped.
+
+        * systemd-fstab-generator has been updated to check for the
+          systemd.volatile= kernel command line option, which either takes an
+          optional boolean parameter or the special value "state". If used the
+          system may be booted in a "volatile" boot mode. Specifically,
+          "systemd.volatile" is used, the root directory will be mounted as
+          tmpfs, and only /usr is mounted from the actual root file system. If
+          "systemd.volatile=state" is used, the root directory will be mounted
+          as usual, but /var is mounted as tmpfs. This concept provides similar
+          functionality as systemd-nspawn's --volatile= option, but provides it
+          on physical boots. Use this option for implementing stateless
+          systems, or testing systems with all state and/or configuration reset
+          to the defaults. (Note though that many distributions are not
+          prepared to boot up without a populated /etc or /var, though.)
+
+        * systemd-gpt-auto-generator gained support for LUKS encrypted root
+          partitions. Previously it only supported LUKS encrypted partitions
+          for all other uses, except for the root partition itself.
+
+        * Socket units gained support for listening on AF_VSOCK sockets for
+          communication in virtualized QEMU environments.
+
+        * The "configure" script gained a new option --with-fallback-hostname=
+          for specifying the fallback hostname to use if none is configured in
+          /etc/hostname. For example, by specifying
+          --with-fallback-hostname=fedora it is possible to default to a
+          hostname of "fedora" on pristine installations.
+
+        * systemd-cgls gained support for a new --unit= switch for listing only
+          the control groups of a specific unit. Similar --user-unit= has been
+          added for listing only the control groups of a specific user unit.
+
+        * systemd-mount gained a new --umount switch for unmounting a mount or
+          automount point (and all mount/automount points below it).
+
+        * systemd will now refuse full configuration reloads (via systemctl
+          daemon-reload and related calls) unless at least 16MiB of free space
+          are available in /run. This is a safety precaution in order to ensure
+          that generators can safely operate after the reload completed.
+
+        * A new unit file option RootImage= has been added, which has a similar
+          effect as RootDirectory= but mounts the service's root directory from
+          a disk image instead of plain directory. This logic reuses the same
+          image dissection and mount logic that systemd-nspawn already uses,
+          and hence supports any disk images systemd-nspawn supports, including
+          those following the Discoverable Partition Specification, as well as
+          Verity enabled images. This option enables systemd to run system
+          services directly off disk images acting as resource bundles,
+          possibly even including full integrity data.
+
+        * A new MountAPIVFS= unit file option has been added, taking a boolean
+          argument. If enabled /proc, /sys and /dev (collectively called the
+          "API VFS") will be mounted for the service. This is only relevant if
+          RootDirectory= or RootImage= is used for the service, as these mounts
+          are of course in place in the host mount namespace anyway.
+
+        * systemd-nspawn gained support for a new --pivot-root= switch. If
+          specified the root directory within the container image is pivoted to
+          the specified mount point, while the original root disk is moved to a
+          different place. This option enables booting of ostree images
+          directly with systemd-nspawn.
+
+        * The systemd build scripts will no longer complain if the NTP server
+          addresses are not changed from the defaults. Google now supports
+          these NTP servers officially. We still recommend downstreams to
+          properly register an NTP pool with the NTP pool project though.
+
+        * coredumpctl gained a new "--reverse" option for printing the list
+          of coredumps in reverse order.
+
+        * coredumpctl will now show additional information about truncated and
+          inaccessible coredumps, as well as coredumps that are still being
+          processed. It also gained a new --quiet switch for suppressing
+          additional informational message in its output.
+
+        * coredumpctl gained support for only showing coredumps newer and/or
+          older than specific timestamps, using the new --since= and --until=
+          options, reminiscent of journalctl's options by the same name.
+
+        * The systemd-coredump logic has been improved so that it may be reused
+          to collect backtraces in non-compiled languages, for example in
+          scripting languages such as Python.
+
+        * machinectl will now show the UID shift of local containers, if user
+          namespacing is enabled for them.
+
+        * systemd will now optionally run "environment generator" binaries at
+          configuration load time. They may be used to add environment
+          variables to the environment block passed to services invoked. One
+          user environment generator is shipped by default that sets up
+          environment variables based on files dropped into /etc/environment.d
+          and ~/.config/environment.d/.
+
+        * systemd-resolved now includes the new, recently published 2017 DNSSEC
+          root key (KSK).
+
+        * hostnamed has been updated to report a new chassis type of
+          "convertible" to cover "foldable" laptops that can both act as a
+          tablet and as a laptop, such as various Lenovo Yoga devices.
+
+        Contributions from: Adrián López, Alexander Galanin, Alexander
+        Kochetkov, Alexandros Frantzis, Andrey Ulanov, Antoine Eiche, Baruch
+        Siach, Bastien Nocera, Benjamin Robin, Björn, Brandon Philips, Cédric
+        Schieli, Charles (Chas) Williams, Christian Hesse, Daniele Medri,
+        Daniel Drake, Daniel Rusek, Daniel Wagner, Dan Streetman, Dave Reisner,
+        David Glasser, David Herrmann, David Michael, Djalal Harouni, Dmitry
+        Khlebnikov, Dmitry Rozhkov, Dongsu Park, Douglas Christman, Earnestly,
+        Emil Soleyman, Eric Cook, Evgeny Vereshchagin, Felipe Sateler, Fionn
+        Cleary, Florian Klink, Francesco Brozzu, Franck Bui, Gabriel Rauter,
+        Gianluca Boiano, Giedrius Statkevičius, Graeme Lawes, Hans de Goede,
+        Harald Hoyer, Ian Kelling, Ivan Shapovalov, Jakub Wilk, Janne Heß, Jan
+        Synacek, Jason Reeder, Jonathan Boulle, Jörg Thalheim, Jouke Witteveen,
+        Karl Kraus, Kees Cook, Keith Busch, Kieran Colford, kilian-k, Lennart
+        Poettering, Lubomir Rintel, Lucas Werkmeister, Lukas Rusak, Maarten de
+        Vries, Maks Naumov, Mantas Mikulėnas, Marc-Andre Lureau, Marcin Bachry,
+        Mark Stosberg, Martin Ejdestig, Martin Pitt, Mauricio Faria de
+        Oliveira, micah, Michael Biebl, Michael Shields, Michal Schmidt, Michal
+        Sekletar, Michel Kraus, Mike Gilbert, Mikko Ylinen, Mirza Krak,
+        Namhyung Kim, nikolaof, peoronoob, Peter Hutterer, Peter Körner, Philip
+        Withnall, Piotr Drąg, Ray Strode, Reverend Homer, Rike-Benjamin
+        Schuppner, Robert Kreuzer, Ronny Chevalier, Ruslan Bilovol, sammynx,
+        Sergey Ptashnick, Sergiusz Urbaniak, Stefan Berger, Stefan Hajnoczi,
+        Stefan Schweter, Stuart McLaren, Susant Sahani, Sylvain Plantefève,
+        Taylor Smock, Tejun Heo, Thomas Blume, Thomas H. P. Andersen, Tibor
+        Nagy, Tobias Stoeckmann, Tom Gundersen, Torstein Husebø, Viktar
+        Vaŭčkievič, Viktor Mihajlovski, Vitaly Sulimov, Waldemar Brodkorb,
+        Walter Garcia-Fontes, Wim de With, Yassine Imounachen, Yi EungJun,
+        YunQiang Su, Yu Watanabe, Zbigniew Jędrzejewski-Szmek, Александр
+        Тихонов
+
+        — Berlin, 2017-03-01
+
 CHANGES WITH 232:
+
+        * udev now runs with MemoryDenyWriteExecute=, RestrictRealtime= and
+          RestrictAddressFamilies= enabled. These sandboxing options should
+          generally be compatible with the various external udev call-out
+          binaries we are aware of, however there may be exceptions, in
+          particular when exotic languages for these call-outs are used. In
+          this case, consider turning off these settings locally.
 
         * The new RemoveIPC= option can be used to remove IPC objects owned by
           the user or group of a service when that service exits.
@@ -218,7 +2632,7 @@ CHANGES WITH 232:
           counted multiple times, if it takes multiple references.
 
         * sd-bus gained new API calls sd_bus_set_exit_on_disconnect() and
-          sd_bus_get_exit_on_disconnect(). They may be used to to make a
+          sd_bus_get_exit_on_disconnect(). They may be used to make a
           process using sd-bus automatically exit if the bus connection is
           severed.
 
@@ -417,7 +2831,7 @@ CHANGES WITH 231:
           desired options.
 
         * systemd now supports the "memory" cgroup controller also on
-          cgroupsv2.
+          cgroup v2.
 
         * The systemd-cgtop tool now optionally takes a control group path as
           command line argument. If specified, the control group list shown is
@@ -549,7 +2963,7 @@ CHANGES WITH 231:
           with future releases) that the components link to. This should
           decrease systemd footprint both in memory during runtime and on
           disk. Note that the shared library is not for public use, and is
-          neither API not ABI stable, but is likely to change with every new
+          neither API nor ABI stable, but is likely to change with every new
           released update. Packagers need to make sure that binaries
           linking to libsystemd-shared.so are updated in step with the
           library.
@@ -563,7 +2977,7 @@ CHANGES WITH 231:
           booted up with "systemd-nspawn -b -i", qemu-kvm or on any physical
           UEFI PC. This functionality is particularly useful to easily test
           local changes made to systemd in a pristine, defined environment. See
-          HACKING for details.
+          doc/HACKING for details.
 
         * configure learned the --with-support-url= option to specify the
           distribution's bugtracker.
@@ -1025,6 +3439,13 @@ CHANGES WITH 229:
           create your own tmpfiles.d config file with:
 
                   d /run/lock/lockdev 0775 root lock -
+
+        * The settings StartLimitBurst=, StartLimitInterval=, StartLimitAction=
+          and RebootArgument= have been moved from the [Service] section of
+          unit files to [Unit], and they are now supported on all unit types,
+          not just service units. Of course, systemd will continue to
+          understand these settings also at the old location, in order to
+          maintain compatibility.
 
         Contributions from: Abdo Roig-Maranges, Alban Crequy, Aleksander
         Adamowski, Alexander Kuleshov, Andreas Pokorny, Andrei Borzenkov,
@@ -1550,11 +3971,10 @@ CHANGES WITH 226:
           correct dequeuing of real-time signals, without losing
           signal events.
 
-        * When systemd requests a PolicyKit decision when managing
-          units it will now add additional fields to the request,
-          including unit name and desired operation. This enables more
-          powerful PolicyKit policies, that make decisions depending
-          on these parameters.
+        * When systemd requests a polkit decision when managing units it
+          will now add additional fields to the request, including unit
+          name and desired operation. This enables more powerful polkit
+          policies, that make decisions depending on these parameters.
 
         * nspawn learnt support for .nspawn settings files, that may
           accompany the image files or directories of containers, and
@@ -1589,13 +4009,12 @@ CHANGES WITH 225:
           options and allows other programs to query the values.
 
         * SELinux access control when enabling/disabling units is no
-          longer enforced with this release. The previous
-          implementation was incorrect, and a new corrected
-          implementation is not yet available. As unit file operations
-          are still protected via PolicyKit and D-Bus policy this is
-          not a security problem. Yet, distributions which care about
-          optimal SELinux support should probably not stabilize on
-          this release.
+          longer enforced with this release. The previous implementation
+          was incorrect, and a new corrected implementation is not yet
+          available. As unit file operations are still protected via
+          polkit and D-Bus policy this is not a security problem. Yet,
+          distributions which care about optimal SELinux support should
+          probably not stabilize on this release.
 
         * sd-bus gained support for matches of type "arg0has=", that
           test for membership of strings in string arrays sent in bus
@@ -1853,7 +4272,7 @@ CHANGES WITH 220:
           gudev from the Gnome project instead. gudev is still included
           in systemd, for now. It will be removed soon, though. Please
           also see the announcement-thread on systemd-devel:
-          http://lists.freedesktop.org/archives/systemd-devel/2015-May/032070.html
+          https://lists.freedesktop.org/archives/systemd-devel/2015-May/032070.html
 
         * systemd now exposes a CPUUsageNSec= property for each
           service unit on the bus, that contains the overall consumed
@@ -1967,11 +4386,10 @@ CHANGES WITH 220:
         * systemd-importd gained support for verifying downloaded
           images with gpg2 (previously only gpg1 was supported).
 
-        * systemd-machined, systemd-logind, systemd: most bus calls
-          are now accessible to unprivileged processes via
-          PolicyKit. Also, systemd-logind will now allow users to kill
-          their own sessions without further privileges or
-          authorization.
+        * systemd-machined, systemd-logind, systemd: most bus calls are
+          now accessible to unprivileged processes via polkit. Also,
+          systemd-logind will now allow users to kill their own sessions
+          without further privileges or authorization.
 
         * systemd-shutdownd has been removed. This service was
           previously responsible for implementing scheduled shutdowns
@@ -2626,7 +5044,7 @@ CHANGES WITH 217:
           /run/systemd/user directory that was already previously
           supported, but is under the control of the user.
 
-        * Job timeouts (i.e. time-outs on the time a job that is
+        * Job timeouts (i.e. timeouts on the time a job that is
           queued stays in the run queue) can now optionally result in
           immediate reboot or power-off actions (JobTimeoutAction= and
           JobTimeoutRebootArgument=). This is useful on ".target"
@@ -2753,11 +5171,11 @@ CHANGES WITH 217:
           directly from now on, again.
 
         * Support for the new ALLOW_INTERACTIVE_AUTHORIZATION D-Bus
-          message flag has been added for all of systemd's PolicyKit
-          authenticated method calls has been added. In particular
-          this now allows optional interactive authorization via
-          PolicyKit for many of PID1's privileged operations such as
-          unit file enabling and disabling.
+          message flag has been added for all of systemd's polkit
+          authenticated method calls has been added. In particular this
+          now allows optional interactive authorization via polkit for
+          many of PID1's privileged operations such as unit file
+          enabling and disabling.
 
         * "udevadm hwdb --update" learnt a new switch "--usr" for
           placing the rebuilt hardware database in /usr instead of
@@ -2836,11 +5254,11 @@ CHANGES WITH 216:
           well as the user/group databases, which should enhance
           compatibility with certain tools like grpck.
 
-        * A number of bus APIs of PID 1 now optionally consult
-          PolicyKit to permit access for otherwise unprivileged
-          clients under certain conditions. Note that this currently
-          doesn't support interactive authentication yet, but this is
-          expected to be added eventually, too.
+        * A number of bus APIs of PID 1 now optionally consult polkit to
+          permit access for otherwise unprivileged clients under certain
+          conditions. Note that this currently doesn't support
+          interactive authentication yet, but this is expected to be
+          added eventually, too.
 
         * /etc/machine-info now has new fields for configuring the
           deployment environment of the machine, as well as the
@@ -2895,7 +5313,7 @@ CHANGES WITH 216:
           like Cockpit which register web clients as PAM sessions.
 
         * timer units with at least one OnCalendar= setting will now
-          be started only after timer-sync.target has been
+          be started only after time-sync.target has been
           reached. This way they will not elapse before the system
           clock has been corrected by a local NTP client or
           similar. This is particular useful on RTC-less embedded
@@ -3756,7 +6174,7 @@ CHANGES WITH 211:
           also supports LUKS-encrypted partitions now. With this in
           place, automatic discovery of partitions to mount following
           the Discoverable Partitions Specification
-          (http://www.freedesktop.org/wiki/Specifications/DiscoverablePartitionsSpec)
+          (https://www.freedesktop.org/wiki/Specifications/DiscoverablePartitionsSpec)
           is now a lot more complete. This allows booting without
           /etc/fstab and without root= on the kernel command line on
           systems prepared appropriately.
@@ -3939,6 +6357,9 @@ CHANGES WITH 210:
           for other architectures like x86 and does not support
           IFUNC. Please make sure to use --enable-compat-libs only
           during a transitional period!
+
+        * The .include syntax has been deprecated and is not documented
+          anymore. Drop-in files in .d directories should be used instead.
 
         Contributions from: Andreas Fuchs, Armin K., Colin Walters,
         Daniel Mack, Dave Reisner, David Herrmann, Djalal Harouni,
@@ -4266,7 +6687,7 @@ CHANGES WITH 209:
           option as supported by Debian is added. It allows indicating
           which LUKS slot to use on disk, speeding up key loading.
 
-        * The sd_journald_sendv() API call has been checked and
+        * The sd_journal_sendv() API call has been checked and
           officially declared to be async-signal-safe so that it may
           be invoked from signal handlers for logging purposes.
 
@@ -5108,7 +7529,7 @@ CHANGES WITH 199:
         * A new libsystemd-bus module has been added that implements a
           pretty complete D-Bus client library. For details see:
 
-          http://lists.freedesktop.org/archives/systemd-devel/2013-March/009797.html
+          https://lists.freedesktop.org/archives/systemd-devel/2013-March/009797.html
 
         * journald will now explicitly flush the journal files to disk
           at the latest 5min after each write. The file will then also
@@ -5258,7 +7679,7 @@ CHANGES WITH 198:
           only in conjunction with Gummiboot, but could be supported
           by other boot loaders too. For details see:
 
-          http://www.freedesktop.org/wiki/Software/systemd/BootLoaderInterface
+          https://www.freedesktop.org/wiki/Software/systemd/BootLoaderInterface
 
         * A new generator has been added that automatically mounts the
           EFI System Partition (ESP) to /boot, if that directory
@@ -5313,8 +7734,8 @@ CHANGES WITH 198:
           the rest of the package. It also has been updated to work
           correctly in initrds.
 
-        * Policykit previously has been runtime optional, and is now
-          also compile time optional via a configure switch.
+        * polkit previously has been runtime optional, and is now also
+          compile time optional via a configure switch.
 
         * systemd-analyze has been reimplemented in C. Also "systemctl
           dot" has moved into systemd-analyze.
@@ -5334,7 +7755,7 @@ CHANGES WITH 198:
         * A new tool kernel-install has been added that can install
           kernel images according to the Boot Loader Specification:
 
-          http://www.freedesktop.org/wiki/Specifications/BootLoaderSpec
+          https://www.freedesktop.org/wiki/Specifications/BootLoaderSpec
 
         * Boot time console output has been improved to provide
           animated boot time output for hanging jobs.
@@ -5424,7 +7845,7 @@ CHANGES WITH 197:
           of these policies is now the default. Please see this wiki
           document for details:
 
-          http://www.freedesktop.org/wiki/Software/systemd/PredictableNetworkInterfaceNames
+          https://www.freedesktop.org/wiki/Software/systemd/PredictableNetworkInterfaceNames
 
         * Auke Kok's bootchart implementation has been added to the
           systemd tree. It is an optional component that can graph the
@@ -5482,9 +7903,9 @@ CHANGES WITH 197:
           user/vendor or is automatically determined from ACPI and DMI
           information if possible.
 
-        * A number of PolicyKit actions are now bound together with
-          "imply" rules. This should simplify creating UIs because
-          many actions will now authenticate similar ones as well.
+        * A number of polkit actions are now bound together with "imply"
+          rules. This should simplify creating UIs because many actions
+          will now authenticate similar ones as well.
 
         * Unit files learnt a new condition ConditionACPower= which
           may be used to conditionalize a unit depending on whether an
@@ -5572,7 +7993,7 @@ CHANGES WITH 196:
           indexed database to link up additional information with
           journal entries. For further details please check:
 
-          http://www.freedesktop.org/wiki/Software/systemd/catalog
+          https://www.freedesktop.org/wiki/Software/systemd/catalog
 
           The indexed message catalog database also needs to be
           rebuilt after installation of message catalog files. Use
@@ -5623,14 +8044,13 @@ CHANGES WITH 196:
           to maintain the necessary patches downstream, or find a
           different solution. (Talk to us if you have questions!)
 
-        * Various systemd components will now bypass PolicyKit checks
-          for root and otherwise handle properly if PolicyKit is not
-          found to be around. This should fix most issues for
-          PolicyKit-less systems. Quite frankly this should have been
-          this way since day one. It is absolutely our intention to
-          make systemd work fine on PolicyKit-less systems, and we
-          consider it a bug if something does not work as it should if
-          PolicyKit is not around.
+        * Various systemd components will now bypass polkit checks for
+          root and otherwise handle properly if polkit is not found to
+          be around. This should fix most issues for polkit-less
+          systems. Quite frankly this should have been this way since
+          day one. It is absolutely our intention to make systemd work
+          fine on polkit-less systems, and we consider it a bug if
+          something does not work as it should if polkit is not around.
 
         * For embedded systems it is now possible to build udev and
           systemd without blkid and/or kmod support.
@@ -6424,7 +8844,7 @@ CHANGES WITH 183:
 
         * A framework for implementing offline system updates is now
           integrated, for details see:
-          http://freedesktop.org/wiki/Software/systemd/SystemUpdates
+          https://www.freedesktop.org/wiki/Software/systemd/SystemUpdates
 
         * A new service type Type=idle is available now which helps us
           avoiding ugly interleaving of getty output and boot status
@@ -6705,7 +9125,7 @@ CHANGES WITH 39:
 
         * New unit file option ControlGroupPersistent= to make cgroups
           persistent, following the mechanisms outlined in
-          http://www.freedesktop.org/wiki/Software/systemd/PaxControlGroups
+          https://www.freedesktop.org/wiki/Software/systemd/PaxControlGroups
 
         * Support multiple local RTCs in a sane way
 
@@ -6792,7 +9212,7 @@ CHANGES WITH 38:
         * Processes with '@' in argv[0][0] are now excluded from the
           final shut-down killing spree, following the logic explained
           in:
-          http://www.freedesktop.org/wiki/Software/systemd/RootStorageDaemons
+          https://www.freedesktop.org/wiki/Software/systemd/RootStorageDaemons
 
         * All processes remaining in a service cgroup when we enter
           the START or START_PRE states are now killed with

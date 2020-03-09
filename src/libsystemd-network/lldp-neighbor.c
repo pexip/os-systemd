@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2016 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
 #include "escape.h"
@@ -24,58 +7,29 @@
 #include "in-addr-util.h"
 #include "lldp-internal.h"
 #include "lldp-neighbor.h"
+#include "missing.h"
 #include "unaligned.h"
+#include "util.h"
 
-static void lldp_neighbor_id_hash_func(const void *p, struct siphash *state) {
-        const LLDPNeighborID *id = p;
-
+static void lldp_neighbor_id_hash_func(const LLDPNeighborID *id, struct siphash *state) {
         siphash24_compress(id->chassis_id, id->chassis_id_size, state);
         siphash24_compress(&id->chassis_id_size, sizeof(id->chassis_id_size), state);
         siphash24_compress(id->port_id, id->port_id_size, state);
         siphash24_compress(&id->port_id_size, sizeof(id->port_id_size), state);
 }
 
-static int lldp_neighbor_id_compare_func(const void *a, const void *b) {
-        const LLDPNeighborID *x = a, *y = b;
-        int r;
-
-        r = memcmp(x->chassis_id, y->chassis_id, MIN(x->chassis_id_size, y->chassis_id_size));
-        if (r != 0)
-                return r;
-
-        if (x->chassis_id_size < y->chassis_id_size)
-                return -1;
-
-        if (x->chassis_id_size > y->chassis_id_size)
-                return 1;
-
-        r = memcmp(x->port_id, y->port_id, MIN(x->port_id_size, y->port_id_size));
-        if (r != 0)
-                return r;
-
-        if (x->port_id_size < y->port_id_size)
-                return -1;
-        if (x->port_id_size > y->port_id_size)
-                return 1;
-
-        return 0;
+int lldp_neighbor_id_compare_func(const LLDPNeighborID *x, const LLDPNeighborID *y) {
+        return memcmp_nn(x->chassis_id, x->chassis_id_size, y->chassis_id, y->chassis_id_size)
+            ?: memcmp_nn(x->port_id, x->port_id_size, y->port_id, y->port_id_size);
 }
 
-const struct hash_ops lldp_neighbor_id_hash_ops = {
-        .hash = lldp_neighbor_id_hash_func,
-        .compare = lldp_neighbor_id_compare_func
-};
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(lldp_neighbor_hash_ops, LLDPNeighborID, lldp_neighbor_id_hash_func, lldp_neighbor_id_compare_func,
+                                      sd_lldp_neighbor, lldp_neighbor_unlink);
 
 int lldp_neighbor_prioq_compare_func(const void *a, const void *b) {
         const sd_lldp_neighbor *x = a, *y = b;
 
-        if (x->until < y->until)
-                return -1;
-
-        if (x->until > y->until)
-                return 1;
-
-        return 0;
+        return CMP(x->until, y->until);
 }
 
 _public_ sd_lldp_neighbor *sd_lldp_neighbor_ref(sd_lldp_neighbor *n) {
@@ -128,7 +82,12 @@ sd_lldp_neighbor *lldp_neighbor_unlink(sd_lldp_neighbor *n) {
         if (!n->lldp)
                 return NULL;
 
-        assert_se(hashmap_remove(n->lldp->neighbor_by_id, &n->id) == n);
+        /* Only remove the neighbor object from the hash table if it's in there, don't complain if it isn't. This is
+         * because we are used as destructor call for hashmap_clear() and thus sometimes are called to de-register
+         * ourselves from the hashtable and sometimes are called after we already are de-registered. */
+
+        (void) hashmap_remove_value(n->lldp->neighbor_by_id, &n->id, n);
+
         assert_se(prioq_remove(n->lldp->neighbor_by_expiry, n, &n->prioq_idx) >= 0);
 
         n->lldp = NULL;
@@ -249,10 +208,9 @@ int lldp_neighbor_parse(sd_lldp_neighbor *n) {
                                 log_lldp("End marker TLV not zero-sized, ignoring datagram.");
                                 return -EBADMSG;
                         }
-                        if (left != 0) {
-                                log_lldp("Trailing garbage in datagram, ignoring datagram.");
-                                return -EBADMSG;
-                        }
+
+                        /* Note that after processing the SD_LLDP_TYPE_END left could still be > 0
+                         * as the message may contain padding (see IEEE 802.1AB-2016, sec. 8.5.12) */
 
                         goto end_marker;
 
@@ -340,7 +298,6 @@ int lldp_neighbor_parse(sd_lldp_neighbor *n) {
 
                         break;
                 }
-
 
                 p += length, left -= length;
         }
@@ -674,8 +631,7 @@ _public_ int sd_lldp_neighbor_from_raw(sd_lldp_neighbor **ret, const void *raw, 
         if (r < 0)
                 return r;
 
-        *ret = n;
-        n = NULL;
+        *ret = TAKE_PTR(n);
 
         return r;
 }
@@ -735,7 +691,7 @@ _public_ int sd_lldp_neighbor_tlv_is_type(sd_lldp_neighbor *n, uint8_t type) {
         return type == k;
 }
 
-_public_ int sd_lldp_neighbor_tlv_get_oui(sd_lldp_neighbor *n, uint8_t oui[3], uint8_t *subtype) {
+_public_ int sd_lldp_neighbor_tlv_get_oui(sd_lldp_neighbor *n, uint8_t oui[_SD_ARRAY_STATIC 3], uint8_t *subtype) {
         const uint8_t *d;
         size_t length;
         int r;
@@ -764,7 +720,7 @@ _public_ int sd_lldp_neighbor_tlv_get_oui(sd_lldp_neighbor *n, uint8_t oui[3], u
         return 0;
 }
 
-_public_ int sd_lldp_neighbor_tlv_is_oui(sd_lldp_neighbor *n, const uint8_t oui[3], uint8_t subtype) {
+_public_ int sd_lldp_neighbor_tlv_is_oui(sd_lldp_neighbor *n, const uint8_t oui[_SD_ARRAY_STATIC 3], uint8_t subtype) {
         uint8_t k[3], st;
         int r;
 

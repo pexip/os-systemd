@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 #include <grp.h>
 #include <netdb.h>
@@ -26,6 +8,10 @@
 #include <resolv.h>
 
 #define NSS_SIGNALS_BLOCK SIGALRM,SIGVTALRM,SIGPIPE,SIGCHLD,SIGTSTP,SIGIO,SIGHUP,SIGUSR1,SIGUSR2,SIGPROF,SIGURG,SIGWINCH
+
+#ifndef DEPRECATED_RES_USE_INET6
+#  define DEPRECATED_RES_USE_INET6 0x00002000
+#endif
 
 #define NSS_GETHOSTBYNAME_PROTOTYPES(module)            \
 enum nss_status _nss_##module##_gethostbyname4_r(       \
@@ -92,7 +78,7 @@ enum nss_status _nss_##module##_gethostbyname_r(        \
                 int *errnop, int *h_errnop) {           \
         enum nss_status ret = NSS_STATUS_NOTFOUND;      \
                                                         \
-        if (_res.options & RES_USE_INET6)               \
+        if (_res.options & DEPRECATED_RES_USE_INET6)    \
                 ret = _nss_##module##_gethostbyname3_r( \
                         name,                           \
                         AF_INET6,                       \
@@ -111,8 +97,7 @@ enum nss_status _nss_##module##_gethostbyname_r(        \
                         NULL,                           \
                         NULL);                          \
        return ret;                                      \
-}                                                       \
-struct __useless_struct_to_allow_trailing_semicolon__
+}
 
 #define NSS_GETHOSTBYADDR_FALLBACKS(module)             \
 enum nss_status _nss_##module##_gethostbyaddr_r(        \
@@ -128,8 +113,7 @@ enum nss_status _nss_##module##_gethostbyaddr_r(        \
                         buffer, buflen,                 \
                         errnop, h_errnop,               \
                         NULL);                          \
-}                                                       \
-struct __useless_struct_to_allow_trailing_semicolon__
+}
 
 #define NSS_GETPW_PROTOTYPES(module)                    \
 enum nss_status _nss_##module##_getpwnam_r(             \

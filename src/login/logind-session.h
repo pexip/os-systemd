@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2011 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
 
 typedef struct Session Session;
 typedef enum KillWho KillWho;
@@ -64,11 +46,19 @@ enum KillWho {
         _KILL_WHO_INVALID = -1
 };
 
+typedef enum TTYValidity {
+        TTY_FROM_PAM,
+        TTY_FROM_UTMP,
+        TTY_UTMP_INCONSISTENT, /* may happen on ssh sessions with multiplexed TTYs */
+        _TTY_VALIDITY_MAX,
+        _TTY_VALIDITY_INVALID = -1,
+} TTYValidity;
+
 struct Session {
         Manager *manager;
 
         const char *id;
-        unsigned int position;
+        unsigned position;
         SessionType type;
         SessionClass class;
 
@@ -78,8 +68,9 @@ struct Session {
 
         dual_timestamp timestamp;
 
-        char *tty;
         char *display;
+        char *tty;
+        TTYValidity tty_validity;
 
         bool remote;
         char *remote_user;
@@ -91,7 +82,7 @@ struct Session {
         char *scope_job;
 
         Seat *seat;
-        unsigned int vtnr;
+        unsigned vtnr;
         int vtfd;
 
         pid_t leader;
@@ -111,8 +102,11 @@ struct Session {
         bool started:1;
         bool stopping:1;
 
+        bool was_active:1;
+
         sd_bus_message *create_message;
 
+        /* Set up when a client requested to release the session via the bus */
         sd_event_source *timer_event_source;
 
         char *controller;
@@ -125,10 +119,14 @@ struct Session {
         LIST_FIELDS(Session, gc_queue);
 };
 
-Session *session_new(Manager *m, const char *id);
-void session_free(Session *s);
+int session_new(Session **ret, Manager *m, const char *id);
+Session* session_free(Session *s);
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(Session *, session_free);
+
 void session_set_user(Session *s, User *u);
-bool session_check_gc(Session *s, bool drop_not_started);
+int session_set_leader(Session *s, pid_t pid);
+bool session_may_gc(Session *s, bool drop_not_started);
 void session_add_to_gc_queue(Session *s);
 int session_activate(Session *s);
 bool session_is_active(Session *s);
@@ -137,7 +135,7 @@ void session_set_idle_hint(Session *s, bool b);
 int session_get_locked_hint(Session *s);
 void session_set_locked_hint(Session *s, bool b);
 int session_create_fifo(Session *s);
-int session_start(Session *s);
+int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error);
 int session_stop(Session *s, bool force);
 int session_finalize(Session *s);
 int session_release(Session *s);
@@ -171,12 +169,14 @@ SessionClass session_class_from_string(const char *s) _pure_;
 const char *kill_who_to_string(KillWho k) _const_;
 KillWho kill_who_from_string(const char *s) _pure_;
 
+const char* tty_validity_to_string(TTYValidity t) _const_;
+TTYValidity tty_validity_from_string(const char *s) _pure_;
+
 int session_prepare_vt(Session *s);
-void session_restore_vt(Session *s);
 void session_leave_vt(Session *s);
 
 bool session_is_controller(Session *s, const char *sender);
-int session_set_controller(Session *s, const char *sender, bool force);
+int session_set_controller(Session *s, const char *sender, bool force, bool prepare);
 void session_drop_controller(Session *s);
 
 int bus_session_method_activate(sd_bus_message *message, void *userdata, sd_bus_error *error);

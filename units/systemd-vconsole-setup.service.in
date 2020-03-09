@@ -1,3 +1,5 @@
+#  SPDX-License-Identifier: LGPL-2.1+
+#
 #  This file is part of systemd.
 #
 #  systemd is free software; you can redistribute it and/or modify it
@@ -9,6 +11,7 @@
 Description=Setup Virtual Console
 Documentation=man:systemd-vconsole-setup.service(8) man:vconsole.conf(5)
 DefaultDependencies=no
+Before=initrd-switch-root.target shutdown.target
 ConditionPathExists=/dev/tty0
 
 [Service]

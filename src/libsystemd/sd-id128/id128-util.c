@@ -1,26 +1,11 @@
-/***
-  This file is part of systemd.
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
-  Copyright 2016 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
-
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include "fd-util.h"
+#include "fs-util.h"
 #include "hexdecoct.h"
 #include "id128-util.h"
 #include "io-util.h"
@@ -75,7 +60,7 @@ bool id128_is_valid(const char *s) {
                 for (i = 0; i < l; i++) {
                         char c = s[i];
 
-                        if ((i == 8 || i == 13 || i == 18 || i == 23)) {
+                        if (IN_SET(i, 8, 13, 18, 23)) {
                                 if (c != '-')
                                         return false;
                         } else {
@@ -116,7 +101,7 @@ int id128_read_fd(int fd, Id128Format f, sd_id128_t *ret) {
                 if (buffer[32] != '\n')
                         return -EINVAL;
 
-                /* fall through */
+                _fallthrough_;
         case 32: /* plain UUID without trailing newline */
                 if (f == ID128_UUID)
                         return -EINVAL;
@@ -128,7 +113,7 @@ int id128_read_fd(int fd, Id128Format f, sd_id128_t *ret) {
                 if (buffer[36] != '\n')
                         return -EINVAL;
 
-                /* fall through */
+                _fallthrough_;
         case 36: /* RFC UUID without trailing newline */
                 if (f == ID128_PLAIN)
                         return -EINVAL;
@@ -178,30 +163,31 @@ int id128_write_fd(int fd, Id128Format f, sd_id128_t id, bool do_sync) {
         if (do_sync) {
                 if (fsync(fd) < 0)
                         return -errno;
+
+                r = fsync_directory_of_file(fd);
+                if (r < 0)
+                        return r;
         }
 
-        return r;
+        return 0;
 }
 
 int id128_write(const char *p, Id128Format f, sd_id128_t id, bool do_sync) {
         _cleanup_close_ int fd = -1;
 
-        fd = open(p, O_WRONLY|O_CREAT|O_CLOEXEC|O_NOCTTY, 0444);
+        fd = open(p, O_WRONLY|O_CREAT|O_CLOEXEC|O_NOCTTY|O_TRUNC, 0444);
         if (fd < 0)
                 return -errno;
 
         return id128_write_fd(fd, f, id, do_sync);
 }
 
-void id128_hash_func(const void *p, struct siphash *state) {
-        siphash24_compress(p, 16, state);
+void id128_hash_func(const sd_id128_t *p, struct siphash *state) {
+        siphash24_compress(p, sizeof(sd_id128_t), state);
 }
 
-int id128_compare_func(const void *a, const void *b) {
+int id128_compare_func(const sd_id128_t *a, const sd_id128_t *b) {
         return memcmp(a, b, 16);
 }
 
-const struct hash_ops id128_hash_ops = {
-        .hash = id128_hash_func,
-        .compare = id128_compare_func,
-};
+DEFINE_HASH_OPS(id128_hash_ops, sd_id128_t, id128_hash_func, id128_compare_func);

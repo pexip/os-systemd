@@ -1,25 +1,16 @@
-<?xml version='1.0'?> <!--*- Mode: nxml; nxml-child-indent: 2; indent-tabs-mode: nil -*-->
+<?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+
+<!--
+  SPDX-License-Identifier: LGPL-2.1+
+  Copyright © 2014 Jason St. John
+-->
 
 <refentry id="udev">
   <refentryinfo>
     <title>udev</title>
     <productname>systemd</productname>
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Greg</firstname>
-        <surname>Kroah-Hartmann</surname>
-        <email>greg@kroah.com</email>
-      </author>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Kay</firstname>
-        <surname>Sievers</surname>
-        <email>kay@vrfy.org</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -193,6 +184,8 @@
             value itself contains trailing whitespace.
             </para>
           </listitem>
+        </varlistentry>
+        <varlistentry>
           <term><varname>SYSCTL{<replaceable>kernel parameter</replaceable>}</varname></term>
           <listitem>
             <para>Match a kernel parameter value.
@@ -443,6 +436,9 @@
             <para>Starting daemons or other long-running processes is not appropriate
             for udev; the forked processes, detached or not, will be unconditionally
             killed after the event handling has finished.</para>
+            <para>Note that running programs that access the network or mount/unmount
+            filesystems is not allowed inside of udev rules, due to the default sandbox
+            that is enforced on <filename>systemd-udevd.service</filename>.</para>
           </listitem>
         </varlistentry>
 
@@ -568,6 +564,18 @@
                 <term><option>nowatch</option></term>
                 <listitem>
                   <para>Disable the watching of a device node with inotify.</para>
+                </listitem>
+              </varlistentry>
+              <varlistentry>
+                <term><option>db_persist</option></term>
+                <listitem>
+                  <para>Set the flag (sticky bit) on the udev database entry
+                  of the event device. Device properties are then kept in the
+                  database even when
+                  <command>udevadm info --cleanup-db</command> is called.
+                  This option can be useful in certain cases
+                  (e.g. Device Mapper devices) for persisting device state
+                  on the transition from initramfs.</para>
                 </listitem>
               </varlistentry>
             </variablelist>

@@ -1,31 +1,16 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013-2014 Tom Gundersen <teg@jklm.no>
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <netinet/ether.h>
 #include <linux/if.h>
 
 #include "network-internal.h"
-#include "networkd.h"
+#include "networkd-address.h"
+#include "networkd-manager.h"
+#include "networkd-link.h"
 
 static int ipv4ll_address_lost(Link *link) {
-        _cleanup_address_free_ Address *address = NULL;
-        _cleanup_route_free_ Route *route = NULL;
+        _cleanup_(address_freep) Address *address = NULL;
+        _cleanup_(route_freep) Route *route = NULL;
         struct in_addr addr;
         int r;
 
@@ -41,37 +26,32 @@ static int ipv4ll_address_lost(Link *link) {
         log_link_debug(link, "IPv4 link-local release %u.%u.%u.%u", ADDRESS_FMT_VAL(addr));
 
         r = address_new(&address);
-        if (r < 0) {
-                log_link_error_errno(link, r, "Could not allocate address: %m");
-                return r;
-        }
+        if (r < 0)
+                return log_link_error_errno(link, r, "Could not allocate address: %m");
 
         address->family = AF_INET;
         address->in_addr.in = addr;
         address->prefixlen = 16;
         address->scope = RT_SCOPE_LINK;
 
-        address_remove(address, link, link_address_remove_handler);
+        address_remove(address, link, NULL);
 
         r = route_new(&route);
-        if (r < 0) {
-                log_link_error_errno(link, r, "Could not allocate route: %m");
-                return r;
-        }
+        if (r < 0)
+                return log_link_error_errno(link, r, "Could not allocate route: %m");
 
         route->family = AF_INET;
         route->scope = RT_SCOPE_LINK;
         route->priority = IPV4LL_ROUTE_METRIC;
 
-        route_remove(route, link, link_route_remove_handler);
+        route_remove(route, link, NULL);
 
         link_check_ready(link);
 
         return 0;
 }
 
-static int ipv4ll_route_handler(sd_netlink *rtnl, sd_netlink_message *m, void *userdata) {
-        _cleanup_link_unref_ Link *link = userdata;
+static int ipv4ll_route_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) {
         int r;
 
         assert(link);
@@ -91,8 +71,7 @@ static int ipv4ll_route_handler(sd_netlink *rtnl, sd_netlink_message *m, void *u
         return 1;
 }
 
-static int ipv4ll_address_handler(sd_netlink *rtnl, sd_netlink_message *m, void *userdata) {
-        _cleanup_link_unref_ Link *link = userdata;
+static int ipv4ll_address_handler(sd_netlink *rtnl, sd_netlink_message *m, Link *link) {
         int r;
 
         assert(link);
@@ -107,15 +86,15 @@ static int ipv4ll_address_handler(sd_netlink *rtnl, sd_netlink_message *m, void 
 
         link->ipv4ll_address = true;
 
-        if (link->ipv4ll_route == true)
+        if (link->ipv4ll_route)
                 link_check_ready(link);
 
         return 1;
 }
 
 static int ipv4ll_address_claimed(sd_ipv4ll *ll, Link *link) {
-        _cleanup_address_free_ Address *ll_addr = NULL;
-        _cleanup_route_free_ Route *route = NULL;
+        _cleanup_(address_freep) Address *ll_addr = NULL;
+        _cleanup_(route_freep) Route *route = NULL;
         struct in_addr address;
         int r;
 
@@ -171,19 +150,28 @@ static void ipv4ll_handler(sd_ipv4ll *ll, int event, void *userdata) {
 
         assert(link);
         assert(link->network);
-        assert(link->manager);
 
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
                 return;
 
         switch(event) {
                 case SD_IPV4LL_EVENT_STOP:
+                        r = ipv4ll_address_lost(link);
+                        if (r < 0) {
+                                link_enter_failed(link);
+                                return;
+                        }
+                        break;
                 case SD_IPV4LL_EVENT_CONFLICT:
                         r = ipv4ll_address_lost(link);
                         if (r < 0) {
                                 link_enter_failed(link);
                                 return;
                         }
+
+                        r = sd_ipv4ll_restart(ll);
+                        if (r < 0)
+                                log_link_warning(link, "Could not acquire IPv4 link-local address");
                         break;
                 case SD_IPV4LL_EVENT_BIND:
                         r = ipv4ll_address_claimed(ll, link);
@@ -212,13 +200,11 @@ int ipv4ll_configure(Link *link) {
                         return r;
         }
 
-        if (link->udev_device) {
-                r = net_get_unique_predictable_data(link->udev_device, &seed);
-                if (r >= 0) {
-                        r = sd_ipv4ll_set_address_seed(link->ipv4ll, seed);
-                        if (r < 0)
-                                return r;
-                }
+        if (link->sd_device &&
+            net_get_unique_predictable_data(link->sd_device, &seed) >= 0) {
+                r = sd_ipv4ll_set_address_seed(link->ipv4ll, seed);
+                if (r < 0)
+                        return r;
         }
 
         r = sd_ipv4ll_attach_event(link->ipv4ll, NULL, 0);

@@ -3,38 +3,14 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-  This file is part of systemd.
-
-  Copyright 2012 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 
-<refentry id="sd_journal_print">
+<refentry id="sd_journal_print" xmlns:xi="http://www.w3.org/2001/XInclude">
 
   <refentryinfo>
     <title>sd_journal_print</title>
     <productname>systemd</productname>
-
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Lennart</firstname>
-        <surname>Poettering</surname>
-        <email>lennart@poettering.net</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -60,7 +36,7 @@
         <funcdef>int <function>sd_journal_print</function></funcdef>
         <paramdef>int <parameter>priority</parameter></paramdef>
         <paramdef>const char *<parameter>format</parameter></paramdef>
-        <paramdef>...</paramdef>
+        <paramdef>…</paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -73,7 +49,7 @@
       <funcprototype>
         <funcdef>int <function>sd_journal_send</function></funcdef>
         <paramdef>const char *<parameter>format</parameter></paramdef>
-        <paramdef>...</paramdef>
+        <paramdef>…</paramdef>
       </funcprototype>
 
       <funcprototype>
@@ -133,7 +109,7 @@
     project='man-pages'><refentrytitle>readv</refentrytitle><manvolnum>3</manvolnum></citerefentry> for details)
     instead of the format string. Each structure should reference one field of the entry to submit. The second argument
     specifies the number of structures in the array.  <function>sd_journal_sendv()</function> is particularly useful to
-    submit binary objects to the journal where that is necessary. Note that this function wil not strip trailing
+    submit binary objects to the journal where that is necessary. Note that this function will not strip trailing
     whitespace of the passed fields, but passes the specified data along unmodified. This is different from both
     <function>sd_journal_print()</function> and <function>sd_journal_send()</function> described above, which are based
     on format strings, and do strip trailing whitespace.</para>
@@ -189,10 +165,9 @@ sd_journal_send("MESSAGE=Hello World, this is PID %lu!", (unsigned long) getpid(
   <refsect1>
     <title>Return Value</title>
 
-    <para>The four calls return 0 on success or a negative errno-style
-    error code. The
-    <citerefentry project='man-pages'><refentrytitle>errno</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    variable itself is not altered.</para>
+    <para>The five calls return 0 on success or a negative errno-style error code. The <citerefentry
+    project='man-pages'><refentrytitle>errno</refentrytitle><manvolnum>3</manvolnum></citerefentry> variable itself is
+    not altered.</para>
 
     <para>If
     <citerefentry><refentrytitle>systemd-journald</refentrytitle><manvolnum>8</manvolnum></citerefentry>
@@ -202,10 +177,11 @@ sd_journal_send("MESSAGE=Hello World, this is PID %lu!", (unsigned long) getpid(
 
   <refsect1>
     <title>Thread safety</title>
-    <para>All functions listed here are thread-safe and may be called in parallel from multiple threads.</para>
 
-    <para><function>sd_journal_sendv()</function> is "async signal safe" in the meaning of
-    <citerefentry project='man-pages'><refentrytitle>signal</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+    <xi:include href="threads-aware.xml" xpointer="safe"/>
+
+    <para><function>sd_journal_sendv()</function> is "async signal safe" in the meaning of <citerefentry
+    project='man-pages'><refentrytitle>signal-safety</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
     </para>
 
     <para><function>sd_journal_print</function>,
@@ -215,17 +191,7 @@ sd_journal_send("MESSAGE=Hello World, this is PID %lu!", (unsigned long) getpid(
     not async signal safe.</para>
   </refsect1>
 
-  <refsect1>
-    <title>Notes</title>
-
-    <para>The <function>sd_journal_print()</function>,
-    <function>sd_journal_printv()</function>,
-    <function>sd_journal_send()</function> and
-    <function>sd_journal_sendv()</function> interfaces are available
-    as a shared library, which can be compiled and linked to with the
-    <constant>libsystemd</constant> <citerefentry project='die-net'><refentrytitle>pkg-config</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-    file.</para>
-  </refsect1>
+  <xi:include href="libsystemd-pkgconfig.xml" />
 
   <refsect1>
     <title>See Also</title>

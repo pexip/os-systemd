@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2015 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "import-compress.h"
 #include "string-table.h"
@@ -31,11 +14,13 @@ void import_compress_free(ImportCompress *c) {
                         deflateEnd(&c->gzip);
                 else
                         inflateEnd(&c->gzip);
+#if HAVE_BZIP2
         } else if (c->type == IMPORT_COMPRESS_BZIP2) {
                 if (c->encoding)
                         BZ2_bzCompressEnd(&c->bzip2);
                 else
                         BZ2_bzDecompressEnd(&c->bzip2);
+#endif
         }
 
         c->type = IMPORT_COMPRESS_UNKNOWN;
@@ -69,7 +54,7 @@ int import_uncompress_detect(ImportCompress *c, const void *data, size_t size) {
         if (memcmp(data, xz_signature, sizeof(xz_signature)) == 0) {
                 lzma_ret xzr;
 
-                xzr = lzma_stream_decoder(&c->xz, UINT64_MAX, LZMA_TELL_UNSUPPORTED_CHECK);
+                xzr = lzma_stream_decoder(&c->xz, UINT64_MAX, LZMA_TELL_UNSUPPORTED_CHECK | LZMA_CONCATENATED);
                 if (xzr != LZMA_OK)
                         return -EIO;
 
@@ -82,12 +67,14 @@ int import_uncompress_detect(ImportCompress *c, const void *data, size_t size) {
 
                 c->type = IMPORT_COMPRESS_GZIP;
 
+#if HAVE_BZIP2
         } else if (memcmp(data, bzip2_signature, sizeof(bzip2_signature)) == 0) {
                 r = BZ2_bzDecompressInit(&c->bzip2, 0, 0);
                 if (r != BZ_OK)
                         return -EIO;
 
                 c->type = IMPORT_COMPRESS_BZIP2;
+#endif
         } else
                 c->type = IMPORT_COMPRESS_UNCOMPRESSED;
 
@@ -135,7 +122,7 @@ int import_uncompress(ImportCompress *c, const void *data, size_t size, ImportCo
                         c->xz.avail_out = sizeof(buffer);
 
                         lzr = lzma_code(&c->xz, LZMA_RUN);
-                        if (lzr != LZMA_OK && lzr != LZMA_STREAM_END)
+                        if (!IN_SET(lzr, LZMA_OK, LZMA_STREAM_END))
                                 return -EIO;
 
                         r = callback(buffer, sizeof(buffer) - c->xz.avail_out, userdata);
@@ -156,7 +143,7 @@ int import_uncompress(ImportCompress *c, const void *data, size_t size, ImportCo
                         c->gzip.avail_out = sizeof(buffer);
 
                         r = inflate(&c->gzip, Z_NO_FLUSH);
-                        if (r != Z_OK && r != Z_STREAM_END)
+                        if (!IN_SET(r, Z_OK, Z_STREAM_END))
                                 return -EIO;
 
                         r = callback(buffer, sizeof(buffer) - c->gzip.avail_out, userdata);
@@ -166,6 +153,7 @@ int import_uncompress(ImportCompress *c, const void *data, size_t size, ImportCo
 
                 break;
 
+#if HAVE_BZIP2
         case IMPORT_COMPRESS_BZIP2:
                 c->bzip2.next_in = (void*) data;
                 c->bzip2.avail_in = size;
@@ -177,7 +165,7 @@ int import_uncompress(ImportCompress *c, const void *data, size_t size, ImportCo
                         c->bzip2.avail_out = sizeof(buffer);
 
                         r = BZ2_bzDecompress(&c->bzip2);
-                        if (r != BZ_OK && r != BZ_STREAM_END)
+                        if (!IN_SET(r, BZ_OK, BZ_STREAM_END))
                                 return -EIO;
 
                         r = callback(buffer, sizeof(buffer) - c->bzip2.avail_out, userdata);
@@ -186,6 +174,7 @@ int import_uncompress(ImportCompress *c, const void *data, size_t size, ImportCo
                 }
 
                 break;
+#endif
 
         default:
                 assert_not_reached("Unknown compression");
@@ -220,6 +209,7 @@ int import_compress_init(ImportCompress *c, ImportCompressType t) {
                 c->type = IMPORT_COMPRESS_GZIP;
                 break;
 
+#if HAVE_BZIP2
         case IMPORT_COMPRESS_BZIP2:
                 r = BZ2_bzCompressInit(&c->bzip2, 9, 0, 0);
                 if (r != BZ_OK)
@@ -227,6 +217,7 @@ int import_compress_init(ImportCompress *c, ImportCompressType t) {
 
                 c->type = IMPORT_COMPRESS_BZIP2;
                 break;
+#endif
 
         case IMPORT_COMPRESS_UNCOMPRESSED:
                 c->type = IMPORT_COMPRESS_UNCOMPRESSED;
@@ -324,6 +315,7 @@ int import_compress(ImportCompress *c, const void *data, size_t size, void **buf
 
                 break;
 
+#if HAVE_BZIP2
         case IMPORT_COMPRESS_BZIP2:
 
                 c->bzip2.next_in = (void*) data;
@@ -345,6 +337,7 @@ int import_compress(ImportCompress *c, const void *data, size_t size, void **buf
                 }
 
                 break;
+#endif
 
         case IMPORT_COMPRESS_UNCOMPRESSED:
 
@@ -399,7 +392,7 @@ int import_compress_finish(ImportCompress *c, void **buffer, size_t *buffer_size
                         c->xz.avail_out = *buffer_allocated - *buffer_size;
 
                         lzr = lzma_code(&c->xz, LZMA_FINISH);
-                        if (lzr != LZMA_OK && lzr != LZMA_STREAM_END)
+                        if (!IN_SET(lzr, LZMA_OK, LZMA_STREAM_END))
                                 return -EIO;
 
                         *buffer_size += (*buffer_allocated - *buffer_size) - c->xz.avail_out;
@@ -420,7 +413,7 @@ int import_compress_finish(ImportCompress *c, void **buffer, size_t *buffer_size
                         c->gzip.avail_out = *buffer_allocated - *buffer_size;
 
                         r = deflate(&c->gzip, Z_FINISH);
-                        if (r != Z_OK && r != Z_STREAM_END)
+                        if (!IN_SET(r, Z_OK, Z_STREAM_END))
                                 return -EIO;
 
                         *buffer_size += (*buffer_allocated - *buffer_size) - c->gzip.avail_out;
@@ -428,6 +421,7 @@ int import_compress_finish(ImportCompress *c, void **buffer, size_t *buffer_size
 
                 break;
 
+#if HAVE_BZIP2
         case IMPORT_COMPRESS_BZIP2:
                 c->bzip2.avail_in = 0;
 
@@ -440,13 +434,14 @@ int import_compress_finish(ImportCompress *c, void **buffer, size_t *buffer_size
                         c->bzip2.avail_out = *buffer_allocated - *buffer_size;
 
                         r = BZ2_bzCompress(&c->bzip2, BZ_FINISH);
-                        if (r != BZ_FINISH_OK && r != BZ_STREAM_END)
+                        if (!IN_SET(r, BZ_FINISH_OK, BZ_STREAM_END))
                                 return -EIO;
 
                         *buffer_size += (*buffer_allocated - *buffer_size) - c->bzip2.avail_out;
                 } while (r != BZ_STREAM_END);
 
                 break;
+#endif
 
         case IMPORT_COMPRESS_UNCOMPRESSED:
                 break;
@@ -463,7 +458,9 @@ static const char* const import_compress_type_table[_IMPORT_COMPRESS_TYPE_MAX] =
         [IMPORT_COMPRESS_UNCOMPRESSED] = "uncompressed",
         [IMPORT_COMPRESS_XZ] = "xz",
         [IMPORT_COMPRESS_GZIP] = "gzip",
+#if HAVE_BZIP2
         [IMPORT_COMPRESS_BZIP2] = "bzip2",
+#endif
 };
 
 DEFINE_STRING_TABLE_LOOKUP(import_compress_type, ImportCompressType);

@@ -1,24 +1,10 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright 2010-2013 Lennart Poettering
-  Copyright 2013 Simon Peeters
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2013 Simon Peeters
 ***/
 
 #include <getopt.h>
+#include <inttypes.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,27 +12,41 @@
 #include "sd-bus.h"
 
 #include "alloc-util.h"
+#include "analyze-security.h"
 #include "analyze-verify.h"
+#include "build.h"
 #include "bus-error.h"
 #include "bus-unit-util.h"
 #include "bus-util.h"
+#include "calendarspec.h"
+#include "conf-files.h"
+#include "copy.h"
+#include "def.h"
+#include "fd-util.h"
+#include "fileio.h"
 #include "glob-util.h"
 #include "hashmap.h"
 #include "locale-util.h"
 #include "log.h"
+#include "main-func.h"
 #include "pager.h"
 #include "parse-util.h"
+#include "path-util.h"
+#include "pretty-print.h"
+#if HAVE_SECCOMP
+#  include "seccomp-util.h"
+#endif
 #include "special.h"
 #include "strv.h"
 #include "strxcpyx.h"
+#include "time-util.h"
 #include "terminal-util.h"
 #include "unit-name.h"
 #include "util.h"
+#include "verbs.h"
 
 #define SCALE_X (0.1 / 1000.0)   /* pixels per us */
 #define SCALE_Y (20.0)
-
-#define compare(a, b) (((a) > (b))? 1 : (((b) > (a))? -1 : 0))
 
 #define svg(...) printf(__VA_ARGS__)
 
@@ -71,11 +71,16 @@ static enum dot {
 static char** arg_dot_from_patterns = NULL;
 static char** arg_dot_to_patterns = NULL;
 static usec_t arg_fuzz = 0;
-static bool arg_no_pager = false;
+static PagerFlags arg_pager_flags = 0;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
-static char *arg_host = NULL;
-static bool arg_user = false;
+static const char *arg_host = NULL;
+static UnitFileScope arg_scope = UNIT_FILE_SYSTEM;
 static bool arg_man = true;
+static bool arg_generators = false;
+static const char *arg_root = NULL;
+
+STATIC_DESTRUCTOR_REGISTER(arg_dot_from_patterns, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_dot_to_patterns, strv_freep);
 
 struct boot_times {
         usec_t firmware_time;
@@ -91,6 +96,12 @@ struct boot_times {
         usec_t generators_finish_time;
         usec_t unitsload_start_time;
         usec_t unitsload_finish_time;
+        usec_t initrd_security_start_time;
+        usec_t initrd_security_finish_time;
+        usec_t initrd_generators_start_time;
+        usec_t initrd_generators_finish_time;
+        usec_t initrd_unitsload_start_time;
+        usec_t initrd_unitsload_finish_time;
 
         /*
          * If we're analyzing the user instance, all timestamps will be offset
@@ -106,6 +117,7 @@ struct boot_times {
 };
 
 struct unit_times {
+        bool has_data;
         char *name;
         usec_t activating;
         usec_t activated;
@@ -123,6 +135,21 @@ struct host_info {
         char *virtualization;
         char *architecture;
 };
+
+static int acquire_bus(sd_bus **bus, bool *use_full_bus) {
+        bool user = arg_scope != UNIT_FILE_SYSTEM;
+        int r;
+
+        if (use_full_bus && *use_full_bus) {
+                r = bus_connect_transport(arg_transport, arg_host, user, bus);
+                if (IN_SET(r, 0, -EHOSTDOWN))
+                        return r;
+
+                *use_full_bus = false;
+        }
+
+        return bus_connect_transport_systemd(arg_transport, arg_host, user, bus);
+}
 
 static int bus_get_uint64_property(sd_bus *bus, const char *path, const char *interface, const char *property, uint64_t *val) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -143,10 +170,8 @@ static int bus_get_uint64_property(sd_bus *bus, const char *path, const char *in
                         &error,
                         't', val);
 
-        if (r < 0) {
-                log_error("Failed to parse reply: %s", bus_error_message(&error, -r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse reply: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -168,32 +193,29 @@ static int bus_get_unit_property_strv(sd_bus *bus, const char *path, const char 
                         property,
                         &error,
                         strv);
-        if (r < 0) {
-                log_error("Failed to get unit property %s: %s", property, bus_error_message(&error, -r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get unit property %s: %s", property, bus_error_message(&error, r));
 
         return 0;
 }
 
-static int compare_unit_time(const void *a, const void *b) {
-        return compare(((struct unit_times *)b)->time,
-                       ((struct unit_times *)a)->time);
+static int compare_unit_time(const struct unit_times *a, const struct unit_times *b) {
+        return CMP(b->time, a->time);
 }
 
-static int compare_unit_start(const void *a, const void *b) {
-        return compare(((struct unit_times *)a)->activating,
-                       ((struct unit_times *)b)->activating);
+static int compare_unit_start(const struct unit_times *a, const struct unit_times *b) {
+        return CMP(a->activating, b->activating);
 }
 
-static void free_unit_times(struct unit_times *t, unsigned n) {
+static void unit_times_free(struct unit_times *t) {
         struct unit_times *p;
 
-        for (p = t; p < t + n; p++)
+        for (p = t; p->has_data; p++)
                 free(p->name);
-
         free(t);
 }
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(struct unit_times *, unit_times_free);
 
 static void subtract_timestamp(usec_t *a, usec_t b) {
         assert(a);
@@ -205,104 +227,81 @@ static void subtract_timestamp(usec_t *a, usec_t b) {
 }
 
 static int acquire_boot_times(sd_bus *bus, struct boot_times **bt) {
+        static const struct bus_properties_map property_map[] = {
+                { "FirmwareTimestampMonotonic",               "t", NULL, offsetof(struct boot_times, firmware_time)                 },
+                { "LoaderTimestampMonotonic",                 "t", NULL, offsetof(struct boot_times, loader_time)                   },
+                { "KernelTimestamp",                          "t", NULL, offsetof(struct boot_times, kernel_time)                   },
+                { "InitRDTimestampMonotonic",                 "t", NULL, offsetof(struct boot_times, initrd_time)                   },
+                { "UserspaceTimestampMonotonic",              "t", NULL, offsetof(struct boot_times, userspace_time)                },
+                { "FinishTimestampMonotonic",                 "t", NULL, offsetof(struct boot_times, finish_time)                   },
+                { "SecurityStartTimestampMonotonic",          "t", NULL, offsetof(struct boot_times, security_start_time)           },
+                { "SecurityFinishTimestampMonotonic",         "t", NULL, offsetof(struct boot_times, security_finish_time)          },
+                { "GeneratorsStartTimestampMonotonic",        "t", NULL, offsetof(struct boot_times, generators_start_time)         },
+                { "GeneratorsFinishTimestampMonotonic",       "t", NULL, offsetof(struct boot_times, generators_finish_time)        },
+                { "UnitsLoadStartTimestampMonotonic",         "t", NULL, offsetof(struct boot_times, unitsload_start_time)          },
+                { "UnitsLoadFinishTimestampMonotonic",        "t", NULL, offsetof(struct boot_times, unitsload_finish_time)         },
+                { "InitRDSecurityStartTimestampMonotonic",    "t", NULL, offsetof(struct boot_times, initrd_security_start_time)    },
+                { "InitRDSecurityFinishTimestampMonotonic",   "t", NULL, offsetof(struct boot_times, initrd_security_finish_time)   },
+                { "InitRDGeneratorsStartTimestampMonotonic",  "t", NULL, offsetof(struct boot_times, initrd_generators_start_time)  },
+                { "InitRDGeneratorsFinishTimestampMonotonic", "t", NULL, offsetof(struct boot_times, initrd_generators_finish_time) },
+                { "InitRDUnitsLoadStartTimestampMonotonic",   "t", NULL, offsetof(struct boot_times, initrd_unitsload_start_time)   },
+                { "InitRDUnitsLoadFinishTimestampMonotonic",  "t", NULL, offsetof(struct boot_times, initrd_unitsload_finish_time)  },
+                {},
+        };
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         static struct boot_times times;
         static bool cached = false;
+        int r;
 
         if (cached)
                 goto finish;
 
         assert_cc(sizeof(usec_t) == sizeof(uint64_t));
 
-        if (bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "FirmwareTimestampMonotonic",
-                                    &times.firmware_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "LoaderTimestampMonotonic",
-                                    &times.loader_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "KernelTimestamp",
-                                    &times.kernel_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "InitRDTimestampMonotonic",
-                                    &times.initrd_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "UserspaceTimestampMonotonic",
-                                    &times.userspace_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "FinishTimestampMonotonic",
-                                    &times.finish_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "SecurityStartTimestampMonotonic",
-                                    &times.security_start_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "SecurityFinishTimestampMonotonic",
-                                    &times.security_finish_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "GeneratorsStartTimestampMonotonic",
-                                    &times.generators_start_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "GeneratorsFinishTimestampMonotonic",
-                                    &times.generators_finish_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "UnitsLoadStartTimestampMonotonic",
-                                    &times.unitsload_start_time) < 0 ||
-            bus_get_uint64_property(bus,
-                                    "/org/freedesktop/systemd1",
-                                    "org.freedesktop.systemd1.Manager",
-                                    "UnitsLoadFinishTimestampMonotonic",
-                                    &times.unitsload_finish_time) < 0)
-                return -EIO;
+        r = bus_map_all_properties(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        property_map,
+                        BUS_MAP_STRDUP,
+                        &error,
+                        NULL,
+                        &times);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get timestamp properties: %s", bus_error_message(&error, r));
 
         if (times.finish_time <= 0) {
-                log_error("Bootup is not yet finished. Please try again later.");
+                log_error("Bootup is not yet finished (org.freedesktop.systemd1.Manager.FinishTimestampMonotonic=%"PRIu64").\n"
+                          "Please try again later.\n"
+                          "Hint: Use 'systemctl%s list-jobs' to see active jobs",
+                          times.finish_time,
+                          arg_scope == UNIT_FILE_SYSTEM ? "" : " --user");
                 return -EINPROGRESS;
         }
 
-        if (arg_user) {
+        if (arg_scope == UNIT_FILE_SYSTEM && times.security_start_time > 0) {
+                /* security_start_time is set when systemd is not running under container environment. */
+                if (times.initrd_time > 0)
+                        times.kernel_done_time = times.initrd_time;
+                else
+                        times.kernel_done_time = times.userspace_time;
+        } else {
                 /*
-                 * User-instance-specific timestamps processing
+                 * User-instance-specific or container-system-specific timestamps processing
                  * (see comment to reverse_offset in struct boot_times).
                  */
                 times.reverse_offset = times.userspace_time;
 
-                times.firmware_time = times.loader_time = times.kernel_time = times.initrd_time = times.userspace_time = 0;
-                subtract_timestamp(&times.finish_time, times.reverse_offset);
+                times.firmware_time = times.loader_time = times.kernel_time = times.initrd_time = times.userspace_time =
+                        times.security_start_time = times.security_finish_time = 0;
 
-                subtract_timestamp(&times.security_start_time, times.reverse_offset);
-                subtract_timestamp(&times.security_finish_time, times.reverse_offset);
+                subtract_timestamp(&times.finish_time, times.reverse_offset);
 
                 subtract_timestamp(&times.generators_start_time, times.reverse_offset);
                 subtract_timestamp(&times.generators_finish_time, times.reverse_offset);
 
                 subtract_timestamp(&times.unitsload_start_time, times.reverse_offset);
                 subtract_timestamp(&times.unitsload_finish_time, times.reverse_offset);
-        } else {
-                if (times.initrd_time)
-                        times.kernel_done_time = times.initrd_time;
-                else
-                        times.kernel_done_time = times.userspace_time;
         }
 
         cached = true;
@@ -330,17 +329,24 @@ static void free_host_info(struct host_info *hi) {
 DEFINE_TRIVIAL_CLEANUP_FUNC(struct host_info*, free_host_info);
 
 static int acquire_time_data(sd_bus *bus, struct unit_times **out) {
+        static const struct bus_properties_map property_map[] = {
+                { "InactiveExitTimestampMonotonic",  "t", NULL, offsetof(struct unit_times, activating)   },
+                { "ActiveEnterTimestampMonotonic",   "t", NULL, offsetof(struct unit_times, activated)    },
+                { "ActiveExitTimestampMonotonic",    "t", NULL, offsetof(struct unit_times, deactivating) },
+                { "InactiveEnterTimestampMonotonic", "t", NULL, offsetof(struct unit_times, deactivated)  },
+                {},
+        };
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        int r, c = 0;
+        _cleanup_(unit_times_freep) struct unit_times *unit_times = NULL;
         struct boot_times *boot_times = NULL;
-        struct unit_times *unit_times = NULL;
-        size_t size = 0;
+        size_t allocated = 0, c = 0;
         UnitInfo u;
+        int r;
 
         r = acquire_boot_times(bus, &boot_times);
         if (r < 0)
-                goto fail;
+                return r;
 
         r = sd_bus_call_method(
                         bus,
@@ -350,49 +356,36 @@ static int acquire_time_data(sd_bus *bus, struct unit_times **out) {
                         "ListUnits",
                         &error, &reply,
                         NULL);
-        if (r < 0) {
-                log_error("Failed to list units: %s", bus_error_message(&error, -r));
-                goto fail;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to list units: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "(ssssssouso)");
-        if (r < 0) {
-                bus_log_parse_error(r);
-                goto fail;
-        }
+        if (r < 0)
+                return bus_log_parse_error(r);
 
         while ((r = bus_parse_unit_info(reply, &u)) > 0) {
                 struct unit_times *t;
 
-                if (!GREEDY_REALLOC(unit_times, size, c+1)) {
-                        r = log_oom();
-                        goto fail;
-                }
+                if (!GREEDY_REALLOC(unit_times, allocated, c+2))
+                        return log_oom();
 
-                t = unit_times+c;
+                unit_times[c+1].has_data = false;
+                t = &unit_times[c];
                 t->name = NULL;
 
                 assert_cc(sizeof(usec_t) == sizeof(uint64_t));
 
-                if (bus_get_uint64_property(bus, u.unit_path,
-                                            "org.freedesktop.systemd1.Unit",
-                                            "InactiveExitTimestampMonotonic",
-                                            &t->activating) < 0 ||
-                    bus_get_uint64_property(bus, u.unit_path,
-                                            "org.freedesktop.systemd1.Unit",
-                                            "ActiveEnterTimestampMonotonic",
-                                            &t->activated) < 0 ||
-                    bus_get_uint64_property(bus, u.unit_path,
-                                            "org.freedesktop.systemd1.Unit",
-                                            "ActiveExitTimestampMonotonic",
-                                            &t->deactivating) < 0 ||
-                    bus_get_uint64_property(bus, u.unit_path,
-                                            "org.freedesktop.systemd1.Unit",
-                                            "InactiveEnterTimestampMonotonic",
-                                            &t->deactivated) < 0) {
-                        r = -EIO;
-                        goto fail;
-                }
+                r = bus_map_all_properties(
+                                bus,
+                                "org.freedesktop.systemd1",
+                                u.unit_path,
+                                property_map,
+                                BUS_MAP_STRDUP,
+                                &error,
+                                NULL,
+                                t);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get timestamp properties of unit %s: %s", u.id, bus_error_message(&error, r));
 
                 subtract_timestamp(&t->activating, boot_times->reverse_offset);
                 subtract_timestamp(&t->activated, boot_times->reverse_offset);
@@ -410,24 +403,17 @@ static int acquire_time_data(sd_bus *bus, struct unit_times **out) {
                         continue;
 
                 t->name = strdup(u.id);
-                if (t->name == NULL) {
-                        r = log_oom();
-                        goto fail;
-                }
+                if (!t->name)
+                        return log_oom();
+
+                t->has_data = true;
                 c++;
         }
-        if (r < 0) {
-                bus_log_parse_error(r);
-                goto fail;
-        }
+        if (r < 0)
+                return bus_log_parse_error(r);
 
-        *out = unit_times;
+        *out = TAKE_PTR(unit_times);
         return c;
-
-fail:
-        if (unit_times)
-                free_unit_times(unit_times, (unsigned) c);
-        return r;
 }
 
 static int acquire_host_info(sd_bus *bus, struct host_info **hi) {
@@ -447,6 +433,7 @@ static int acquire_host_info(sd_bus *bus, struct host_info **hi) {
         };
 
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *system_bus = NULL;
         _cleanup_(free_host_infop) struct host_info *host;
         int r;
 
@@ -454,24 +441,40 @@ static int acquire_host_info(sd_bus *bus, struct host_info **hi) {
         if (!host)
                 return log_oom();
 
-        r = bus_map_all_properties(bus,
+        if (arg_scope != UNIT_FILE_SYSTEM) {
+                r = bus_connect_transport(arg_transport, arg_host, false, &system_bus);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to connect to system bus, ignoring: %m");
+                        goto manager;
+                }
+        }
+
+        r = bus_map_all_properties(system_bus ?: bus,
                                    "org.freedesktop.hostname1",
                                    "/org/freedesktop/hostname1",
                                    hostname_map,
+                                   BUS_MAP_STRDUP,
+                                   &error,
+                                   NULL,
                                    host);
-        if (r < 0)
-                log_debug_errno(r, "Failed to get host information from systemd-hostnamed: %s", bus_error_message(&error, r));
+        if (r < 0) {
+                log_debug_errno(r, "Failed to get host information from systemd-hostnamed, ignoring: %s", bus_error_message(&error, r));
+                sd_bus_error_free(&error);
+        }
 
+manager:
         r = bus_map_all_properties(bus,
                                    "org.freedesktop.systemd1",
                                    "/org/freedesktop/systemd1",
                                    manager_map,
+                                   BUS_MAP_STRDUP,
+                                   &error,
+                                   NULL,
                                    host);
         if (r < 0)
                 return log_error_errno(r, "Failed to get host information from systemd: %s", bus_error_message(&error, r));
 
-        *hi = host;
-        host = NULL;
+        *hi = TAKE_PTR(host);
 
         return 0;
 }
@@ -483,26 +486,68 @@ static int pretty_boot_time(sd_bus *bus, char **_buf) {
         size_t size;
         char *ptr;
         int r;
+        usec_t activated_time = USEC_INFINITY;
+        _cleanup_free_ char* path = NULL, *unit_id = NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
 
         r = acquire_boot_times(bus, &t);
         if (r < 0)
                 return r;
 
+        path = unit_dbus_path_from_name(SPECIAL_DEFAULT_TARGET);
+        if (!path)
+                return log_oom();
+
+        r = sd_bus_get_property_string(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        path,
+                        "org.freedesktop.systemd1.Unit",
+                        "Id",
+                        &error,
+                        &unit_id);
+        if (r < 0) {
+                log_error_errno(r, "default.target doesn't seem to exist: %s", bus_error_message(&error, r));
+                unit_id = NULL;
+        }
+
+        r = bus_get_uint64_property(bus, path,
+                        "org.freedesktop.systemd1.Unit",
+                        "ActiveEnterTimestampMonotonic",
+                        &activated_time);
+        if (r < 0) {
+                log_info_errno(r, "Could not get time to reach default.target, ignoring: %m");
+                activated_time = USEC_INFINITY;
+        }
+
         ptr = buf;
         size = sizeof(buf);
 
         size = strpcpyf(&ptr, size, "Startup finished in ");
-        if (t->firmware_time)
+        if (t->firmware_time > 0)
                 size = strpcpyf(&ptr, size, "%s (firmware) + ", format_timespan(ts, sizeof(ts), t->firmware_time - t->loader_time, USEC_PER_MSEC));
-        if (t->loader_time)
+        if (t->loader_time > 0)
                 size = strpcpyf(&ptr, size, "%s (loader) + ", format_timespan(ts, sizeof(ts), t->loader_time, USEC_PER_MSEC));
-        if (t->kernel_time)
+        if (t->kernel_done_time > 0)
                 size = strpcpyf(&ptr, size, "%s (kernel) + ", format_timespan(ts, sizeof(ts), t->kernel_done_time, USEC_PER_MSEC));
         if (t->initrd_time > 0)
                 size = strpcpyf(&ptr, size, "%s (initrd) + ", format_timespan(ts, sizeof(ts), t->userspace_time - t->initrd_time, USEC_PER_MSEC));
 
         size = strpcpyf(&ptr, size, "%s (userspace) ", format_timespan(ts, sizeof(ts), t->finish_time - t->userspace_time, USEC_PER_MSEC));
-        strpcpyf(&ptr, size, "= %s", format_timespan(ts, sizeof(ts), t->firmware_time + t->finish_time, USEC_PER_MSEC));
+        if (t->kernel_done_time > 0)
+                strpcpyf(&ptr, size, "= %s ", format_timespan(ts, sizeof(ts), t->firmware_time + t->finish_time, USEC_PER_MSEC));
+
+        if (unit_id && activated_time > 0 && activated_time != USEC_INFINITY) {
+                usec_t base = t->userspace_time > 0 ? t->userspace_time : t->reverse_offset;
+
+                size = strpcpyf(&ptr, size, "\n%s reached after %s in userspace", unit_id,
+                                format_timespan(ts, sizeof(ts), activated_time - base, USEC_PER_MSEC));
+        } else if (unit_id && activated_time == 0)
+                size = strpcpyf(&ptr, size, "\n%s was never reached", unit_id);
+        else if (unit_id && activated_time == USEC_INFINITY)
+                size = strpcpyf(&ptr, size, "\nCould not get time to reach %s.", unit_id);
+        else if (!unit_id)
+                size = strpcpyf(&ptr, size, "\ncould not find default.target");
 
         ptr = strdup(buf);
         if (!ptr)
@@ -535,14 +580,42 @@ static void svg_graph_box(double height, double begin, double end) {
         }
 }
 
-static int analyze_plot(sd_bus *bus) {
+static int plot_unit_times(struct unit_times *u, double width, int y) {
+        char ts[FORMAT_TIMESPAN_MAX];
+        bool b;
+
+        if (!u->name)
+                return 0;
+
+        svg_bar("activating",   u->activating, u->activated, y);
+        svg_bar("active",       u->activated, u->deactivating, y);
+        svg_bar("deactivating", u->deactivating, u->deactivated, y);
+
+        /* place the text on the left if we have passed the half of the svg width */
+        b = u->activating * SCALE_X < width / 2;
+        if (u->time)
+                svg_text(b, u->activating, y, "%s (%s)",
+                         u->name, format_timespan(ts, sizeof(ts), u->time, USEC_PER_MSEC));
+        else
+                svg_text(b, u->activating, y, "%s", u->name);
+
+        return 1;
+}
+
+static int analyze_plot(int argc, char *argv[], void *userdata) {
         _cleanup_(free_host_infop) struct host_info *host = NULL;
-        struct unit_times *times;
-        struct boot_times *boot;
-        int n, m = 1, y=0;
-        double width;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(unit_times_freep) struct unit_times *times = NULL;
         _cleanup_free_ char *pretty_times = NULL;
+        bool use_full_bus = arg_scope == UNIT_FILE_SYSTEM;
+        struct boot_times *boot;
         struct unit_times *u;
+        int n, m = 1, y = 0, r;
+        double width;
+
+        r = acquire_bus(&bus, &use_full_bus);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
         n = acquire_boot_times(bus, &boot);
         if (n < 0)
@@ -552,15 +625,17 @@ static int analyze_plot(sd_bus *bus) {
         if (n < 0)
                 return n;
 
-        n = acquire_host_info(bus, &host);
-        if (n < 0)
-                return n;
+        if (use_full_bus || arg_scope != UNIT_FILE_SYSTEM) {
+                n = acquire_host_info(bus, &host);
+                if (n < 0)
+                        return n;
+        }
 
         n = acquire_time_data(bus, &times);
         if (n <= 0)
                 return n;
 
-        qsort(times, n, sizeof(struct unit_times), compare_unit_start);
+        typesafe_qsort(times, n, compare_unit_start);
 
         width = SCALE_X * (boot->firmware_time + boot->finish_time);
         if (width < 800.0)
@@ -568,21 +643,20 @@ static int analyze_plot(sd_bus *bus) {
 
         if (boot->firmware_time > boot->loader_time)
                 m++;
-        if (boot->loader_time) {
+        if (boot->loader_time > 0) {
                 m++;
                 if (width < 1000.0)
                         width = 1000.0;
         }
-        if (boot->initrd_time)
+        if (boot->initrd_time > 0)
                 m++;
-        if (boot->kernel_time)
+        if (boot->kernel_done_time > 0)
                 m++;
 
-        for (u = times; u < times + n; u++) {
+        for (u = times; u->has_data; u++) {
                 double text_start, text_width;
 
-                if (u->activating < boot->userspace_time ||
-                    u->activating > boot->finish_time) {
+                if (u->activating > boot->finish_time) {
                         u->name = mfree(u->name);
                         continue;
                 }
@@ -595,12 +669,13 @@ static int analyze_plot(sd_bus *bus) {
                 if (text_width > text_start && text_width + text_start > width)
                         width = text_width + text_start;
 
-                if (u->deactivated > u->activating && u->deactivated <= boot->finish_time
-                                && u->activated == 0 && u->deactivating == 0)
+                if (u->deactivated > u->activating &&
+                    u->deactivated <= boot->finish_time &&
+                    u->activated == 0 && u->deactivating == 0)
                         u->activated = u->deactivating = u->deactivated;
                 if (u->activated < u->activating || u->activated > boot->finish_time)
                         u->activated = boot->finish_time;
-                if (u->deactivating < u->activated || u->activated > boot->finish_time)
+                if (u->deactivating < u->activated || u->deactivating > boot->finish_time)
                         u->deactivating = boot->finish_time;
                 if (u->deactivated < u->deactivating || u->deactivated > boot->finish_time)
                         u->deactivated = boot->finish_time;
@@ -622,7 +697,7 @@ static int analyze_plot(sd_bus *bus) {
             "<!-- that render these files properly but much slower are ImageMagick,   -->\n"
             "<!-- gimp, inkscape, etc. To display the files on your system, just      -->\n"
             "<!-- point your browser to this file.                                    -->\n\n"
-            "<!-- This plot was generated by systemd-analyze version %-16.16s -->\n\n", VERSION);
+            "<!-- This plot was generated by systemd-analyze version %-16.16s -->\n\n", GIT_VERSION);
 
         /* style sheet */
         svg("<defs>\n  <style type=\"text/css\">\n    <![CDATA[\n"
@@ -652,65 +727,63 @@ static int analyze_plot(sd_bus *bus) {
 
         svg("<rect class=\"background\" width=\"100%%\" height=\"100%%\" />\n");
         svg("<text x=\"20\" y=\"50\">%s</text>", pretty_times);
-        svg("<text x=\"20\" y=\"30\">%s %s (%s %s %s) %s %s</text>",
-            isempty(host->os_pretty_name) ? "Linux" : host->os_pretty_name,
-            strempty(host->hostname),
-            strempty(host->kernel_name),
-            strempty(host->kernel_release),
-            strempty(host->kernel_version),
-            strempty(host->architecture),
-            strempty(host->virtualization));
+        if (host)
+                svg("<text x=\"20\" y=\"30\">%s %s (%s %s %s) %s %s</text>",
+                    isempty(host->os_pretty_name) ? "Linux" : host->os_pretty_name,
+                    strempty(host->hostname),
+                    strempty(host->kernel_name),
+                    strempty(host->kernel_release),
+                    strempty(host->kernel_version),
+                    strempty(host->architecture),
+                    strempty(host->virtualization));
 
         svg("<g transform=\"translate(%.3f,100)\">\n", 20.0 + (SCALE_X * boot->firmware_time));
         svg_graph_box(m, -(double) boot->firmware_time, boot->finish_time);
 
-        if (boot->firmware_time) {
+        if (boot->firmware_time > 0) {
                 svg_bar("firmware", -(double) boot->firmware_time, -(double) boot->loader_time, y);
                 svg_text(true, -(double) boot->firmware_time, y, "firmware");
                 y++;
         }
-        if (boot->loader_time) {
+        if (boot->loader_time > 0) {
                 svg_bar("loader", -(double) boot->loader_time, 0, y);
                 svg_text(true, -(double) boot->loader_time, y, "loader");
                 y++;
         }
-        if (boot->kernel_time) {
+        if (boot->kernel_done_time > 0) {
                 svg_bar("kernel", 0, boot->kernel_done_time, y);
                 svg_text(true, 0, y, "kernel");
                 y++;
         }
-        if (boot->initrd_time) {
+        if (boot->initrd_time > 0) {
                 svg_bar("initrd", boot->initrd_time, boot->userspace_time, y);
+                if (boot->initrd_security_start_time < boot->initrd_security_finish_time)
+                        svg_bar("security", boot->initrd_security_start_time, boot->initrd_security_finish_time, y);
+                if (boot->initrd_generators_start_time < boot->initrd_generators_finish_time)
+                        svg_bar("generators", boot->initrd_generators_start_time, boot->initrd_generators_finish_time, y);
+                if (boot->initrd_unitsload_start_time < boot->initrd_unitsload_finish_time)
+                        svg_bar("unitsload", boot->initrd_unitsload_start_time, boot->initrd_unitsload_finish_time, y);
                 svg_text(true, boot->initrd_time, y, "initrd");
                 y++;
         }
+
+        for (u = times; u->has_data; u++) {
+                if (u->activating >= boot->userspace_time)
+                        break;
+
+                y += plot_unit_times(u, width, y);
+        }
+
         svg_bar("active", boot->userspace_time, boot->finish_time, y);
-        svg_bar("security", boot->security_start_time, boot->security_finish_time, y);
+        if (boot->security_start_time > 0)
+                svg_bar("security", boot->security_start_time, boot->security_finish_time, y);
         svg_bar("generators", boot->generators_start_time, boot->generators_finish_time, y);
         svg_bar("unitsload", boot->unitsload_start_time, boot->unitsload_finish_time, y);
         svg_text(true, boot->userspace_time, y, "systemd");
         y++;
 
-        for (u = times; u < times + n; u++) {
-                char ts[FORMAT_TIMESPAN_MAX];
-                bool b;
-
-                if (!u->name)
-                        continue;
-
-                svg_bar("activating",   u->activating, u->activated, y);
-                svg_bar("active",       u->activated, u->deactivating, y);
-                svg_bar("deactivating", u->deactivating, u->deactivated, y);
-
-                /* place the text on the left if we have passed the half of the svg width */
-                b = u->activating * SCALE_X < width / 2;
-                if (u->time)
-                        svg_text(b, u->activating, y, "%s (%s)",
-                                 u->name, format_timespan(ts, sizeof(ts), u->time, USEC_PER_MSEC));
-                else
-                        svg_text(b, u->activating, y, "%s", u->name);
-                y++;
-        }
+        for (; u->has_data; u++)
+                y += plot_unit_times(u, width, y);
 
         svg("</g>\n");
 
@@ -726,9 +799,11 @@ static int analyze_plot(sd_bus *bus) {
         svg_bar("deactivating", 0, 300000, y);
         svg_text(true, 400000, y, "Deactivating");
         y++;
-        svg_bar("security", 0, 300000, y);
-        svg_text(true, 400000, y, "Setting up security module");
-        y++;
+        if (boot->security_start_time > 0) {
+                svg_bar("security", 0, 300000, y);
+                svg_text(true, 400000, y, "Setting up security module");
+                y++;
+        }
         svg_bar("generators", 0, 300000, y);
         svg_text(true, 400000, y, "Generators");
         y++;
@@ -740,24 +815,21 @@ static int analyze_plot(sd_bus *bus) {
 
         svg("</svg>\n");
 
-        free_unit_times(times, (unsigned) n);
-
-        n = 0;
-        return n;
+        return 0;
 }
 
-static int list_dependencies_print(const char *name, unsigned int level, unsigned int branches,
+static int list_dependencies_print(const char *name, unsigned level, unsigned branches,
                                    bool last, struct unit_times *times, struct boot_times *boot) {
-        unsigned int i;
+        unsigned i;
         char ts[FORMAT_TIMESPAN_MAX], ts2[FORMAT_TIMESPAN_MAX];
 
         for (i = level; i != 0; i--)
-                printf("%s", special_glyph(branches & (1 << (i-1)) ? TREE_VERTICAL : TREE_SPACE));
+                printf("%s", special_glyph(branches & (1 << (i-1)) ? SPECIAL_GLYPH_TREE_VERTICAL : SPECIAL_GLYPH_TREE_SPACE));
 
-        printf("%s", special_glyph(last ? TREE_RIGHT : TREE_BRANCH));
+        printf("%s", special_glyph(last ? SPECIAL_GLYPH_TREE_RIGHT : SPECIAL_GLYPH_TREE_BRANCH));
 
         if (times) {
-                if (times->time)
+                if (times->time > 0)
                         printf("%s%s @%s +%s%s", ansi_highlight_red(), name,
                                format_timespan(ts, sizeof(ts), times->activating - boot->userspace_time, USEC_PER_MSEC),
                                format_timespan(ts2, sizeof(ts2), times->time, USEC_PER_MSEC), ansi_normal());
@@ -780,7 +852,7 @@ static int list_dependencies_get_dependencies(sd_bus *bus, const char *name, cha
         assert(deps);
 
         path = unit_dbus_path_from_name(name);
-        if (path == NULL)
+        if (!path)
                 return -ENOMEM;
 
         return bus_get_unit_property_strv(bus, path, "After", deps);
@@ -788,8 +860,7 @@ static int list_dependencies_get_dependencies(sd_bus *bus, const char *name, cha
 
 static Hashmap *unit_times_hashmap;
 
-static int list_dependencies_compare(const void *_a, const void *_b) {
-        const char **a = (const char**) _a, **b = (const char**) _b;
+static int list_dependencies_compare(char * const *a, char * const *b) {
         usec_t usa = 0, usb = 0;
         struct unit_times *times;
 
@@ -800,11 +871,16 @@ static int list_dependencies_compare(const void *_a, const void *_b) {
         if (times)
                 usb = times->activated;
 
-        return usb - usa;
+        return CMP(usb, usa);
 }
 
-static int list_dependencies_one(sd_bus *bus, const char *name, unsigned int level, char ***units,
-                                 unsigned int branches) {
+static bool times_in_range(const struct unit_times *times, const struct boot_times *boot) {
+        return times &&
+                times->activated > 0 && times->activated <= boot->finish_time;
+}
+
+static int list_dependencies_one(sd_bus *bus, const char *name, unsigned level, char ***units,
+                                 unsigned branches) {
         _cleanup_strv_free_ char **deps = NULL;
         char **c;
         int r = 0;
@@ -820,7 +896,7 @@ static int list_dependencies_one(sd_bus *bus, const char *name, unsigned int lev
         if (r < 0)
                 return r;
 
-        qsort_safe(deps, strv_length(deps), sizeof (char*), list_dependencies_compare);
+        typesafe_qsort(deps, strv_length(deps), list_dependencies_compare);
 
         r = acquire_boot_times(bus, &boot);
         if (r < 0)
@@ -828,22 +904,18 @@ static int list_dependencies_one(sd_bus *bus, const char *name, unsigned int lev
 
         STRV_FOREACH(c, deps) {
                 times = hashmap_get(unit_times_hashmap, *c);
-                if (times
-                    && times->activated
-                    && times->activated <= boot->finish_time
-                    && (times->activated >= service_longest
-                        || service_longest == 0)) {
+                if (times_in_range(times, boot) &&
+                    times->activated >= service_longest)
                         service_longest = times->activated;
-                        break;
-                }
         }
 
-        if (service_longest == 0 )
+        if (service_longest == 0)
                 return r;
 
         STRV_FOREACH(c, deps) {
                 times = hashmap_get(unit_times_hashmap, *c);
-                if (times && times->activated && times->activated <= boot->finish_time && (service_longest - times->activated) <= arg_fuzz)
+                if (times_in_range(times, boot) &&
+                    service_longest - times->activated <= arg_fuzz)
                         to_print++;
         }
 
@@ -852,10 +924,8 @@ static int list_dependencies_one(sd_bus *bus, const char *name, unsigned int lev
 
         STRV_FOREACH(c, deps) {
                 times = hashmap_get(unit_times_hashmap, *c);
-                if (!times
-                    || !times->activated
-                    || times->activated > boot->finish_time
-                    || service_longest - times->activated > arg_fuzz)
+                if (!times_in_range(times, boot) ||
+                    service_longest - times->activated > arg_fuzz)
                         continue;
 
                 to_print--;
@@ -877,7 +947,7 @@ static int list_dependencies_one(sd_bus *bus, const char *name, unsigned int lev
                 if (r < 0)
                         return r;
 
-                if (!to_print)
+                if (to_print == 0)
                         break;
         }
         return 0;
@@ -897,7 +967,7 @@ static int list_dependencies(sd_bus *bus, const char *name) {
         assert(bus);
 
         path = unit_dbus_path_from_name(name);
-        if (path == NULL)
+        if (!path)
                 return -ENOMEM;
 
         r = sd_bus_get_property(
@@ -909,10 +979,8 @@ static int list_dependencies(sd_bus *bus, const char *name) {
                         &error,
                         &reply,
                         "s");
-        if (r < 0) {
-                log_error("Failed to get ID: %s", bus_error_message(&error, -r));
-                return r;
-        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to get ID: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "s", &id);
         if (r < 0)
@@ -937,11 +1005,16 @@ static int list_dependencies(sd_bus *bus, const char *name) {
         return list_dependencies_one(bus, name, 0, &units, 0);
 }
 
-static int analyze_critical_chain(sd_bus *bus, char *names[]) {
-        struct unit_times *times;
-        unsigned int i;
+static int analyze_critical_chain(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(unit_times_freep) struct unit_times *times = NULL;
+        struct unit_times *u;
         Hashmap *h;
         int n, r;
+
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
         n = acquire_time_data(bus, &times);
         if (n <= 0)
@@ -949,59 +1022,67 @@ static int analyze_critical_chain(sd_bus *bus, char *names[]) {
 
         h = hashmap_new(&string_hash_ops);
         if (!h)
-                return -ENOMEM;
+                return log_oom();
 
-        for (i = 0; i < (unsigned)n; i++) {
-                r = hashmap_put(h, times[i].name, &times[i]);
+        for (u = times; u->has_data; u++) {
+                r = hashmap_put(h, u->name, u);
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to add entry to hashmap: %m");
         }
         unit_times_hashmap = h;
 
-        pager_open(arg_no_pager, false);
+        (void) pager_open(arg_pager_flags);
 
         puts("The time after the unit is active or started is printed after the \"@\" character.\n"
              "The time the unit takes to start is printed after the \"+\" character.\n");
 
-        if (!strv_isempty(names)) {
+        if (argc > 1) {
                 char **name;
-                STRV_FOREACH(name, names)
+                STRV_FOREACH(name, strv_skip(argv, 1))
                         list_dependencies(bus, *name);
         } else
                 list_dependencies(bus, SPECIAL_DEFAULT_TARGET);
 
-        hashmap_free(h);
-        free_unit_times(times, (unsigned) n);
+        h = hashmap_free(h);
         return 0;
 }
 
-static int analyze_blame(sd_bus *bus) {
-        struct unit_times *times;
-        unsigned i;
-        int n;
+static int analyze_blame(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_(unit_times_freep) struct unit_times *times = NULL;
+        struct unit_times *u;
+        int n, r;
+
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
         n = acquire_time_data(bus, &times);
         if (n <= 0)
                 return n;
 
-        qsort(times, n, sizeof(struct unit_times), compare_unit_time);
+        typesafe_qsort(times, n, compare_unit_time);
 
-        pager_open(arg_no_pager, false);
+        (void) pager_open(arg_pager_flags);
 
-        for (i = 0; i < (unsigned) n; i++) {
+        for (u = times; u->has_data; u++) {
                 char ts[FORMAT_TIMESPAN_MAX];
 
-                if (times[i].time > 0)
-                        printf("%16s %s\n", format_timespan(ts, sizeof(ts), times[i].time, USEC_PER_MSEC), times[i].name);
+                if (u->time > 0)
+                        printf("%16s %s\n", format_timespan(ts, sizeof(ts), u->time, USEC_PER_MSEC), u->name);
         }
 
-        free_unit_times(times, (unsigned) n);
         return 0;
 }
 
-static int analyze_time(sd_bus *bus) {
+static int analyze_time(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_free_ char *buf = NULL;
         int r;
+
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
         r = pretty_boot_time(bus, &buf);
         if (r < 0)
@@ -1123,16 +1204,21 @@ static int expand_patterns(sd_bus *bus, char **patterns, char ***ret) {
         return 0;
 }
 
-static int dot(sd_bus *bus, char* patterns[]) {
+static int dot(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_strv_free_ char **expanded_patterns = NULL;
         _cleanup_strv_free_ char **expanded_from_patterns = NULL;
         _cleanup_strv_free_ char **expanded_to_patterns = NULL;
         int r;
         UnitInfo u;
 
-        r = expand_patterns(bus, patterns, &expanded_patterns);
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
+
+        r = expand_patterns(bus, strv_skip(argv, 1), &expanded_patterns);
         if (r < 0)
                 return r;
 
@@ -1153,10 +1239,8 @@ static int dot(sd_bus *bus, char* patterns[]) {
                        &error,
                        &reply,
                        "");
-        if (r < 0) {
-                log_error("Failed to list units: %s", bus_error_message(&error, -r));
-                return r;
-        }
+        if (r < 0)
+                log_error_errno(r, "Failed to list units: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "(ssssssouso)");
         if (r < 0)
@@ -1188,30 +1272,25 @@ static int dot(sd_bus *bus, char* patterns[]) {
         return 0;
 }
 
-static int dump(sd_bus *bus, char **args) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+static int dump_fallback(sd_bus *bus) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         const char *text = NULL;
         int r;
 
-        if (!strv_isempty(args)) {
-                log_error("Too many arguments.");
-                return -E2BIG;
-        }
-
-        pager_open(arg_no_pager, false);
+        assert(bus);
 
         r = sd_bus_call_method(
                         bus,
-                       "org.freedesktop.systemd1",
-                       "/org/freedesktop/systemd1",
-                       "org.freedesktop.systemd1.Manager",
-                       "Dump",
-                       &error,
-                       &reply,
-                       "");
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "Dump",
+                        &error,
+                        &reply,
+                        NULL);
         if (r < 0)
-                return log_error_errno(r, "Failed issue method call: %s", bus_error_message(&error, r));
+                return log_error_errno(r, "Failed to issue method call Dump: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "s", &text);
         if (r < 0)
@@ -1221,17 +1300,95 @@ static int dump(sd_bus *bus, char **args) {
         return 0;
 }
 
-static int set_log_level(sd_bus *bus, char **args) {
+static int dump(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int fd = -1;
         int r;
 
-        assert(bus);
-        assert(args);
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
-        if (strv_length(args) != 1) {
-                log_error("This command expects one argument only.");
-                return -E2BIG;
+        (void) pager_open(arg_pager_flags);
+
+        if (!sd_bus_can_send(bus, SD_BUS_TYPE_UNIX_FD))
+                return dump_fallback(bus);
+
+        r = sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "DumpByFileDescriptor",
+                        &error,
+                        &reply,
+                        NULL);
+        if (r < 0) {
+                /* fall back to Dump if DumpByFileDescriptor is not supported */
+                if (!IN_SET(r, -EACCES, -EBADR))
+                        return log_error_errno(r, "Failed to issue method call DumpByFileDescriptor: %s", bus_error_message(&error, r));
+
+                return dump_fallback(bus);
         }
+
+        r = sd_bus_message_read(reply, "h", &fd);
+        if (r < 0)
+                return bus_log_parse_error(r);
+
+        fflush(stdout);
+        return copy_bytes(fd, STDOUT_FILENO, (uint64_t) -1, 0);
+}
+
+static int cat_config(int argc, char *argv[], void *userdata) {
+        char **arg, **list;
+        int r;
+
+        (void) pager_open(arg_pager_flags);
+
+        list = strv_skip(argv, 1);
+        STRV_FOREACH(arg, list) {
+                const char *t = NULL;
+
+                if (arg != list)
+                        print_separator();
+
+                if (path_is_absolute(*arg)) {
+                        const char *dir;
+
+                        NULSTR_FOREACH(dir, CONF_PATHS_NULSTR("")) {
+                                t = path_startswith(*arg, dir);
+                                if (t)
+                                        break;
+                        }
+
+                        if (!t)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Path %s does not start with any known prefix.",
+                                                       *arg);
+                } else
+                        t = *arg;
+
+                r = conf_files_cat(arg_root, t);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+static int set_log_level(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r;
+
+        assert(argc == 2);
+        assert(argv);
+
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
         r = sd_bus_set_property(
                         bus,
@@ -1241,24 +1398,53 @@ static int set_log_level(sd_bus *bus, char **args) {
                         "LogLevel",
                         &error,
                         "s",
-                        args[0]);
+                        argv[1]);
         if (r < 0)
                 return log_error_errno(r, "Failed to issue method call: %s", bus_error_message(&error, r));
 
         return 0;
 }
 
-static int set_log_target(sd_bus *bus, char **args) {
+static int get_log_level(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_free_ char *level = NULL;
         int r;
 
-        assert(bus);
-        assert(args);
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
-        if (strv_length(args) != 1) {
-                log_error("This command expects one argument only.");
-                return -E2BIG;
-        }
+        r = sd_bus_get_property_string(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "LogLevel",
+                        &error,
+                        &level);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get log level: %s", bus_error_message(&error, r));
+
+        puts(level);
+        return 0;
+}
+
+static int get_or_set_log_level(int argc, char *argv[], void *userdata) {
+        return (argc == 1) ? get_log_level(argc, argv, userdata) : set_log_level(argc, argv, userdata);
+}
+
+static int set_log_target(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r;
+
+        assert(argc == 2);
+        assert(argv);
+
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
 
         r = sd_bus_set_property(
                         bus,
@@ -1268,48 +1454,405 @@ static int set_log_target(sd_bus *bus, char **args) {
                         "LogTarget",
                         &error,
                         "s",
-                        args[0]);
+                        argv[1]);
         if (r < 0)
                 return log_error_errno(r, "Failed to issue method call: %s", bus_error_message(&error, r));
 
         return 0;
 }
 
-static void help(void) {
+static int get_log_target(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        _cleanup_free_ char *target = NULL;
+        int r;
 
-        pager_open(arg_no_pager, false);
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
+
+        r = sd_bus_get_property_string(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "LogTarget",
+                        &error,
+                        &target);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get log target: %s", bus_error_message(&error, r));
+
+        puts(target);
+        return 0;
+}
+
+static int get_or_set_log_target(int argc, char *argv[], void *userdata) {
+        return (argc == 1) ? get_log_target(argc, argv, userdata) : set_log_target(argc, argv, userdata);
+}
+
+static int dump_unit_paths(int argc, char *argv[], void *userdata) {
+        _cleanup_(lookup_paths_free) LookupPaths paths = {};
+        int r;
+        char **p;
+
+        r = lookup_paths_init(&paths, arg_scope, 0, NULL);
+        if (r < 0)
+                return log_error_errno(r, "lookup_paths_init() failed: %m");
+
+        STRV_FOREACH(p, paths.search_path)
+                puts(*p);
+
+        return 0;
+}
+
+#if HAVE_SECCOMP
+
+static int load_kernel_syscalls(Set **ret) {
+        _cleanup_(set_free_freep) Set *syscalls = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
+        int r;
+
+        /* Let's read the available system calls from the list of available tracing events. Slightly dirty, but good
+         * enough for analysis purposes. */
+
+        f = fopen("/sys/kernel/debug/tracing/available_events", "re");
+        if (!f)
+                return log_full_errno(IN_SET(errno, EPERM, EACCES, ENOENT) ? LOG_DEBUG : LOG_WARNING, errno, "Can't read open /sys/kernel/debug/tracing/available_events: %m");
+
+        for (;;) {
+                _cleanup_free_ char *line = NULL;
+                const char *e;
+
+                r = read_line(f, LONG_LINE_MAX, &line);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read system call list: %m");
+                if (r == 0)
+                        break;
+
+                e = startswith(line, "syscalls:sys_enter_");
+                if (!e)
+                        continue;
+
+                /* These are named differently inside the kernel than their external name for historical reasons. Let's hide them here. */
+                if (STR_IN_SET(e, "newuname", "newfstat", "newstat", "newlstat", "sysctl"))
+                        continue;
+
+                r = set_ensure_allocated(&syscalls, &string_hash_ops);
+                if (r < 0)
+                        return log_oom();
+
+                r = set_put_strdup(syscalls, e);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add system call to list: %m");
+        }
+
+        *ret = TAKE_PTR(syscalls);
+        return 0;
+}
+
+static void kernel_syscalls_remove(Set *s, const SyscallFilterSet *set) {
+        const char *syscall;
+
+        NULSTR_FOREACH(syscall, set->value) {
+                if (syscall[0] == '@')
+                        continue;
+
+                (void) set_remove(s, syscall);
+        }
+}
+
+static void dump_syscall_filter(const SyscallFilterSet *set) {
+        const char *syscall;
+
+        printf("%s%s%s\n"
+               "    # %s\n",
+               ansi_highlight(),
+               set->name,
+               ansi_normal(),
+               set->help);
+
+        NULSTR_FOREACH(syscall, set->value)
+                printf("    %s%s%s\n",
+                       syscall[0] == '@' ? ansi_underline() : "",
+                       syscall,
+                       ansi_normal());
+}
+
+static int dump_syscall_filters(int argc, char *argv[], void *userdata) {
+        bool first = true;
+
+        (void) pager_open(arg_pager_flags);
+
+        if (strv_isempty(strv_skip(argv, 1))) {
+                _cleanup_(set_free_freep) Set *kernel = NULL;
+                int i, k;
+
+                k = load_kernel_syscalls(&kernel);
+
+                for (i = 0; i < _SYSCALL_FILTER_SET_MAX; i++) {
+                        const SyscallFilterSet *set = syscall_filter_sets + i;
+                        if (!first)
+                                puts("");
+
+                        dump_syscall_filter(set);
+                        kernel_syscalls_remove(kernel, set);
+                        first = false;
+                }
+
+                if (k < 0) {
+                        fputc('\n', stdout);
+                        fflush(stdout);
+                        log_notice_errno(k, "# Not showing unlisted system calls, couldn't retrieve kernel system call list: %m");
+                } else if (!set_isempty(kernel)) {
+                        const char *syscall;
+                        Iterator j;
+
+                        printf("\n"
+                               "# %sUnlisted System Calls%s (supported by the local kernel, but not included in any of the groups listed above):\n",
+                               ansi_highlight(), ansi_normal());
+
+                        SET_FOREACH(syscall, kernel, j)
+                                printf("#   %s\n", syscall);
+                }
+        } else {
+                char **name;
+
+                STRV_FOREACH(name, strv_skip(argv, 1)) {
+                        const SyscallFilterSet *set;
+
+                        if (!first)
+                                puts("");
+
+                        set = syscall_filter_set_find(*name);
+                        if (!set) {
+                                /* make sure the error appears below normal output */
+                                fflush(stdout);
+
+                                log_error("Filter set \"%s\" not found.", *name);
+                                return -ENOENT;
+                        }
+
+                        dump_syscall_filter(set);
+                        first = false;
+                }
+        }
+
+        return 0;
+}
+
+#else
+static int dump_syscall_filters(int argc, char *argv[], void *userdata) {
+        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                               "Not compiled with syscall filters, sorry.");
+}
+#endif
+
+static int dump_timespan(int argc, char *argv[], void *userdata) {
+        char **input_timespan;
+
+        STRV_FOREACH(input_timespan, strv_skip(argv, 1)) {
+                int r;
+                usec_t usec_magnitude = 1, output_usecs;
+                char ft_buf[FORMAT_TIMESPAN_MAX];
+
+                r = parse_time(*input_timespan, &output_usecs, USEC_PER_SEC);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse time span '%s': %m", *input_timespan);
+
+                printf("Original: %s\n", *input_timespan);
+                printf("      %ss: %" PRIu64 "\n", special_glyph(SPECIAL_GLYPH_MU), output_usecs);
+                printf("   Human: %s\n", format_timespan(ft_buf, sizeof(ft_buf), output_usecs, usec_magnitude));
+
+                if (input_timespan[1])
+                        putchar('\n');
+        }
+
+        return EXIT_SUCCESS;
+}
+
+static int test_calendar(int argc, char *argv[], void *userdata) {
+        int ret = 0, r;
+        char **p;
+        usec_t n;
+
+        n = now(CLOCK_REALTIME);
+
+        STRV_FOREACH(p, strv_skip(argv, 1)) {
+                _cleanup_(calendar_spec_freep) CalendarSpec *spec = NULL;
+                _cleanup_free_ char *t = NULL;
+                usec_t next;
+
+                r = calendar_spec_from_string(*p, &spec);
+                if (r < 0) {
+                        ret = log_error_errno(r, "Failed to parse calendar specification '%s': %m", *p);
+                        continue;
+                }
+
+                r = calendar_spec_normalize(spec);
+                if (r < 0) {
+                        ret = log_error_errno(r, "Failed to normalize calendar specification '%s': %m", *p);
+                        continue;
+                }
+
+                r = calendar_spec_to_string(spec, &t);
+                if (r < 0) {
+                        ret = log_error_errno(r, "Failed to format calendar specification '%s': %m", *p);
+                        continue;
+                }
+
+                if (!streq(t, *p))
+                        printf("  Original form: %s\n", *p);
+
+                printf("Normalized form: %s\n", t);
+
+                r = calendar_spec_next_usec(spec, n, &next);
+                if (r == -ENOENT)
+                        printf("    Next elapse: never\n");
+                else if (r < 0) {
+                        ret = log_error_errno(r, "Failed to determine next elapse for '%s': %m", *p);
+                        continue;
+                } else {
+                        char buffer[CONST_MAX(FORMAT_TIMESTAMP_MAX, FORMAT_TIMESTAMP_RELATIVE_MAX)];
+
+                        printf("    Next elapse: %s\n", format_timestamp(buffer, sizeof(buffer), next));
+
+                        if (!in_utc_timezone())
+                                printf("       (in UTC): %s\n", format_timestamp_utc(buffer, sizeof(buffer), next));
+
+                        printf("       From now: %s\n", format_timestamp_relative(buffer, sizeof(buffer), next));
+                }
+
+                if (*(p+1))
+                        putchar('\n');
+        }
+
+        return ret;
+}
+
+static int service_watchdogs(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int b, r;
+
+        assert(IN_SET(argc, 1, 2));
+        assert(argv);
+
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
+
+        /* get ServiceWatchdogs */
+        if (argc == 1) {
+                r = sd_bus_get_property_trivial(
+                                bus,
+                                "org.freedesktop.systemd1",
+                                "/org/freedesktop/systemd1",
+                                "org.freedesktop.systemd1.Manager",
+                                "ServiceWatchdogs",
+                                &error,
+                                'b',
+                                &b);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get service-watchdog state: %s", bus_error_message(&error, r));
+
+                printf("%s\n", yes_no(!!b));
+
+                return 0;
+        }
+
+        /* set ServiceWatchdogs */
+        b = parse_boolean(argv[1]);
+        if (b < 0) {
+                log_error("Failed to parse service-watchdogs argument.");
+                return -EINVAL;
+        }
+
+        r = sd_bus_set_property(
+                        bus,
+                        "org.freedesktop.systemd1",
+                        "/org/freedesktop/systemd1",
+                        "org.freedesktop.systemd1.Manager",
+                        "ServiceWatchdogs",
+                        &error,
+                        "b",
+                        b);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set service-watchdog state: %s", bus_error_message(&error, r));
+
+        return 0;
+}
+
+static int do_verify(int argc, char *argv[], void *userdata) {
+        return verify_units(strv_skip(argv, 1), arg_scope, arg_man, arg_generators);
+}
+
+static int do_security(int argc, char *argv[], void *userdata) {
+        _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
+        int r;
+
+        r = acquire_bus(&bus, NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create bus connection: %m");
+
+        (void) pager_open(arg_pager_flags);
+
+        return analyze_security(bus, strv_skip(argv, 1), 0);
+}
+
+static int help(int argc, char *argv[], void *userdata) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        (void) pager_open(arg_pager_flags);
+
+        r = terminal_urlify_man("systemd-analyze", "1", &link);
+        if (r < 0)
+                return log_oom();
 
         printf("%s [OPTIONS...] {COMMAND} ...\n\n"
                "Profile systemd, show unit dependencies, check unit files.\n\n"
-               "  -h --help               Show this help\n"
-               "     --version            Show package version\n"
-               "     --no-pager           Do not pipe output into a pager\n"
-               "     --system             Operate on system systemd instance\n"
-               "     --user               Operate on user systemd instance\n"
-               "  -H --host=[USER@]HOST   Operate on remote host\n"
-               "  -M --machine=CONTAINER  Operate on local container\n"
-               "     --order              Show only order in the graph\n"
-               "     --require            Show only requirement in the graph\n"
-               "     --from-pattern=GLOB  Show only origins in the graph\n"
-               "     --to-pattern=GLOB    Show only destinations in the graph\n"
-               "     --fuzz=SECONDS       Also print also services which finished SECONDS\n"
-               "                          earlier than the latest in the branch\n"
-               "     --man[=BOOL]         Do [not] check for existence of man pages\n\n"
-               "Commands:\n"
-               "  time                    Print time spent in the kernel\n"
-               "  blame                   Print list of running units ordered by time to init\n"
-               "  critical-chain          Print a tree of the time critical chain of units\n"
-               "  plot                    Output SVG graphic showing service initialization\n"
-               "  dot                     Output dependency graph in dot(1) format\n"
-               "  set-log-level LEVEL     Set logging threshold for manager\n"
-               "  set-log-target TARGET   Set logging target for manager\n"
-               "  dump                    Output state serialization of service manager\n"
-               "  verify FILE...          Check unit files for correctness\n"
-               , program_invocation_short_name);
+               "  -h --help                Show this help\n"
+               "     --version             Show package version\n"
+               "     --no-pager            Do not pipe output into a pager\n"
+               "     --system              Operate on system systemd instance\n"
+               "     --user                Operate on user systemd instance\n"
+               "     --global              Operate on global user configuration\n"
+               "  -H --host=[USER@]HOST    Operate on remote host\n"
+               "  -M --machine=CONTAINER   Operate on local container\n"
+               "     --order               Show only order in the graph\n"
+               "     --require             Show only requirement in the graph\n"
+               "     --from-pattern=GLOB   Show only origins in the graph\n"
+               "     --to-pattern=GLOB     Show only destinations in the graph\n"
+               "     --fuzz=SECONDS        Also print also services which finished SECONDS\n"
+               "                           earlier than the latest in the branch\n"
+               "     --man[=BOOL]          Do [not] check for existence of man pages\n"
+               "     --generators[=BOOL]   Do [not] run unit generators (requires privileges)\n"
+               "\nCommands:\n"
+               "  time                     Print time spent in the kernel\n"
+               "  blame                    Print list of running units ordered by time to init\n"
+               "  critical-chain [UNIT...] Print a tree of the time critical chain of units\n"
+               "  plot                     Output SVG graphic showing service initialization\n"
+               "  dot [UNIT...]            Output dependency graph in man:dot(1) format\n"
+               "  log-level [LEVEL]        Get/set logging threshold for manager\n"
+               "  log-target [TARGET]      Get/set logging target for manager\n"
+               "  dump                     Output state serialization of service manager\n"
+               "  cat-config               Show configuration file and drop-ins\n"
+               "  unit-paths               List load directories for units\n"
+               "  syscall-filter [NAME...] Print list of syscalls in seccomp filter\n"
+               "  verify FILE...           Check unit files for correctness\n"
+               "  calendar SPEC...         Validate repetitive calendar time events\n"
+               "  service-watchdogs [BOOL] Get/set service watchdog state\n"
+               "  timespan SPAN...         Validate a time span\n"
+               "  security [UNIT...]       Analyze security of unit\n"
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , link
+        );
 
-        /* When updating this list, including descriptions, apply
-         * changes to shell-completion/bash/systemd-analyze and
+        /* When updating this list, including descriptions, apply changes to shell-completion/bash/systemd-analyze and
          * shell-completion/zsh/_systemd-analyze too. */
+
+        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -1317,13 +1860,16 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_VERSION = 0x100,
                 ARG_ORDER,
                 ARG_REQUIRE,
-                ARG_USER,
+                ARG_ROOT,
                 ARG_SYSTEM,
+                ARG_USER,
+                ARG_GLOBAL,
                 ARG_DOT_FROM_PATTERN,
                 ARG_DOT_TO_PATTERN,
                 ARG_FUZZ,
                 ARG_NO_PAGER,
                 ARG_MAN,
+                ARG_GENERATORS,
         };
 
         static const struct option options[] = {
@@ -1331,13 +1877,16 @@ static int parse_argv(int argc, char *argv[]) {
                 { "version",      no_argument,       NULL, ARG_VERSION          },
                 { "order",        no_argument,       NULL, ARG_ORDER            },
                 { "require",      no_argument,       NULL, ARG_REQUIRE          },
-                { "user",         no_argument,       NULL, ARG_USER             },
+                { "root",         required_argument, NULL, ARG_ROOT             },
                 { "system",       no_argument,       NULL, ARG_SYSTEM           },
+                { "user",         no_argument,       NULL, ARG_USER             },
+                { "global",       no_argument,       NULL, ARG_GLOBAL           },
                 { "from-pattern", required_argument, NULL, ARG_DOT_FROM_PATTERN },
                 { "to-pattern",   required_argument, NULL, ARG_DOT_TO_PATTERN   },
                 { "fuzz",         required_argument, NULL, ARG_FUZZ             },
                 { "no-pager",     no_argument,       NULL, ARG_NO_PAGER         },
                 { "man",          optional_argument, NULL, ARG_MAN              },
+                { "generators",   optional_argument, NULL, ARG_GENERATORS       },
                 { "host",         required_argument, NULL, 'H'                  },
                 { "machine",      required_argument, NULL, 'M'                  },
                 {}
@@ -1352,18 +1901,25 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 case 'h':
-                        help();
-                        return 0;
+                        return help(0, NULL, NULL);
 
                 case ARG_VERSION:
                         return version();
 
-                case ARG_USER:
-                        arg_user = true;
+                case ARG_ROOT:
+                        arg_root = optarg;
                         break;
 
                 case ARG_SYSTEM:
-                        arg_user = false;
+                        arg_scope = UNIT_FILE_SYSTEM;
+                        break;
+
+                case ARG_USER:
+                        arg_scope = UNIT_FILE_USER;
+                        break;
+
+                case ARG_GLOBAL:
+                        arg_scope = UNIT_FILE_GLOBAL;
                         break;
 
                 case ARG_ORDER:
@@ -1393,7 +1949,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_NO_PAGER:
-                        arg_no_pager = true;
+                        arg_pager_flags |= PAGER_DISABLE;
                         break;
 
                 case 'H':
@@ -1409,14 +1965,26 @@ static int parse_argv(int argc, char *argv[]) {
                 case ARG_MAN:
                         if (optarg) {
                                 r = parse_boolean(optarg);
-                                if (r < 0) {
-                                        log_error("Failed to parse --man= argument.");
-                                        return -EINVAL;
-                                }
+                                if (r < 0)
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                               "Failed to parse --man= argument.");
 
-                                arg_man = !!r;
+                                arg_man = r;
                         } else
                                 arg_man = true;
+
+                        break;
+
+                case ARG_GENERATORS:
+                        if (optarg) {
+                                r = parse_boolean(optarg);
+                                if (r < 0)
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                               "Failed to parse --generators= argument.");
+
+                                arg_generators = r;
+                        } else
+                                arg_generators = true;
 
                         break;
 
@@ -1427,59 +1995,59 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option code.");
                 }
 
+        if (arg_scope == UNIT_FILE_GLOBAL &&
+            !STR_IN_SET(argv[optind] ?: "time", "dot", "unit-paths", "verify"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Option --global only makes sense with verbs dot, unit-paths, verify.");
+
+        if (arg_root && !streq_ptr(argv[optind], "cat-config"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Option --root is only supported for cat-config right now.");
+
         return 1; /* work to do */
 }
 
-int main(int argc, char *argv[]) {
+static int run(int argc, char *argv[]) {
+
+        static const Verb verbs[] = {
+                { "help",              VERB_ANY, VERB_ANY, 0,            help                   },
+                { "time",              VERB_ANY, 1,        VERB_DEFAULT, analyze_time           },
+                { "blame",             VERB_ANY, 1,        0,            analyze_blame          },
+                { "critical-chain",    VERB_ANY, VERB_ANY, 0,            analyze_critical_chain },
+                { "plot",              VERB_ANY, 1,        0,            analyze_plot           },
+                { "dot",               VERB_ANY, VERB_ANY, 0,            dot                    },
+                { "log-level",         VERB_ANY, 2,        0,            get_or_set_log_level   },
+                { "log-target",        VERB_ANY, 2,        0,            get_or_set_log_target  },
+                /* The following four verbs are deprecated aliases */
+                { "set-log-level",     2,        2,        0,            set_log_level          },
+                { "get-log-level",     VERB_ANY, 1,        0,            get_log_level          },
+                { "set-log-target",    2,        2,        0,            set_log_target         },
+                { "get-log-target",    VERB_ANY, 1,        0,            get_log_target         },
+                { "dump",              VERB_ANY, 1,        0,            dump                   },
+                { "cat-config",        2,        VERB_ANY, 0,            cat_config             },
+                { "unit-paths",        1,        1,        0,            dump_unit_paths        },
+                { "syscall-filter",    VERB_ANY, VERB_ANY, 0,            dump_syscall_filters   },
+                { "verify",            2,        VERB_ANY, 0,            do_verify              },
+                { "calendar",          2,        VERB_ANY, 0,            test_calendar          },
+                { "service-watchdogs", VERB_ANY, 2,        0,            service_watchdogs      },
+                { "timespan",          2,        VERB_ANY, 0,            dump_timespan          },
+                { "security",          VERB_ANY, VERB_ANY, 0,            do_security            },
+                {}
+        };
+
         int r;
 
         setlocale(LC_ALL, "");
         setlocale(LC_NUMERIC, "C"); /* we want to format/parse floats in C style */
+
         log_parse_environment();
         log_open();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return r;
 
-        if (streq_ptr(argv[optind], "verify"))
-                r = verify_units(argv+optind+1,
-                                 arg_user ? UNIT_FILE_USER : UNIT_FILE_SYSTEM,
-                                 arg_man);
-        else {
-                _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-
-                r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to create bus connection: %m");
-                        goto finish;
-                }
-
-                if (!argv[optind] || streq(argv[optind], "time"))
-                        r = analyze_time(bus);
-                else if (streq(argv[optind], "blame"))
-                        r = analyze_blame(bus);
-                else if (streq(argv[optind], "critical-chain"))
-                        r = analyze_critical_chain(bus, argv+optind+1);
-                else if (streq(argv[optind], "plot"))
-                        r = analyze_plot(bus);
-                else if (streq(argv[optind], "dot"))
-                        r = dot(bus, argv+optind+1);
-                else if (streq(argv[optind], "dump"))
-                        r = dump(bus, argv+optind+1);
-                else if (streq(argv[optind], "set-log-level"))
-                        r = set_log_level(bus, argv+optind+1);
-                else if (streq(argv[optind], "set-log-target"))
-                        r = set_log_target(bus, argv+optind+1);
-                else
-                        log_error("Unknown operation '%s'.", argv[optind]);
-        }
-
-finish:
-        pager_close();
-
-        strv_free(arg_dot_from_patterns);
-        strv_free(arg_dot_to_patterns);
-
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        return dispatch_verb(argc, argv, verbs, NULL);
 }
+
+DEFINE_MAIN_FUNCTION(run);

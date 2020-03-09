@@ -1,48 +1,40 @@
-From: Chris Coulson <chris.coulson@canonical.com>
-Date: Thu, 4 Apr 2019 12:23:10 +0200
+From: Lennart Poettering <lennart@poettering.net>
+Date: Mon, 4 Feb 2019 10:23:43 +0100
 Subject: pam-systemd: use secure_getenv() rather than getenv()
 
-Backport of upstream commit 83d4ab55336ff8a0643c6aa627b31e351a24040a.
+And explain why in a comment.
 
-CVE-2019-3842
+(cherry picked from commit 83d4ab55336ff8a0643c6aa627b31e351a24040a)
 ---
- src/login/pam_systemd.c | 10 +++++-----
- 1 file changed, 5 insertions(+), 5 deletions(-)
+ src/login/pam_systemd.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
 
 diff --git a/src/login/pam_systemd.c b/src/login/pam_systemd.c
-index b62b8d2..5114736 100644
+index 997b74e..ea245c8 100644
 --- a/src/login/pam_systemd.c
 +++ b/src/login/pam_systemd.c
-@@ -283,27 +283,27 @@ _public_ PAM_EXTERN int pam_sm_open_session(
+@@ -316,14 +316,21 @@ static const char* getenv_harder(pam_handle_t *handle, const char *key, const ch
+         assert(handle);
+         assert(key);
  
-         seat = pam_getenv(handle, "XDG_SEAT");
-         if (isempty(seat))
--                seat = getenv("XDG_SEAT");
-+                seat = secure_getenv("XDG_SEAT");
+-        /* Looks for an environment variable, preferrably in the environment block associated with the specified PAM
+-         * handle, falling back to the process' block instead. */
++        /* Looks for an environment variable, preferrably in the environment block associated with the
++         * specified PAM handle, falling back to the process' block instead. Why check both? Because we want
++         * to permit configuration of session properties from unit files that invoke PAM services, so that
++         * PAM services don't have to be reworked to set systemd-specific properties, but these properties
++         * can still be set from the unit file Environment= block. */
  
-         cvtnr = pam_getenv(handle, "XDG_VTNR");
-         if (isempty(cvtnr))
--                cvtnr = getenv("XDG_VTNR");
-+                cvtnr = secure_getenv("XDG_VTNR");
+         v = pam_getenv(handle, key);
+         if (!isempty(v))
+                 return v;
  
-         type = pam_getenv(handle, "XDG_SESSION_TYPE");
-         if (isempty(type))
--                type = getenv("XDG_SESSION_TYPE");
-+                type = secure_getenv("XDG_SESSION_TYPE");
-         if (isempty(type))
-                 type = type_pam;
- 
-         class = pam_getenv(handle, "XDG_SESSION_CLASS");
-         if (isempty(class))
--                class = getenv("XDG_SESSION_CLASS");
-+                class = secure_getenv("XDG_SESSION_CLASS");
-         if (isempty(class))
-                 class = class_pam;
- 
-         desktop = pam_getenv(handle, "XDG_SESSION_DESKTOP");
-         if (isempty(desktop))
--                desktop = getenv("XDG_SESSION_DESKTOP");
-+                desktop = secure_getenv("XDG_SESSION_DESKTOP");
- 
-         tty = strempty(tty);
+-        v = getenv(key);
++        /* We use secure_getenv() here, since we might get loaded into su/sudo, which are SUID. Ideally
++         * they'd clean up the environment before invoking foreign code (such as PAM modules), but alas they
++         * currently don't (to be precise, they clean up the environment they pass to their children, but
++         * not their own environ[]). */
++        v = secure_getenv(key);
+         if (!isempty(v))
+                 return v;
  

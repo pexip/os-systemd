@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <fcntl.h>
 #include <sched.h>
@@ -32,7 +15,7 @@
 #include "machine-id-setup.h"
 #include "macro.h"
 #include "mkdir.h"
-#include "mount-util.h"
+#include "mountpoint-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "stat-util.h"
@@ -90,7 +73,7 @@ static int generate_machine_id(const char *root, sd_id128_t *ret) {
         /* If that didn't work, generate a random machine id */
         r = sd_id128_randomize(ret);
         if (r < 0)
-                return log_error_errno(r, "Failed to generate randomized : %m");
+                return log_error_errno(r, "Failed to generate randomized machine ID: %m");
 
         log_info("Initializing machine ID from random generator.");
         return 0;
@@ -118,16 +101,14 @@ int machine_id_setup(const char *root, sd_id128_t machine_id, sd_id128_t *ret) {
                         fd = open(etc_machine_id, O_RDONLY|O_CLOEXEC|O_NOCTTY);
                         if (fd < 0) {
                                 if (old_errno == EROFS && errno == ENOENT)
-                                        log_error_errno(errno,
+                                        return log_error_errno(errno,
                                                   "System cannot boot: Missing /etc/machine-id and /etc is mounted read-only.\n"
                                                   "Booting up is supported only when:\n"
                                                   "1) /etc/machine-id exists and is populated.\n"
                                                   "2) /etc/machine-id exists and is empty.\n"
                                                   "3) /etc/machine-id is missing and /etc is writable.\n");
                                 else
-                                        log_error_errno(errno, "Cannot open %s: %m", etc_machine_id);
-
-                                return -errno;
+                                        return log_error_errno(errno, "Cannot open %s: %m", etc_machine_id);
                         }
 
                         writable = false;
@@ -146,14 +127,18 @@ int machine_id_setup(const char *root, sd_id128_t machine_id, sd_id128_t *ret) {
                 r = generate_machine_id(root, &machine_id);
                 if (r < 0)
                         return r;
-
-                if (lseek(fd, 0, SEEK_SET) == (off_t) -1)
-                        return log_error_errno(errno, "Failed to seek: %m");
         }
 
-        if (writable)
+        if (writable) {
+                if (lseek(fd, 0, SEEK_SET) == (off_t) -1)
+                        return log_error_errno(errno, "Failed to seek %s: %m", etc_machine_id);
+
+                if (ftruncate(fd, 0) < 0)
+                        return log_error_errno(errno, "Failed to truncate %s: %m", etc_machine_id);
+
                 if (id128_write_fd(fd, ID128_PLAIN, machine_id, true) >= 0)
                         goto finish;
+        }
 
         fd = safe_close(fd);
 
@@ -199,7 +184,7 @@ int machine_id_commit(const char *root) {
 
         etc_machine_id = prefix_roota(root, "/etc/machine-id");
 
-        r = path_is_mount_point(etc_machine_id, 0);
+        r = path_is_mount_point(etc_machine_id, NULL, 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine whether %s is a mount point: %m", etc_machine_id);
         if (r == 0) {
@@ -215,14 +200,14 @@ int machine_id_commit(const char *root) {
         r = fd_is_temporary_fs(fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine whether %s is on a temporary file system: %m", etc_machine_id);
-        if (r == 0) {
-                log_error("%s is not on a temporary file system.", etc_machine_id);
-                return -EROFS;
-        }
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EROFS),
+                                       "%s is not on a temporary file system.",
+                                       etc_machine_id);
 
         r = id128_read_fd(fd, ID128_PLAIN, &id);
         if (r < 0)
-                return log_error_errno(r, "We didn't find a valid machine ID in %s.", etc_machine_id);
+                return log_error_errno(r, "We didn't find a valid machine ID in %s: %m", etc_machine_id);
 
         fd = safe_close(fd);
 

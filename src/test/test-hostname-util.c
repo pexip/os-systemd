@@ -1,28 +1,10 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-  Copyright 2013 Thomas H.P. Andersen
-  Copyright 2015 Zbigniew Jędrzejewski-Szmek
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
 #include "fileio.h"
 #include "hostname-util.h"
 #include "string-util.h"
+#include "tmpfile-util.h"
 #include "util.h"
 
 static void test_hostname_is_valid(void) {
@@ -71,6 +53,12 @@ static void test_hostname_cleanup(void) {
         assert_se(streq(hostname_cleanup(s), "foobar.com"));
         s = strdupa("foobar.com.");
         assert_se(streq(hostname_cleanup(s), "foobar.com"));
+        s = strdupa("foo-bar.-com-.");
+        assert_se(streq(hostname_cleanup(s), "foo-bar.com"));
+        s = strdupa("foo-bar-.-com-.");
+        assert_se(streq(hostname_cleanup(s), "foo-bar--com"));
+        s = strdupa("--foo-bar.-com");
+        assert_se(streq(hostname_cleanup(s), "foo-bar.com"));
         s = strdupa("fooBAR");
         assert_se(streq(hostname_cleanup(s), "fooBAR"));
         s = strdupa("fooBAR.com");
@@ -97,9 +85,11 @@ static void test_hostname_cleanup(void) {
         assert_se(streq(hostname_cleanup(s), "foo.bar"));
         s = strdupa("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
         assert_se(streq(hostname_cleanup(s), "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+        s = strdupa("xxxx........xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        assert_se(streq(hostname_cleanup(s), "xxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
 }
 
-static void test_read_hostname_config(void) {
+static void test_read_etc_hostname(void) {
         char path[] = "/tmp/hostname.XXXXXX";
         char *hostname;
         int fd;
@@ -109,40 +99,40 @@ static void test_read_hostname_config(void) {
         close(fd);
 
         /* simple hostname */
-        write_string_file(path, "foo", WRITE_STRING_FILE_CREATE);
-        assert_se(read_hostname_config(path, &hostname) == 0);
+        assert_se(write_string_file(path, "foo", WRITE_STRING_FILE_CREATE) == 0);
+        assert_se(read_etc_hostname(path, &hostname) == 0);
         assert_se(streq(hostname, "foo"));
         hostname = mfree(hostname);
 
         /* with comment */
-        write_string_file(path, "# comment\nfoo", WRITE_STRING_FILE_CREATE);
-        assert_se(read_hostname_config(path, &hostname) == 0);
+        assert_se(write_string_file(path, "# comment\nfoo", WRITE_STRING_FILE_CREATE) == 0);
+        assert_se(read_etc_hostname(path, &hostname) == 0);
         assert_se(hostname);
         assert_se(streq(hostname, "foo"));
         hostname = mfree(hostname);
 
         /* with comment and extra whitespace */
-        write_string_file(path, "# comment\n\n foo ", WRITE_STRING_FILE_CREATE);
-        assert_se(read_hostname_config(path, &hostname) == 0);
+        assert_se(write_string_file(path, "# comment\n\n foo ", WRITE_STRING_FILE_CREATE) == 0);
+        assert_se(read_etc_hostname(path, &hostname) == 0);
         assert_se(hostname);
         assert_se(streq(hostname, "foo"));
         hostname = mfree(hostname);
 
         /* cleans up name */
-        write_string_file(path, "!foo/bar.com", WRITE_STRING_FILE_CREATE);
-        assert_se(read_hostname_config(path, &hostname) == 0);
+        assert_se(write_string_file(path, "!foo/bar.com", WRITE_STRING_FILE_CREATE) == 0);
+        assert_se(read_etc_hostname(path, &hostname) == 0);
         assert_se(hostname);
         assert_se(streq(hostname, "foobar.com"));
         hostname = mfree(hostname);
 
         /* no value set */
         hostname = (char*) 0x1234;
-        write_string_file(path, "# nothing here\n", WRITE_STRING_FILE_CREATE);
-        assert_se(read_hostname_config(path, &hostname) == -ENOENT);
+        assert_se(write_string_file(path, "# nothing here\n", WRITE_STRING_FILE_CREATE) == 0);
+        assert_se(read_etc_hostname(path, &hostname) == -ENOENT);
         assert_se(hostname == (char*) 0x1234);  /* does not touch argument on error */
 
         /* nonexisting file */
-        assert_se(read_hostname_config("/non/existing", &hostname) == -ENOENT);
+        assert_se(read_etc_hostname("/non/existing", &hostname) == -ENOENT);
         assert_se(hostname == (char*) 0x1234);  /* does not touch argument on error */
 
         unlink(path);
@@ -154,7 +144,7 @@ int main(int argc, char *argv[]) {
 
         test_hostname_is_valid();
         test_hostname_cleanup();
-        test_read_hostname_config();
+        test_read_etc_hostname();
 
         return 0;
 }

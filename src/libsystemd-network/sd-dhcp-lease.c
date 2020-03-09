@@ -1,26 +1,12 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2013 Intel Corporation. All rights reserved.
-  Copyright (C) 2014 Tom Gundersen
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  Copyright © 2013 Intel Corporation. All rights reserved.
 ***/
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdio_ext.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,6 +16,7 @@
 #include "dhcp-lease-internal.h"
 #include "dhcp-protocol.h"
 #include "dns-domain.h"
+#include "env-file.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "hexdecoct.h"
@@ -39,6 +26,8 @@
 #include "parse-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "strv.h"
+#include "tmpfile-util.h"
 #include "unaligned.h"
 
 int sd_dhcp_lease_get_address(sd_dhcp_lease *lease, struct in_addr *addr) {
@@ -231,6 +220,21 @@ int sd_dhcp_lease_get_routes(sd_dhcp_lease *lease, sd_dhcp_route ***routes) {
         return (int) lease->static_route_size;
 }
 
+int sd_dhcp_lease_get_search_domains(sd_dhcp_lease *lease, char ***domains) {
+        size_t r;
+
+        assert_return(lease, -EINVAL);
+        assert_return(domains, -EINVAL);
+
+        r = strv_length(lease->search_domains);
+        if (r > 0) {
+                *domains = lease->search_domains;
+                return (int) r;
+        }
+
+        return -ENODATA;
+}
+
 int sd_dhcp_lease_get_vendor_specific(sd_dhcp_lease *lease, const void **data, size_t *data_len) {
         assert_return(lease, -EINVAL);
         assert_return(data, -EINVAL);
@@ -244,27 +248,8 @@ int sd_dhcp_lease_get_vendor_specific(sd_dhcp_lease *lease, const void **data, s
         return 0;
 }
 
-sd_dhcp_lease *sd_dhcp_lease_ref(sd_dhcp_lease *lease) {
-
-        if (!lease)
-                return NULL;
-
-        assert(lease->n_ref >= 1);
-        lease->n_ref++;
-
-        return lease;
-}
-
-sd_dhcp_lease *sd_dhcp_lease_unref(sd_dhcp_lease *lease) {
-
-        if (!lease)
-                return NULL;
-
-        assert(lease->n_ref >= 1);
-        lease->n_ref--;
-
-        if (lease->n_ref > 0)
-                return NULL;
+static sd_dhcp_lease *dhcp_lease_free(sd_dhcp_lease *lease) {
+        assert(lease);
 
         while (lease->private_options) {
                 struct sd_dhcp_raw_option *option = lease->private_options;
@@ -275,6 +260,8 @@ sd_dhcp_lease *sd_dhcp_lease_unref(sd_dhcp_lease *lease) {
                 free(option);
         }
 
+        free(lease->root_path);
+        free(lease->timezone);
         free(lease->hostname);
         free(lease->domainname);
         free(lease->dns);
@@ -282,8 +269,11 @@ sd_dhcp_lease *sd_dhcp_lease_unref(sd_dhcp_lease *lease) {
         free(lease->static_route);
         free(lease->client_id);
         free(lease->vendor_specific);
+        strv_free(lease->search_domains);
         return mfree(lease);
 }
+
+DEFINE_TRIVIAL_REF_UNREF_FUNC(sd_dhcp_lease, sd_dhcp_lease, dhcp_lease_free);
 
 static int lease_parse_u32(const uint8_t *option, size_t len, uint32_t *ret, uint32_t min) {
         assert(option);
@@ -344,8 +334,7 @@ static int lease_parse_string(const uint8_t *option, size_t len, char **ret) {
                 if (!string)
                         return -ENOMEM;
 
-                free(*ret);
-                *ret = string;
+                free_and_replace(*ret, string);
         }
 
         return 0;
@@ -366,7 +355,7 @@ static int lease_parse_domain(const uint8_t *option, size_t len, char **ret) {
                 return 0;
         }
 
-        r = dns_name_normalize(name, &normalized);
+        r = dns_name_normalize(name, 0, &normalized);
         if (r < 0)
                 return r;
 
@@ -376,11 +365,26 @@ static int lease_parse_domain(const uint8_t *option, size_t len, char **ret) {
         if (dns_name_is_root(normalized))
                 return -EINVAL;
 
-        free(*ret);
-        *ret = normalized;
-        normalized = NULL;
+        free_and_replace(*ret, normalized);
 
         return 0;
+}
+
+static void filter_bogus_addresses(struct in_addr *addresses, size_t *n) {
+        size_t i, j;
+
+        /* Silently filter DNS/NTP servers supplied to us that do not make outside of the local scope. */
+
+        for (i = 0, j = 0; i < *n; i ++) {
+
+                if (in4_addr_is_null(addresses+i) ||
+                    in4_addr_is_localhost(addresses+i))
+                        continue;
+
+                addresses[j++] = addresses[i];
+        }
+
+        *n = j;
 }
 
 static int lease_parse_in_addrs(const uint8_t *option, size_t len, struct in_addr **ret, size_t *n_ret) {
@@ -403,6 +407,8 @@ static int lease_parse_in_addrs(const uint8_t *option, size_t len, struct in_add
                 addresses = newdup(struct in_addr, option, n_addresses);
                 if (!addresses)
                         return -ENOMEM;
+
+                filter_bogus_addresses(addresses, &n_addresses);
 
                 free(*ret);
                 *ret = addresses;
@@ -436,7 +442,8 @@ static int lease_parse_routes(
                 struct sd_dhcp_route *route = *routes + *routes_size;
                 int r;
 
-                r = in_addr_default_prefixlen((struct in_addr*) option, &route->dst_prefixlen);
+                route->option = SD_DHCP_OPTION_STATIC_ROUTE;
+                r = in4_addr_default_prefixlen((struct in_addr*) option, &route->dst_prefixlen);
                 if (r < 0) {
                         log_debug("Failed to determine destination prefix length from class based IP, ignoring");
                         continue;
@@ -479,6 +486,7 @@ static int lease_parse_classless_routes(
                         return -ENOMEM;
 
                 route = *routes + *routes_size;
+                route->option = SD_DHCP_OPTION_CLASSLESS_STATIC_ROUTE;
 
                 dst_octets = (*option == 0 ? 0 : ((*option - 1) / 8) + 1);
                 route->dst_prefixlen = *option;
@@ -575,6 +583,11 @@ int dhcp_lease_parse_options(uint8_t code, uint8_t len, const void *option, void
                 r = lease_parse_u16(option, len, &lease->mtu, 68);
                 if (r < 0)
                         log_debug_errno(r, "Failed to parse MTU, ignoring: %m");
+                if (lease->mtu < DHCP_DEFAULT_MIN_SIZE) {
+                        log_debug("MTU value of %" PRIu16 " too small. Using default MTU value of %d instead.", lease->mtu, DHCP_DEFAULT_MIN_SIZE);
+                        lease->mtu = DHCP_DEFAULT_MIN_SIZE;
+                }
+
                 break;
 
         case SD_DHCP_OPTION_DOMAIN_NAME:
@@ -584,6 +597,12 @@ int dhcp_lease_parse_options(uint8_t code, uint8_t len, const void *option, void
                         return 0;
                 }
 
+                break;
+
+        case SD_DHCP_OPTION_DOMAIN_SEARCH_LIST:
+                r = dhcp_lease_parse_search_domains(option, len, &lease->search_domains);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to parse Domain Search List, ignoring: %m");
                 break;
 
         case SD_DHCP_OPTION_HOST_NAME:
@@ -632,14 +651,12 @@ int dhcp_lease_parse_options(uint8_t code, uint8_t len, const void *option, void
                         return 0;
                 }
 
-                if (!timezone_is_valid(tz)) {
+                if (!timezone_is_valid(tz, LOG_DEBUG)) {
                         log_debug_errno(r, "Timezone is not valid, ignoring: %m");
                         return 0;
                 }
 
-                free(lease->timezone);
-                lease->timezone = tz;
-                tz = NULL;
+                free_and_replace(lease->timezone, tz);
 
                 break;
         }
@@ -675,6 +692,95 @@ int dhcp_lease_parse_options(uint8_t code, uint8_t len, const void *option, void
         }
 
         return 0;
+}
+
+/* Parses compressed domain names. */
+int dhcp_lease_parse_search_domains(const uint8_t *option, size_t len, char ***domains) {
+        _cleanup_strv_free_ char **names = NULL;
+        size_t pos = 0, cnt = 0;
+        int r;
+
+        assert(domains);
+        assert_return(option && len > 0, -ENODATA);
+
+        while (pos < len) {
+                _cleanup_free_ char *name = NULL;
+                size_t n = 0, allocated = 0;
+                size_t jump_barrier = pos, next_chunk = 0;
+                bool first = true;
+
+                for (;;) {
+                        uint8_t c;
+                        c = option[pos++];
+
+                        if (c == 0) {
+                                /* End of name */
+                                break;
+                        } else if (c <= 63) {
+                                const char *label;
+
+                                /* Literal label */
+                                label = (const char*) (option + pos);
+                                pos += c;
+                                if (pos >= len)
+                                        return -EBADMSG;
+
+                                if (!GREEDY_REALLOC(name, allocated, n + !first + DNS_LABEL_ESCAPED_MAX))
+                                        return -ENOMEM;
+
+                                if (first)
+                                        first = false;
+                                else
+                                        name[n++] = '.';
+
+                                r = dns_label_escape(label, c, name + n, DNS_LABEL_ESCAPED_MAX);
+                                if (r < 0)
+                                        return r;
+
+                                n += r;
+                        } else if ((c & 0xc0) == 0xc0) {
+                                /* Pointer */
+
+                                uint8_t d;
+                                uint16_t ptr;
+
+                                if (pos >= len)
+                                        return -EBADMSG;
+
+                                d = option[pos++];
+                                ptr = (uint16_t) (c & ~0xc0) << 8 | (uint16_t) d;
+
+                                /* Jumps are limited to a "prior occurrence" (RFC-1035 4.1.4) */
+                                if (ptr >= jump_barrier)
+                                        return -EBADMSG;
+                                jump_barrier = ptr;
+
+                                /* Save current location so we don't end up re-parsing what's parsed so far. */
+                                if (next_chunk == 0)
+                                        next_chunk = pos;
+
+                                pos = ptr;
+                        } else
+                                return -EBADMSG;
+                }
+
+                if (!GREEDY_REALLOC(name, allocated, n + 1))
+                        return -ENOMEM;
+                name[n] = 0;
+
+                r = strv_extend(&names, name);
+                if (r < 0)
+                        return r;
+
+                cnt++;
+
+                if (next_chunk != 0)
+                      pos = next_chunk;
+        }
+
+        *domains = TAKE_PTR(names);
+
+        return cnt;
 }
 
 int dhcp_lease_insert_private_option(sd_dhcp_lease *lease, uint8_t tag, const void *data, uint8_t len) {
@@ -732,6 +838,7 @@ int dhcp_lease_save(sd_dhcp_lease *lease, const char *lease_file) {
         const char *string;
         uint16_t mtu;
         _cleanup_free_ sd_dhcp_route **routes = NULL;
+        char **search_domains = NULL;
         uint32_t t1, t2, lifetime;
         int r;
 
@@ -742,7 +849,8 @@ int dhcp_lease_save(sd_dhcp_lease *lease, const char *lease_file) {
         if (r < 0)
                 goto fail;
 
-        fchmod(fileno(f), 0644);
+        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
+        (void) fchmod(fileno(f), 0644);
 
         fprintf(f,
                 "# This is private data. Do not parse.\n");
@@ -805,6 +913,13 @@ int dhcp_lease_save(sd_dhcp_lease *lease, const char *lease_file) {
         if (r >= 0)
                 fprintf(f, "DOMAINNAME=%s\n", string);
 
+        r = sd_dhcp_lease_get_search_domains(lease, &search_domains);
+        if (r > 0) {
+                fputs("DOMAIN_SEARCH_LIST=", f);
+                fputstrv(f, search_domains, NULL, NULL);
+                fputs("\n", f);
+        }
+
         r = sd_dhcp_lease_get_hostname(lease, &string);
         if (r >= 0)
                 fprintf(f, "HOSTNAME=%s\n", string);
@@ -846,7 +961,7 @@ int dhcp_lease_save(sd_dhcp_lease *lease, const char *lease_file) {
         }
 
         LIST_FOREACH(options, option, lease->private_options) {
-                char key[strlen("OPTION_000")+1];
+                char key[STRLEN("OPTION_000")+1];
 
                 xsprintf(key, "OPTION_%" PRIu8, option->tag);
                 r = serialize_dhcp_option(f, key, option->data, option->length);
@@ -886,6 +1001,7 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
                 *ntp = NULL,
                 *mtu = NULL,
                 *routes = NULL,
+                *domains = NULL,
                 *client_id_hex = NULL,
                 *vendor_specific_hex = NULL,
                 *lifetime = NULL,
@@ -902,7 +1018,7 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
         if (r < 0)
                 return r;
 
-        r = parse_env_file(lease_file, NEWLINE,
+        r = parse_env_file(NULL, lease_file,
                            "ADDRESS", &address,
                            "ROUTER", &router,
                            "NETMASK", &netmask,
@@ -914,6 +1030,7 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
                            "MTU", &mtu,
                            "DOMAINNAME", &lease->domainname,
                            "HOSTNAME", &lease->hostname,
+                           "DOMAIN_SEARCH_LIST", &domains,
                            "ROOT_PATH", &lease->root_path,
                            "ROUTES", &routes,
                            "CLIENTID", &client_id_hex,
@@ -952,8 +1069,7 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
                            "OPTION_251", &options[27],
                            "OPTION_252", &options[28],
                            "OPTION_253", &options[29],
-                           "OPTION_254", &options[30],
-                           NULL);
+                           "OPTION_254", &options[30]);
         if (r < 0)
                 return r;
 
@@ -1019,6 +1135,18 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
                         log_debug_errno(r, "Failed to parse MTU %s, ignoring: %m", mtu);
         }
 
+        if (domains) {
+                _cleanup_strv_free_ char **a = NULL;
+                a = strv_split(domains, " ");
+                if (!a)
+                        return -ENOMEM;
+
+                if (!strv_isempty(a)) {
+                        lease->search_domains = a;
+                        a = NULL;
+                }
+        }
+
         if (routes) {
                 r = deserialize_dhcp_routes(
                                 &lease->static_route,
@@ -1048,13 +1176,13 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
         }
 
         if (client_id_hex) {
-                r = deserialize_dhcp_option(&lease->client_id, &lease->client_id_len, client_id_hex);
+                r = unhexmem(client_id_hex, (size_t) -1, &lease->client_id, &lease->client_id_len);
                 if (r < 0)
                         log_debug_errno(r, "Failed to parse client ID %s, ignoring: %m", client_id_hex);
         }
 
         if (vendor_specific_hex) {
-                r = deserialize_dhcp_option(&lease->vendor_specific, &lease->vendor_specific_len, vendor_specific_hex);
+                r = unhexmem(vendor_specific_hex, (size_t) -1, &lease->vendor_specific, &lease->vendor_specific_len);
                 if (r < 0)
                         log_debug_errno(r, "Failed to parse vendor specific data %s, ignoring: %m", vendor_specific_hex);
         }
@@ -1066,7 +1194,7 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
                 if (!options[i])
                         continue;
 
-                r = deserialize_dhcp_option(&data, &len, options[i]);
+                r = unhexmem(options[i], (size_t) -1, &data, &len);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to parse private DHCP option %s, ignoring: %m", options[i]);
                         continue;
@@ -1077,8 +1205,7 @@ int dhcp_lease_load(sd_dhcp_lease **ret, const char *lease_file) {
                         return r;
         }
 
-        *ret = lease;
-        lease = NULL;
+        *ret = TAKE_PTR(lease);
 
         return 0;
 }
@@ -1095,7 +1222,7 @@ int dhcp_lease_set_default_subnet_mask(sd_dhcp_lease *lease) {
         address.s_addr = lease->address;
 
         /* fall back to the default subnet masks based on address class */
-        r = in_addr_default_subnet_mask(&address, &mask);
+        r = in4_addr_default_subnet_mask(&address, &mask);
         if (r < 0)
                 return r;
 
@@ -1173,4 +1300,10 @@ int sd_dhcp_route_get_gateway(sd_dhcp_route *route, struct in_addr *gateway) {
 
         *gateway = route->gw_addr;
         return 0;
+}
+
+int sd_dhcp_route_get_option(sd_dhcp_route *route) {
+        assert_return(route, -EINVAL);
+
+        return route->option;
 }

@@ -1,24 +1,8 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2013 Dave Reisner
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "alloc-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "utf8.h"
 #include "util.h"
 
@@ -36,9 +20,19 @@ static void test_utf8_is_valid(void) {
 }
 
 static void test_ascii_is_valid(void) {
-        assert_se(ascii_is_valid("alsdjf\t\vbarr\nba z"));
+        assert_se( ascii_is_valid("alsdjf\t\vbarr\nba z"));
         assert_se(!ascii_is_valid("\342\204\242"));
         assert_se(!ascii_is_valid("\341\204"));
+}
+
+static void test_ascii_is_valid_n(void) {
+        assert_se( ascii_is_valid_n("alsdjf\t\vbarr\nba z", 17));
+        assert_se( ascii_is_valid_n("alsdjf\t\vbarr\nba z", 16));
+        assert_se(!ascii_is_valid_n("alsdjf\t\vbarr\nba z", 18));
+        assert_se(!ascii_is_valid_n("\342\204\242", 3));
+        assert_se(!ascii_is_valid_n("\342\204\242", 2));
+        assert_se(!ascii_is_valid_n("\342\204\242", 1));
+        assert_se( ascii_is_valid_n("\342\204\242", 0));
 }
 
 static void test_utf8_encoded_valid_unichar(void) {
@@ -94,25 +88,79 @@ static void test_utf8_escaping_printable(void) {
 }
 
 static void test_utf16_to_utf8(void) {
-        char *a = NULL;
-        const uint16_t utf16[] = { htole16('a'), htole16(0xd800), htole16('b'), htole16(0xdc00), htole16('c'), htole16(0xd801), htole16(0xdc37) };
-        const char utf8[] = { 'a', 'b', 'c', 0xf0, 0x90, 0x90, 0xb7, 0 };
+        const char16_t utf16[] = { htole16('a'), htole16(0xd800), htole16('b'), htole16(0xdc00), htole16('c'), htole16(0xd801), htole16(0xdc37) };
+        static const char utf8[] = { 'a', 'b', 'c', 0xf0, 0x90, 0x90, 0xb7 };
+        _cleanup_free_ char16_t *b = NULL;
+        _cleanup_free_ char *a = NULL;
 
-        a = utf16_to_utf8(utf16, 14);
+        /* Convert UTF-16 to UTF-8, filtering embedded bad chars */
+        a = utf16_to_utf8(utf16, sizeof(utf16));
         assert_se(a);
-        assert_se(streq(a, utf8));
+        assert_se(memcmp(a, utf8, sizeof(utf8)) == 0);
+
+        /* Convert UTF-8 to UTF-16, and back */
+        b = utf8_to_utf16(utf8, sizeof(utf8));
+        assert_se(b);
 
         free(a);
+        a = utf16_to_utf8(b, char16_strlen(b) * 2);
+        assert_se(a);
+        assert_se(strlen(a) == sizeof(utf8));
+        assert_se(memcmp(a, utf8, sizeof(utf8)) == 0);
+}
+
+static void test_utf8_n_codepoints(void) {
+        assert_se(utf8_n_codepoints("abc") == 3);
+        assert_se(utf8_n_codepoints("zażółcić gęślą jaźń") == 19);
+        assert_se(utf8_n_codepoints("串") == 1);
+        assert_se(utf8_n_codepoints("") == 0);
+        assert_se(utf8_n_codepoints("…👊🔪💐…") == 5);
+        assert_se(utf8_n_codepoints("\xF1") == (size_t) -1);
+}
+
+static void test_utf8_console_width(void) {
+        assert_se(utf8_console_width("abc") == 3);
+        assert_se(utf8_console_width("zażółcić gęślą jaźń") == 19);
+        assert_se(utf8_console_width("串") == 2);
+        assert_se(utf8_console_width("") == 0);
+        assert_se(utf8_console_width("…👊🔪💐…") == 8);
+        assert_se(utf8_console_width("\xF1") == (size_t) -1);
+}
+
+static void test_utf8_to_utf16(void) {
+        const char *p;
+
+        FOREACH_STRING(p,
+                       "abc",
+                       "zażółcić gęślą jaźń",
+                       "串",
+                       "",
+                       "…👊🔪💐…") {
+
+                _cleanup_free_ char16_t *a = NULL;
+                _cleanup_free_ char *b = NULL;
+
+                a = utf8_to_utf16(p, strlen(p));
+                assert_se(a);
+
+                b = utf16_to_utf8(a, char16_strlen(a) * 2);
+                assert_se(b);
+                assert_se(streq(p, b));
+        }
 }
 
 int main(int argc, char *argv[]) {
         test_utf8_is_valid();
         test_utf8_is_printable();
         test_ascii_is_valid();
+        test_ascii_is_valid_n();
         test_utf8_encoded_valid_unichar();
         test_utf8_escaping();
         test_utf8_escaping_printable();
         test_utf16_to_utf8();
+        test_utf8_n_codepoints();
+        test_utf8_console_width();
+        test_utf8_to_utf16();
 
         return 0;
 }

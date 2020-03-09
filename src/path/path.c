@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <getopt.h>
@@ -27,6 +10,8 @@
 #include "alloc-util.h"
 #include "log.h"
 #include "macro.h"
+#include "main-func.h"
+#include "pretty-print.h"
 #include "string-util.h"
 #include "util.h"
 
@@ -66,6 +51,7 @@ static const char* const path_table[_SD_PATH_MAX] = {
         [SD_PATH_USER_TEMPLATES] = "user-templates",
         [SD_PATH_USER_DESKTOP] = "user-desktop",
         [SD_PATH_SEARCH_BINARIES] = "search-binaries",
+        [SD_PATH_SEARCH_BINARIES_DEFAULT] = "search-binaries-default",
         [SD_PATH_SEARCH_LIBRARY_PRIVATE] = "search-library-private",
         [SD_PATH_SEARCH_LIBRARY_ARCH] = "search-library-arch",
         [SD_PATH_SEARCH_SHARED] = "search-shared",
@@ -114,17 +100,29 @@ static int print_home(const char *n) {
                 }
         }
 
-        log_error("Path %s not known.", n);
-        return -EOPNOTSUPP;
+        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                               "Path %s not known.", n);
 }
 
-static void help(void) {
+static int help(void) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        r = terminal_urlify_man("systemd-path", "1", &link);
+        if (r < 0)
+                return log_oom();
+
         printf("%s [OPTIONS...] [NAME...]\n\n"
                "Show system and user paths.\n\n"
                "  -h --help             Show this help\n"
                "     --version          Show package version\n"
-               "     --suffix=SUFFIX    Suffix to append to paths\n",
-               program_invocation_short_name);
+               "     --suffix=SUFFIX    Suffix to append to paths\n"
+               "\nSee the %s for details.\n"
+               , program_invocation_short_name
+               , link
+        );
+
+        return 0;
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -151,8 +149,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 case 'h':
-                        help();
-                        return 0;
+                        return help();
 
                 case ARG_VERSION:
                         return version();
@@ -171,7 +168,7 @@ static int parse_argv(int argc, char *argv[]) {
         return 1;
 }
 
-int main(int argc, char* argv[]) {
+static int run(int argc, char* argv[]) {
         int r;
 
         log_parse_environment();
@@ -179,7 +176,7 @@ int main(int argc, char* argv[]) {
 
         r = parse_argv(argc, argv);
         if (r <= 0)
-                goto finish;
+                return r;
 
         if (argc > optind) {
                 int i, q;
@@ -189,10 +186,10 @@ int main(int argc, char* argv[]) {
                         if (q < 0)
                                 r = q;
                 }
+
+                return r;
         } else
-                r = list_homes();
-
-
-finish:
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+                return list_homes();
 }
+
+DEFINE_MAIN_FUNCTION(run);

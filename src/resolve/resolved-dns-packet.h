@@ -1,23 +1,5 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #pragma once
-
-/***
-  This file is part of systemd.
-
-  Copyright 2014 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
- ***/
 
 #include <netinet/ip.h>
 #include <netinet/udp.h>
@@ -56,22 +38,24 @@ struct DnsPacketHeader {
 #define UDP_PACKET_HEADER_SIZE (sizeof(struct iphdr) + sizeof(struct udphdr))
 
 /* The various DNS protocols deviate in how large a packet can grow,
-   but the TCP transport has a 16bit size field, hence that appears to
-   be the absolute maximum. */
-#define DNS_PACKET_SIZE_MAX 0xFFFF
+ * but the TCP transport has a 16bit size field, hence that appears to
+ * be the absolute maximum. */
+#define DNS_PACKET_SIZE_MAX 0xFFFFu
+
+/* The default size to use for allocation when we don't know how large
+ * the packet will turn out to be. */
+#define DNS_PACKET_SIZE_START 512u
 
 /* RFC 1035 say 512 is the maximum, for classic unicast DNS */
-#define DNS_PACKET_UNICAST_SIZE_MAX 512
+#define DNS_PACKET_UNICAST_SIZE_MAX 512u
 
 /* With EDNS0 we can use larger packets, default to 4096, which is what is commonly used */
-#define DNS_PACKET_UNICAST_SIZE_LARGE_MAX 4096
-
-#define DNS_PACKET_SIZE_START 512
+#define DNS_PACKET_UNICAST_SIZE_LARGE_MAX 4096u
 
 struct DnsPacket {
-        int n_ref;
+        unsigned n_ref;
         DnsProtocol protocol;
-        size_t size, allocated, rindex;
+        size_t size, allocated, rindex, max_size;
         void *_data; /* don't access directly, use DNS_PACKET_DATA()! */
         Hashmap *names; /* For name compression */
         size_t opt_start, opt_size;
@@ -133,10 +117,13 @@ static inline uint16_t DNS_PACKET_RCODE(DnsPacket *p) {
 
 static inline uint16_t DNS_PACKET_PAYLOAD_SIZE_MAX(DnsPacket *p) {
 
-        /* Returns the advertised maximum datagram size for replies, or the DNS default if there's nothing defined. */
+        /* Returns the advertised maximum size for replies, or the DNS default if there's nothing defined. */
 
         if (p->opt)
                 return MAX(DNS_PACKET_UNICAST_SIZE_MAX, p->opt->key->class);
+
+        if (p->ipproto == IPPROTO_TCP)
+                return DNS_PACKET_SIZE_MAX;
 
         return DNS_PACKET_UNICAST_SIZE_MAX;
 }
@@ -185,8 +172,8 @@ static inline unsigned DNS_PACKET_RRCOUNT(DnsPacket *p) {
                 (unsigned) DNS_PACKET_ARCOUNT(p);
 }
 
-int dns_packet_new(DnsPacket **p, DnsProtocol protocol, size_t mtu);
-int dns_packet_new_query(DnsPacket **p, DnsProtocol protocol, size_t mtu, bool dnssec_checking_disabled);
+int dns_packet_new(DnsPacket **p, DnsProtocol protocol, size_t min_alloc_dsize, size_t max_size);
+int dns_packet_new_query(DnsPacket **p, DnsProtocol protocol, size_t min_alloc_dsize, bool dnssec_checking_disabled);
 
 void dns_packet_set_flags(DnsPacket *p, bool dnssec_checking_disabled, bool truncated);
 
@@ -209,8 +196,8 @@ int dns_packet_append_string(DnsPacket *p, const char *s, size_t *start);
 int dns_packet_append_raw_string(DnsPacket *p, const void *s, size_t size, size_t *start);
 int dns_packet_append_label(DnsPacket *p, const char *s, size_t l, bool canonical_candidate, size_t *start);
 int dns_packet_append_name(DnsPacket *p, const char *name, bool allow_compression, bool canonical_candidate, size_t *start);
-int dns_packet_append_key(DnsPacket *p, const DnsResourceKey *key, size_t *start);
-int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, size_t *start, size_t *rdata_start);
+int dns_packet_append_key(DnsPacket *p, const DnsResourceKey *key, const DnsAnswerFlags flags, size_t *start);
+int dns_packet_append_rr(DnsPacket *p, const DnsResourceRecord *rr, const DnsAnswerFlags flags, size_t *start, size_t *rdata_start);
 int dns_packet_append_opt(DnsPacket *p, uint16_t max_udp_size, bool edns0_do, int rcode, size_t *start);
 int dns_packet_append_question(DnsPacket *p, DnsQuestion *q);
 int dns_packet_append_answer(DnsPacket *p, DnsAnswer *a);
@@ -280,6 +267,8 @@ DnsProtocol dns_protocol_from_string(const char *s) _pure_;
 #define MDNS_MULTICAST_IPV4_ADDRESS  ((struct in_addr) { .s_addr = htobe32(224U << 24 | 251U) })
 #define MDNS_MULTICAST_IPV6_ADDRESS  ((struct in6_addr) { .s6_addr = { 0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb } })
 
+extern const struct hash_ops dns_packet_hash_ops;
+
 static inline uint64_t SD_RESOLVED_FLAGS_MAKE(DnsProtocol protocol, int family, bool authenticated) {
         uint64_t f;
 
@@ -300,4 +289,14 @@ static inline uint64_t SD_RESOLVED_FLAGS_MAKE(DnsProtocol protocol, int family, 
         default:
                 return f;
         }
+}
+
+static inline size_t dns_packet_size_max(DnsPacket *p) {
+        assert(p);
+
+        /* Why not insist on a fully initialized max_size during DnsPacket construction? Well, this way it's easy to
+         * allocate a transient, throw-away DnsPacket on the stack by simple zero initialization, without having to
+         * deal with explicit field initialization. */
+
+        return p->max_size != 0 ? p->max_size : DNS_PACKET_SIZE_MAX;
 }

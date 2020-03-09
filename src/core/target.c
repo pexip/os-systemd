@@ -1,29 +1,14 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2010 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include "dbus-target.h"
+#include "dbus-unit.h"
 #include "log.h"
+#include "serialize.h"
 #include "special.h"
 #include "string-util.h"
+#include "target.h"
 #include "unit-name.h"
 #include "unit.h"
-#include "target.h"
 
 static const UnitActiveState state_translation_table[_TARGET_STATE_MAX] = {
         [TARGET_DEAD] = UNIT_INACTIVE,
@@ -34,6 +19,9 @@ static void target_set_state(Target *t, TargetState state) {
         TargetState old_state;
         assert(t);
 
+        if (t->state != state)
+                bus_unit_send_pending_change_signal(UNIT(t), false);
+
         old_state = t->state;
         t->state = state;
 
@@ -43,7 +31,7 @@ static void target_set_state(Target *t, TargetState state) {
                           target_state_to_string(old_state),
                           target_state_to_string(state));
 
-        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], true);
+        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], 0);
 }
 
 static int target_add_default_dependencies(Target *t) {
@@ -56,27 +44,34 @@ static int target_add_default_dependencies(Target *t) {
                 UNIT_PART_OF
         };
 
-        Iterator i;
-        Unit *other;
         int r;
         unsigned k;
 
         assert(t);
 
-        /* Imply ordering for requirement dependencies on target
-         * units. Note that when the user created a contradicting
-         * ordering manually we won't add anything in here to make
-         * sure we don't create a loop. */
+        if (!UNIT(t)->default_dependencies)
+                return 0;
 
-        for (k = 0; k < ELEMENTSOF(deps); k++)
-                SET_FOREACH(other, UNIT(t)->dependencies[deps[k]], i) {
+        /* Imply ordering for requirement dependencies on target units. Note that when the user created a contradicting
+         * ordering manually we won't add anything in here to make sure we don't create a loop. */
+
+        for (k = 0; k < ELEMENTSOF(deps); k++) {
+                Unit *other;
+                Iterator i;
+                void *v;
+
+                HASHMAP_FOREACH_KEY(v, other, UNIT(t)->dependencies[deps[k]], i) {
                         r = unit_add_default_target_dependency(other, UNIT(t));
                         if (r < 0)
                                 return r;
                 }
+        }
+
+        if (unit_has_name(UNIT(t), SPECIAL_SHUTDOWN_TARGET))
+                return 0;
 
         /* Make sure targets are unloaded on shutdown */
-        return unit_add_dependency_by_name(UNIT(t), UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, NULL, true);
+        return unit_add_two_dependencies_by_name(UNIT(t), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
 }
 
 static int target_load(Unit *u) {
@@ -90,7 +85,7 @@ static int target_load(Unit *u) {
                 return r;
 
         /* This is a new unit? Then let's add in some extras */
-        if (u->load_state == UNIT_LOADED && u->default_dependencies) {
+        if (u->load_state == UNIT_LOADED) {
                 r = target_add_default_dependencies(t);
                 if (r < 0)
                         return r;
@@ -154,7 +149,7 @@ static int target_serialize(Unit *u, FILE *f, FDSet *fds) {
         assert(f);
         assert(fds);
 
-        unit_serialize_item(u, f, "state", target_state_to_string(s->state));
+        (void) serialize_item(f, "state", target_state_to_string(s->state));
         return 0;
 }
 

@@ -1,10 +1,9 @@
+/* SPDX-License-Identifier: LGPL-2.1+ */
 #ifndef foosddhcp6clienthfoo
 #define foosddhcp6clienthfoo
 
 /***
-  This file is part of systemd.
-
-  Copyright (C) 2014 Intel Corporation. All rights reserved.
+  Copyright © 2014 Intel Corporation. All rights reserved.
 
   systemd is free software; you can redistribute it and/or modify it
   under the terms of the GNU Lesser General Public License as published by
@@ -63,10 +62,14 @@ enum {
 
         SD_DHCP6_OPTION_DNS_SERVERS                = 23,  /* RFC 3646 */
         SD_DHCP6_OPTION_DOMAIN_LIST                = 24,  /* RFC 3646 */
+        SD_DHCP6_OPTION_IA_PD                      = 25,  /* RFC 3633, prefix delegation */
+        SD_DHCP6_OPTION_IA_PD_PREFIX               = 26,  /* RFC 3633, prefix delegation */
 
         SD_DHCP6_OPTION_SNTP_SERVERS               = 31,  /* RFC 4075, deprecated */
 
         /* option code 35 is unassigned */
+
+        SD_DHCP6_OPTION_FQDN                       = 39,  /* RFC 4704 */
 
         SD_DHCP6_OPTION_NTP_SERVER                 = 56,  /* RFC 5908 */
 
@@ -98,9 +101,15 @@ int sd_dhcp6_client_set_duid(
                 uint16_t duid_type,
                 const void *duid,
                 size_t duid_len);
+int sd_dhcp6_client_set_duid_llt(
+                sd_dhcp6_client *client,
+                uint64_t llt_time);
 int sd_dhcp6_client_set_iaid(
                 sd_dhcp6_client *client,
                 uint32_t iaid);
+int sd_dhcp6_client_set_fqdn(
+                sd_dhcp6_client *client,
+                const char *fqdn);
 int sd_dhcp6_client_set_information_request(
                 sd_dhcp6_client *client,
                 int enabled);
@@ -110,6 +119,15 @@ int sd_dhcp6_client_get_information_request(
 int sd_dhcp6_client_set_request_option(
                 sd_dhcp6_client *client,
                 uint16_t option);
+int sd_dhcp6_client_get_prefix_delegation(sd_dhcp6_client *client,
+                                          int *delegation);
+int sd_dhcp6_client_set_prefix_delegation(sd_dhcp6_client *client,
+                                          int delegation);
+int sd_dhcp6_client_get_address_request(sd_dhcp6_client *client,
+                                        int *request);
+int sd_dhcp6_client_set_address_request(sd_dhcp6_client *client,
+                                        int request);
+int sd_dhcp6_client_set_transaction_id(sd_dhcp6_client *client, uint32_t transaction_id);
 
 int sd_dhcp6_client_get_lease(
                 sd_dhcp6_client *client,

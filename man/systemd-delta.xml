@@ -3,22 +3,7 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 
 <!--
-  This file is part of systemd.
-
-  Copyright 2012 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
+  SPDX-License-Identifier: LGPL-2.1+
 -->
 
 <refentry id="systemd-delta"
@@ -27,15 +12,6 @@
   <refentryinfo>
     <title>systemd-delta</title>
     <productname>systemd</productname>
-
-    <authorgroup>
-      <author>
-        <contrib>Developer</contrib>
-        <firstname>Lennart</firstname>
-        <surname>Poettering</surname>
-        <email>lennart@poettering.net</email>
-      </author>
-    </authorgroup>
   </refentryinfo>
 
   <refmeta>
@@ -63,7 +39,7 @@
     compare configuration files that override other configuration
     files. Files in <filename>/etc</filename> have highest priority,
     files in <filename>/run</filename> have the second highest
-    priority, ..., files in <filename>/lib</filename> have lowest
+    priority, …, files in <filename>/usr/lib</filename> have lowest
     priority. Files in a directory with higher priority override files
     with the same name in directories of lower priority. In addition,
     certain configuration files can have <literal>.d</literal>
@@ -82,7 +58,7 @@
     suffix. Either is optional. The prefix must be one of the
     directories containing configuration files
     (<filename>/etc</filename>, <filename>/run</filename>,
-    <filename>/usr/lib</filename>, ...). If it is given, only
+    <filename>/usr/lib</filename>, …). If it is given, only
     overriding files contained in this directory will be shown.
     Otherwise, all overriding files will be shown. The suffix must be
     a name of a subdirectory containing configuration files like

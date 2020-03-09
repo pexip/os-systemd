@@ -1,21 +1,4 @@
-/***
-  This file is part of systemd.
-
-  Copyright 2012 Lennart Poettering
-
-  systemd is free software; you can redistribute it and/or modify it
-  under the terms of the GNU Lesser General Public License as published by
-  the Free Software Foundation; either version 2.1 of the License, or
-  (at your option) any later version.
-
-  systemd is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public License
-  along with systemd; If not, see <http://www.gnu.org/licenses/>.
-***/
+/* SPDX-License-Identifier: LGPL-2.1+ */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,15 +6,17 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "env-file.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "formats-util.h"
+#include "format-util.h"
 #include "logind-inhibit.h"
 #include "mkdir.h"
 #include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "tmpfile-util.h"
 #include "user-util.h"
 #include "util.h"
 
@@ -86,7 +71,7 @@ int inhibitor_save(Inhibitor *i) {
 
         assert(i);
 
-        r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0);
+        r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, MKDIR_WARN_MODE);
         if (r < 0)
                 goto fail;
 
@@ -210,15 +195,14 @@ int inhibitor_load(Inhibitor *i) {
         char *cc;
         int r;
 
-        r = parse_env_file(i->state_file, NEWLINE,
+        r = parse_env_file(NULL, i->state_file,
                            "WHAT", &what,
                            "UID", &uid,
                            "PID", &pid,
                            "WHO", &who,
                            "WHY", &why,
                            "MODE", &mode,
-                           "FIFO", &i->fifo_path,
-                           NULL);
+                           "FIFO", &i->fifo_path);
         if (r < 0)
                 return r;
 
@@ -290,11 +274,11 @@ int inhibitor_create_fifo(Inhibitor *i) {
 
         /* Create FIFO */
         if (!i->fifo_path) {
-                r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0);
+                r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, MKDIR_WARN_MODE);
                 if (r < 0)
                         return r;
 
-                i->fifo_path = strjoin("/run/systemd/inhibit/", i->id, ".ref", NULL);
+                i->fifo_path = strjoin("/run/systemd/inhibit/", i->id, ".ref");
                 if (!i->fifo_path)
                         return -ENOMEM;
 
@@ -304,7 +288,7 @@ int inhibitor_create_fifo(Inhibitor *i) {
 
         /* Open reading side */
         if (i->fifo_fd < 0) {
-                i->fifo_fd = open(i->fifo_path, O_RDONLY|O_CLOEXEC|O_NDELAY);
+                i->fifo_fd = open(i->fifo_path, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
                 if (i->fifo_fd < 0)
                         return -errno;
         }
@@ -320,7 +304,7 @@ int inhibitor_create_fifo(Inhibitor *i) {
         }
 
         /* Open writing side */
-        r = open(i->fifo_path, O_WRONLY|O_CLOEXEC|O_NDELAY);
+        r = open(i->fifo_path, O_WRONLY|O_CLOEXEC|O_NONBLOCK);
         if (r < 0)
                 return -errno;
 
@@ -347,7 +331,7 @@ InhibitWhat manager_inhibit_what(Manager *m, InhibitMode mm) {
         assert(m);
 
         HASHMAP_FOREACH(i, m->inhibitors, j)
-                if (i->mode == mm)
+                if (i->mode == mm && i->started)
                         what |= i->what;
 
         return what;
@@ -357,6 +341,8 @@ static int pid_is_active(Manager *m, pid_t pid) {
         Session *s;
         int r;
 
+        /* Get client session.  This is not what you are looking for these days.
+         * FIXME #6852 */
         r = manager_get_session_by_pid(m, pid, &s);
         if (r < 0)
                 return r;
@@ -388,6 +374,9 @@ bool manager_is_inhibited(
         assert(w > 0 && w < _INHIBIT_WHAT_MAX);
 
         HASHMAP_FOREACH(i, m->inhibitors, j) {
+                if (!i->started)
+                        continue;
+
                 if (!(i->what & w))
                         continue;
 
