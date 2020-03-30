@@ -10,6 +10,7 @@ systemd (241-7~deb10u3pexip1) pexip; urgency=medium
     systemctl-Don-t-forward-telinit-u-to-upstart.patch
     systemctl-try-upstart.patch
     random-seed-add-entropy.patch
+  * debian/patches/mount-shm-noexec.patch: Add patch to mount /dev/shm noexec.
 
  -- Vincent Sanders <vince@pexip.com>  Mon, 09 Mar 2020 13:42:19 +0000
 
