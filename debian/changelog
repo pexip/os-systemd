@@ -1,3 +1,9 @@
+systemd (232-25+deb9u12pexip2) pexip; urgency=medium
+
+  * debian/patches/mount-shm-noexec.patch: Add patch to mount /dev/shm noexec.
+
+ -- John-Mark Bell <jmb@pexip.com>  Tue, 26 May 2020 22:25:58 +0100
+
 systemd (232-25+deb9u12pexip1) pexip; urgency=medium
 
   * New upstream release
