@@ -106,7 +106,7 @@ CONFFLAGS_deb += \
 	-Dlibcurl=true \
 	-Dimportd=true \
 	-Dmicrohttpd=true \
-	-Dgnutls=true
+	-Dgnutls=false
 else
 CONFFLAGS_deb += \
 	-Daudit=false \
