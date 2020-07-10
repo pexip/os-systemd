@@ -1,3 +1,10 @@
+systemd (241-7~deb10u4pexip2) pexip; urgency=medium
+
+  * Drop the patch to mount /dev/shm noexec.
+    It's causing problems with bad behaviour in libffi.
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Fri, 10 Jul 2020 14:38:40 +0100
+
 systemd (241-7~deb10u4pexip1) pexip; urgency=medium
 
   * New upstream release

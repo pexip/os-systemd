@@ -74,4 +74,3 @@ systemctl-Don-t-forward-telinit-u-to-upstart.patch
 disable-journald-audit.patch
 install-avoid-utf8.patch
 random-seed-add-entropy.patch
-mount-shm-noexec.patch
