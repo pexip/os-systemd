@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <arpa/inet.h>
 #include <netinet/icmp6.h>
@@ -42,6 +42,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         };
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
+
+        if (size > 2048)
+                return 0;
 
         assert_se(sd_event_new(&e) >= 0);
         assert_se(sd_ndisc_new(&nd) >= 0);

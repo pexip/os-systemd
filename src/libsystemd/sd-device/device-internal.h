@@ -1,14 +1,25 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "sd-device.h"
 
+#include "device-private.h"
 #include "hashmap.h"
 #include "set.h"
 #include "time-util.h"
 
+#define LATEST_UDEV_DATABASE_VERSION 1
+
 struct sd_device {
         unsigned n_ref;
+
+        /* The database version indicates the supported features by the udev database.
+         * This is saved and parsed in V field.
+         *
+         * 0: None of the following features are supported (systemd version <= 246).
+         * 1: The current tags (Q) and the database version (V) features are implemented (>= 247).
+         */
+        unsigned database_version;
 
         int watch_handle;
 
@@ -27,10 +38,10 @@ struct sd_device {
         Set *sysattrs; /* names of sysattrs */
         Iterator sysattrs_iterator;
 
-        Set *tags;
-        Iterator tags_iterator;
+        Set *all_tags, *current_tags;
+        Iterator all_tags_iterator, current_tags_iterator;
+        uint64_t all_tags_iterator_generation, current_tags_iterator_generation; /* generation when iteration was started */
         uint64_t tags_generation; /* changes whenever the tags are changed */
-        uint64_t tags_iterator_generation; /* generation when iteration was started */
 
         Set *devlinks;
         Iterator devlinks_iterator;
@@ -64,9 +75,13 @@ struct sd_device {
         uid_t devuid;
         gid_t devgid;
 
+        /* only set when device is passed through netlink */
+        DeviceAction action;
+        uint64_t seqnum;
+
         bool parent_set:1; /* no need to try to reload parent */
         bool sysattrs_read:1; /* don't try to re-read sysattrs once read */
-        bool property_tags_outdated:1; /* need to update TAGS= property */
+        bool property_tags_outdated:1; /* need to update TAGS= or CURRENT_TAGS= property */
         bool property_devlinks_outdated:1; /* need to update DEVLINKS= property */
         bool properties_buf_outdated:1; /* need to reread hashmap */
         bool sysname_set:1; /* don't reread sysname */
@@ -81,33 +96,19 @@ struct sd_device {
         bool db_persist:1; /* don't clean up the db when switching from initrd to real root */
 };
 
-typedef enum DeviceAction {
-        DEVICE_ACTION_ADD,
-        DEVICE_ACTION_REMOVE,
-        DEVICE_ACTION_CHANGE,
-        DEVICE_ACTION_MOVE,
-        DEVICE_ACTION_ONLINE,
-        DEVICE_ACTION_OFFLINE,
-        DEVICE_ACTION_BIND,
-        DEVICE_ACTION_UNBIND,
-        _DEVICE_ACTION_MAX,
-        _DEVICE_ACTION_INVALID = -1,
-} DeviceAction;
-
 int device_new_aux(sd_device **ret);
 int device_add_property_aux(sd_device *device, const char *key, const char *value, bool db);
-int device_add_property_internal(sd_device *device, const char *key, const char *value);
+static inline int device_add_property_internal(sd_device *device, const char *key, const char *value) {
+        return device_add_property_aux(device, key, value, false);
+}
 int device_read_uevent_file(sd_device *device);
 
 int device_set_syspath(sd_device *device, const char *_syspath, bool verify);
 int device_set_ifindex(sd_device *device, const char *ifindex);
 int device_set_devmode(sd_device *device, const char *devmode);
-int device_set_devname(sd_device *device, const char *_devname);
-int device_set_devtype(sd_device *device, const char *_devtype);
+int device_set_devname(sd_device *device, const char *devname);
+int device_set_devtype(sd_device *device, const char *devtype);
 int device_set_devnum(sd_device *device, const char *major, const char *minor);
 int device_set_subsystem(sd_device *device, const char *_subsystem);
 int device_set_driver(sd_device *device, const char *_driver);
 int device_set_usec_initialized(sd_device *device, usec_t when);
-
-DeviceAction device_action_from_string(const char *s) _pure_;
-const char *device_action_to_string(DeviceAction a) _const_;

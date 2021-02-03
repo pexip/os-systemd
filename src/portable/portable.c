@@ -1,6 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <stdio_ext.h>
+#include <linux/loop.h>
 
 #include "bus-common-errors.h"
 #include "bus-error.h"
@@ -12,11 +12,13 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "install.h"
 #include "io-util.h"
 #include "locale-util.h"
 #include "loop-util.h"
 #include "machine-image.h"
 #include "mkdir.h"
+#include "nulstr-util.h"
 #include "os-util.h"
 #include "path-lookup.h"
 #include "portable.h"
@@ -24,6 +26,7 @@
 #include "set.h"
 #include "signal-util.h"
 #include "socket-util.h"
+#include "sort-util.h"
 #include "string-table.h"
 #include "strv.h"
 #include "tmpfile-util.h"
@@ -100,7 +103,6 @@ static int compare_metadata(PortableMetadata *const *x, PortableMetadata *const 
 int portable_metadata_hashmap_to_sorted_array(Hashmap *unit_files, PortableMetadata ***ret) {
 
         _cleanup_free_ PortableMetadata **sorted = NULL;
-        Iterator iterator;
         PortableMetadata *item;
         size_t k = 0;
 
@@ -108,7 +110,7 @@ int portable_metadata_hashmap_to_sorted_array(Hashmap *unit_files, PortableMetad
         if (!sorted)
                 return -ENOMEM;
 
-        HASHMAP_FOREACH(item, unit_files, iterator)
+        HASHMAP_FOREACH(item, unit_files)
                 sorted[k++] = item;
 
         assert(k == hashmap_size(unit_files));
@@ -124,10 +126,7 @@ static int send_item(
                 const char *name,
                 int fd) {
 
-        union {
-                struct cmsghdr cmsghdr;
-                uint8_t buf[CMSG_SPACE(sizeof(int))];
-        } control = {};
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(int))) control = {};
         struct iovec iovec;
         struct msghdr mh = {
                 .msg_control = &control,
@@ -152,7 +151,6 @@ static int send_item(
         cmsg->cmsg_len = CMSG_LEN(sizeof(int));
         memcpy(CMSG_DATA(cmsg), &data_fd, sizeof(int));
 
-        mh.msg_controllen = CMSG_SPACE(sizeof(int));
         iovec = IOVEC_MAKE_STRING(name);
 
         if (sendmsg(socket_fd, &mh, MSG_NOSIGNAL) < 0)
@@ -166,10 +164,7 @@ static int recv_item(
                 char **ret_name,
                 int *ret_fd) {
 
-        union {
-                struct cmsghdr cmsghdr;
-                uint8_t buf[CMSG_SPACE(sizeof(int))];
-        } control = {};
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(int))) control;
         char buffer[PATH_MAX+2];
         struct iovec iov = IOVEC_INIT(buffer, sizeof(buffer)-1);
         struct msghdr mh = {
@@ -187,9 +182,9 @@ static int recv_item(
         assert(ret_name);
         assert(ret_fd);
 
-        n = recvmsg(socket_fd, &mh, MSG_CMSG_CLOEXEC);
+        n = recvmsg_safe(socket_fd, &mh, MSG_CMSG_CLOEXEC);
         if (n < 0)
-                return -errno;
+                return (int) n;
 
         CMSG_FOREACH(cmsg, &mh) {
                 if (cmsg->cmsg_level == SOL_SOCKET &&
@@ -325,7 +320,7 @@ static int extract_now(
                                 return -ENOMEM;
                         fd = -1;
 
-                        m->source = strjoin(resolved, "/", de->d_name);
+                        m->source = path_join(resolved, de->d_name);
                         if (!m->source)
                                 return -ENOMEM;
 
@@ -358,7 +353,7 @@ static int portable_extract_by_path(
 
         assert(path);
 
-        r = loop_device_make_by_path(path, O_RDONLY, &d);
+        r = loop_device_make_by_path(path, O_RDONLY, LO_FLAGS_PARTSCAN, &d);
         if (r == -EISDIR) {
                 /* We can't turn this into a loop-back block device, and this returns EISDIR? Then this is a directory
                  * tree and not a raw device. It's easy then. */
@@ -384,7 +379,7 @@ static int portable_extract_by_path(
                 if (r < 0)
                         return log_debug_errno(r, "Failed to create temporary directory: %m");
 
-                r = dissect_image(d->fd, NULL, 0, DISSECT_IMAGE_READ_ONLY|DISSECT_IMAGE_REQUIRE_ROOT|DISSECT_IMAGE_DISCARD_ON_LOOP, &m);
+                r = dissect_image(d->fd, NULL, NULL, DISSECT_IMAGE_READ_ONLY|DISSECT_IMAGE_REQUIRE_ROOT|DISSECT_IMAGE_DISCARD_ON_LOOP|DISSECT_IMAGE_RELAX_VAR_CHECK, &m);
                 if (r == -ENOPKG)
                         sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Couldn't identify a suitable partition table or file system in '%s'.", path);
                 else if (r == -EADDRNOTAVAIL)
@@ -434,15 +429,14 @@ static int portable_extract_by_path(
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to receive item: %m");
 
-                        /* We can't really distuingish a zero-length datagram without any fds from EOF (both are signalled the
+                        /* We can't really distinguish a zero-length datagram without any fds from EOF (both are signalled the
                          * same way by recvmsg()). Hence, accept either as end notification. */
                         if (isempty(name) && fd < 0)
                                 break;
 
-                        if (isempty(name) || fd < 0) {
-                                log_debug("Invalid item sent from child.");
-                                return -EINVAL;
-                        }
+                        if (isempty(name) || fd < 0)
+                                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Invalid item sent from child.");
 
                         add = portable_metadata_new(name, fd);
                         if (!add)
@@ -653,10 +647,10 @@ static int portable_changes_add_with_prefix(
                 return 0;
 
         if (prefix) {
-                path = strjoina(prefix, "/", path);
+                path = prefix_roota(prefix, path);
 
                 if (source)
-                        source = strjoina(prefix, "/", source);
+                        source = prefix_roota(prefix, source);
         }
 
         return portable_changes_add(changes, n_changes, type, path, source);
@@ -691,7 +685,7 @@ static int install_chroot_dropin(
         assert(m);
         assert(dropin_dir);
 
-        dropin = strjoin(dropin_dir, "/20-portable.conf");
+        dropin = path_join(dropin_dir, "20-portable.conf");
         if (!dropin)
                 return -ENOMEM;
 
@@ -699,16 +693,28 @@ static int install_chroot_dropin(
         if (!text)
                 return -ENOMEM;
 
-        if (endswith(m->name, ".service"))
+        if (endswith(m->name, ".service")) {
+                const char *os_release_source;
+
+                if (access("/etc/os-release", F_OK) < 0) {
+                        if (errno != ENOENT)
+                                return log_debug_errno(errno, "Failed to check if /etc/os-release exists: %m");
+
+                        os_release_source = "/usr/lib/os-release";
+                } else
+                        os_release_source = "/etc/os-release";
+
                 if (!strextend(&text,
                                "\n"
                                "[Service]\n",
                                IN_SET(type, IMAGE_DIRECTORY, IMAGE_SUBVOLUME) ? "RootDirectory=" : "RootImage=", image_path, "\n"
                                "Environment=PORTABLE=", basename(image_path), "\n"
+                               "BindReadOnlyPaths=", os_release_source, ":/run/host/os-release\n"
                                "LogExtraFields=PORTABLE=", basename(image_path), "\n",
                                NULL))
 
                         return -ENOMEM;
+        }
 
         r = write_string_file(dropin, text, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC);
         if (r < 0)
@@ -778,13 +784,13 @@ static int install_profile_dropin(
                 return 0;
         }
 
-        dropin = strjoin(dropin_dir, "/10-profile.conf");
+        dropin = path_join(dropin_dir, "10-profile.conf");
         if (!dropin)
                 return -ENOMEM;
 
         if (flags & PORTABLE_PREFER_COPY) {
 
-                r = copy_file_atomic(from, dropin, 0644, 0, COPY_REFLINK);
+                r = copy_file_atomic(from, dropin, 0644, 0, 0, COPY_REFLINK);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to copy %s %s %s: %m", from, special_glyph(SPECIAL_GLYPH_ARROW), dropin);
 
@@ -847,7 +853,7 @@ static int attach_unit_file(
         } else
                 (void) portable_changes_add(changes, n_changes, PORTABLE_MKDIR, where, NULL);
 
-        path = strjoina(where, "/", m->name);
+        path = prefix_roota(where, m->name);
         dropin_dir = strjoin(path, ".d");
         if (!dropin_dir)
                 return -ENOMEM;
@@ -881,7 +887,7 @@ static int attach_unit_file(
                 _cleanup_(unlink_and_freep) char *tmp = NULL;
                 _cleanup_close_ int fd = -1;
 
-                fd = open_tmpfile_linkable(where, O_WRONLY|O_CLOEXEC, &tmp);
+                fd = open_tmpfile_linkable(path, O_WRONLY|O_CLOEXEC, &tmp);
                 if (fd < 0)
                         return log_debug_errno(fd, "Failed to create unit file '%s': %m", path);
 
@@ -979,7 +985,6 @@ int portable_attach(
         _cleanup_(lookup_paths_free) LookupPaths paths = {};
         _cleanup_(image_unrefp) Image *image = NULL;
         PortableMetadata *item;
-        Iterator iterator;
         int r;
 
         assert(name_or_path);
@@ -996,7 +1001,7 @@ int portable_attach(
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(item, unit_files, iterator) {
+        HASHMAP_FOREACH(item, unit_files) {
                 r = unit_file_exists(UNIT_FILE_SYSTEM, &paths, item->name);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to determine whether unit '%s' exists on the host: %m", item->name);
@@ -1010,7 +1015,7 @@ int portable_attach(
                         return sd_bus_error_setf(error, BUS_ERROR_UNIT_EXISTS, "Unit file '%s' is active already, refusing.", item->name);
         }
 
-        HASHMAP_FOREACH(item, unit_files, iterator) {
+        HASHMAP_FOREACH(item, unit_files) {
                 r = attach_unit_file(&paths, image->path, image->type, item, profile, flags, changes, n_changes);
                 if (r < 0)
                         return r;
@@ -1089,12 +1094,9 @@ static int test_chroot_dropin(
                 return log_debug_errno(errno, "Failed to open %s/%s: %m", where, p);
         }
 
-        f = fdopen(fd, "r");
-        if (!f)
-                return log_debug_errno(errno, "Failed to convert file handle: %m");
-        fd = -1;
-
-        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
+        r = take_fdopen_unlocked(&fd, "r", &f);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to convert file handle: %m");
 
         r = read_line(f, LONG_LINE_MAX, &line);
         if (r < 0)
@@ -1132,10 +1134,9 @@ int portable_detach(
                 sd_bus_error *error) {
 
         _cleanup_(lookup_paths_free) LookupPaths paths = {};
-        _cleanup_set_free_free_ Set *unit_files = NULL, *markers = NULL;
+        _cleanup_set_free_ Set *unit_files = NULL, *markers = NULL;
         _cleanup_closedir_ DIR *d = NULL;
         const char *where, *item;
-        Iterator iterator;
         struct dirent *de;
         int ret = 0;
         int r;
@@ -1156,14 +1157,6 @@ int portable_detach(
                 return log_debug_errno(errno, "Failed to open '%s' directory: %m", where);
         }
 
-        unit_files = set_new(&string_hash_ops);
-        if (!unit_files)
-                return -ENOMEM;
-
-        markers = set_new(&path_hash_ops);
-        if (!markers)
-                return -ENOMEM;
-
         FOREACH_DIRENT(de, d, return log_debug_errno(errno, "Failed to enumerate '%s' directory: %m", where)) {
                 _cleanup_free_ char *marker = NULL;
                 UnitFileState state;
@@ -1172,7 +1165,7 @@ int portable_detach(
                         continue;
 
                 /* Filter out duplicates */
-                if (set_get(unit_files, de->d_name))
+                if (set_contains(unit_files, de->d_name))
                         continue;
 
                 dirent_ensure_type(d, de);
@@ -1188,7 +1181,7 @@ int portable_detach(
                 r = unit_file_lookup_state(UNIT_FILE_SYSTEM, &paths, de->d_name, &state);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to determine unit file state of '%s': %m", de->d_name);
-                if (!IN_SET(state, UNIT_FILE_STATIC, UNIT_FILE_DISABLED, UNIT_FILE_LINKED, UNIT_FILE_RUNTIME))
+                if (!IN_SET(state, UNIT_FILE_STATIC, UNIT_FILE_DISABLED, UNIT_FILE_LINKED, UNIT_FILE_RUNTIME, UNIT_FILE_LINKED_RUNTIME))
                         return sd_bus_error_setf(error, BUS_ERROR_UNIT_EXISTS, "Unit file '%s' is in state '%s', can't detach.", de->d_name, unit_file_state_to_string(state));
 
                 r = unit_file_is_active(bus, de->d_name, error);
@@ -1197,21 +1190,15 @@ int portable_detach(
                 if (r > 0)
                         return sd_bus_error_setf(error, BUS_ERROR_UNIT_EXISTS, "Unit file '%s' is active, can't detach.", de->d_name);
 
-                r = set_put_strdup(unit_files, de->d_name);
+                r = set_put_strdup(&unit_files, de->d_name);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to add unit name '%s' to set: %m", de->d_name);
 
                 if (path_is_absolute(marker) &&
                     !image_in_search_path(IMAGE_PORTABLE, marker)) {
 
-                        r = set_ensure_allocated(&markers, &path_hash_ops);
+                        r = set_ensure_consume(&markers, &path_hash_ops_free, TAKE_PTR(marker));
                         if (r < 0)
-                                return r;
-
-                        r = set_put(markers, marker);
-                        if (r >= 0)
-                                marker = NULL;
-                        else if (r != -EEXIST)
                                 return r;
                 }
         }
@@ -1219,7 +1206,7 @@ int portable_detach(
         if (set_isempty(unit_files))
                 goto not_found;
 
-        SET_FOREACH(item, unit_files, iterator) {
+        SET_FOREACH(item, unit_files) {
                 _cleanup_free_ char *md = NULL;
                 const char *suffix;
 
@@ -1261,7 +1248,7 @@ int portable_detach(
         }
 
         /* Now, also drop any image symlink, for images outside of the sarch path */
-        SET_FOREACH(item, markers, iterator) {
+        SET_FOREACH(item, markers) {
                 _cleanup_free_ char *sl = NULL;
                 struct stat st;
 
@@ -1310,7 +1297,7 @@ static int portable_get_state_internal(
 
         _cleanup_(lookup_paths_free) LookupPaths paths = {};
         bool found_enabled = false, found_running = false;
-        _cleanup_set_free_free_ Set *unit_files = NULL;
+        _cleanup_set_free_ Set *unit_files = NULL;
         _cleanup_closedir_ DIR *d = NULL;
         const char *where;
         struct dirent *de;
@@ -1336,10 +1323,6 @@ static int portable_get_state_internal(
                 return log_debug_errno(errno, "Failed to open '%s' directory: %m", where);
         }
 
-        unit_files = set_new(&string_hash_ops);
-        if (!unit_files)
-                return -ENOMEM;
-
         FOREACH_DIRENT(de, d, return log_debug_errno(errno, "Failed to enumerate '%s' directory: %m", where)) {
                 UnitFileState state;
 
@@ -1347,7 +1330,7 @@ static int portable_get_state_internal(
                         continue;
 
                 /* Filter out duplicates */
-                if (set_get(unit_files, de->d_name))
+                if (set_contains(unit_files, de->d_name))
                         continue;
 
                 dirent_ensure_type(d, de);
@@ -1372,7 +1355,7 @@ static int portable_get_state_internal(
                 if (r > 0)
                         found_running = true;
 
-                r = set_put_strdup(unit_files, de->d_name);
+                r = set_put_strdup(&unit_files, de->d_name);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to add unit name '%s' to set: %m", de->d_name);
         }

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
@@ -33,6 +33,7 @@ typedef struct SwapParameters {
         char *what;
         char *options;
         int priority;
+        bool priority_set;
 } SwapParameters;
 
 struct Swap {
@@ -57,6 +58,7 @@ struct Swap {
         bool just_activated:1;
 
         SwapResult result;
+        SwapResult clean_result;
 
         usec_t timeout_usec;
 

@@ -1,6 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "fileio.h"
@@ -10,7 +13,6 @@
 #include "log.h"
 #include "selinux-util.h"
 #include "string-util.h"
-#include "util.h"
 
 static int run(int argc, char *argv[]) {
         int r, k;
@@ -23,7 +25,9 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        mac_selinux_init();
+        r = mac_selinux_init();
+        if (r < 0)
+                return r;
 
         if (streq(argv[1], "start")) {
                 r = unlink_or_warn("/run/nologin");

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/fs.h>
 
@@ -60,7 +60,7 @@ struct TarImport {
         pid_t tar_pid;
 
         unsigned last_percent;
-        RateLimit progress_rate_limit;
+        RateLimit progress_ratelimit;
 };
 
 TarImport* tar_import_unref(TarImport *i) {
@@ -119,9 +119,8 @@ int tar_import_new(
                 .userdata = userdata,
                 .last_percent = (unsigned) -1,
                 .image_root = TAKE_PTR(root),
+                .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
         };
-
-        RATELIMIT_INIT(i->progress_rate_limit, 100 * USEC_PER_MSEC, 1);
 
         if (event)
                 i->event = sd_event_ref(event);
@@ -152,7 +151,7 @@ static void tar_import_report_progress(TarImport *i) {
         if (percent == i->last_percent)
                 return;
 
-        if (!ratelimit_below(&i->progress_rate_limit))
+        if (!ratelimit_below(&i->progress_ratelimit))
                 return;
 
         sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
@@ -211,7 +210,7 @@ static int tar_import_fork_tar(TarImport *i) {
         assert(!i->temp_path);
         assert(i->tar_fd < 0);
 
-        i->final_path = strjoin(i->image_root, "/", i->local);
+        i->final_path = path_join(i->image_root, i->local);
         if (!i->final_path)
                 return log_oom();
 
@@ -221,13 +220,10 @@ static int tar_import_fork_tar(TarImport *i) {
 
         (void) mkdir_parents_label(i->temp_path, 0700);
 
-        r = btrfs_subvol_make(i->temp_path);
-        if (r == -ENOTTY) {
-                if (mkdir(i->temp_path, 0755) < 0)
-                        return log_error_errno(errno, "Failed to create directory %s: %m", i->temp_path);
-        } else if (r < 0)
-                return log_error_errno(r, "Failed to create subvolume %s: %m", i->temp_path);
-        else
+        r = btrfs_subvol_make_fallback(i->temp_path, 0755);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create directory/subvolume %s: %m", i->temp_path);
+        if (r > 0) /* actually btrfs subvol */
                 (void) import_assign_pool_quota_and_warn(i->temp_path);
 
         i->tar_fd = import_fork_tar_x(i->temp_path, &i->tar_pid);

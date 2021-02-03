@@ -1,16 +1,28 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include "sd-event.h"
+
+#include "ordered-set.h"
 #include "socket-util.h"
 
+typedef struct DnsServer DnsServer;
 typedef struct DnsStream DnsStream;
+typedef struct DnsTransaction DnsTransaction;
+typedef struct Manager Manager;
+typedef struct DnsStubListenerExtra DnsStubListenerExtra;
 
 #include "resolved-dns-packet.h"
-#include "resolved-dns-transaction.h"
-#include "resolved-manager.h"
-#if ENABLE_DNS_OVER_TLS
 #include "resolved-dnstls.h"
-#endif
+
+typedef enum DnsStreamType {
+        DNS_STREAM_LOOKUP,        /* Outgoing connection to a classic DNS server */
+        DNS_STREAM_LLMNR_SEND,    /* Outgoing LLMNR TCP lookup */
+        DNS_STREAM_LLMNR_RECV,    /* Incoming LLMNR TCP lookup */
+        DNS_STREAM_STUB,          /* Incoming DNS stub connection */
+        _DNS_STREAM_TYPE_MAX,
+        _DNS_STREAM_TYPE_INVALID = -1,
+} DnsStreamType;
 
 #define DNS_STREAM_WRITE_TLS_DATA 1
 
@@ -25,6 +37,7 @@ struct DnsStream {
         Manager *manager;
         unsigned n_ref;
 
+        DnsStreamType type;
         DnsProtocol protocol;
 
         int fd;
@@ -58,15 +71,17 @@ struct DnsStream {
 
         LIST_HEAD(DnsTransaction, transactions); /* when used by the transaction logic */
         DnsServer *server;                       /* when used by the transaction logic */
-        DnsQuery *query;                         /* when used by the DNS stub logic */
+        Set *queries;                            /* when used by the DNS stub logic */
 
         /* used when DNS-over-TLS is enabled */
         bool encrypted:1;
 
+        DnsStubListenerExtra *stub_listener_extra;
+
         LIST_FIELDS(DnsStream, streams);
 };
 
-int dns_stream_new(Manager *m, DnsStream **s, DnsProtocol protocol, int fd, const union sockaddr_union *tfo_address);
+int dns_stream_new(Manager *m, DnsStream **s, DnsStreamType type, DnsProtocol protocol, int fd, const union sockaddr_union *tfo_address);
 #if ENABLE_DNS_OVER_TLS
 int dns_stream_connect_tls(DnsStream *s, void *tls_session);
 #endif

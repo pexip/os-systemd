@@ -1,13 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <pwd.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <linux/vt.h>
-#if ENABLE_UTMP
-#include <utmpx.h>
-#endif
 
 #include "sd-device.h"
 
@@ -17,14 +13,21 @@
 #include "cgroup-util.h"
 #include "conf-parser.h"
 #include "device-util.h"
+#include "efi-loader.h"
+#include "errno-util.h"
 #include "fd-util.h"
+#include "limits-util.h"
 #include "logind.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "stdio-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "udev-util.h"
 #include "user-util.h"
+#include "userdb.h"
+#include "utmp-wtmp.h"
 
 void manager_reset_config(Manager *m) {
         assert(m);
@@ -41,10 +44,12 @@ void manager_reset_config(Manager *m) {
         m->handle_lid_switch = HANDLE_SUSPEND;
         m->handle_lid_switch_ep = _HANDLE_ACTION_INVALID;
         m->handle_lid_switch_docked = HANDLE_IGNORE;
+        m->handle_reboot_key = HANDLE_REBOOT;
         m->power_key_ignore_inhibited = false;
         m->suspend_key_ignore_inhibited = false;
         m->hibernate_key_ignore_inhibited = false;
         m->lid_switch_ignore_inhibited = true;
+        m->reboot_key_ignore_inhibited = false;
 
         m->holdoff_timeout_usec = 30 * USEC_PER_SEC;
 
@@ -52,7 +57,7 @@ void manager_reset_config(Manager *m) {
         m->idle_action = HANDLE_IGNORE;
 
         m->runtime_dir_size = physical_memory_scale(10U, 100U); /* 10% */
-        m->user_tasks_max = system_tasks_max_scale(DEFAULT_USER_TASKS_MAX_PERCENTAGE, 100U); /* 33% */
+        m->runtime_dir_inodes = DIV_ROUND_UP(m->runtime_dir_size, 4096); /* 4k per inode */
         m->sessions_max = 8192;
         m->inhibitors_max = 8192;
 
@@ -65,14 +70,16 @@ void manager_reset_config(Manager *m) {
 int manager_parse_config_file(Manager *m) {
         assert(m);
 
-        return config_parse_many_nulstr(PKGSYSCONFDIR "/logind.conf",
-                                        CONF_PATHS_NULSTR("systemd/logind.conf.d"),
-                                        "Login\0",
-                                        config_item_perf_lookup, logind_gperf_lookup,
-                                        CONFIG_PARSE_WARN, m);
+        return config_parse_many_nulstr(
+                        PKGSYSCONFDIR "/logind.conf",
+                        CONF_PATHS_NULSTR("systemd/logind.conf.d"),
+                        "Login\0",
+                        config_item_perf_lookup, logind_gperf_lookup,
+                        CONFIG_PARSE_WARN, m,
+                        NULL);
 }
 
-int manager_add_device(Manager *m, const char *sysfs, bool master, Device **_device) {
+int manager_add_device(Manager *m, const char *sysfs, bool master, Device **ret_device) {
         Device *d;
 
         assert(m);
@@ -88,13 +95,13 @@ int manager_add_device(Manager *m, const char *sysfs, bool master, Device **_dev
                         return -ENOMEM;
         }
 
-        if (_device)
-                *_device = d;
+        if (ret_device)
+                *ret_device = d;
 
         return 0;
 }
 
-int manager_add_seat(Manager *m, const char *id, Seat **_seat) {
+int manager_add_seat(Manager *m, const char *id, Seat **ret_seat) {
         Seat *s;
         int r;
 
@@ -108,13 +115,13 @@ int manager_add_seat(Manager *m, const char *id, Seat **_seat) {
                         return r;
         }
 
-        if (_seat)
-                *_seat = s;
+        if (ret_seat)
+                *ret_seat = s;
 
         return 0;
 }
 
-int manager_add_session(Manager *m, const char *id, Session **_session) {
+int manager_add_session(Manager *m, const char *id, Session **ret_session) {
         Session *s;
         int r;
 
@@ -128,35 +135,32 @@ int manager_add_session(Manager *m, const char *id, Session **_session) {
                         return r;
         }
 
-        if (_session)
-                *_session = s;
+        if (ret_session)
+                *ret_session = s;
 
         return 0;
 }
 
 int manager_add_user(
                 Manager *m,
-                uid_t uid,
-                gid_t gid,
-                const char *name,
-                const char *home,
-                User **_user) {
+                UserRecord *ur,
+                User **ret_user) {
 
         User *u;
         int r;
 
         assert(m);
-        assert(name);
+        assert(ur);
 
-        u = hashmap_get(m->users, UID_TO_PTR(uid));
+        u = hashmap_get(m->users, UID_TO_PTR(ur->uid));
         if (!u) {
-                r = user_new(&u, m, uid, gid, name, home);
+                r = user_new(&u, m, ur);
                 if (r < 0)
                         return r;
         }
 
-        if (_user)
-                *_user = u;
+        if (ret_user)
+                *ret_user = u;
 
         return 0;
 }
@@ -164,61 +168,60 @@ int manager_add_user(
 int manager_add_user_by_name(
                 Manager *m,
                 const char *name,
-                User **_user) {
+                User **ret_user) {
 
-        const char *home = NULL;
-        uid_t uid;
-        gid_t gid;
+        _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
         int r;
 
         assert(m);
         assert(name);
 
-        r = get_user_creds(&name, &uid, &gid, &home, NULL, 0);
+        r = userdb_by_name(name, USERDB_AVOID_SHADOW, &ur);
         if (r < 0)
                 return r;
 
-        return manager_add_user(m, uid, gid, name, home, _user);
+        return manager_add_user(m, ur, ret_user);
 }
 
-int manager_add_user_by_uid(Manager *m, uid_t uid, User **_user) {
-        struct passwd *p;
+int manager_add_user_by_uid(
+                Manager *m,
+                uid_t uid,
+                User **ret_user) {
+
+        _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
+        int r;
 
         assert(m);
+        assert(uid_is_valid(uid));
 
-        errno = 0;
-        p = getpwuid(uid);
-        if (!p)
-                return errno > 0 ? -errno : -ENOENT;
+        r = userdb_by_uid(uid, USERDB_AVOID_SHADOW, &ur);
+        if (r < 0)
+                return r;
 
-        return manager_add_user(m, uid, p->pw_gid, p->pw_name, p->pw_dir, _user);
+        return manager_add_user(m, ur, ret_user);
 }
 
-int manager_add_inhibitor(Manager *m, const char* id, Inhibitor **_inhibitor) {
+int manager_add_inhibitor(Manager *m, const char* id, Inhibitor **ret) {
         Inhibitor *i;
+        int r;
 
         assert(m);
         assert(id);
 
         i = hashmap_get(m->inhibitors, id);
-        if (i) {
-                if (_inhibitor)
-                        *_inhibitor = i;
-
-                return 0;
+        if (!i) {
+                r = inhibitor_new(&i, m, id);
+                if (r < 0)
+                        return r;
         }
 
-        i = inhibitor_new(m, id);
-        if (!i)
-                return -ENOMEM;
-
-        if (_inhibitor)
-                *_inhibitor = i;
+        if (ret)
+                *ret = i;
 
         return 0;
 }
 
-int manager_add_button(Manager *m, const char *name, Button **_button) {
+int manager_add_button(Manager *m, const char *name, Button **ret_button) {
         Button *b;
 
         assert(m);
@@ -231,21 +234,20 @@ int manager_add_button(Manager *m, const char *name, Button **_button) {
                         return -ENOMEM;
         }
 
-        if (_button)
-                *_button = b;
+        if (ret_button)
+                *ret_button = b;
 
         return 0;
 }
 
 int manager_process_seat_device(Manager *m, sd_device *d) {
-        const char *action;
         Device *device;
         int r;
 
         assert(m);
 
-        if (sd_device_get_property_value(d, "ACTION", &action) >= 0 &&
-            streq(action, "remove")) {
+        if (device_for_action(d, DEVICE_ACTION_REMOVE) ||
+            sd_device_has_current_tag(d, "seat") <= 0) {
                 const char *syspath;
 
                 r = sd_device_get_syspath(d, &syspath);
@@ -273,7 +275,7 @@ int manager_process_seat_device(Manager *m, sd_device *d) {
                 }
 
                 seat = hashmap_get(m->seats, sn);
-                master = sd_device_has_tag(d, "master-of-seat") > 0;
+                master = sd_device_has_current_tag(d, "master-of-seat") > 0;
 
                 /* Ignore non-master devices for unknown seats */
                 if (!master && !seat)
@@ -305,7 +307,7 @@ int manager_process_seat_device(Manager *m, sd_device *d) {
 }
 
 int manager_process_button_device(Manager *m, sd_device *d) {
-        const char *action, *sysname;
+        const char *sysname;
         Button *b;
         int r;
 
@@ -315,8 +317,8 @@ int manager_process_button_device(Manager *m, sd_device *d) {
         if (r < 0)
                 return r;
 
-        if (sd_device_get_property_value(d, "ACTION", &action) >= 0 &&
-            streq(action, "remove")) {
+        if (device_for_action(d, DEVICE_ACTION_REMOVE) ||
+            sd_device_has_current_tag(d, "power-switch") <= 0) {
 
                 b = hashmap_get(m->buttons, sysname);
                 if (!b)
@@ -358,28 +360,19 @@ int manager_get_session_by_pid(Manager *m, pid_t pid, Session **ret) {
         s = hashmap_get(m->sessions_by_leader, PID_TO_PTR(pid));
         if (!s) {
                 r = cg_pid_get_unit(pid, &unit);
-                if (r < 0)
-                        goto not_found;
-
-                s = hashmap_get(m->session_units, unit);
-                if (!s)
-                        goto not_found;
+                if (r >= 0)
+                        s = hashmap_get(m->session_units, unit);
         }
 
         if (ret)
                 *ret = s;
 
-        return 1;
-
-not_found:
-        if (ret)
-                *ret = NULL;
-        return 0;
+        return !!s;
 }
 
 int manager_get_user_by_pid(Manager *m, pid_t pid, User **ret) {
         _cleanup_free_ char *unit = NULL;
-        User *u;
+        User *u = NULL;
         int r;
 
         assert(m);
@@ -388,36 +381,25 @@ int manager_get_user_by_pid(Manager *m, pid_t pid, User **ret) {
                 return -EINVAL;
 
         r = cg_pid_get_slice(pid, &unit);
-        if (r < 0)
-                goto not_found;
-
-        u = hashmap_get(m->user_units, unit);
-        if (!u)
-                goto not_found;
+        if (r >= 0)
+                u = hashmap_get(m->user_units, unit);
 
         if (ret)
                 *ret = u;
 
-        return 1;
-
-not_found:
-        if (ret)
-                *ret = NULL;
-
-        return 0;
+        return !!u;
 }
 
 int manager_get_idle_hint(Manager *m, dual_timestamp *t) {
         Session *s;
         bool idle_hint;
         dual_timestamp ts = DUAL_TIMESTAMP_NULL;
-        Iterator i;
 
         assert(m);
 
         idle_hint = !manager_is_inhibited(m, INHIBIT_IDLE, INHIBIT_BLOCK, t, false, false, 0, NULL);
 
-        HASHMAP_FOREACH(s, m->sessions, i) {
+        HASHMAP_FOREACH(s, m->sessions) {
                 dual_timestamp k;
                 int ih;
 
@@ -485,12 +467,14 @@ int config_parse_n_autovts(
 
         r = safe_atou(rvalue, &o);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse number of autovts, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse number of autovts, ignoring: %s", rvalue);
                 return 0;
         }
 
         if (o > 15) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "A maximum of 15 autovts are supported, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
+                           "A maximum of 15 autovts are supported, ignoring: %s", rvalue);
                 return 0;
         }
 
@@ -500,7 +484,7 @@ int config_parse_n_autovts(
 
 static int vt_is_busy(unsigned vtnr) {
         struct vt_stat vt_stat;
-        int r = 0;
+        int r;
         _cleanup_close_ int fd;
 
         assert(vtnr >= 1);
@@ -550,7 +534,7 @@ int manager_spawn_autovt(Manager *m, unsigned vtnr) {
                         return -EBUSY;
         }
 
-        snprintf(name, sizeof(name), "autovt@tty%u.service", vtnr);
+        xsprintf(name, "autovt@tty%u.service", vtnr);
         r = sd_bus_call_method(
                         m->bus,
                         "org.freedesktop.systemd1",
@@ -567,10 +551,9 @@ int manager_spawn_autovt(Manager *m, unsigned vtnr) {
 }
 
 bool manager_is_lid_closed(Manager *m) {
-        Iterator i;
         Button *b;
 
-        HASHMAP_FOREACH(b, m->buttons, i)
+        HASHMAP_FOREACH(b, m->buttons)
                 if (b->lid_closed)
                         return true;
 
@@ -578,10 +561,9 @@ bool manager_is_lid_closed(Manager *m) {
 }
 
 static bool manager_is_docked(Manager *m) {
-        Iterator i;
         Button *b;
 
-        HASHMAP_FOREACH(b, m->buttons, i)
+        HASHMAP_FOREACH(b, m->buttons)
                 if (b->docked)
                         return true;
 
@@ -621,10 +603,10 @@ static int manager_count_external_displays(Manager *m) {
                 if (sd_device_get_sysname(d, &nn) < 0)
                         continue;
 
-                /* Ignore internal displays: the type is encoded in the sysfs name, as the second dash separated item
-                 * (the first is the card name, the last the connector number). We implement a blacklist of external
-                 * displays here, rather than a whitelist of internal ones, to ensure we don't block suspends too
-                 * eagerly. */
+                /* Ignore internal displays: the type is encoded in the sysfs name, as the second dash
+                 * separated item (the first is the card name, the last the connector number). We implement a
+                 * deny list of external displays here, rather than an allow list of internal ones, to ensure
+                 * we don't block suspends too eagerly. */
                 dash = strchr(nn, '-');
                 if (!dash)
                         continue;
@@ -694,10 +676,11 @@ bool manager_all_buttons_ignored(Manager *m) {
                 return false;
         if (m->handle_lid_switch != HANDLE_IGNORE)
                 return false;
-        if (m->handle_lid_switch_ep != _HANDLE_ACTION_INVALID &&
-            m->handle_lid_switch_ep != HANDLE_IGNORE)
+        if (!IN_SET(m->handle_lid_switch_ep, _HANDLE_ACTION_INVALID, HANDLE_IGNORE))
                 return false;
         if (m->handle_lid_switch_docked != HANDLE_IGNORE)
+                return false;
+        if (m->handle_reboot_key != HANDLE_IGNORE)
                 return false;
 
         return true;
@@ -706,13 +689,14 @@ bool manager_all_buttons_ignored(Manager *m) {
 int manager_read_utmp(Manager *m) {
 #if ENABLE_UTMP
         int r;
+        _cleanup_(utxent_cleanup) bool utmpx = false;
 
         assert(m);
 
         if (utmpxname(_PATH_UTMPX) < 0)
                 return log_error_errno(errno, "Failed to set utmp path to " _PATH_UTMPX ": %m");
 
-        setutxent();
+        utmpx = utxent_start();
 
         for (;;) {
                 _cleanup_free_ char *t = NULL;
@@ -725,8 +709,7 @@ int manager_read_utmp(Manager *m) {
                 if (!u) {
                         if (errno != 0)
                                 log_warning_errno(errno, "Failed to read " _PATH_UTMPX ", ignoring: %m");
-                        r = 0;
-                        break;
+                        return 0;
                 }
 
                 if (u->ut_type != USER_PROCESS)
@@ -736,18 +719,14 @@ int manager_read_utmp(Manager *m) {
                         continue;
 
                 t = strndup(u->ut_line, sizeof(u->ut_line));
-                if (!t) {
-                        r = log_oom();
-                        break;
-                }
+                if (!t)
+                        return log_oom();
 
                 c = path_startswith(t, "/dev/");
                 if (c) {
                         r = free_and_strdup(&t, c);
-                        if (r < 0) {
-                                log_oom();
-                                break;
-                        }
+                        if (r < 0)
+                                return log_oom();
                 }
 
                 if (isempty(t))
@@ -777,8 +756,6 @@ int manager_read_utmp(Manager *m) {
                 log_debug("Acquired TTY information '%s' from utmp for session '%s'.", s->tty, s->id);
         }
 
-        endutxent();
-        return r;
 #else
         return 0;
 #endif
@@ -839,5 +816,29 @@ void manager_reconnect_utmp(Manager *m) {
                 return;
 
         manager_connect_utmp(m);
+#endif
+}
+
+int manager_read_efi_boot_loader_entries(Manager *m) {
+#if ENABLE_EFI
+        int r;
+
+        assert(m);
+        if (m->efi_boot_loader_entries_set)
+                return 0;
+
+        r = efi_loader_get_entries(&m->efi_boot_loader_entries);
+        if (r == -ENOENT || ERRNO_IS_NOT_SUPPORTED(r)) {
+                log_debug_errno(r, "Boot loader reported no entries.");
+                m->efi_boot_loader_entries_set = true;
+                return 0;
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine entries reported by boot loader: %m");
+
+        m->efi_boot_loader_entries_set = true;
+        return 1;
+#else
+        return 0;
 #endif
 }

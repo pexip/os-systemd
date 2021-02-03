@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stddef.h>
 #include <sys/epoll.h>
@@ -19,6 +19,7 @@
 #include "journald-syslog.h"
 #include "journald-wall.h"
 #include "memfd-util.h"
+#include "memory-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -62,7 +63,7 @@ static void server_process_entry_meta(
                  startswith(p, "SYSLOG_IDENTIFIER=")) {
                 char *t;
 
-                t = strndup(p + 18, l - 18);
+                t = memdup_suffix0(p + 18, l - 18);
                 if (t) {
                         free(*identifier);
                         *identifier = t;
@@ -72,7 +73,7 @@ static void server_process_entry_meta(
                    startswith(p, "MESSAGE=")) {
                 char *t;
 
-                t = strndup(p + 8, l - 8);
+                t = memdup_suffix0(p + 8, l - 8);
                 if (t) {
                         free(*message);
                         *message = t;
@@ -449,24 +450,28 @@ void server_process_native_file(
         }
 }
 
-int server_open_native_socket(Server *s) {
-
-        static const union sockaddr_union sa = {
-                .un.sun_family = AF_UNIX,
-                .un.sun_path = "/run/systemd/journal/socket",
-        };
+int server_open_native_socket(Server *s, const char *native_socket) {
         int r;
 
         assert(s);
+        assert(native_socket);
 
         if (s->native_fd < 0) {
+                union sockaddr_union sa;
+                size_t sa_len;
+
+                r = sockaddr_un_set_path(&sa.un, native_socket);
+                if (r < 0)
+                        return log_error_errno(r, "Unable to use namespace path %s for AF_UNIX socket: %m", native_socket);
+                sa_len = r;
+
                 s->native_fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
                 if (s->native_fd < 0)
                         return log_error_errno(errno, "socket() failed: %m");
 
                 (void) sockaddr_un_unlink(&sa.un);
 
-                r = bind(s->native_fd, &sa.sa, SOCKADDR_UN_LEN(sa.un));
+                r = bind(s->native_fd, &sa.sa, sa_len);
                 if (r < 0)
                         return log_error_errno(errno, "bind(%s) failed: %m", sa.un.sun_path);
 
@@ -478,13 +483,11 @@ int server_open_native_socket(Server *s) {
         if (r < 0)
                 return log_error_errno(r, "SO_PASSCRED failed: %m");
 
-#if HAVE_SELINUX
         if (mac_selinux_use()) {
                 r = setsockopt_int(s->native_fd, SOL_SOCKET, SO_PASSSEC, true);
                 if (r < 0)
                         log_warning_errno(r, "SO_PASSSEC failed: %m");
         }
-#endif
 
         r = setsockopt_int(s->native_fd, SOL_SOCKET, SO_TIMESTAMP, true);
         if (r < 0)

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "bus-internal.h"
@@ -43,7 +43,7 @@ bool object_path_is_valid(const char *p) {
         if (slash)
                 return false;
 
-        return true;
+        return (q - p) <= BUS_PATH_SIZE_MAX;
 }
 
 char* object_path_startswith(const char *a, const char *b) {
@@ -97,7 +97,7 @@ bool interface_name_is_valid(const char *p) {
                         dot = false;
                 }
 
-        if (q - p > 255)
+        if (q - p > SD_BUS_MAXIMUM_NAME_LENGTH)
                 return false;
 
         if (dot)
@@ -139,7 +139,7 @@ bool service_name_is_valid(const char *p) {
                         dot = false;
                 }
 
-        if (q - p > 255)
+        if (q - p > SD_BUS_MAXIMUM_NAME_LENGTH)
                 return false;
 
         if (dot)
@@ -170,7 +170,7 @@ bool member_name_is_valid(const char *p) {
                         return false;
         }
 
-        if (q - p > 255)
+        if (q - p > SD_BUS_MAXIMUM_NAME_LENGTH)
                 return false;
 
         return true;
@@ -180,7 +180,7 @@ bool member_name_is_valid(const char *p) {
  * Complex pattern match
  * This checks whether @a is a 'complex-prefix' of @b, or @b is a
  * 'complex-prefix' of @a, based on strings that consist of labels with @c as
- * spearator. This function returns true if:
+ * separator. This function returns true if:
  *   - both strings are equal
  *   - either is a prefix of the other and ends with @c
  * The second rule makes sure that either string needs to be fully included in
@@ -314,13 +314,9 @@ char *bus_address_escape(const char *v) {
 int bus_maybe_reply_error(sd_bus_message *m, int r, sd_bus_error *error) {
         assert(m);
 
-        if (r < 0) {
+        if (sd_bus_error_is_set(error) || r < 0) {
                 if (m->header->type == SD_BUS_MESSAGE_METHOD_CALL)
                         sd_bus_reply_method_errno(m, r, error);
-
-        } else if (sd_bus_error_is_set(error)) {
-                if (m->header->type == SD_BUS_MESSAGE_METHOD_CALL)
-                        sd_bus_reply_method_error(m, error);
         } else
                 return r;
 

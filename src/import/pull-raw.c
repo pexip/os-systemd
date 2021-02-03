@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <curl/curl.h>
 #include <linux/fs.h>
@@ -8,7 +8,6 @@
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
-#include "chattr-util.h"
 #include "copy.h"
 #include "curl-util.h"
 #include "fd-util.h"
@@ -242,23 +241,19 @@ static int raw_pull_maybe_convert_qcow2(RawPull *i) {
         if (converted_fd < 0)
                 return log_error_errno(errno, "Failed to create %s: %m", t);
 
-        r = chattr_fd(converted_fd, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
-        if (r < 0)
-                log_warning_errno(r, "Failed to set file attributes on %s: %m", t);
+        (void) import_set_nocow_and_log(converted_fd, t);
 
         log_info("Unpacking QCOW2 file.");
 
         r = qcow2_convert(i->raw_job->disk_fd, converted_fd);
         if (r < 0) {
-                unlink(t);
+                (void) unlink(t);
                 return log_error_errno(r, "Failed to convert qcow2 image: %m");
         }
 
         (void) unlink(i->temp_path);
         free_and_replace(i->temp_path, t);
-
-        safe_close(i->raw_job->disk_fd);
-        i->raw_job->disk_fd = TAKE_FD(converted_fd);
+        CLOSE_AND_REPLACE(i->raw_job->disk_fd, converted_fd);
 
         return 1;
 }
@@ -299,7 +294,7 @@ static int raw_pull_copy_auxiliary_file(
 
         local = strjoina(i->image_root, "/", i->local, suffix);
 
-        r = copy_file_atomic(*path, local, 0644, 0, COPY_REFLINK | (i->force_local ? COPY_REPLACE : 0));
+        r = copy_file_atomic(*path, local, 0644, 0, 0, COPY_REFLINK | (i->force_local ? COPY_REPLACE : 0));
         if (r == -EEXIST)
                 log_warning_errno(r, "File %s already exists, not replacing.", local);
         else if (r == -ENOENT)
@@ -354,21 +349,17 @@ static int raw_pull_make_local_copy(RawPull *i) {
         if (dfd < 0)
                 return log_error_errno(errno, "Failed to create writable copy of image: %m");
 
-        /* Turn off COW writing. This should greatly improve
-         * performance on COW file systems like btrfs, since it
-         * reduces fragmentation caused by not allowing in-place
-         * writes. */
-        r = chattr_fd(dfd, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
-        if (r < 0)
-                log_warning_errno(r, "Failed to set file attributes on %s: %m", tp);
+        /* Turn off COW writing. This should greatly improve performance on COW file systems like btrfs,
+         * since it reduces fragmentation caused by not allowing in-place writes. */
+        (void) import_set_nocow_and_log(dfd, tp);
 
         r = copy_bytes(i->raw_job->disk_fd, dfd, (uint64_t) -1, COPY_REFLINK);
         if (r < 0) {
-                unlink(tp);
+                (void) unlink(tp);
                 return log_error_errno(r, "Failed to make writable copy of image: %m");
         }
 
-        (void) copy_times(i->raw_job->disk_fd, dfd);
+        (void) copy_times(i->raw_job->disk_fd, dfd, COPY_CRTIME);
         (void) copy_xattr(i->raw_job->disk_fd, dfd);
 
         dfd = safe_close(dfd);
@@ -376,7 +367,7 @@ static int raw_pull_make_local_copy(RawPull *i) {
         r = rename(tp, p);
         if (r < 0)  {
                 r = log_error_errno(errno, "Failed to move writable image into place: %m");
-                unlink(tp);
+                (void) unlink(tp);
                 return r;
         }
 
@@ -516,14 +507,17 @@ static void raw_pull_job_on_finished(PullJob *j) {
 
                 raw_pull_report_progress(i, RAW_FINALIZING);
 
-                r = import_make_read_only_fd(i->raw_job->disk_fd);
-                if (r < 0)
-                        goto finish;
+                if (i->raw_job->etag) {
+                        /* Only make a read-only copy if ETag header is set. */
+                        r = import_make_read_only_fd(i->raw_job->disk_fd);
+                        if (r < 0)
+                                goto finish;
 
-                r = rename_noreplace(AT_FDCWD, i->temp_path, AT_FDCWD, i->final_path);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to rename raw file to %s: %m", i->final_path);
-                        goto finish;
+                        r = rename_noreplace(AT_FDCWD, i->temp_path, AT_FDCWD, i->final_path);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to rename raw file to %s: %m", i->final_path);
+                                goto finish;
+                        }
                 }
 
                 i->temp_path = mfree(i->temp_path);
@@ -600,10 +594,7 @@ static int raw_pull_job_on_open_disk_raw(PullJob *j) {
         if (r < 0)
                 return r;
 
-        r = chattr_fd(j->disk_fd, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
-        if (r < 0)
-                log_warning_errno(r, "Failed to set file attributes on %s, ignoring: %m", i->temp_path);
-
+        (void) import_set_nocow_and_log(j->disk_fd, i->temp_path);
         return 0;
 }
 

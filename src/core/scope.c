@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <unistd.h>
@@ -8,6 +8,7 @@
 #include "dbus-unit.h"
 #include "load-dropin.h"
 #include "log.h"
+#include "process-util.h"
 #include "scope.h"
 #include "serialize.h"
 #include "special.h"
@@ -34,6 +35,7 @@ static void scope_init(Unit *u) {
         assert(u);
         assert(u->load_state == UNIT_STUB);
 
+        s->runtime_max_usec = USEC_INFINITY;
         s->timeout_stop_usec = u->manager->default_timeout_stop_usec;
         u->ignore_on_isolate = true;
 }
@@ -125,9 +127,7 @@ static int scope_add_default_dependencies(Scope *s) {
 
 static int scope_verify(Scope *s) {
         assert(s);
-
-        if (UNIT(s)->load_state != UNIT_LOADED)
-                return 0;
+        assert(UNIT(s)->load_state == UNIT_LOADED);
 
         if (set_isempty(UNIT(s)->pids) &&
             !MANAGER_IS_RELOADING(UNIT(s)->manager) &&
@@ -162,6 +162,20 @@ static int scope_load_init_scope(Unit *u) {
         return 1;
 }
 
+static int scope_add_extras(Scope *s) {
+        int r;
+
+        r = unit_patch_contexts(UNIT(s));
+        if (r < 0)
+                return r;
+
+        r = unit_set_default_slice(UNIT(s));
+        if (r < 0)
+                return r;
+
+        return scope_add_default_dependencies(s);
+}
+
 static int scope_load(Unit *u) {
         Scope *s = SCOPE(u);
         int r;
@@ -176,25 +190,36 @@ static int scope_load(Unit *u) {
         r = scope_load_init_scope(u);
         if (r < 0)
                 return r;
-        r = unit_load_fragment_and_dropin_optional(u);
+
+        r = unit_load_fragment_and_dropin(u, false);
         if (r < 0)
                 return r;
 
-        if (u->load_state == UNIT_LOADED) {
-                r = unit_patch_contexts(u);
-                if (r < 0)
-                        return r;
+        if (u->load_state != UNIT_LOADED)
+                return 0;
 
-                r = unit_set_default_slice(u);
-                if (r < 0)
-                        return r;
-
-                r = scope_add_default_dependencies(s);
-                if (r < 0)
-                        return r;
-        }
+        r = scope_add_extras(s);
+        if (r < 0)
+                return r;
 
         return scope_verify(s);
+}
+
+static usec_t scope_coldplug_timeout(Scope *s) {
+        assert(s);
+
+        switch (s->deserialized_state) {
+
+        case SCOPE_RUNNING:
+                return usec_add(UNIT(s)->active_enter_timestamp.monotonic, s->runtime_max_usec);
+
+        case SCOPE_STOP_SIGKILL:
+        case SCOPE_STOP_SIGTERM:
+                return usec_add(UNIT(s)->state_change_timestamp.monotonic, s->timeout_stop_usec);
+
+        default:
+                return USEC_INFINITY;
+        }
 }
 
 static int scope_coldplug(Unit *u) {
@@ -207,14 +232,22 @@ static int scope_coldplug(Unit *u) {
         if (s->deserialized_state == s->state)
                 return 0;
 
-        if (IN_SET(s->deserialized_state, SCOPE_STOP_SIGKILL, SCOPE_STOP_SIGTERM)) {
-                r = scope_arm_timer(s, usec_add(u->state_change_timestamp.monotonic, s->timeout_stop_usec));
-                if (r < 0)
-                        return r;
-        }
+        r = scope_arm_timer(s, scope_coldplug_timeout(s));
+        if (r < 0)
+                return r;
 
-        if (!IN_SET(s->deserialized_state, SCOPE_DEAD, SCOPE_FAILED))
-                (void) unit_enqueue_rewatch_pids(u);
+        if (!IN_SET(s->deserialized_state, SCOPE_DEAD, SCOPE_FAILED)) {
+                if (u->pids) {
+                        void *pidp;
+
+                        SET_FOREACH(pidp, u->pids) {
+                                r = unit_watch_pid(u, PTR_TO_PID(pidp), false);
+                                if (r < 0 && r != -EEXIST)
+                                        return r;
+                        }
+                } else
+                        (void) unit_enqueue_rewatch_pids(u);
+        }
 
         bus_scope_track_controller(s);
 
@@ -224,17 +257,20 @@ static int scope_coldplug(Unit *u) {
 
 static void scope_dump(Unit *u, FILE *f, const char *prefix) {
         Scope *s = SCOPE(u);
+        char buf_runtime[FORMAT_TIMESPAN_MAX];
 
         assert(s);
         assert(f);
 
         fprintf(f,
                 "%sScope State: %s\n"
-                "%sResult: %s\n",
+                "%sResult: %s\n"
+                "%sRuntimeMaxSec: %s\n",
                 prefix, scope_state_to_string(s->state),
-                prefix, scope_result_to_string(s->result));
+                prefix, scope_result_to_string(s->result),
+                prefix, format_timespan(buf_runtime, sizeof(buf_runtime), s->runtime_max_usec, USEC_PER_SEC));
 
-        cgroup_context_dump(&s->cgroup_context, f, prefix);
+        cgroup_context_dump(UNIT(s), f, prefix);
         kill_context_dump(&s->kill_context, f, prefix);
 }
 
@@ -330,14 +366,13 @@ static int scope_start(Unit *u) {
                 return r;
 
         (void) unit_realize_cgroup(u);
-        (void) unit_reset_cpu_accounting(u);
-        (void) unit_reset_ip_accounting(u);
+        (void) unit_reset_accounting(u);
 
-        unit_export_state_files(UNIT(s));
+        unit_export_state_files(u);
 
-        r = unit_attach_pids_to_cgroup(u, UNIT(s)->pids, NULL);
+        r = unit_attach_pids_to_cgroup(u, u->pids, NULL);
         if (r < 0) {
-                log_unit_warning_errno(UNIT(s), r, "Failed to add PIDs to scope's control group: %m");
+                log_unit_warning_errno(u, r, "Failed to add PIDs to scope's control group: %m");
                 scope_enter_dead(s, SCOPE_FAILURE_RESOURCES);
                 return r;
         }
@@ -346,8 +381,17 @@ static int scope_start(Unit *u) {
 
         scope_set_state(s, SCOPE_RUNNING);
 
-        /* Start watching the PIDs currently in the scope */
-        (void) unit_enqueue_rewatch_pids(UNIT(s));
+        /* Set the maximum runtime timeout. */
+        scope_arm_timer(s, usec_add(UNIT(s)->active_enter_timestamp.monotonic, s->runtime_max_usec));
+
+        /* On unified we use proper notifications hence we can unwatch the PIDs
+         * we just attached to the scope. This can also be done on legacy as
+         * we're going to update the list of the processes we watch with the
+         * PIDs currently in the scope anyway. */
+        unit_unwatch_all_pids(u);
+
+        /* Start watching the PIDs currently in the scope (legacy hierarchy only) */
+        (void) unit_enqueue_rewatch_pids(u);
         return 1;
 }
 
@@ -400,6 +444,7 @@ static int scope_get_timeout(Unit *u, usec_t *timeout) {
 
 static int scope_serialize(Unit *u, FILE *f, FDSet *fds) {
         Scope *s = SCOPE(u);
+        void *pidp;
 
         assert(s);
         assert(f);
@@ -410,6 +455,9 @@ static int scope_serialize(Unit *u, FILE *f, FDSet *fds) {
 
         if (s->controller)
                 (void) serialize_item(f, "controller", s->controller);
+
+        SET_FOREACH(pidp, u->pids)
+                serialize_item_format(f, "pids", PID_FMT, PTR_TO_PID(pidp));
 
         return 0;
 }
@@ -446,6 +494,20 @@ static int scope_deserialize_item(Unit *u, const char *key, const char *value, F
                 if (r < 0)
                         return log_oom();
 
+        } else if (streq(key, "pids")) {
+                pid_t pid;
+
+                if (parse_pid(value, &pid) < 0)
+                        log_unit_debug(u, "Failed to parse pids value: %s", value);
+                else {
+                        r = set_ensure_allocated(&u->pids, NULL);
+                        if (r < 0)
+                                return r;
+
+                        r = set_put(u->pids, PID_TO_PTR(pid));
+                        if (r < 0)
+                                return r;
+                }
         } else
                 log_unit_debug(u, "Unknown serialization key: %s", key);
 
@@ -460,6 +522,11 @@ static void scope_notify_cgroup_empty_event(Unit *u) {
 
         if (IN_SET(s->state, SCOPE_RUNNING, SCOPE_ABANDONED, SCOPE_STOP_SIGTERM, SCOPE_STOP_SIGKILL))
                 scope_enter_dead(s, SCOPE_SUCCESS);
+
+        /* If the cgroup empty notification comes when the unit is not active, we must have failed to clean
+         * up the cgroup earlier and should do it now. */
+        if (IN_SET(s->state, SCOPE_DEAD, SCOPE_FAILED))
+                unit_prune_cgroup(u);
 }
 
 static void scope_sigchld_event(Unit *u, pid_t pid, int code, int status) {
@@ -479,6 +546,11 @@ static int scope_dispatch_timer(sd_event_source *source, usec_t usec, void *user
         assert(s->timer_event_source == source);
 
         switch (s->state) {
+
+        case SCOPE_RUNNING:
+                log_unit_warning(UNIT(s), "Scope reached runtime time limit. Stopping.");
+                scope_enter_signal(s, SCOPE_STOP_SIGTERM, SCOPE_FAILURE_TIMEOUT);
+                break;
 
         case SCOPE_STOP_SIGTERM:
                 if (s->kill_context.send_sigkill) {
@@ -587,7 +659,9 @@ const UnitVTable scope_vtable = {
 
         .can_transient = true,
         .can_delegate = true,
+        .can_fail = true,
         .once_only = true,
+        .can_set_managed_oom = true,
 
         .init = scope_init,
         .load = scope_load,
@@ -601,6 +675,9 @@ const UnitVTable scope_vtable = {
         .stop = scope_stop,
 
         .kill = scope_kill,
+
+        .freeze = unit_freeze_vtable_common,
+        .thaw = unit_thaw_vtable_common,
 
         .get_timeout = scope_get_timeout,
 
@@ -616,7 +693,6 @@ const UnitVTable scope_vtable = {
 
         .notify_cgroup_empty = scope_notify_cgroup_empty_event,
 
-        .bus_vtable = bus_scope_vtable,
         .bus_set_property = bus_scope_set_property,
         .bus_commit_properties = bus_scope_commit_properties,
 

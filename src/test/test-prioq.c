@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdlib.h>
 
@@ -6,7 +6,7 @@
 #include "prioq.h"
 #include "set.h"
 #include "siphash24.h"
-#include "util.h"
+#include "sort-util.h"
 
 #define SET_SIZE 1024*4
 
@@ -60,7 +60,7 @@ DEFINE_PRIVATE_HASH_OPS(test_hash_ops, struct test, test_hash, test_compare);
 
 static void test_struct(void) {
         _cleanup_(prioq_freep) Prioq *q = NULL;
-        _cleanup_(set_freep) Set *s = NULL;
+        _cleanup_set_free_ Set *s = NULL;
         unsigned previous = 0, i;
         struct test *t;
 

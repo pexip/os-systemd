@@ -1,5 +1,7 @@
 ---
 title: Automatic Boot Assessment
+category: Booting
+layout: default
 ---
 
 # Automatic Boot Assessment
@@ -8,12 +10,11 @@ systemd provides support for automatically reverting back to the previous
 version of the OS or kernel in case the system consistently fails to boot. This
 support is built into various of its components. When used together these
 components provide a complete solution on UEFI systems, built as add-on to the
-[Boot Loader
-Specification](https://systemd.io/BOOT_LOADER_SPECIFICATION). However, the
-different components may also be used independently, and in combination with
-other software, to implement similar schemes, for example with other boot
-loaders or for non-UEFI systems. Here's a brief overview of the complete set of
-components:
+[Boot Loader Specification](https://systemd.io/BOOT_LOADER_SPECIFICATION).
+However, the different components may also be used independently, and in
+combination with other software, to implement similar schemes, for example with
+other boot loaders or for non-UEFI systems. Here's a brief overview of the
+complete set of components:
 
 * The
   [`systemd-boot(7)`](https://www.freedesktop.org/software/systemd/man/systemd-boot.html)
@@ -43,18 +44,17 @@ components:
 
 * The `boot-complete.target` target unit (see
   [`systemd.special(7)`](https://www.freedesktop.org/software/systemd/man/systemd.special.html))
-  serves as a generic extension point both for units that shall be considered
-  necessary to consider a boot successful on one side (example:
-  `systemd-boot-check-no-failures.service` as described above), and units that
-  want to act only if the boot is successful on the other (example:
-  `systemd-bless-boot.service` as described above).
+  serves as a generic extension point both for units that are necessary to
+  consider a boot successful (example: `systemd-boot-check-no-failures.service`
+  as described above), and units that want to act only if the boot is
+  successful (example: `systemd-bless-boot.service` as described above).
 
 * The
   [`kernel-install(8)`](https://www.freedesktop.org/software/systemd/man/kernel-install.html)
   script can optionally create boot loader entries that carry an initial boot
   counter (the initial counter is configurable in `/etc/kernel/tries`).
 
-# Details
+## Details
 
 The boot counting data `systemd-boot` and `systemd-bless-boot.service`
 manage is stored in the name of the boot loader entries. If a boot loader entry
@@ -97,11 +97,11 @@ Here's an example walkthrough of how this all fits together.
    see the `+1-2` tag, and rename the file to
    `4.14.11-300.fc27.x86_64+0-3.conf` and boot it.
 
-6. If this boot also fails, on the next boot the boot loader will see the the
+6. If this boot also fails, on the next boot the boot loader will see the
    tag `+0-3`, i.e. the counter reached zero. At this point the entry will be
-   considered "bad", and ordered to the end of the list of entries. The next
-   newest boot entry is now tried, i.e. the system automatically reverted back
-   to an earlier version.
+   considered "bad", and ordered to the beginning of the list of entries. The
+   next newest boot entry is now tried, i.e. the system automatically reverted
+   back to an earlier version.
 
 The above describes the walkthrough when the selected boot entry continuously
 fails. Let's have a look at an alternative ending to this walkthrough. In this
@@ -147,7 +147,7 @@ scenario the first 4 steps are the same as above:
 12. On the following boot (and all subsequent boots after that) the entry is
     now seen with boot counting turned off, no further renaming takes place.
 
-# How to adapt this scheme to other setups
+## How to adapt this scheme to other setups
 
 Of the stack described above many components may be replaced or augmented. Here
 are a couple of recommendations.
@@ -178,7 +178,7 @@ are a couple of recommendations.
    wrap them in a unit and order them after `boot-complete.target`, pulling it
    in.
 
-# FAQ
+## FAQ
 
 1. *Why do you use file renames to store the counter? Why not a regular file?*
    — Mainly two reasons: it's relatively likely that renames can be implemented

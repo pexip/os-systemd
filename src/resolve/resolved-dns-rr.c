@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <math.h>
 
@@ -7,6 +7,7 @@
 #include "dns-type.h"
 #include "escape.h"
 #include "hexdecoct.h"
+#include "memory-util.h"
 #include "resolved-dns-dnssec.h"
 #include "resolved-dns-packet.h"
 #include "resolved-dns-rr.h"
@@ -96,14 +97,16 @@ DnsResourceKey* dns_resource_key_new_consume(uint16_t class, uint16_t type, char
 
         assert(name);
 
-        k = new0(DnsResourceKey, 1);
+        k = new(DnsResourceKey, 1);
         if (!k)
                 return NULL;
 
-        k->n_ref = 1;
-        k->class = class;
-        k->type = type;
-        k->_name = name;
+        *k = (DnsResourceKey) {
+                .n_ref = 1,
+                .class = class,
+                .type = type,
+                ._name = name,
+        };
 
         return k;
 }
@@ -371,14 +374,17 @@ bool dns_resource_key_reduce(DnsResourceKey **a, DnsResourceKey **b) {
 DnsResourceRecord* dns_resource_record_new(DnsResourceKey *key) {
         DnsResourceRecord *rr;
 
-        rr = new0(DnsResourceRecord, 1);
+        rr = new(DnsResourceRecord, 1);
         if (!rr)
                 return NULL;
 
-        rr->n_ref = 1;
-        rr->key = dns_resource_key_ref(key);
-        rr->expiry = USEC_INFINITY;
-        rr->n_skip_labels_signer = rr->n_skip_labels_source = (unsigned) -1;
+        *rr = (DnsResourceRecord) {
+                .n_ref = 1,
+                .key = dns_resource_key_ref(key),
+                .expiry = USEC_INFINITY,
+                .n_skip_labels_signer = (unsigned) -1,
+                .n_skip_labels_source = (unsigned) -1,
+        };
 
         return rr;
 }
@@ -473,11 +479,11 @@ static DnsResourceRecord* dns_resource_record_free(DnsResourceRecord *rr) {
 
                 case DNS_TYPE_OPENPGPKEY:
                 default:
-                        if (!rr->unparseable)
+                        if (!rr->unparsable)
                                 free(rr->generic.data);
                 }
 
-                if (rr->unparseable)
+                if (rr->unparsable)
                         free(rr->generic.data);
 
                 free(rr->wire_format);
@@ -555,25 +561,17 @@ int dns_resource_record_new_address(DnsResourceRecord **ret, int family, const u
 
 #define FIELD_EQUAL(a, b, field) \
         ((a).field ## _size == (b).field ## _size &&  \
-         memcmp((a).field, (b).field, (a).field ## _size) == 0)
+         memcmp_safe((a).field, (b).field, (a).field ## _size) == 0)
 
-int dns_resource_record_equal(const DnsResourceRecord *a, const DnsResourceRecord *b) {
+int dns_resource_record_payload_equal(const DnsResourceRecord *a, const DnsResourceRecord *b) {
         int r;
 
-        assert(a);
-        assert(b);
+        /* Check if a and b are the same, but don't look at their keys */
 
-        if (a == b)
-                return 1;
-
-        r = dns_resource_key_equal(a->key, b->key);
-        if (r <= 0)
-                return r;
-
-        if (a->unparseable != b->unparseable)
+        if (a->unparsable != b->unparsable)
                 return 0;
 
-        switch (a->unparseable ? _DNS_TYPE_INVALID : a->key->type) {
+        switch (a->unparsable ? _DNS_TYPE_INVALID : a->key->type) {
 
         case DNS_TYPE_SRV:
                 r = dns_name_equal(a->srv.name, b->srv.name);
@@ -692,6 +690,22 @@ int dns_resource_record_equal(const DnsResourceRecord *a, const DnsResourceRecor
         }
 }
 
+int dns_resource_record_equal(const DnsResourceRecord *a, const DnsResourceRecord *b) {
+        int r;
+
+        assert(a);
+        assert(b);
+
+        if (a == b)
+                return 1;
+
+        r = dns_resource_key_equal(a->key, b->key);
+        if (r <= 0)
+                return r;
+
+        return dns_resource_record_payload_equal(a, b);
+}
+
 static char* format_location(uint32_t latitude, uint32_t longitude, uint32_t altitude,
                              uint8_t size, uint8_t horiz_pre, uint8_t vert_pre) {
         char *s;
@@ -741,11 +755,10 @@ static int format_timestamp_dns(char *buf, size_t l, time_t sec) {
 static char *format_types(Bitmap *types) {
         _cleanup_strv_free_ char **strv = NULL;
         _cleanup_free_ char *str = NULL;
-        Iterator i;
         unsigned type;
         int r;
 
-        BITMAP_FOREACH(type, types, i) {
+        BITMAP_FOREACH(type, types) {
                 if (dns_type_to_string(type)) {
                         r = strv_extend(&strv, dns_type_to_string(type));
                         if (r < 0)
@@ -819,7 +832,7 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
 
         dns_resource_key_to_string(rr->key, k, sizeof(k));
 
-        switch (rr->unparseable ? _DNS_TYPE_INVALID : rr->key->type) {
+        switch (rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
 
         case DNS_TYPE_SRV:
                 r = asprintf(&s, "%s %u %u %u %s",
@@ -954,7 +967,6 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
         case DNS_TYPE_DNSKEY: {
                 _cleanup_free_ char *alg = NULL;
                 char *ss;
-                int n;
                 uint16_t key_tag;
 
                 key_tag = dnssec_keytag(rr, true);
@@ -963,16 +975,15 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                 if (r < 0)
                         return NULL;
 
-                r = asprintf(&s, "%s %u %u %s %n",
+                r = asprintf(&s, "%s %u %u %s",
                              k,
                              rr->dnskey.flags,
                              rr->dnskey.protocol,
-                             alg,
-                             &n);
+                             alg);
                 if (r < 0)
                         return NULL;
 
-                r = base64_append(&s, n,
+                r = base64_append(&s, r,
                                   rr->dnskey.key, rr->dnskey.key_size,
                                   8, columns());
                 if (r < 0)
@@ -998,7 +1009,6 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                 _cleanup_free_ char *alg = NULL;
                 char expiration[STRLEN("YYYYMMDDHHmmSS") + 1], inception[STRLEN("YYYYMMDDHHmmSS") + 1];
                 const char *type;
-                int n;
 
                 type = dns_type_to_string(rr->rrsig.type_covered);
 
@@ -1017,7 +1027,7 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                 /* TYPE?? follows
                  * http://tools.ietf.org/html/rfc3597#section-5 */
 
-                r = asprintf(&s, "%s %s%.*u %s %u %u %s %s %u %s %n",
+                r = asprintf(&s, "%s %s%.*u %s %u %u %s %s %u %s",
                              k,
                              type ?: "TYPE",
                              type ? 0 : 1, type ? 0u : (unsigned) rr->rrsig.type_covered,
@@ -1027,12 +1037,11 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                              expiration,
                              inception,
                              rr->rrsig.key_tag,
-                             rr->rrsig.signer,
-                             &n);
+                             rr->rrsig.signer);
                 if (r < 0)
                         return NULL;
 
-                r = base64_append(&s, n,
+                r = base64_append(&s, r,
                                   rr->rrsig.signature, rr->rrsig.signature_size,
                                   8, columns());
                 if (r < 0)
@@ -1138,15 +1147,11 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
         }
 
         case DNS_TYPE_OPENPGPKEY: {
-                int n;
-
-                r = asprintf(&s, "%s %n",
-                             k,
-                             &n);
+                r = asprintf(&s, "%s", k);
                 if (r < 0)
                         return NULL;
 
-                r = base64_append(&s, n,
+                r = base64_append(&s, r,
                                   rr->generic.data, rr->generic.data_size,
                                   8, columns());
                 if (r < 0)
@@ -1174,7 +1179,7 @@ ssize_t dns_resource_record_payload(DnsResourceRecord *rr, void **out) {
         assert(rr);
         assert(out);
 
-        switch(rr->unparseable ? _DNS_TYPE_INVALID : rr->key->type) {
+        switch(rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
         case DNS_TYPE_SRV:
         case DNS_TYPE_PTR:
         case DNS_TYPE_NS:
@@ -1342,7 +1347,7 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
 
         dns_resource_key_hash_func(rr->key, state);
 
-        switch (rr->unparseable ? _DNS_TYPE_INVALID : rr->key->type) {
+        switch (rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
 
         case DNS_TYPE_SRV:
                 siphash24_compress(&rr->srv.priority, sizeof(rr->srv.priority), state);
@@ -1368,7 +1373,7 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
                 DnsTxtItem *j;
 
                 LIST_FOREACH(items, j, rr->txt.items) {
-                        siphash24_compress(j->data, j->length, state);
+                        siphash24_compress_safe(j->data, j->length, state);
 
                         /* Add an extra NUL byte, so that "a" followed by "b" doesn't result in the same hash as "ab"
                          * followed by "". */
@@ -1413,14 +1418,14 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
         case DNS_TYPE_SSHFP:
                 siphash24_compress(&rr->sshfp.algorithm, sizeof(rr->sshfp.algorithm), state);
                 siphash24_compress(&rr->sshfp.fptype, sizeof(rr->sshfp.fptype), state);
-                siphash24_compress(rr->sshfp.fingerprint, rr->sshfp.fingerprint_size, state);
+                siphash24_compress_safe(rr->sshfp.fingerprint, rr->sshfp.fingerprint_size, state);
                 break;
 
         case DNS_TYPE_DNSKEY:
                 siphash24_compress(&rr->dnskey.flags, sizeof(rr->dnskey.flags), state);
                 siphash24_compress(&rr->dnskey.protocol, sizeof(rr->dnskey.protocol), state);
                 siphash24_compress(&rr->dnskey.algorithm, sizeof(rr->dnskey.algorithm), state);
-                siphash24_compress(rr->dnskey.key, rr->dnskey.key_size, state);
+                siphash24_compress_safe(rr->dnskey.key, rr->dnskey.key_size, state);
                 break;
 
         case DNS_TYPE_RRSIG:
@@ -1432,7 +1437,7 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
                 siphash24_compress(&rr->rrsig.inception, sizeof(rr->rrsig.inception), state);
                 siphash24_compress(&rr->rrsig.key_tag, sizeof(rr->rrsig.key_tag), state);
                 dns_name_hash_func(rr->rrsig.signer, state);
-                siphash24_compress(rr->rrsig.signature, rr->rrsig.signature_size, state);
+                siphash24_compress_safe(rr->rrsig.signature, rr->rrsig.signature_size, state);
                 break;
 
         case DNS_TYPE_NSEC:
@@ -1446,15 +1451,15 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
                 siphash24_compress(&rr->ds.key_tag, sizeof(rr->ds.key_tag), state);
                 siphash24_compress(&rr->ds.algorithm, sizeof(rr->ds.algorithm), state);
                 siphash24_compress(&rr->ds.digest_type, sizeof(rr->ds.digest_type), state);
-                siphash24_compress(rr->ds.digest, rr->ds.digest_size, state);
+                siphash24_compress_safe(rr->ds.digest, rr->ds.digest_size, state);
                 break;
 
         case DNS_TYPE_NSEC3:
                 siphash24_compress(&rr->nsec3.algorithm, sizeof(rr->nsec3.algorithm), state);
                 siphash24_compress(&rr->nsec3.flags, sizeof(rr->nsec3.flags), state);
                 siphash24_compress(&rr->nsec3.iterations, sizeof(rr->nsec3.iterations), state);
-                siphash24_compress(rr->nsec3.salt, rr->nsec3.salt_size, state);
-                siphash24_compress(rr->nsec3.next_hashed_name, rr->nsec3.next_hashed_name_size, state);
+                siphash24_compress_safe(rr->nsec3.salt, rr->nsec3.salt_size, state);
+                siphash24_compress_safe(rr->nsec3.next_hashed_name, rr->nsec3.next_hashed_name_size, state);
                 /* FIXME: We leave the bitmaps out */
                 break;
 
@@ -1462,18 +1467,18 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
                 siphash24_compress(&rr->tlsa.cert_usage, sizeof(rr->tlsa.cert_usage), state);
                 siphash24_compress(&rr->tlsa.selector, sizeof(rr->tlsa.selector), state);
                 siphash24_compress(&rr->tlsa.matching_type, sizeof(rr->tlsa.matching_type), state);
-                siphash24_compress(rr->tlsa.data, rr->tlsa.data_size, state);
+                siphash24_compress_safe(rr->tlsa.data, rr->tlsa.data_size, state);
                 break;
 
         case DNS_TYPE_CAA:
                 siphash24_compress(&rr->caa.flags, sizeof(rr->caa.flags), state);
                 string_hash_func(rr->caa.tag, state);
-                siphash24_compress(rr->caa.value, rr->caa.value_size, state);
+                siphash24_compress_safe(rr->caa.value, rr->caa.value_size, state);
                 break;
 
         case DNS_TYPE_OPENPGPKEY:
         default:
-                siphash24_compress(rr->generic.data, rr->generic.data_size, state);
+                siphash24_compress_safe(rr->generic.data, rr->generic.data_size, state);
                 break;
         }
 }
@@ -1509,9 +1514,9 @@ DnsResourceRecord *dns_resource_record_copy(DnsResourceRecord *rr) {
         copy->expiry = rr->expiry;
         copy->n_skip_labels_signer = rr->n_skip_labels_signer;
         copy->n_skip_labels_source = rr->n_skip_labels_source;
-        copy->unparseable = rr->unparseable;
+        copy->unparsable = rr->unparsable;
 
-        switch (rr->unparseable ? _DNS_TYPE_INVALID : rr->key->type) {
+        switch (rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
 
         case DNS_TYPE_SRV:
                 copy->srv.priority = rr->srv.priority;
@@ -1645,7 +1650,7 @@ DnsResourceRecord *dns_resource_record_copy(DnsResourceRecord *rr) {
                         return NULL;
                 copy->nsec3.salt_size = rr->nsec3.salt_size;
                 copy->nsec3.next_hashed_name = memdup(rr->nsec3.next_hashed_name, rr->nsec3.next_hashed_name_size);
-                if (!copy->nsec3.next_hashed_name_size)
+                if (!copy->nsec3.next_hashed_name)
                         return NULL;
                 copy->nsec3.next_hashed_name_size = rr->nsec3.next_hashed_name_size;
                 copy->nsec3.types = bitmap_copy(rr->nsec3.types);

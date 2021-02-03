@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <getopt.h>
@@ -66,7 +66,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hqcv", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -128,7 +128,7 @@ static int run(int argc, char *argv[]) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to read machine ID back: %m");
         } else {
-                r = machine_id_setup(arg_root, SD_ID128_NULL, &id);
+                r = machine_id_setup(arg_root, false, SD_ID128_NULL, &id);
                 if (r < 0)
                         return r;
         }

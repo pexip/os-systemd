@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <curl/curl.h>
 #include <sys/prctl.h>
@@ -244,7 +244,7 @@ static int tar_pull_make_local_copy(TarPull *i) {
 
                 local_settings = strjoina(i->image_root, "/", i->local, ".nspawn");
 
-                r = copy_file_atomic(i->settings_path, local_settings, 0664, 0, COPY_REFLINK | (i->force_local ? COPY_REPLACE : 0));
+                r = copy_file_atomic(i->settings_path, local_settings, 0664, 0, 0, COPY_REFLINK | (i->force_local ? COPY_REPLACE : 0));
                 if (r == -EEXIST)
                         log_warning_errno(r, "Settings file %s already exists, not replacing.", local_settings);
                 else if (r == -ENOENT)
@@ -296,9 +296,8 @@ static void tar_pull_job_on_finished(PullJob *j) {
                 goto finish;
         }
 
-        /* This is invoked if either the download completed
-         * successfully, or the download was skipped because we
-         * already have the etag. */
+        /* This is invoked if either the download completed successfully, or the download was skipped because
+         * we already have the etag. */
 
         if (!tar_pull_is_done(i))
                 return;
@@ -339,6 +338,10 @@ static void tar_pull_job_on_finished(PullJob *j) {
                         goto finish;
 
                 tar_pull_report_progress(i, TAR_FINALIZING);
+
+                r = import_mangle_os_tree(i->temp_path);
+                if (r < 0)
+                        goto finish;
 
                 r = import_make_read_only(i->temp_path);
                 if (r < 0)
@@ -415,13 +418,10 @@ static int tar_pull_job_on_open_disk_tar(PullJob *j) {
 
         mkdir_parents_label(i->temp_path, 0700);
 
-        r = btrfs_subvol_make(i->temp_path);
-        if (r == -ENOTTY) {
-                if (mkdir(i->temp_path, 0755) < 0)
-                        return log_error_errno(errno, "Failed to create directory %s: %m", i->temp_path);
-        } else if (r < 0)
-                return log_error_errno(r, "Failed to create subvolume %s: %m", i->temp_path);
-        else
+        r = btrfs_subvol_make_fallback(i->temp_path, 0755);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create directory/subvolume %s: %m", i->temp_path);
+        if (r > 0) /* actually btrfs subvol */
                 (void) import_assign_pool_quota_and_warn(i->temp_path);
 
         j->disk_fd = import_fork_tar_x(i->temp_path, &i->tar_pid);

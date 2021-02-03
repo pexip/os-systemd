@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdio.h>
 
@@ -32,6 +32,21 @@ int main(int argc, char *argv[]) {
         assert_se(p = strdup("\x1B[waldo"));
         assert_se(strip_tab_ansi(&p, NULL, NULL));
         assert_se(streq(p, "\x1B[waldo"));
+        free(p);
+
+        assert_se(p = strdup("\r\rwaldo"));
+        assert_se(strip_tab_ansi(&p, NULL, NULL));
+        assert_se(streq(p, "\r\rwaldo"));
+        free(p);
+
+        assert_se(p = strdup("waldo\r\r"));
+        assert_se(strip_tab_ansi(&p, NULL, NULL));
+        assert_se(streq(p, "waldo"));
+        free(p);
+
+        assert_se(p = strdup("waldo\r\r\n\r\n"));
+        assert_se(strip_tab_ansi(&p, NULL, NULL));
+        assert_se(streq(p, "waldo\n\n"));
         free(p);
 
         assert_se(terminal_urlify_path("/etc/fstab", "i am a fabulous link", &urlified) >= 0);

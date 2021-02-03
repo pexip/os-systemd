@@ -1,10 +1,7 @@
 <?xml version='1.0'?>
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
-"http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-
-<!--
-  SPDX-License-Identifier: LGPL-2.1+
--->
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-run"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -120,6 +117,7 @@
 
       <varlistentry>
         <term><option>--unit=</option></term>
+        <term><option>-u</option></term>
 
         <listitem><para>Use this unit name instead of an automatically
         generated one.</para></listitem>
@@ -148,8 +146,24 @@
       <varlistentry>
         <term><option>--slice=</option></term>
 
-        <listitem><para>Make the new <filename>.service</filename> or <filename>.scope</filename> unit part of the
-        specified slice, instead of <filename>system.slice</filename>.</para>
+        <listitem><para>Make the new <filename>.service</filename> or <filename>.scope</filename> unit part
+        of the specified slice, instead of <filename>system.slice</filename> (when running in
+        <option>--system</option> mode) or the root slice (when running in <option>--user</option>
+        mode).</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--slice-inherit</option></term>
+
+        <listitem><para>Make the new <filename>.service</filename> or <filename>.scope</filename> unit part
+        of the inherited slice. This option can be combined with <option>--slice=</option>.</para>
+
+        <para>An inherited slice is located within <command>systemd-run</command> slice. Example: if
+        <command>systemd-run</command> slice is <filename>foo.slice</filename>, and the
+        <option>--slice=</option> argument is <filename>bar</filename>, the unit will be placed under the
+        <filename>foo-bar.slice</filename>.</para>
+
         </listitem>
       </varlistentry>
 
@@ -320,6 +334,18 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>--on-clock-change</option></term>
+        <term><option>--on-timezone-change</option></term>
+
+        <listitem><para>Defines a trigger based on system clock jumps or timezone changes for starting the
+        specified command. See <varname>OnClockChange=</varname> and <varname>OnTimezoneChange=</varname> in
+        <citerefentry><refentrytitle>systemd.timer</refentrytitle><manvolnum>5</manvolnum></citerefentry>. These
+        options are shortcuts for <command>--timer-property=OnClockChange=yes</command> and
+        <command>--timer-property=OnTimezoneChange=yes</command>. These options may not be combined with
+        <option>--scope</option> or <option>--pty</option>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>--path-property=</option></term>
         <term><option>--socket-property=</option></term>
         <term><option>--timer-property=</option></term>
@@ -389,8 +415,13 @@
   <refsect1>
     <title>Exit status</title>
 
-    <para>On success, 0 is returned, a non-zero failure
-    code otherwise.</para>
+    <para>On success, 0 is returned. If <command>systemd-run</command> failed to start the service, a
+    non-zero return value will be returned. If <command>systemd-run</command> waits for the service to
+    terminate, the return value will be propagated from the service. 0 will be returned on success, including
+    all the cases where systemd considers a service to have exited cleanly, see the discussion of
+    <varname>SuccessExitStatus=</varname> in
+    <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+    </para>
   </refsect1>
 
   <refsect1>
@@ -432,11 +463,11 @@ Mon Dec  8 20:44:24 KST 2014
 Running as unit: run-71.timer
 Will run service as unit: run-71.service
 # journalctl -b -u run-71.timer
--- Logs begin at Fri 2014-12-05 19:09:21 KST, end at Mon 2014-12-08 20:44:54 KST. --
+-- Journal begins at Fri 2014-12-05 19:09:21 KST, ends at Mon 2014-12-08 20:44:54 KST. --
 Dec 08 20:44:38 container systemd[1]: Starting /bin/touch /tmp/foo.
 Dec 08 20:44:38 container systemd[1]: Started /bin/touch /tmp/foo.
 # journalctl -b -u run-71.service
--- Logs begin at Fri 2014-12-05 19:09:21 KST, end at Mon 2014-12-08 20:44:54 KST. --
+-- Journal begins at Fri 2014-12-05 19:09:21 KST, ends at Mon 2014-12-08 20:44:54 KST. --
 Dec 08 20:44:48 container systemd[1]: Starting /bin/touch /tmp/foo...
 Dec 08 20:44:48 container systemd[1]: Started /bin/touch /tmp/foo.</programlisting>
     </example>
@@ -492,6 +523,16 @@ There is a screen on:
       enable lingering for themselves:</para>
 
       <programlisting>$ loginctl enable-linger</programlisting>
+    </example>
+
+    <example>
+      <title>Return value</title>
+
+      <programlisting>$ systemd-run --user --wait true
+$ systemd-run --user --wait -p SuccessExitStatus=11 bash -c 'exit 11'
+$ systemd-run --user --wait -p SuccessExitStatus=SIGUSR1 bash -c 'kill -SIGUSR1 $$$$'</programlisting>
+
+      <para>Those three invocations will succeed, i.e. terminate with an exit code of 0.</para>
     </example>
   </refsect1>
 

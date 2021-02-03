@@ -1,13 +1,13 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2014 Axis Communications AB. All rights reserved.
 ***/
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/if_ether.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "sd-ipv4acd.h"
 
@@ -21,7 +21,7 @@
 #include "random-util.h"
 #include "siphash24.h"
 #include "string-util.h"
-#include "util.h"
+#include "time-util.h"
 
 /* Constants from the RFC */
 #define PROBE_WAIT_USEC (1U * USEC_PER_SEC)
@@ -72,7 +72,7 @@ struct sd_ipv4acd {
         void* userdata;
 };
 
-#define log_ipv4acd_errno(acd, error, fmt, ...) log_internal(LOG_DEBUG, error, __FILE__, __LINE__, __func__, "IPV4ACD: " fmt, ##__VA_ARGS__)
+#define log_ipv4acd_errno(acd, error, fmt, ...) log_internal(LOG_DEBUG, error, PROJECT_FILE, __LINE__, __func__, "IPV4ACD: " fmt, ##__VA_ARGS__)
 #define log_ipv4acd(acd, fmt, ...) log_ipv4acd_errno(acd, 0, fmt, ##__VA_ARGS__)
 
 static void ipv4acd_set_state(sd_ipv4acd *acd, IPv4ACDState st, bool reset_counter) {
@@ -142,9 +142,17 @@ static void ipv4acd_client_notify(sd_ipv4acd *acd, int event) {
 }
 
 int sd_ipv4acd_stop(sd_ipv4acd *acd) {
-        assert_return(acd, -EINVAL);
+        IPv4ACDState old_state;
+
+        if (!acd)
+                return 0;
+
+        old_state = acd->state;
 
         ipv4acd_reset(acd);
+
+        if (old_state == IPV4ACD_STATE_INIT)
+                return 0;
 
         log_ipv4acd(acd, "STOPPED");
 
@@ -435,13 +443,22 @@ int sd_ipv4acd_set_address(sd_ipv4acd *acd, const struct in_addr *address) {
         return 0;
 }
 
+int sd_ipv4acd_get_address(sd_ipv4acd *acd, struct in_addr *address) {
+        assert_return(acd, -EINVAL);
+        assert_return(address, -EINVAL);
+
+        address->s_addr = acd->address;
+
+        return 0;
+}
+
 int sd_ipv4acd_is_running(sd_ipv4acd *acd) {
         assert_return(acd, false);
 
         return acd->state != IPV4ACD_STATE_INIT;
 }
 
-int sd_ipv4acd_start(sd_ipv4acd *acd) {
+int sd_ipv4acd_start(sd_ipv4acd *acd, bool reset_conflicts) {
         int r;
 
         assert_return(acd, -EINVAL);
@@ -455,10 +472,11 @@ int sd_ipv4acd_start(sd_ipv4acd *acd) {
         if (r < 0)
                 return r;
 
-        safe_close(acd->fd);
-        acd->fd = r;
+        CLOSE_AND_REPLACE(acd->fd, r);
         acd->defend_window = 0;
-        acd->n_conflict = 0;
+
+        if (reset_conflicts)
+                acd->n_conflict = 0;
 
         r = sd_event_add_io(acd->event, &acd->receive_message_event_source, acd->fd, EPOLLIN, ipv4acd_on_packet, acd);
         if (r < 0)

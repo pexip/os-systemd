@@ -1,6 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
-
-#include <stdio_ext.h>
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "env-file.h"
@@ -211,17 +209,21 @@ static int parse_env_file_internal(
                 case DOUBLE_QUOTE_VALUE_ESCAPE:
                         state = DOUBLE_QUOTE_VALUE;
 
-                        if (c == '"') {
+                        if (strchr(SHELL_NEED_ESCAPE, c)) {
+                                /* If this is a char that needs escaping, just unescape it. */
                                 if (!GREEDY_REALLOC(value, value_alloc, n_value+2))
                                         return -ENOMEM;
-                                value[n_value++] = '"';
-                        } else if (!strchr(NEWLINE, c)) {
+                                value[n_value++] = c;
+                        } else if (c != '\n') {
+                                /* If other char than what needs escaping, keep the "\" in place, like the
+                                 * real shell does. */
                                 if (!GREEDY_REALLOC(value, value_alloc, n_value+3))
                                         return -ENOMEM;
                                 value[n_value++] = '\\';
                                 value[n_value++] = c;
                         }
 
+                        /* Escaped newlines (aka "continuation lines") are eaten up entirely */
                         break;
 
                 case COMMENT:
@@ -487,6 +489,8 @@ static int merge_env_file_push(
 
         free_and_replace(value, expanded_value);
 
+        log_debug("%s:%u: setting %s=%s", filename, line, key, value);
+
         return load_env_file_push(filename, line, key, value, env, n_pushed);
 }
 
@@ -545,7 +549,6 @@ int write_env_file(const char *fname, char **l) {
         if (r < 0)
                 return r;
 
-        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
         (void) fchmod_umask(fileno(f), 0644);
 
         STRV_FOREACH(i, l)
@@ -559,6 +562,6 @@ int write_env_file(const char *fname, char **l) {
                 r = -errno;
         }
 
-        unlink(p);
+        (void) unlink(p);
         return r;
 }

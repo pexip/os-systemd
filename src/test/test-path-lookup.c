@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -22,15 +22,15 @@ static void test_paths(UnitFileScope scope) {
         assert_se(unsetenv("SYSTEMD_UNIT_PATH") == 0);
         assert_se(lookup_paths_init(&lp_without_env, scope, 0, NULL) >= 0);
         assert_se(!strv_isempty(lp_without_env.search_path));
-        assert_se(lookup_paths_reduce(&lp_without_env) >= 0);
+        lookup_paths_log(&lp_without_env);
 
         systemd_unit_path = strjoina(template, "/systemd-unit-path");
         assert_se(setenv("SYSTEMD_UNIT_PATH", systemd_unit_path, 1) == 0);
         assert_se(lookup_paths_init(&lp_with_env, scope, 0, NULL) == 0);
         assert_se(strv_length(lp_with_env.search_path) == 1);
         assert_se(streq(lp_with_env.search_path[0], systemd_unit_path));
-        assert_se(lookup_paths_reduce(&lp_with_env) >= 0);
-        assert_se(strv_isempty(lp_with_env.search_path));
+        lookup_paths_log(&lp_with_env);
+        assert_se(strv_equal(lp_with_env.search_path, STRV_MAKE(systemd_unit_path)));
 
         assert_se(rm_rf(template, REMOVE_ROOT|REMOVE_PHYSICAL) >= 0);
 }
@@ -67,15 +67,54 @@ static void test_user_and_global_paths(void) {
                 log_info("+ %s", *p);
 }
 
-static void print_generator_binary_paths(UnitFileScope scope) {
-        _cleanup_strv_free_ char **paths;
+static void test_generator_binary_paths(UnitFileScope scope) {
+        char template[] = "/tmp/test-path-lookup.XXXXXXX";
+
+        _cleanup_strv_free_ char **gp_without_env = NULL;
+        _cleanup_strv_free_ char **env_gp_without_env = NULL;
+        _cleanup_strv_free_ char **gp_with_env = NULL;
+        _cleanup_strv_free_ char **env_gp_with_env = NULL;
+        char *systemd_generator_path = NULL;
+        char *systemd_env_generator_path = NULL;
         char **dir;
 
-        log_info("Generators dirs (%s):", scope == UNIT_FILE_SYSTEM ? "system" : "user");
+        assert_se(mkdtemp(template));
 
-        paths = generator_binary_paths(scope);
-        STRV_FOREACH(dir, paths)
+        assert_se(unsetenv("SYSTEMD_GENERATOR_PATH") == 0);
+        assert_se(unsetenv("SYSTEMD_ENVIRONMENT_GENERATOR_PATH") == 0);
+
+        gp_without_env = generator_binary_paths(scope);
+        env_gp_without_env = env_generator_binary_paths(scope == UNIT_FILE_SYSTEM ? true : false);
+
+        log_info("Generators dirs (%s):", scope == UNIT_FILE_SYSTEM ? "system" : "user");
+        STRV_FOREACH(dir, gp_without_env)
                 log_info("        %s", *dir);
+
+        log_info("Environment generators dirs (%s):", scope == UNIT_FILE_SYSTEM ? "system" : "user");
+        STRV_FOREACH(dir, env_gp_without_env)
+                log_info("        %s", *dir);
+
+        assert_se(!strv_isempty(gp_without_env));
+        assert_se(!strv_isempty(env_gp_without_env));
+
+        systemd_generator_path = strjoina(template, "/systemd-generator-path");
+        systemd_env_generator_path = strjoina(template, "/systemd-environment-generator-path");
+        assert_se(setenv("SYSTEMD_GENERATOR_PATH", systemd_generator_path, 1) == 0);
+        assert_se(setenv("SYSTEMD_ENVIRONMENT_GENERATOR_PATH", systemd_env_generator_path, 1) == 0);
+
+        gp_with_env = generator_binary_paths(scope);
+        env_gp_with_env = env_generator_binary_paths(scope == UNIT_FILE_SYSTEM ? true : false);
+
+        log_info("Generators dirs (%s):", scope == UNIT_FILE_SYSTEM ? "system" : "user");
+        STRV_FOREACH(dir, gp_with_env)
+                log_info("        %s", *dir);
+
+        log_info("Environment generators dirs (%s):", scope == UNIT_FILE_SYSTEM ? "system" : "user");
+        STRV_FOREACH(dir, env_gp_with_env)
+                log_info("        %s", *dir);
+
+        assert_se(strv_equal(gp_with_env, STRV_MAKE(systemd_generator_path)));
+        assert_se(strv_equal(env_gp_with_env, STRV_MAKE(systemd_env_generator_path)));
 }
 
 int main(int argc, char **argv) {
@@ -87,8 +126,8 @@ int main(int argc, char **argv) {
 
         test_user_and_global_paths();
 
-        print_generator_binary_paths(UNIT_FILE_SYSTEM);
-        print_generator_binary_paths(UNIT_FILE_USER);
+        test_generator_binary_paths(UNIT_FILE_SYSTEM);
+        test_generator_binary_paths(UNIT_FILE_USER);
 
         return EXIT_SUCCESS;
 }

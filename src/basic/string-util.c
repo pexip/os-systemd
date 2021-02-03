@@ -1,37 +1,39 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdio_ext.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "alloc-util.h"
 #include "escape.h"
+#include "extract-word.h"
+#include "fileio.h"
 #include "gunicode.h"
 #include "locale-util.h"
 #include "macro.h"
+#include "memory-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "terminal-util.h"
 #include "utf8.h"
 #include "util.h"
-#include "fileio.h"
 
 int strcmp_ptr(const char *a, const char *b) {
-
         /* Like strcmp(), but tries to make sense of NULL pointers */
+
         if (a && b)
                 return strcmp(a, b);
+        return CMP(a, b); /* Direct comparison of pointers, one of which is NULL */
+}
 
-        if (!a && b)
-                return -1;
+int strcasecmp_ptr(const char *a, const char *b) {
+        /* Like strcasecmp(), but tries to make sense of NULL pointers */
 
-        if (a && !b)
-                return 1;
-
-        return 0;
+        if (a && b)
+                return strcasecmp(a, b);
+        return CMP(a, b); /* Direct comparison of pointers, one of which is NULL */
 }
 
 char* endswith(const char *s, const char *postfix) {
@@ -110,71 +112,6 @@ char* first_word(const char *s, const char *word) {
         return (char*) p;
 }
 
-static size_t strcspn_escaped(const char *s, const char *reject) {
-        bool escaped = false;
-        int n;
-
-        for (n=0; s[n]; n++) {
-                if (escaped)
-                        escaped = false;
-                else if (s[n] == '\\')
-                        escaped = true;
-                else if (strchr(reject, s[n]))
-                        break;
-        }
-
-        /* if s ends in \, return index of previous char */
-        return n - escaped;
-}
-
-/* Split a string into words. */
-const char* split(const char **state, size_t *l, const char *separator, SplitFlags flags) {
-        const char *current;
-
-        current = *state;
-
-        if (!*current) {
-                assert(**state == '\0');
-                return NULL;
-        }
-
-        current += strspn(current, separator);
-        if (!*current) {
-                *state = current;
-                return NULL;
-        }
-
-        if (flags & SPLIT_QUOTES && strchr("\'\"", *current)) {
-                char quotechars[2] = {*current, '\0'};
-
-                *l = strcspn_escaped(current + 1, quotechars);
-                if (current[*l + 1] == '\0' || current[*l + 1] != quotechars[0] ||
-                    (current[*l + 2] && !strchr(separator, current[*l + 2]))) {
-                        /* right quote missing or garbage at the end */
-                        if (flags & SPLIT_RELAX) {
-                                *state = current + *l + 1 + (current[*l + 1] != '\0');
-                                return current + 1;
-                        }
-                        *state = current;
-                        return NULL;
-                }
-                *state = current++ + *l + 2;
-        } else if (flags & SPLIT_QUOTES) {
-                *l = strcspn_escaped(current, separator);
-                if (current[*l] && !strchr(separator, current[*l]) && !(flags & SPLIT_RELAX)) {
-                        /* unfinished escape */
-                        *state = current;
-                        return NULL;
-                }
-                *state = current + *l;
-        } else {
-                *l = strcspn(current, separator);
-                *state = current + *l;
-        }
-
-        return current;
-}
-
 char *strnappend(const char *s, const char *suffix, size_t b) {
         size_t a;
         char *r;
@@ -206,63 +143,34 @@ char *strnappend(const char *s, const char *suffix, size_t b) {
         return r;
 }
 
-char *strappend(const char *s, const char *suffix) {
-        return strnappend(s, suffix, strlen_ptr(suffix));
-}
-
 char *strjoin_real(const char *x, ...) {
         va_list ap;
-        size_t l;
+        size_t l = 1;
         char *r, *p;
 
         va_start(ap, x);
+        for (const char *t = x; t; t = va_arg(ap, const char *)) {
+                size_t n;
 
-        if (x) {
-                l = strlen(x);
-
-                for (;;) {
-                        const char *t;
-                        size_t n;
-
-                        t = va_arg(ap, const char *);
-                        if (!t)
-                                break;
-
-                        n = strlen(t);
-                        if (n > ((size_t) -1) - l) {
-                                va_end(ap);
-                                return NULL;
-                        }
-
-                        l += n;
+                n = strlen(t);
+                if (n > SIZE_MAX - l) {
+                        va_end(ap);
+                        return NULL;
                 }
-        } else
-                l = 0;
-
+                l += n;
+        }
         va_end(ap);
 
-        r = new(char, l+1);
+        p = r = new(char, l);
         if (!r)
                 return NULL;
 
-        if (x) {
-                p = stpcpy(r, x);
+        va_start(ap, x);
+        for (const char *t = x; t; t = va_arg(ap, const char *))
+                p = stpcpy(p, t);
+        va_end(ap);
 
-                va_start(ap, x);
-
-                for (;;) {
-                        const char *t;
-
-                        t = va_arg(ap, const char *);
-                        if (!t)
-                                break;
-
-                        p = stpcpy(p, t);
-                }
-
-                va_end(ap);
-        } else
-                r[0] = 0;
+        *p = 0;
 
         return r;
 }
@@ -675,19 +583,6 @@ char *cellescape(char *buf, size_t len, const char *s) {
         return buf;
 }
 
-bool nulstr_contains(const char *nulstr, const char *needle) {
-        const char *i;
-
-        if (!nulstr)
-                return false;
-
-        NULSTR_FOREACH(i, nulstr)
-                if (streq(i, needle))
-                        return true;
-
-        return false;
-}
-
 char* strshorten(char *s, size_t l) {
         assert(s);
 
@@ -742,9 +637,16 @@ char *strreplace(const char *text, const char *old_string, const char *new_strin
         return ret;
 }
 
-static void advance_offsets(ssize_t diff, size_t offsets[static 2], size_t shift[static 2], size_t size) {
+static void advance_offsets(
+                ssize_t diff,
+                size_t offsets[2], /* note: we can't use [static 2] here, since this may be NULL */
+                size_t shift[static 2],
+                size_t size) {
+
         if (!offsets)
                 return;
+
+        assert(shift);
 
         if ((size_t) diff < offsets[0])
                 shift[0] += size;
@@ -753,7 +655,7 @@ static void advance_offsets(ssize_t diff, size_t offsets[static 2], size_t shift
 }
 
 char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
-        const char *i, *begin = NULL;
+        const char *begin = NULL;
         enum {
                 STATE_OTHER,
                 STATE_ESCAPE,
@@ -761,7 +663,7 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                 STATE_CSO,
         } state = STATE_OTHER;
         char *obuf = NULL;
-        size_t osz = 0, isz, shift[2] = {};
+        size_t osz = 0, isz, shift[2] = {}, n_carriage_returns = 0;
         FILE *f;
 
         assert(ibuf);
@@ -772,32 +674,41 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
          * 1. Replaces TABs by 8 spaces
          * 2. Strips ANSI color sequences (a subset of CSI), i.e. ESC '[' … 'm' sequences
          * 3. Strips ANSI operating system sequences (CSO), i.e. ESC ']' … BEL sequences
+         * 4. Strip trailing \r characters (since they would "move the cursor", but have no
+         *    other effect).
          *
-         * Everything else will be left as it is. In particular other ANSI sequences are left as they are, as are any
-         * other special characters. Truncated ANSI sequences are left-as is too. This call is supposed to suppress the
-         * most basic formatting noise, but nothing else.
+         * Everything else will be left as it is. In particular other ANSI sequences are left as they are, as
+         * are any other special characters. Truncated ANSI sequences are left-as is too. This call is
+         * supposed to suppress the most basic formatting noise, but nothing else.
          *
          * Why care for CSO sequences? Well, to undo what terminal_urlify() and friends generate. */
 
         isz = _isz ? *_isz : strlen(*ibuf);
 
-        f = open_memstream(&obuf, &osz);
+        /* Note we turn off internal locking on f for performance reasons. It's safe to do so since we
+         * created f here and it doesn't leave our scope. */
+        f = open_memstream_unlocked(&obuf, &osz);
         if (!f)
                 return NULL;
 
-        /* Note we turn off internal locking on f for performance reasons.  It's safe to do so since we created f here
-         * and it doesn't leave our scope. */
-
-        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
-
-        for (i = *ibuf; i < *ibuf + isz + 1; i++) {
+        for (const char *i = *ibuf; i < *ibuf + isz + 1; i++) {
 
                 switch (state) {
 
                 case STATE_OTHER:
                         if (i >= *ibuf + isz) /* EOT */
                                 break;
-                        else if (*i == '\x1B')
+
+                        if (*i == '\r') {
+                                n_carriage_returns++;
+                                break;
+                        } else if (*i == '\n')
+                                /* Ignore carriage returns before new line */
+                                n_carriage_returns = 0;
+                        for (; n_carriage_returns > 0; n_carriage_returns--)
+                                fputc('\r', f);
+
+                        if (*i == '\x1B')
                                 state = STATE_ESCAPE;
                         else if (*i == '\t') {
                                 fputs("        ", f);
@@ -808,6 +719,8 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                         break;
 
                 case STATE_ESCAPE:
+                        assert(n_carriage_returns == 0);
+
                         if (i >= *ibuf + isz) { /* EOT */
                                 fputc('\x1B', f);
                                 advance_offsets(i - *ibuf, highlight, shift, 1);
@@ -828,6 +741,7 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                         break;
 
                 case STATE_CSI:
+                        assert(n_carriage_returns == 0);
 
                         if (i >= *ibuf + isz || /* EOT … */
                             !strchr("01234567890;m", *i)) { /* … or invalid chars in sequence */
@@ -842,6 +756,7 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                         break;
 
                 case STATE_CSO:
+                        assert(n_carriage_returns == 0);
 
                         if (i >= *ibuf + isz || /* EOT … */
                             (*i != '\a' && (uint8_t) *i < 32U) || (uint8_t) *i > 126U) { /* … or invalid chars in sequence */
@@ -861,11 +776,9 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                 fclose(f);
                 return mfree(obuf);
         }
-
         fclose(f);
 
-        free(*ibuf);
-        *ibuf = obuf;
+        free_and_replace(*ibuf, obuf);
 
         if (_isz)
                 *_isz = osz;
@@ -875,7 +788,7 @@ char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]) {
                 highlight[1] += shift[1];
         }
 
-        return obuf;
+        return *ibuf;
 }
 
 char *strextend_with_separator(char **x, const char *separator, ...) {
@@ -1048,44 +961,13 @@ int free_and_strndup(char **p, const char *s, size_t l) {
         return 1;
 }
 
-#if !HAVE_EXPLICIT_BZERO
-/*
- * Pointer to memset is volatile so that compiler must de-reference
- * the pointer and can't assume that it points to any function in
- * particular (such as memset, which it then might further "optimize")
- * This approach is inspired by openssl's crypto/mem_clr.c.
- */
-typedef void *(*memset_t)(void *,int,size_t);
-
-static volatile memset_t memset_func = memset;
-
-void* explicit_bzero_safe(void *p, size_t l) {
-        if (l > 0)
-                memset_func(p, '\0', l);
-
-        return p;
-}
-#endif
-
-char* string_erase(char *x) {
-        if (!x)
-                return NULL;
-
-        /* A delicious drop of snake-oil! To be called on memory where
-         * we stored passphrases or so, after we used them. */
-        explicit_bzero_safe(x, strlen(x));
-        return x;
-}
-
-char *string_free_erase(char *s) {
-        return mfree(string_erase(s));
-}
-
 bool string_is_safe(const char *p) {
         const char *t;
 
         if (!p)
                 return false;
+
+        /* Checks if the specified string contains no quotes or control characters */
 
         for (t = p; *t; t++) {
                 if (*t > 0 && *t < ' ') /* no control characters */
@@ -1096,4 +978,159 @@ bool string_is_safe(const char *p) {
         }
 
         return true;
+}
+
+char* string_erase(char *x) {
+        if (!x)
+                return NULL;
+
+        /* A delicious drop of snake-oil! To be called on memory where we stored passphrases or so, after we
+         * used them. */
+        explicit_bzero_safe(x, strlen(x));
+        return x;
+}
+
+int string_truncate_lines(const char *s, size_t n_lines, char **ret) {
+        const char *p = s, *e = s;
+        bool truncation_applied = false;
+        char *copy;
+        size_t n = 0;
+
+        assert(s);
+
+        /* Truncate after the specified number of lines. Returns > 0 if a truncation was applied or == 0 if
+         * there were fewer lines in the string anyway. Trailing newlines on input are ignored, and not
+         * generated either. */
+
+        for (;;) {
+                size_t k;
+
+                k = strcspn(p, "\n");
+
+                if (p[k] == 0) {
+                        if (k == 0) /* final empty line */
+                                break;
+
+                        if (n >= n_lines) /* above threshold */
+                                break;
+
+                        e = p + k; /* last line to include */
+                        break;
+                }
+
+                assert(p[k] == '\n');
+
+                if (n >= n_lines)
+                        break;
+
+                if (k > 0)
+                        e = p + k;
+
+                p += k + 1;
+                n++;
+        }
+
+        /* e points after the last character we want to keep */
+        if (isempty(e))
+                copy = strdup(s);
+        else {
+                if (!in_charset(e, "\n")) /* We only consider things truncated if we remove something that
+                                           * isn't a new-line or a series of them */
+                        truncation_applied = true;
+
+                copy = strndup(s, e - s);
+        }
+        if (!copy)
+                return -ENOMEM;
+
+        *ret = copy;
+        return truncation_applied;
+}
+
+int string_extract_line(const char *s, size_t i, char **ret) {
+        const char *p = s;
+        size_t c = 0;
+
+        /* Extract the i'nth line from the specified string. Returns > 0 if there are more lines after that,
+         * and == 0 if we are looking at the last line or already beyond the last line. As special
+         * optimization, if the first line is requested and the string only consists of one line we return
+         * NULL, indicating the input string should be used as is, and avoid a memory allocation for a very
+         * common case. */
+
+        for (;;) {
+                const char *q;
+
+                q = strchr(p, '\n');
+                if (i == c) {
+                        /* The line we are looking for! */
+
+                        if (q) {
+                                char *m;
+
+                                m = strndup(p, q - p);
+                                if (!m)
+                                        return -ENOMEM;
+
+                                *ret = m;
+                                return !isempty(q + 1); /* more coming? */
+                        } else {
+                                if (p == s)
+                                        *ret = NULL; /* Just use the input string */
+                                else {
+                                        char *m;
+
+                                        m = strdup(p);
+                                        if (!m)
+                                                return -ENOMEM;
+
+                                        *ret = m;
+                                }
+
+                                return 0; /* The end */
+                        }
+                }
+
+                if (!q) {
+                        char *m;
+
+                        /* No more lines, return empty line */
+
+                        m = strdup("");
+                        if (!m)
+                                return -ENOMEM;
+
+                        *ret = m;
+                        return 0; /* The end */
+                }
+
+                p = q + 1;
+                c++;
+        }
+}
+
+int string_contains_word_strv(const char *string, const char *separators, char **words, const char **ret_word) {
+        /* In the default mode with no separators specified, we split on whitespace and
+         * don't coalesce separators. */
+        const ExtractFlags flags = separators ? EXTRACT_DONT_COALESCE_SEPARATORS : 0;
+
+        const char *found = NULL;
+
+        for (const char *p = string;;) {
+                _cleanup_free_ char *w = NULL;
+                int r;
+
+                r = extract_first_word(&p, &w, separators, flags);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                found = strv_find(words, w);
+                if (found)
+                        break;
+        }
+
+        if (ret_word)
+                *ret_word = found;
+        return !!found;
 }

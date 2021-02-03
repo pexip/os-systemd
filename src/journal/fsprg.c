@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+
+/* SPDX-License-Identifier: LGPL-2.1-or-later
  *
  * fsprg v0.1  -  (seekable) forward-secure pseudorandom generator
  * Copyright © 2012 B. Poettering
@@ -27,11 +27,11 @@
  * http://eprint.iacr.org/2013/397
  */
 
-#include <gcrypt.h>
 #include <string.h>
 
 #include "fsprg.h"
 #include "gcrypt-util.h"
+#include "memory-util.h"
 
 #define ISVALID_SECPAR(secpar) (((secpar) % 16 == 0) && ((secpar) >= 16) && ((secpar) <= 16384))
 #define VALIDATE_SECPAR(secpar) assert(ISVALID_SECPAR(secpar));
@@ -60,7 +60,7 @@ static void mpi_export(void *buf, size_t buflen, const gcry_mpi_t x) {
 
 static gcry_mpi_t mpi_import(const void *buf, size_t buflen) {
         gcry_mpi_t h;
-        unsigned len;
+        _unused_ unsigned len;
 
         assert_se(gcry_mpi_scan(&h, GCRYMPI_FMT_USG, buf, buflen, NULL) == 0);
         len = (gcry_mpi_get_nbits(h) + 7) / 8;

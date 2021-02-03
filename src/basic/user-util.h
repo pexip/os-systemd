@@ -1,9 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <grp.h>
 #if ENABLE_GSHADOW
-#include <gshadow.h>
+#  include <gshadow.h>
 #endif
 #include <pwd.h>
 #include <shadow.h>
@@ -19,6 +19,7 @@ static inline bool gid_is_valid(gid_t gid) {
 }
 
 int parse_uid(const char *s, uid_t* ret_uid);
+int parse_uid_range(const char *s, uid_t *ret_lower, uid_t *ret_upper);
 
 static inline int parse_gid(const char *s, gid_t *ret_gid) {
         return parse_uid(s, (uid_t*) ret_gid);
@@ -42,6 +43,9 @@ char* gid_to_name(gid_t gid);
 int in_gid(gid_t gid);
 int in_group(const char *name);
 
+int merge_gid_lists(const gid_t *list1, size_t size1, const gid_t *list2, size_t size2, gid_t **result);
+int getgroups_alloc(gid_t** gids);
+
 int get_home_dir(char **ret);
 int get_shell(char **_ret);
 
@@ -57,22 +61,6 @@ int take_etc_passwd_lock(const char *root);
 
 #define ETC_PASSWD_LOCK_PATH "/etc/.pwd.lock"
 
-static inline bool uid_is_dynamic(uid_t uid) {
-        return DYNAMIC_UID_MIN <= uid && uid <= DYNAMIC_UID_MAX;
-}
-
-static inline bool gid_is_dynamic(gid_t gid) {
-        return uid_is_dynamic((uid_t) gid);
-}
-
-static inline bool uid_is_system(uid_t uid) {
-        return uid <= SYSTEM_UID_MAX;
-}
-
-static inline bool gid_is_system(gid_t gid) {
-        return gid <= SYSTEM_GID_MAX;
-}
-
 /* The following macros add 1 when converting things, since UID 0 is a valid UID, while the pointer
  * NULL is special */
 #define PTR_TO_UID(p) ((uid_t) (((uintptr_t) (p))-1))
@@ -85,9 +73,15 @@ static inline bool userns_supported(void) {
         return access("/proc/self/uid_map", F_OK) >= 0;
 }
 
-bool valid_user_group_name(const char *u);
-bool valid_user_group_name_or_id(const char *u);
+typedef enum ValidUserFlags {
+        VALID_USER_RELAX         = 1 << 0,
+        VALID_USER_WARN          = 1 << 1,
+        VALID_USER_ALLOW_NUMERIC = 1 << 2,
+} ValidUserFlags;
+
+bool valid_user_group_name(const char *u, ValidUserFlags flags);
 bool valid_gecos(const char *d);
+char *mangle_gecos(const char *d);
 bool valid_home(const char *p);
 
 static inline bool valid_shell(const char *p) {
@@ -113,3 +107,5 @@ int putgrent_sane(const struct group *gr, FILE *stream);
 int fgetsgent_sane(FILE *stream, struct sgrp **sg);
 int putsgent_sane(const struct sgrp *sg, FILE *stream);
 #endif
+
+bool is_nologin_shell(const char *shell);

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdlib.h>
@@ -47,7 +47,7 @@ static int client_run(int ifindex, const struct in_addr *pa, const struct ether_
 
         log_info("starting IPv4ACD client");
 
-        assert_se(sd_ipv4acd_start(acd) >= 0);
+        assert_se(sd_ipv4acd_start(acd, true) >= 0);
 
         assert_se(sd_event_loop(e) >= 0);
 

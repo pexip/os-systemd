@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 typedef struct User User;
@@ -6,6 +6,7 @@ typedef struct User User;
 #include "conf-parser.h"
 #include "list.h"
 #include "logind.h"
+#include "user-record.h"
 
 typedef enum UserState {
         USER_OFFLINE,    /* Not logged in at all */
@@ -20,10 +21,9 @@ typedef enum UserState {
 
 struct User {
         Manager *manager;
-        uid_t uid;
-        gid_t gid;
-        char *name;
-        char *home;
+
+        UserRecord *user_record;
+
         char *state_file;
         char *runtime_path;
 
@@ -50,7 +50,7 @@ struct User {
         LIST_FIELDS(User, gc_queue);
 };
 
-int user_new(User **out, Manager *m, uid_t uid, gid_t gid, const char *name, const char *home);
+int user_new(User **out, Manager *m, UserRecord *ur);
 User *user_free(User *u);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(User *, user_free);
@@ -69,18 +69,7 @@ int user_check_linger_file(User *u);
 void user_elect_display(User *u);
 void user_update_last_session_timer(User *u);
 
-extern const sd_bus_vtable user_vtable[];
-int user_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error);
-int user_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error);
-char *user_bus_path(User *s);
-
-int user_send_signal(User *u, bool new_user);
-int user_send_changed(User *u, const char *properties, ...) _sentinel_;
-
 const char* user_state_to_string(UserState s) _const_;
 UserState user_state_from_string(const char *s) _pure_;
-
-int bus_user_method_terminate(sd_bus_message *message, void *userdata, sd_bus_error *error);
-int bus_user_method_kill(sd_bus_message *message, void *userdata, sd_bus_error *error);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_compat_user_tasks_max);

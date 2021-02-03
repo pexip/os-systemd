@@ -1,4 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
 #include <errno.h>
+#include <net/if_arp.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,7 +10,7 @@
 #include "dhcp-internal.h"
 #include "dhcp-protocol.h"
 #include "macro.h"
-#include "util.h"
+#include "memory-util.h"
 
 struct option_desc {
         uint8_t sname[64];

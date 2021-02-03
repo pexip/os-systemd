@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <errno.h>
 #include <getopt.h>
@@ -7,6 +7,7 @@
 #include "sd-event.h"
 
 #include "device-enumerator-private.h"
+#include "device-private.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "path-util.h"
@@ -22,9 +23,9 @@
 static bool arg_verbose = false;
 static bool arg_dry_run = false;
 
-static int exec_list(sd_device_enumerator *e, const char *action, Set *settle_set) {
+static int exec_list(sd_device_enumerator *e, const char *action, Set **settle_set) {
         sd_device *d;
-        int r;
+        int r, ret = 0;
 
         FOREACH_DEVICE_AND_SUBSYSTEM(e, d) {
                 _cleanup_free_ char *filename = NULL;
@@ -44,7 +45,16 @@ static int exec_list(sd_device_enumerator *e, const char *action, Set *settle_se
 
                 r = write_string_file(filename, action, WRITE_STRING_FILE_DISABLE_BUFFER);
                 if (r < 0) {
-                        log_debug_errno(r, "Failed to write '%s' to '%s', ignoring: %m", action, filename);
+                        bool ignore = IN_SET(r, -ENOENT, -ENODEV);
+
+                        log_full_errno(ignore ? LOG_DEBUG : LOG_ERR, r,
+                                       "Failed to write '%s' to '%s'%s: %m",
+                                       action, filename, ignore ? ", ignoring" : "");
+                        if (IN_SET(r, -EACCES, -EROFS))
+                                /* Inovoked by unpriviledged user, or read only filesystem. Return earlier. */
+                                return r;
+                        if (ret == 0 && !ignore)
+                                ret = r;
                         continue;
                 }
 
@@ -55,10 +65,11 @@ static int exec_list(sd_device_enumerator *e, const char *action, Set *settle_se
                 }
         }
 
-        return 0;
+        return ret;
 }
 
 static int device_monitor_handler(sd_device_monitor *m, sd_device *dev, void *userdata) {
+        _cleanup_free_ char *val = NULL;
         Set *settle_set = userdata;
         const char *syspath;
 
@@ -71,7 +82,8 @@ static int device_monitor_handler(sd_device_monitor *m, sd_device *dev, void *us
         if (arg_verbose)
                 printf("settle %s\n", syspath);
 
-        if (!set_remove(settle_set, syspath))
+        val = set_remove(settle_set, syspath);
+        if (!val)
                 log_debug("Got epoll event on syspath %s not present in syspath set", syspath);
 
         if (set_isempty(settle_set))
@@ -109,7 +121,7 @@ static int help(void) {
                "  -t --type=                        Type of events to trigger\n"
                "          devices                     sysfs devices (default)\n"
                "          subsystems                  sysfs subsystems and drivers\n"
-               "  -c --action=ACTION                Event action value, default is \"change\"\n"
+               "  -c --action=ACTION|help           Event action value, default is \"change\"\n"
                "  -s --subsystem-match=SUBSYSTEM    Trigger devices from a matching subsystem\n"
                "  -S --subsystem-nomatch=SUBSYSTEM  Exclude devices from a matching subsystem\n"
                "  -a --attr-match=FILE[=VALUE]      Trigger devices with a matching attribute\n"
@@ -161,7 +173,7 @@ int trigger_main(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
         _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *m = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
-        _cleanup_set_free_free_ Set *settle_set = NULL;
+        _cleanup_set_free_ Set *settle_set = NULL;
         usec_t ping_timeout_usec = 5 * USEC_PER_SEC;
         bool settle = false, ping = false;
         int c, r;
@@ -199,11 +211,14 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown type --type=%s", optarg);
                         break;
                 case 'c':
-                        if (STR_IN_SET(optarg, "add", "remove", "change"))
-                                action = optarg;
-                        else
-                                log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown action '%s'", optarg);
+                        if (streq(optarg, "help")) {
+                                dump_device_action_table();
+                                return 0;
+                        }
+                        if (device_action_from_string(optarg) < 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown action '%s'", optarg);
 
+                        action = optarg;
                         break;
                 case 's':
                         r = sd_device_enumerator_add_match_subsystem(e, optarg, true);
@@ -256,7 +271,7 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to open the device '%s': %m", optarg);
 
-                        r = sd_device_enumerator_add_match_parent(e, dev);
+                        r = device_enumerator_add_match_parent_incremental(e, dev);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to add parent match '%s': %m", optarg);
                         break;
@@ -272,7 +287,7 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                         if (r < 0)
                                 return log_error_errno(r, "Failed to open the device '%s': %m", optarg);
 
-                        r = sd_device_enumerator_add_match_parent(e, dev);
+                        r = device_enumerator_add_match_parent_incremental(e, dev);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to add parent match '%s': %m", optarg);
                         break;
@@ -299,22 +314,20 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                 }
         }
 
-        if (!arg_dry_run || ping) {
-                r = must_be_root();
-                if (r < 0)
-                        return r;
-        }
-
         if (ping) {
                 _cleanup_(udev_ctrl_unrefp) struct udev_ctrl *uctrl = NULL;
 
-                uctrl = udev_ctrl_new();
-                if (!uctrl)
-                        return log_oom();
+                r = udev_ctrl_new(&uctrl);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to initialize udev control: %m");
 
-                r = udev_ctrl_send_ping(uctrl, ping_timeout_usec);
+                r = udev_ctrl_send_ping(uctrl);
                 if (r < 0)
                         return log_error_errno(r, "Failed to connect to udev daemon: %m");
+
+                r = udev_ctrl_wait(uctrl, ping_timeout_usec);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to wait for daemon to reply: %m");
         }
 
         for (; optind < argc; optind++) {
@@ -324,13 +337,13 @@ int trigger_main(int argc, char *argv[], void *userdata) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to open the device '%s': %m", argv[optind]);
 
-                r = sd_device_enumerator_add_match_parent(e, dev);
+                r = device_enumerator_add_match_parent_incremental(e, dev);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add parent match '%s': %m", argv[optind]);
         }
 
         if (settle) {
-                settle_set = set_new(&string_hash_ops);
+                settle_set = set_new(&string_hash_ops_free);
                 if (!settle_set)
                         return log_oom();
 
@@ -365,7 +378,8 @@ int trigger_main(int argc, char *argv[], void *userdata) {
         default:
                 assert_not_reached("Unknown device type");
         }
-        r = exec_list(e, action, settle_set);
+
+        r = exec_list(e, action, settle ? &settle_set : NULL);
         if (r < 0)
                 return r;
 

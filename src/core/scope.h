@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 typedef struct Scope Scope;
@@ -24,6 +24,7 @@ struct Scope {
         ScopeState state, deserialized_state;
         ScopeResult result;
 
+        usec_t runtime_max_usec;
         usec_t timeout_stop_usec;
 
         char *controller;

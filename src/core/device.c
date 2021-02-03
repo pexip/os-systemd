@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <sys/epoll.h>
@@ -17,6 +17,7 @@
 #include "stat-util.h"
 #include "string-util.h"
 #include "swap.h"
+#include "udev-util.h"
 #include "unit-name.h"
 #include "unit.h"
 
@@ -82,6 +83,8 @@ static int device_set_sysfs(Device *d, const char *sysfs) {
         }
 
         d->sysfs = TAKE_PTR(copy);
+        unit_add_to_dbus_queue(UNIT(d));
+
         return 0;
 }
 
@@ -115,7 +118,7 @@ static void device_done(Unit *u) {
 static int device_load(Unit *u) {
         int r;
 
-        r = unit_load_fragment_and_dropin_optional(u);
+        r = unit_load_fragment_and_dropin(u, false);
         if (r < 0)
                 return r;
 
@@ -373,7 +376,7 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
         for (;;) {
                 _cleanup_free_ char *word = NULL, *k = NULL;
 
-                r = extract_first_word(&wants, &word, NULL, EXTRACT_QUOTES);
+                r = extract_first_word(&wants, &word, NULL, EXTRACT_UNQUOTE);
                 if (r == 0)
                         break;
                 if (r == -ENOMEM)
@@ -419,7 +422,7 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
                 /* So here's a special hack, to compensate for the fact that the udev database's reload cycles are not
                  * synchronized with our own reload cycles: when we detect that the SYSTEMD_WANTS property of a device
                  * changes while the device unit is already up, let's manually trigger any new units listed in it not
-                 * seen before. This typically appens during the boot-time switch root transition, as udev devices
+                 * seen before. This typically happens during the boot-time switch root transition, as udev devices
                  * will generally already be up in the initrd, but SYSTEMD_WANTS properties get then added through udev
                  * rules only available on the host system, and thus only when the initial udev coldplug trigger runs.
                  *
@@ -432,16 +435,13 @@ static int device_add_udev_wants(Unit *u, sd_device *dev) {
                         if (strv_contains(d->wants_property, *i)) /* Was this unit already listed before? */
                                 continue;
 
-                        r = manager_add_job_by_name(u->manager, JOB_START, *i, JOB_FAIL, &error, NULL);
+                        r = manager_add_job_by_name(u->manager, JOB_START, *i, JOB_FAIL, NULL, &error, NULL);
                         if (r < 0)
                                 log_unit_warning_errno(u, r, "Failed to enqueue SYSTEMD_WANTS= job, ignoring: %s", bus_error_message(&error, r));
                 }
         }
 
-        strv_free(d->wants_property);
-        d->wants_property = TAKE_PTR(added);
-
-        return 0;
+        return strv_free_and_replace(d->wants_property, added);
 }
 
 static bool device_is_bound_by_mounts(Device *d, sd_device *dev) {
@@ -465,13 +465,12 @@ static bool device_is_bound_by_mounts(Device *d, sd_device *dev) {
 
 static void device_upgrade_mount_deps(Unit *u) {
         Unit *other;
-        Iterator i;
         void *v;
         int r;
 
         /* Let's upgrade Requires= to BindsTo= on us. (Used when SYSTEMD_MOUNT_DEVICE_BOUND is set) */
 
-        HASHMAP_FOREACH_KEY(v, other, u->dependencies[UNIT_REQUIRED_BY], i) {
+        HASHMAP_FOREACH_KEY(v, other, u->dependencies[UNIT_REQUIRED_BY]) {
                 if (other->type != UNIT_MOUNT)
                         continue;
 
@@ -524,7 +523,7 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, bool 
 
                 delete = false;
 
-                /* Let's remove all dependencies generated due to udev properties. We'll readd whatever is configured
+                /* Let's remove all dependencies generated due to udev properties. We'll re-add whatever is configured
                  * now below. */
                 unit_remove_dependencies(u, UNIT_DEPENDENCY_UDEV);
         } else {
@@ -560,9 +559,6 @@ static int device_setup_unit(Manager *m, sd_device *dev, const char *path, bool 
          * the deps on the mount unit but at that time the "bind mounts" flag wasn't not present. Fix this up now. */
         if (dev && device_is_bound_by_mounts(DEVICE(u), dev))
                 device_upgrade_mount_deps(u);
-
-        /* Note that this won't dispatch the load queue, the caller has to do that if needed and appropriate */
-        unit_add_to_dbus_queue(u);
 
         return 0;
 
@@ -625,7 +621,7 @@ static int device_process_new(Manager *m, sd_device *dev) {
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&alias, &word, NULL, EXTRACT_QUOTES);
+                r = extract_first_word(&alias, &word, NULL, EXTRACT_UNQUOTE);
                 if (r == 0)
                         break;
                 if (r == -ENOMEM)
@@ -665,9 +661,13 @@ static void device_found_changed(Device *d, DeviceFound previous, DeviceFound no
 }
 
 static void device_update_found_one(Device *d, DeviceFound found, DeviceFound mask) {
+        Manager *m;
+
         assert(d);
 
-        if (MANAGER_IS_RUNNING(UNIT(d)->manager)) {
+        m = UNIT(d)->manager;
+
+        if (MANAGER_IS_RUNNING(m) && (m->honor_device_enumeration || MANAGER_IS_USER(m))) {
                 DeviceFound n, previous;
 
                 /* When we are already running, then apply the new mask right-away, and trigger state changes
@@ -728,6 +728,13 @@ static bool device_is_ready(sd_device *dev) {
         const char *ready;
 
         assert(dev);
+
+        if (device_is_renaming(dev) > 0)
+                return false;
+
+        /* Is it really tagged as 'systemd' right now? */
+        if (sd_device_has_current_tag(dev, "systemd") <= 0)
+                return false;
 
         if (sd_device_get_property_value(dev, "SYSTEMD_READY", &ready) < 0)
                 return true;
@@ -887,9 +894,33 @@ static void device_propagate_reload_by_sysfs(Manager *m, const char *sysfs) {
         }
 }
 
+static int device_remove_old(Manager *m, sd_device *dev) {
+        _cleanup_free_ char *syspath_old = NULL, *e = NULL;
+        const char *devpath_old;
+        int r;
+
+        r = sd_device_get_property_value(dev, "DEVPATH_OLD", &devpath_old);
+        if (r < 0) {
+                log_device_debug_errno(dev, r, "Failed to get DEVPATH_OLD= property on 'move' uevent, ignoring: %m");
+                return 0;
+        }
+
+        syspath_old = path_join("/sys", devpath_old);
+        if (!syspath_old)
+                return log_oom();
+
+        r = unit_name_from_path(syspath_old, ".device", &e);
+        if (r < 0)
+                return log_device_error_errno(dev, r, "Failed to generate unit name from old device path: %m");
+
+        device_update_found_by_sysfs(m, syspath_old, 0, DEVICE_FOUND_UDEV|DEVICE_FOUND_MOUNT|DEVICE_FOUND_SWAP);
+        return 0;
+}
+
 static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *userdata) {
         Manager *m = userdata;
-        const char *action, *sysfs;
+        DeviceAction action;
+        const char *sysfs;
         int r;
 
         assert(m);
@@ -901,26 +932,28 @@ static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *
                 return 0;
         }
 
-        r = sd_device_get_property_value(dev, "ACTION", &action);
+        r = device_get_action(dev, &action);
         if (r < 0) {
-                log_device_error_errno(dev, r, "Failed to get udev action string: %m");
+                log_device_error_errno(dev, r, "Failed to get udev action: %m");
                 return 0;
         }
 
-        if (streq(action, "change"))
+        if (!IN_SET(action, DEVICE_ACTION_ADD, DEVICE_ACTION_REMOVE, DEVICE_ACTION_MOVE))
                 device_propagate_reload_by_sysfs(m, sysfs);
 
-        /* A change event can signal that a device is becoming ready, in particular if
-         * the device is using the SYSTEMD_READY logic in udev
-         * so we need to reach the else block of the follwing if, even for change events */
-        if (streq(action, "remove"))  {
+        if (action == DEVICE_ACTION_MOVE)
+                (void) device_remove_old(m, dev);
+
+        /* A change event can signal that a device is becoming ready, in particular if the device is using
+         * the SYSTEMD_READY logic in udev so we need to reach the else block of the following if, even for
+         * change events */
+        if (action == DEVICE_ACTION_REMOVE) {
                 r = swap_process_device_remove(m, dev);
                 if (r < 0)
                         log_device_warning_errno(dev, r, "Failed to process swap device remove event, ignoring: %m");
 
-                /* If we get notified that a device was removed by
-                 * udev, then it's completely gone, hence unset all
-                 * found bits */
+                /* If we get notified that a device was removed by udev, then it's completely gone, hence
+                 * unset all found bits */
                 device_update_found_by_sysfs(m, sysfs, 0, DEVICE_FOUND_UDEV|DEVICE_FOUND_MOUNT|DEVICE_FOUND_SWAP);
 
         } else if (device_is_ready(dev)) {
@@ -936,13 +969,10 @@ static int device_dispatch_io(sd_device_monitor *monitor, sd_device *dev, void *
                 /* The device is found now, set the udev found bit */
                 device_update_found_by_sysfs(m, sysfs, DEVICE_FOUND_UDEV, DEVICE_FOUND_UDEV);
 
-        } else {
-                /* The device is nominally around, but not ready for
-                 * us. Hence unset the udev bit, but leave the rest
-                 * around. */
-
+        } else
+                /* The device is nominally around, but not ready for us. Hence unset the udev bit, but leave
+                 * the rest around. */
                 device_update_found_by_sysfs(m, sysfs, 0, DEVICE_FOUND_UDEV);
-        }
 
         return 0;
 }
@@ -1071,8 +1101,6 @@ const UnitVTable device_vtable = {
 
         .active_state = device_active_state,
         .sub_state_to_string = device_sub_state_to_string,
-
-        .bus_vtable = bus_device_vtable,
 
         .following = device_following,
         .following_set = device_following_set,

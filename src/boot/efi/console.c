@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <efi.h>
 #include <efilib.h>
@@ -114,7 +114,7 @@ EFI_STATUS console_key_read(UINT64 *key, BOOLEAN wait) {
         /* fallback for firmware which does not support SimpleTextInputExProtocol
          *
          * This is also called in case ReadKeyStrokeEx did not return a key, because
-         * some broken firmwares offer SimpleTextInputExProtocol, but never acually
+         * some broken firmwares offer SimpleTextInputExProtocol, but never actually
          * handle any key. */
         err  = uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &k);
         if (EFI_ERROR(err))

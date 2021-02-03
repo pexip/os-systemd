@@ -1,8 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <netinet/in.h>
 #include <resolv.h>
 
+#include "errno-util.h"
 #include "fd-util.h"
 #include "resolved-llmnr.h"
 #include "resolved-manager.h"
@@ -289,19 +290,21 @@ static int on_llmnr_stream(sd_event_source *s, int fd, uint32_t revents, void *u
 
         cfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK|SOCK_CLOEXEC);
         if (cfd < 0) {
-                if (IN_SET(errno, EAGAIN, EINTR))
+                if (ERRNO_IS_ACCEPT_AGAIN(errno))
                         return 0;
 
                 return -errno;
         }
 
-        r = dns_stream_new(m, &stream, DNS_PROTOCOL_LLMNR, cfd, NULL);
+        r = dns_stream_new(m, &stream, DNS_STREAM_LLMNR_RECV, DNS_PROTOCOL_LLMNR, cfd, NULL);
         if (r < 0) {
                 safe_close(cfd);
                 return r;
         }
 
         stream->on_packet = on_llmnr_stream_packet;
+        /* We don't configure a "complete" handler here, we rely on the default handler than simply drops the
+         * reference to the stream, thus freeing it */
         return 0;
 }
 
@@ -323,7 +326,7 @@ int manager_llmnr_ipv4_tcp_fd(Manager *m) {
                 return log_error_errno(errno, "LLMNR-IPv4(TCP): Failed to create socket: %m");
 
         /* RFC 4795, section 2.5. requires setting the TTL of TCP streams to 1 */
-        r = setsockopt_int(s, IPPROTO_IP, IP_TTL, true);
+        r = setsockopt_int(s, IPPROTO_IP, IP_TTL, 1);
         if (r < 0)
                 return log_error_errno(r, "LLMNR-IPv4(TCP): Failed to set IP_TTL: %m");
 
@@ -394,7 +397,7 @@ int manager_llmnr_ipv6_tcp_fd(Manager *m) {
                 return log_error_errno(errno, "LLMNR-IPv6(TCP): Failed to create socket: %m");
 
         /* RFC 4795, section 2.5. requires setting the TTL of TCP streams to 1 */
-        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, true);
+        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, 1);
         if (r < 0)
                 return log_error_errno(r, "LLMNR-IPv6(TCP): Failed to set IPV6_UNICAST_HOPS: %m");
 

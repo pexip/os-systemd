@@ -1,13 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <grp.h>
-#include <pwd.h>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "clean-ipc.h"
 #include "dynamic-user.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "io-util.h"
 #include "nscd-flush.h"
@@ -17,6 +18,8 @@
 #include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "strv.h"
+#include "user-record.h"
 #include "user-util.h"
 
 /* Takes a value generated randomly or by hashing and turns it into a UID in the right range */
@@ -114,7 +117,7 @@ static int dynamic_user_acquire(Manager *m, const char *name, DynamicUser** ret)
                 return 0;
         }
 
-        if (!valid_user_group_name_or_id(name))
+        if (!valid_user_group_name(name, VALID_USER_ALLOW_NUMERIC))
                 return -EINVAL;
 
         if (socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, storage_socket) < 0)
@@ -491,7 +494,7 @@ static int dynamic_user_realize(
                 errno = 0;
                 p = getpwuid(num);
                 if (!p)
-                        return errno > 0 ? -errno : -ESRCH;
+                        return errno_or_else(ESRCH);
 
                 gid = p->pw_gid;
         }
@@ -527,7 +530,6 @@ int dynamic_user_current(DynamicUser *d, uid_t *ret) {
         int r;
 
         assert(d);
-        assert(ret);
 
         /* Get the currently assigned UID for the user, if there's any. This simply pops the data from the storage socket, and pushes it back in right-away. */
 
@@ -543,7 +545,9 @@ int dynamic_user_current(DynamicUser *d, uid_t *ret) {
         if (r < 0)
                 return r;
 
-        *ret = uid;
+        if (ret)
+                *ret = uid;
+
         return 0;
 }
 
@@ -608,7 +612,6 @@ static DynamicUser* dynamic_user_destroy(DynamicUser *d) {
 
 int dynamic_user_serialize(Manager *m, FILE *f, FDSet *fds) {
         DynamicUser *d;
-        Iterator i;
 
         assert(m);
         assert(f);
@@ -616,7 +619,7 @@ int dynamic_user_serialize(Manager *m, FILE *f, FDSet *fds) {
 
         /* Dump the dynamic user database into the manager serialization, to deal with daemon reloads. */
 
-        HASHMAP_FOREACH(d, m->dynamic_users, i) {
+        HASHMAP_FOREACH(d, m->dynamic_users) {
                 int copy0, copy1;
 
                 copy0 = fdset_put_dup(fds, d->storage_socket[0]);
@@ -671,7 +674,6 @@ void dynamic_user_deserialize_one(Manager *m, const char *value, FDSet *fds) {
 
 void dynamic_user_vacuum(Manager *m, bool close_user) {
         DynamicUser *d;
-        Iterator i;
 
         assert(m);
 
@@ -679,7 +681,7 @@ void dynamic_user_vacuum(Manager *m, bool close_user) {
          * to which no reference exist. This is called after a daemon reload finished, in order to destroy users which
          * might not be referenced anymore. */
 
-        HASHMAP_FOREACH(d, m->dynamic_users, i) {
+        HASHMAP_FOREACH(d, m->dynamic_users) {
                 if (d->n_ref > 0)
                         continue;
 
@@ -707,7 +709,7 @@ int dynamic_user_lookup_uid(Manager *m, uid_t uid, char **ret) {
 
         xsprintf(lock_path, "/run/systemd/dynamic-uid/" UID_FMT, uid);
         r = read_one_line_file(lock_path, &user);
-        if (r == -ENOENT)
+        if (IN_SET(r, -ENOENT, 0))
                 return -ESRCH;
         if (r < 0)
                 return r;
@@ -730,7 +732,6 @@ int dynamic_user_lookup_name(Manager *m, const char *name, uid_t *ret) {
 
         assert(m);
         assert(name);
-        assert(ret);
 
         /* A friendly call for translating a dynamic user's name into its UID */
 
@@ -768,7 +769,7 @@ int dynamic_creds_acquire(DynamicCreds *creds, Manager *m, const char *user, con
 
                 if (creds->user && (!group || streq_ptr(user, group)))
                         creds->group = dynamic_user_ref(creds->user);
-                else {
+                else if (group) {
                         r = dynamic_user_acquire(m, group, &creds->group);
                         if (r < 0) {
                                 if (acquired)

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <getopt.h>
@@ -6,12 +6,15 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "conf-files.h"
 #include "def.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "glob-util.h"
 #include "hashmap.h"
 #include "log.h"
 #include "main-func.h"
@@ -21,7 +24,6 @@
 #include "string-util.h"
 #include "strv.h"
 #include "sysctl-util.h"
-#include "util.h"
 
 static char **arg_prefixes = NULL;
 static bool arg_cat_config = false;
@@ -29,33 +31,24 @@ static PagerFlags arg_pager_flags = 0;
 
 STATIC_DESTRUCTOR_REGISTER(arg_prefixes, strv_freep);
 
-static int apply_all(OrderedHashmap *sysctl_options) {
-        char *property, *value;
-        Iterator i;
-        int r = 0;
+typedef struct Option {
+        char *key;
+        char *value;
+        bool ignore_failure;
+} Option;
 
-        ORDERED_HASHMAP_FOREACH_KEY(value, property, sysctl_options, i) {
-                int k;
+static Option *option_free(Option *o) {
+        if (!o)
+                return NULL;
 
-                k = sysctl_write(property, value);
-                if (k < 0) {
-                        /* If the sysctl is not available in the kernel or we are running with reduced privileges and
-                         * cannot write it, then log about the issue at LOG_NOTICE level, and proceed without
-                         * failing. (EROFS is treated as a permission problem here, since that's how container managers
-                         * usually protected their sysctls.) In all other cases log an error and make the tool fail. */
+        free(o->key);
+        free(o->value);
 
-                        if (IN_SET(k, -EPERM, -EACCES, -EROFS, -ENOENT))
-                                log_notice_errno(k, "Couldn't write '%s' to '%s', ignoring: %m", value, property);
-                        else {
-                                log_error_errno(k, "Couldn't write '%s' to '%s': %m", value, property);
-                                if (r == 0)
-                                        r = k;
-                        }
-                }
-        }
-
-        return r;
+        return mfree(o);
 }
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(Option*, option_free);
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(option_hash_ops, char, string_hash_func, string_compare_func, Option, option_free);
 
 static bool test_prefix(const char *p) {
         char **i;
@@ -69,6 +62,7 @@ static bool test_prefix(const char *p) {
                 t = path_startswith(*i, "/proc/sys/");
                 if (!t)
                         t = *i;
+
                 if (path_startswith(p, t))
                         return true;
         }
@@ -76,7 +70,117 @@ static bool test_prefix(const char *p) {
         return false;
 }
 
-static int parse_file(OrderedHashmap *sysctl_options, const char *path, bool ignore_enoent) {
+static Option *option_new(
+                const char *key,
+                const char *value,
+                bool ignore_failure) {
+
+        _cleanup_(option_freep) Option *o = NULL;
+
+        assert(key);
+
+        o = new(Option, 1);
+        if (!o)
+                return NULL;
+
+        *o = (Option) {
+                .key = strdup(key),
+                .value = value ? strdup(value) : NULL,
+                .ignore_failure = ignore_failure,
+        };
+
+        if (!o->key)
+                return NULL;
+        if (value && !o->value)
+                return NULL;
+
+        return TAKE_PTR(o);
+}
+
+static int sysctl_write_or_warn(const char *key, const char *value, bool ignore_failure) {
+        int r;
+
+        r = sysctl_write(key, value);
+        if (r < 0) {
+                /* If the sysctl is not available in the kernel or we are running with reduced privileges and
+                 * cannot write it, then log about the issue, and proceed without failing. (EROFS is treated
+                 * as a permission problem here, since that's how container managers usually protected their
+                 * sysctls.) In all other cases log an error and make the tool fail. */
+                if (ignore_failure || r == -EROFS || ERRNO_IS_PRIVILEGE(r))
+                        log_debug_errno(r, "Couldn't write '%s' to '%s', ignoring: %m", value, key);
+                else if (r == -ENOENT)
+                        log_info_errno(r, "Couldn't write '%s' to '%s', ignoring: %m", value, key);
+                else
+                        return log_error_errno(r, "Couldn't write '%s' to '%s': %m", value, key);
+        }
+
+        return 0;
+}
+
+static int apply_all(OrderedHashmap *sysctl_options) {
+        Option *option;
+        int r = 0;
+
+        ORDERED_HASHMAP_FOREACH(option, sysctl_options) {
+                int k;
+
+                /* Ignore "negative match" options, they are there only to exclude stuff from globs. */
+                if (!option->value)
+                        continue;
+
+                if (string_is_glob(option->key)) {
+                        _cleanup_strv_free_ char **paths = NULL;
+                        _cleanup_free_ char *pattern = NULL;
+                        char **s;
+
+                        pattern = path_join("/proc/sys", option->key);
+                        if (!pattern)
+                                return log_oom();
+
+                        k = glob_extend(&paths, pattern, GLOB_NOCHECK);
+                        if (k < 0) {
+                                if (option->ignore_failure || ERRNO_IS_PRIVILEGE(k))
+                                        log_debug_errno(k, "Failed to resolve glob '%s', ignoring: %m",
+                                                        option->key);
+                                else {
+                                        log_error_errno(k, "Couldn't resolve glob '%s': %m",
+                                                        option->key);
+                                        if (r == 0)
+                                                r = k;
+                                }
+
+                        } else if (strv_isempty(paths))
+                                log_debug("No match for glob: %s", option->key);
+
+                        STRV_FOREACH(s, paths) {
+                                const char *key;
+
+                                assert_se(key = path_startswith(*s, "/proc/sys"));
+
+                                if (!test_prefix(key))
+                                        continue;
+
+                                if (ordered_hashmap_contains(sysctl_options, key)) {
+                                        log_info("Not setting %s (explicit setting exists).", key);
+                                        continue;
+                                }
+
+                                k = sysctl_write_or_warn(key, option->value, option->ignore_failure);
+                                if (r == 0)
+                                        r = k;
+                        }
+
+                } else {
+                        k = sysctl_write_or_warn(option->key, option->value, option->ignore_failure);
+                        if (r == 0)
+                                r = k;
+                }
+        }
+
+        return r;
+}
+
+static int parse_file(OrderedHashmap **sysctl_options, const char *path, bool ignore_enoent) {
         _cleanup_fclose_ FILE *f = NULL;
         unsigned c = 0;
         int r;
@@ -93,9 +197,11 @@ static int parse_file(OrderedHashmap *sysctl_options, const char *path, bool ign
 
         log_debug("Parsing %s", path);
         for (;;) {
-                char *p, *value, *new_value, *property, *existing;
+                _cleanup_(option_freep) Option *new_option = NULL;
                 _cleanup_free_ char *l = NULL;
-                void *v;
+                bool ignore_failure = false;
+                Option *existing;
+                char *p, *value;
                 int k;
 
                 k = read_line(f, LONG_LINE_MAX, &l);
@@ -114,50 +220,60 @@ static int parse_file(OrderedHashmap *sysctl_options, const char *path, bool ign
                         continue;
 
                 value = strchr(p, '=');
-                if (!value) {
-                        log_error("Line is not an assignment at '%s:%u': %s", path, c, p);
+                if (value) {
+                        if (p[0] == '-') {
+                                ignore_failure = true;
+                                p++;
+                        }
 
-                        if (r == 0)
-                                r = -EINVAL;
-                        continue;
+                        *value = 0;
+                        value++;
+                        value = strstrip(value);
+
+                } else {
+                        if (p[0] == '-')
+                                /* We have a "negative match" option. Let's continue with value==NULL. */
+                                p++;
+                        else {
+                                log_syntax(NULL, LOG_WARNING, path, c, 0,
+                                           "Line is not an assignment, ignoring: %s", p);
+                                if (r == 0)
+                                        r = -EINVAL;
+                                continue;
+                        }
                 }
 
-                *value = 0;
-                value++;
+                p = strstrip(p);
+                p = sysctl_normalize(p);
 
-                p = sysctl_normalize(strstrip(p));
-                value = strstrip(value);
-
-                if (!test_prefix(p))
+                /* We can't filter out globs at this point, we'll need to do that later. */
+                if (!string_is_glob(p) &&
+                    !test_prefix(p))
                         continue;
 
-                existing = ordered_hashmap_get2(sysctl_options, p, &v);
+                if (ordered_hashmap_ensure_allocated(sysctl_options, &option_hash_ops) < 0)
+                        return log_oom();
+
+                existing = ordered_hashmap_get(*sysctl_options, p);
                 if (existing) {
-                        if (streq(value, existing))
+                        if (streq_ptr(value, existing->value)) {
+                                existing->ignore_failure = existing->ignore_failure || ignore_failure;
                                 continue;
+                        }
 
                         log_debug("Overwriting earlier assignment of %s at '%s:%u'.", p, path, c);
-                        free(ordered_hashmap_remove(sysctl_options, p));
-                        free(v);
+                        option_free(ordered_hashmap_remove(*sysctl_options, p));
                 }
 
-                property = strdup(p);
-                if (!property)
+                new_option = option_new(p, value, ignore_failure);
+                if (!new_option)
                         return log_oom();
 
-                new_value = strdup(value);
-                if (!new_value) {
-                        free(property);
-                        return log_oom();
-                }
+                k = ordered_hashmap_put(*sysctl_options, new_option->key, new_option);
+                if (k < 0)
+                        return log_error_errno(k, "Failed to add sysctl variable %s to hashmap: %m", p);
 
-                k = ordered_hashmap_put(sysctl_options, property, new_value);
-                if (k < 0) {
-                        log_error_errno(k, "Failed to add sysctl variable %s to hashmap: %m", property);
-                        free(property);
-                        free(new_value);
-                        return k;
-                }
+                TAKE_PTR(new_option);
         }
 
         return r;
@@ -235,7 +351,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (path_startswith(optarg, "/proc/sys"))
                                 p = strdup(optarg);
                         else
-                                p = strappend("/proc/sys/", optarg);
+                                p = path_join("/proc/sys", optarg);
                         if (!p)
                                 return log_oom();
 
@@ -264,7 +380,7 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(ordered_hashmap_free_free_freep) OrderedHashmap *sysctl_options = NULL;
+        _cleanup_(ordered_hashmap_freep) OrderedHashmap *sysctl_options = NULL;
         int r, k;
 
         r = parse_argv(argc, argv);
@@ -275,17 +391,13 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        sysctl_options = ordered_hashmap_new(&path_hash_ops);
-        if (!sysctl_options)
-                return log_oom();
-
-        r = 0;
-
         if (argc > optind) {
                 int i;
 
+                r = 0;
+
                 for (i = optind; i < argc; i++) {
-                        k = parse_file(sysctl_options, argv[i], false);
+                        k = parse_file(&sysctl_options, argv[i], false);
                         if (k < 0 && r == 0)
                                 r = k;
                 }
@@ -304,7 +416,7 @@ static int run(int argc, char *argv[]) {
                 }
 
                 STRV_FOREACH(f, files) {
-                        k = parse_file(sysctl_options, *f, true);
+                        k = parse_file(&sysctl_options, *f, true);
                         if (k < 0 && r == 0)
                                 r = k;
                 }

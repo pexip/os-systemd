@@ -1,13 +1,10 @@
 <?xml version='1.0'?>
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
 <!ENTITY % entities SYSTEM "custom-entities.ent" >
 %entities;
 ]>
-
-<!--
-  SPDX-License-Identifier: LGPL-2.1+
--->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-system.conf"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -51,7 +48,7 @@
     <filename>user.conf.d</filename> directories. These configuration
     files contain a few settings controlling basic manager
     operations. See
-    <citerefentry><refentrytitle>systemd.syntax</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+    <citerefentry><refentrytitle>systemd.syntax</refentrytitle><manvolnum>7</manvolnum></citerefentry>
     for a general description of the syntax.</para>
   </refsect1>
 
@@ -61,15 +58,16 @@
     <title>Options</title>
 
     <para>All options are configured in the
-    <literal>[Manager]</literal> section:</para>
+    [Manager] section:</para>
 
     <variablelist class='config-directives'>
 
       <varlistentry>
-        <term><varname>LogLevel=</varname></term>
-        <term><varname>LogTarget=</varname></term>
         <term><varname>LogColor=</varname></term>
+        <term><varname>LogLevel=</varname></term>
         <term><varname>LogLocation=</varname></term>
+        <term><varname>LogTarget=</varname></term>
+        <term><varname>LogTime=</varname></term>
         <term><varname>DumpCore=yes</varname></term>
         <term><varname>CrashChangeVT=no</varname></term>
         <term><varname>CrashShell=no</varname></term>
@@ -99,16 +97,39 @@
       <varlistentry>
         <term><varname>CPUAffinity=</varname></term>
 
-        <listitem><para>Configures the CPU affinity for the service manager as well as the default CPU affinity for all
-        forked off processes. Takes a list of CPU indices or ranges separated by either whitespace or commas. CPU
-        ranges are specified by the lower and upper CPU indices separated by a dash. Individual services may override
-        the CPU affinity for their processes with the <varname>CPUAffinity=</varname> setting in unit files, see
+        <listitem><para>Configures the CPU affinity for the service manager as well as the default CPU
+        affinity for all forked off processes. Takes a list of CPU indices or ranges separated by either
+        whitespace or commas. CPU ranges are specified by the lower and upper CPU indices separated by a
+        dash. This option may be specified more than once, in which case the specified CPU affinity masks are
+        merged. If the empty string is assigned, the mask is reset, all assignments prior to this will have
+        no effect. Individual services may override the CPU affinity for their processes with the
+        <varname>CPUAffinity=</varname> setting in unit files, see
+        <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>NUMAPolicy=</varname></term>
+
+        <listitem><para>Configures the NUMA memory policy for the service manager and the default NUMA memory policy
+        for all forked off processes. Individual services may override the default policy with the
+        <varname>NUMAPolicy=</varname> setting in unit files, see
+        <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>NUMAMask=</varname></term>
+
+        <listitem><para>Configures the NUMA node mask that will be associated with the selected NUMA policy. Note that
+        <option>default</option> and <option>local</option> NUMA policies don't require explicit NUMA node mask and
+        value of the option can be empty. Similarly to <varname>NUMAPolicy=</varname>, value can be overridden
+        by individual services in unit files, see
         <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><varname>RuntimeWatchdogSec=</varname></term>
-        <term><varname>ShutdownWatchdogSec=</varname></term>
+        <term><varname>RebootWatchdogSec=</varname></term>
+        <term><varname>KExecWatchdogSec=</varname></term>
 
         <listitem><para>Configure the hardware watchdog at runtime and at reboot. Takes a timeout value in seconds (or
         in other time units if suffixed with <literal>ms</literal>, <literal>min</literal>, <literal>h</literal>,
@@ -119,18 +140,24 @@
         system manager will ensure to contact it at least once in half the specified timeout interval. This feature
         requires a hardware watchdog device to be present, as it is commonly the case in embedded and server
         systems. Not all hardware watchdogs allow configuration of all possible reboot timeout values, in which case
-        the closest available timeout is picked. <varname>ShutdownWatchdogSec=</varname> may be used to configure the
+        the closest available timeout is picked. <varname>RebootWatchdogSec=</varname> may be used to configure the
         hardware watchdog when the system is asked to reboot. It works as a safety net to ensure that the reboot takes
-        place even if a clean reboot attempt times out. Note that the <varname>ShutdownWatchdogSec=</varname> timeout
+        place even if a clean reboot attempt times out. Note that the <varname>RebootWatchdogSec=</varname> timeout
         applies only to the second phase of the reboot, i.e. after all regular services are already terminated, and
         after the system and service manager process (PID 1) got replaced by the <filename>systemd-shutdown</filename>
         binary, see system <citerefentry><refentrytitle>bootup</refentrytitle><manvolnum>7</manvolnum></citerefentry>
         for details. During the first phase of the shutdown operation the system and service manager remains running
         and hence <varname>RuntimeWatchdogSec=</varname> is still honoured. In order to define a timeout on this first
         phase of system shutdown, configure <varname>JobTimeoutSec=</varname> and <varname>JobTimeoutAction=</varname>
-        in the <literal>[Unit]</literal> section of the <filename>shutdown.target</filename> unit. By default
-        <varname>RuntimeWatchdogSec=</varname> defaults to 0 (off), and <varname>ShutdownWatchdogSec=</varname> to
-        10min. These settings have no effect if a hardware watchdog is not available.</para></listitem>
+        in the [Unit] section of the <filename>shutdown.target</filename> unit. By default
+        <varname>RuntimeWatchdogSec=</varname> defaults to 0 (off), and <varname>RebootWatchdogSec=</varname> to
+        10min. <varname>KExecWatchdogSec=</varname> may be used to additionally enable the watchdog when kexec
+        is being executed rather than when rebooting. Note that if the kernel does not reset the watchdog on kexec (depending
+        on the specific hardware and/or driver), in this case the watchdog might not get disabled after kexec succeeds
+        and thus the system might get rebooted, unless <varname>RuntimeWatchdogSec=</varname> is also enabled at the same time.
+        For this reason it is recommended to enable <varname>KExecWatchdogSec=</varname> only if
+        <varname>RuntimeWatchdogSec=</varname> is also enabled.
+        These settings have no effect if a hardware watchdog is not available.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -226,6 +253,16 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>StatusUnitFormat=</varname></term>
+
+        <listitem><para>Takes either <option>name</option> or <option>description</option> as the value. If
+        <option>name</option>, the system manager will use unit names in status messages, instead of the
+        longer and more informative descriptions set with <varname>Description=</varname>, see
+        <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+        </para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>DefaultTimerAccuracySec=</varname></term>
 
         <listitem><para>Sets the default accuracy of timer units. This
@@ -242,13 +279,15 @@
       <varlistentry>
         <term><varname>DefaultTimeoutStartSec=</varname></term>
         <term><varname>DefaultTimeoutStopSec=</varname></term>
+        <term><varname>DefaultTimeoutAbortSec=</varname></term>
         <term><varname>DefaultRestartSec=</varname></term>
 
-        <listitem><para>Configures the default timeouts for starting
-        and stopping of units, as well as the default time to sleep
+        <listitem><para>Configures the default timeouts for starting,
+        stopping and aborting of units, as well as the default time to sleep
         between automatic restarts of units, as configured per-unit in
         <varname>TimeoutStartSec=</varname>,
-        <varname>TimeoutStopSec=</varname> and
+        <varname>TimeoutStopSec=</varname>,
+        <varname>TimeoutAbortSec=</varname> and
         <varname>RestartSec=</varname> (for services, see
         <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         for details on the per-unit settings). Disabled by default, when
@@ -258,7 +297,9 @@
         <varname>TimeoutSec=</varname>
         value. <varname>DefaultTimeoutStartSec=</varname> and
         <varname>DefaultTimeoutStopSec=</varname> default to
-        90s. <varname>DefaultRestartSec=</varname> defaults to
+        90s. <varname>DefaultTimeoutAbortSec=</varname> is not set by default
+        so that all units fall back to <varname>TimeoutStopSec=</varname>.
+        <varname>DefaultRestartSec=</varname> defaults to
         100ms.</para></listitem>
       </varlistentry>
 
@@ -320,8 +361,11 @@
         <listitem><para>Configure the default value for the per-unit <varname>TasksMax=</varname> setting. See
         <citerefentry><refentrytitle>systemd.resource-control</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         for details. This setting applies to all unit types that support resource control settings, with the exception
-        of slice units. Defaults to 15%, which equals 4915 with the kernel's defaults on the host, but might be smaller
-        in OS containers.</para></listitem>
+        of slice units. Defaults to 15% of the minimum of <varname>kernel.pid_max=</varname>, <varname>kernel.threads-max=</varname>
+        and root cgroup <varname>pids.max</varname>.
+        Kernel has a default value for <varname>kernel.pid_max=</varname> and an algorithm of counting in case of more than 32 cores.
+        For example with the default <varname>kernel.pid_max=</varname>, <varname>DefaultTasksMax=</varname> defaults to 4915,
+        but might be greater in other systems or smaller in OS containers.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -342,30 +386,25 @@
         <term><varname>DefaultLimitRTPRIO=</varname></term>
         <term><varname>DefaultLimitRTTIME=</varname></term>
 
-        <listitem><para>These settings control various default
-        resource limits for units. See
-        <citerefentry><refentrytitle>setrlimit</refentrytitle><manvolnum>2</manvolnum></citerefentry>
-        for details. The resource limit is possible to specify in two formats,
-        <option>value</option> to set soft and hard limits to the same value,
-        or <option>soft:hard</option> to set both limits individually (e.g. DefaultLimitAS=4G:16G).
-        Use the string <varname>infinity</varname> to
-        configure no limit on a specific resource. The multiplicative
-        suffixes K (=1024), M (=1024*1024) and so on for G, T, P and E
-        may be used for resource limits measured in bytes
-        (e.g. DefaultLimitAS=16G). For the limits referring to time values,
-        the usual time units ms, s, min, h and so on may be used (see
-        <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-        for details). Note that if no time unit is specified for
-        <varname>DefaultLimitCPU=</varname> the default unit of seconds is
-        implied, while for <varname>DefaultLimitRTTIME=</varname> the default
-        unit of microseconds is implied. Also, note that the effective
-        granularity of the limits might influence their
-        enforcement. For example, time limits specified for
-        <varname>DefaultLimitCPU=</varname> will be rounded up implicitly to
-        multiples of 1s. These  settings may be overridden in individual units
-        using the corresponding LimitXXX= directives. Note that these resource
-        limits are only defaults for units, they are not applied to PID 1
-        itself.</para></listitem>
+        <listitem><para>These settings control various default resource limits for processes executed by
+        units. See
+        <citerefentry><refentrytitle>setrlimit</refentrytitle><manvolnum>2</manvolnum></citerefentry> for
+        details. These settings may be overridden in individual units using the corresponding
+        <varname>LimitXXX=</varname> directives and they accept the same parameter syntax,
+        see <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for details. Note that these resource limits are only defaults
+        for units, they are not applied to the service manager process (i.e. PID 1) itself.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>DefaultOOMPolicy=</varname></term>
+
+        <listitem><para>Configure the default policy for reacting to processes being killed by the Linux
+        Out-Of-Memory (OOM) killer. This may be used to pick a global default for the per-unit
+        <varname>OOMPolicy=</varname> setting. See
+        <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for details. Note that this default is not used for services that have <varname>Delegate=</varname>
+        turned on.</para></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>

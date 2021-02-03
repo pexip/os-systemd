@@ -1,8 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
-#include <pwd.h>
-#include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "sd-device.h"
@@ -10,76 +9,120 @@
 
 #include "alloc-util.h"
 #include "audit-util.h"
+#include "bootspec.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-get-properties.h"
+#include "bus-locator.h"
+#include "bus-polkit.h"
 #include "bus-unit-util.h"
 #include "bus-util.h"
 #include "cgroup-util.h"
 #include "device-util.h"
 #include "dirent-util.h"
+#include "efi-loader.h"
 #include "efivars.h"
+#include "env-util.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fileio-label.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "logind-dbus.h"
+#include "logind-seat-dbus.h"
+#include "logind-session-dbus.h"
+#include "logind-user-dbus.h"
 #include "logind.h"
 #include "missing_capability.h"
 #include "mkdir.h"
+#include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
+#include "reboot-util.h"
 #include "selinux-util.h"
 #include "sleep-config.h"
 #include "special.h"
+#include "stdio-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
 #include "unit-name.h"
 #include "user-util.h"
 #include "utmp-wtmp.h"
+#include "virt.h"
 
-static int get_sender_session(Manager *m, sd_bus_message *message, sd_bus_error *error, Session **ret) {
+static int get_sender_session(
+                Manager *m,
+                sd_bus_message *message,
+                bool consult_display,
+                sd_bus_error *error,
+                Session **ret) {
 
         _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
+        Session *session = NULL;
         const char *name;
-        Session *session;
         int r;
 
-        /* Get client login session.  This is not what you are looking for these days,
-         * as apps may instead belong to a user service unit.  This includes terminal
-         * emulators and hence command-line apps. */
-        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_SESSION|SD_BUS_CREDS_AUGMENT, &creds);
+        /* Acquire the sender's session. This first checks if the sending process is inside a session itself,
+         * and returns that. If not and 'consult_display' is true, this returns the display session of the
+         * owning user of the caller. */
+
+        r = sd_bus_query_sender_creds(message,
+                                      SD_BUS_CREDS_SESSION|SD_BUS_CREDS_AUGMENT|
+                                      (consult_display ? SD_BUS_CREDS_OWNER_UID : 0), &creds);
         if (r < 0)
                 return r;
 
         r = sd_bus_creds_get_session(creds, &name);
-        if (r == -ENXIO)
-                goto err_no_session;
-        if (r < 0)
-                return r;
+        if (r < 0) {
+                if (r != -ENXIO)
+                        return r;
 
-        session = hashmap_get(m->sessions, name);
+                if (consult_display) {
+                        uid_t uid;
+
+                        r = sd_bus_creds_get_owner_uid(creds, &uid);
+                        if (r < 0) {
+                                if (r != -ENXIO)
+                                        return r;
+                        } else {
+                                User *user;
+
+                                user = hashmap_get(m->users, UID_TO_PTR(uid));
+                                if (user)
+                                        session = user->display;
+                        }
+                }
+        } else
+                session = hashmap_get(m->sessions, name);
+
         if (!session)
-                goto err_no_session;
+                return sd_bus_error_setf(error, BUS_ERROR_NO_SESSION_FOR_PID,
+                                         consult_display ?
+                                         "Caller does not belong to any known session and doesn't own any suitable session." :
+                                         "Caller does not belong to any known session.");
 
         *ret = session;
         return 0;
-
-err_no_session:
-        return sd_bus_error_setf(error, BUS_ERROR_NO_SESSION_FOR_PID,
-                                 "Caller does not belong to any known session");
 }
 
-int manager_get_session_from_creds(Manager *m, sd_bus_message *message, const char *name, sd_bus_error *error, Session **ret) {
+int manager_get_session_from_creds(
+                Manager *m,
+                sd_bus_message *message,
+                const char *name,
+                sd_bus_error *error,
+                Session **ret) {
+
         Session *session;
 
         assert(m);
-        assert(message);
         assert(ret);
 
-        if (isempty(name))
-                return get_sender_session(m, message, error, ret);
+        if (SEAT_IS_SELF(name)) /* the caller's own session */
+                return get_sender_session(m, message, false, error, ret);
+        if (SEAT_IS_AUTO(name)) /* The caller's own session if they have one, otherwise their user's display session */
+                return get_sender_session(m, message, true, error, ret);
 
         session = hashmap_get(m->sessions, name);
         if (!session)
@@ -90,7 +133,6 @@ int manager_get_session_from_creds(Manager *m, sd_bus_message *message, const ch
 }
 
 static int get_sender_user(Manager *m, sd_bus_message *message, sd_bus_error *error, User **ret) {
-
         _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
         uid_t uid;
         User *user;
@@ -102,27 +144,26 @@ static int get_sender_user(Manager *m, sd_bus_message *message, sd_bus_error *er
                 return r;
 
         r = sd_bus_creds_get_owner_uid(creds, &uid);
-        if (r == -ENXIO)
-                goto err_no_user;
-        if (r < 0)
-                return r;
+        if (r < 0) {
+                if (r != -ENXIO)
+                        return r;
 
-        user = hashmap_get(m->users, UID_TO_PTR(uid));
+                user = NULL;
+        } else
+                user = hashmap_get(m->users, UID_TO_PTR(uid));
+
         if (!user)
-                goto err_no_user;
+                return sd_bus_error_setf(error, BUS_ERROR_NO_USER_FOR_PID,
+                                         "Caller does not belong to any logged in or lingering user");
 
         *ret = user;
         return 0;
-
-err_no_user:
-        return sd_bus_error_setf(error, BUS_ERROR_NO_USER_FOR_PID, "Caller does not belong to any logged in user or lingering user");
 }
 
 int manager_get_user_from_creds(Manager *m, sd_bus_message *message, uid_t uid, sd_bus_error *error, User **ret) {
         User *user;
 
         assert(m);
-        assert(message);
         assert(ret);
 
         if (!uid_is_valid(uid))
@@ -130,30 +171,37 @@ int manager_get_user_from_creds(Manager *m, sd_bus_message *message, uid_t uid, 
 
         user = hashmap_get(m->users, UID_TO_PTR(uid));
         if (!user)
-                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_USER, "User ID "UID_FMT" is not logged in or lingering", uid);
+                return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_USER,
+                                         "User ID "UID_FMT" is not logged in or lingering", uid);
 
         *ret = user;
         return 0;
 }
 
-int manager_get_seat_from_creds(Manager *m, sd_bus_message *message, const char *name, sd_bus_error *error, Seat **ret) {
+int manager_get_seat_from_creds(
+                Manager *m,
+                sd_bus_message *message,
+                const char *name,
+                sd_bus_error *error,
+                Seat **ret) {
+
         Seat *seat;
         int r;
 
         assert(m);
-        assert(message);
         assert(ret);
 
-        if (isempty(name)) {
+        if (SEAT_IS_SELF(name) || SEAT_IS_AUTO(name)) {
                 Session *session;
 
-                r = manager_get_session_from_creds(m, message, NULL, error, &session);
+                /* Use these special seat names as session names */
+                r = manager_get_session_from_creds(m, message, name, error, &session);
                 if (r < 0)
                         return r;
 
                 seat = session->seat;
                 if (!seat)
-                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_SEAT, "Session has no seat.");
+                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_SEAT, "Session '%s' has no seat.", session->id);
         } else {
                 seat = hashmap_get(m->seats, name);
                 if (!seat)
@@ -162,6 +210,32 @@ int manager_get_seat_from_creds(Manager *m, sd_bus_message *message, const char 
 
         *ret = seat;
         return 0;
+}
+
+static int return_test_polkit(
+                sd_bus_message *message,
+                int capability,
+                const char *action,
+                const char **details,
+                uid_t good_user,
+                sd_bus_error *e) {
+
+        const char *result;
+        bool challenge;
+        int r;
+
+        r = bus_test_polkit(message, capability, action, details, good_user, &challenge, e);
+        if (r < 0)
+                return r;
+
+        if (r > 0)
+                result = "yes";
+        else if (challenge)
+                result = "challenge";
+        else
+                result = "no";
+
+        return sd_bus_reply_method_return(message, "s", result);
 }
 
 static int property_get_idle_hint(
@@ -338,7 +412,8 @@ static int method_get_session_by_pid(sd_bus_message *message, void *userdata, sd
                         return r;
 
                 if (!session)
-                        return sd_bus_error_setf(error, BUS_ERROR_NO_SESSION_FOR_PID, "PID "PID_FMT" does not belong to any known session", pid);
+                        return sd_bus_error_setf(error, BUS_ERROR_NO_SESSION_FOR_PID,
+                                                 "PID "PID_FMT" does not belong to any known session", pid);
         }
 
         p = session_bus_path(session);
@@ -441,7 +516,6 @@ static int method_list_sessions(sd_bus_message *message, void *userdata, sd_bus_
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         Session *session;
-        Iterator i;
         int r;
 
         assert(message);
@@ -455,7 +529,7 @@ static int method_list_sessions(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(session, m->sessions, i) {
+        HASHMAP_FOREACH(session, m->sessions) {
                 _cleanup_free_ char *p = NULL;
 
                 p = session_bus_path(session);
@@ -464,8 +538,8 @@ static int method_list_sessions(sd_bus_message *message, void *userdata, sd_bus_
 
                 r = sd_bus_message_append(reply, "(susso)",
                                           session->id,
-                                          (uint32_t) session->user->uid,
-                                          session->user->name,
+                                          (uint32_t) session->user->user_record->uid,
+                                          session->user->user_record->user_name,
                                           session->seat ? session->seat->id : "",
                                           p);
                 if (r < 0)
@@ -483,7 +557,6 @@ static int method_list_users(sd_bus_message *message, void *userdata, sd_bus_err
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         User *user;
-        Iterator i;
         int r;
 
         assert(message);
@@ -497,7 +570,7 @@ static int method_list_users(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(user, m->users, i) {
+        HASHMAP_FOREACH(user, m->users) {
                 _cleanup_free_ char *p = NULL;
 
                 p = user_bus_path(user);
@@ -505,8 +578,8 @@ static int method_list_users(sd_bus_message *message, void *userdata, sd_bus_err
                         return -ENOMEM;
 
                 r = sd_bus_message_append(reply, "(uso)",
-                                          (uint32_t) user->uid,
-                                          user->name,
+                                          (uint32_t) user->user_record->uid,
+                                          user->user_record->user_name,
                                           p);
                 if (r < 0)
                         return r;
@@ -523,7 +596,6 @@ static int method_list_seats(sd_bus_message *message, void *userdata, sd_bus_err
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         Seat *seat;
-        Iterator i;
         int r;
 
         assert(message);
@@ -537,7 +609,7 @@ static int method_list_seats(sd_bus_message *message, void *userdata, sd_bus_err
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(seat, m->seats, i) {
+        HASHMAP_FOREACH(seat, m->seats) {
                 _cleanup_free_ char *p = NULL;
 
                 p = seat_bus_path(seat);
@@ -560,7 +632,6 @@ static int method_list_inhibitors(sd_bus_message *message, void *userdata, sd_bu
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         Manager *m = userdata;
         Inhibitor *inhibitor;
-        Iterator i;
         int r;
 
         assert(message);
@@ -574,7 +645,7 @@ static int method_list_inhibitors(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(inhibitor, m->inhibitors, i) {
+        HASHMAP_FOREACH(inhibitor, m->inhibitors) {
 
                 r = sd_bus_message_append(reply, "(ssssuu)",
                                           strempty(inhibit_what_to_string(inhibitor->what)),
@@ -616,7 +687,9 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
         assert_cc(sizeof(pid_t) == sizeof(uint32_t));
         assert_cc(sizeof(uid_t) == sizeof(uint32_t));
 
-        r = sd_bus_message_read(message, "uusssssussbss", &uid, &leader, &service, &type, &class, &desktop, &cseat, &vtnr, &tty, &display, &remote, &remote_user, &remote_host);
+        r = sd_bus_message_read(message, "uusssssussbss",
+                                &uid, &leader, &service, &type, &class, &desktop, &cseat,
+                                &vtnr, &tty, &display, &remote, &remote_user, &remote_host);
         if (r < 0)
                 return r;
 
@@ -630,7 +703,8 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
         else {
                 t = session_type_from_string(type);
                 if (t < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid session type %s", type);
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Invalid session type %s", type);
         }
 
         if (isempty(class))
@@ -638,14 +712,16 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
         else {
                 c = session_class_from_string(class);
                 if (c < 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid session class %s", class);
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Invalid session class %s", class);
         }
 
         if (isempty(desktop))
                 desktop = NULL;
         else {
                 if (!string_is_safe(desktop))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid desktop string %s", desktop);
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Invalid desktop string %s", desktop);
         }
 
         if (isempty(cseat))
@@ -653,7 +729,8 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
         else {
                 seat = hashmap_get(m->seats, cseat);
                 if (!seat)
-                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_SEAT, "No seat '%s' known", cseat);
+                        return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_SEAT,
+                                                 "No seat '%s' known", cseat);
         }
 
         if (tty_is_vc(tty)) {
@@ -662,35 +739,42 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                 if (!seat)
                         seat = m->seat0;
                 else if (seat != m->seat0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "TTY %s is virtual console but seat %s is not seat0", tty, seat->id);
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "TTY %s is virtual console but seat %s is not seat0", tty, seat->id);
 
                 v = vtnr_from_tty(tty);
                 if (v <= 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Cannot determine VT number from virtual console TTY %s", tty);
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Cannot determine VT number from virtual console TTY %s", tty);
 
                 if (vtnr == 0)
                         vtnr = (uint32_t) v;
                 else if (vtnr != (uint32_t) v)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Specified TTY and VT number do not match");
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Specified TTY and VT number do not match");
 
         } else if (tty_is_console(tty)) {
 
                 if (!seat)
                         seat = m->seat0;
                 else if (seat != m->seat0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Console TTY specified but seat is not seat0");
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Console TTY specified but seat is not seat0");
 
                 if (vtnr != 0)
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Console TTY specified but VT number is not 0");
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                 "Console TTY specified but VT number is not 0");
         }
 
         if (seat) {
                 if (seat_has_vts(seat)) {
                         if (vtnr <= 0 || vtnr > 63)
-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "VT number out of range");
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "VT number out of range");
                 } else {
                         if (vtnr != 0)
-                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Seat has no VTs but VT number not 0");
+                                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "Seat has no VTs but VT number not 0");
                 }
         }
 
@@ -722,13 +806,14 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                         return r;
         }
 
-        /* Check if we are already in a logind session. Or if we are in user@.service which is a special PAM session
-         * that avoids creating a logind session. */
+        /* Check if we are already in a logind session. Or if we are in user@.service
+         * which is a special PAM session that avoids creating a logind session. */
         r = manager_get_user_by_pid(m, leader, NULL);
         if (r < 0)
                 return r;
         if (r > 0)
-                return sd_bus_error_setf(error, BUS_ERROR_SESSION_BUSY, "Already running in a session or user slice");
+                return sd_bus_error_setf(error, BUS_ERROR_SESSION_BUSY,
+                                         "Already running in a session or user slice");
 
         /*
          * Old gdm and lightdm start the user-session on the same VT as
@@ -748,7 +833,9 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                 return sd_bus_error_setf(error, BUS_ERROR_SESSION_BUSY, "Already occupied by a session");
 
         if (hashmap_size(m->sessions) >= m->sessions_max)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Maximum number of sessions (%" PRIu64 ") reached, refusing further sessions.", m->sessions_max);
+                return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                         "Maximum number of sessions (%" PRIu64 ") reached, refusing further sessions.",
+                                         m->sessions_max);
 
         (void) audit_session_from_pid(leader, &audit_id);
         if (audit_session_is_valid(audit_id)) {
@@ -757,11 +844,9 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                 if (asprintf(&id, "%"PRIu32, audit_id) < 0)
                         return -ENOMEM;
 
-                /* Wut? There's already a session by this name and we
-                 * didn't find it above? Weird, then let's not trust
-                 * the audit data and let's better register a new
-                 * ID */
-                if (hashmap_get(m->sessions, id)) {
+                /* Wut? There's already a session by this name and we didn't find it above? Weird, then let's
+                 * not trust the audit data and let's better register a new ID */
+                if (hashmap_contains(m->sessions, id)) {
                         log_warning("Existing logind session ID %s used by new audit session, ignoring.", id);
                         audit_id = AUDIT_SESSION_INVALID;
                         id = mfree(id);
@@ -775,10 +860,14 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                         if (asprintf(&id, "c%lu", ++m->session_counter) < 0)
                                 return -ENOMEM;
 
-                } while (hashmap_get(m->sessions, id));
+                } while (hashmap_contains(m->sessions, id));
         }
 
-        /* If we are not watching utmp aleady, try again */
+        /* The generated names should not clash with 'auto' or 'self' */
+        assert(!SESSION_IS_SELF(id));
+        assert(!SESSION_IS_AUTO(id));
+
+        /* If we are not watching utmp already, try again */
         manager_reconnect_utmp(m);
 
         r = manager_add_user_by_uid(m, uid, &user);
@@ -790,9 +879,11 @@ static int method_create_session(sd_bus_message *message, void *userdata, sd_bus
                 goto fail;
 
         session_set_user(session, user);
-        session_set_leader(session, leader);
+        r = session_set_leader(session, leader);
+        if (r < 0)
+                goto fail;
 
-        session->type = t;
+        session->original_type = session->type = t;
         session->class = c;
         session->remote = remote;
         session->vtnr = vtnr;
@@ -923,6 +1014,8 @@ static int method_activate_session(sd_bus_message *message, void *userdata, sd_b
         if (r < 0)
                 return r;
 
+        /* PolicyKit is done by bus_session_method_activate() */
+
         return bus_session_method_activate(message, session, error);
 }
 
@@ -936,8 +1029,7 @@ static int method_activate_session_on_seat(sd_bus_message *message, void *userda
         assert(message);
         assert(m);
 
-        /* Same as ActivateSession() but refuses to work if
-         * the seat doesn't match */
+        /* Same as ActivateSession() but refuses to work if the seat doesn't match */
 
         r = sd_bus_message_read(message, "ss", &session_name, &seat_name);
         if (r < 0)
@@ -952,7 +1044,22 @@ static int method_activate_session_on_seat(sd_bus_message *message, void *userda
                 return r;
 
         if (session->seat != seat)
-                return sd_bus_error_setf(error, BUS_ERROR_SESSION_NOT_ON_SEAT, "Session %s not on seat %s", session_name, seat_name);
+                return sd_bus_error_setf(error, BUS_ERROR_SESSION_NOT_ON_SEAT,
+                                         "Session %s not on seat %s", session_name, seat_name);
+
+        r = bus_verify_polkit_async(
+                        message,
+                        CAP_SYS_ADMIN,
+                        "org.freedesktop.login1.chvt",
+                        NULL,
+                        false,
+                        UID_INVALID,
+                        &m->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
 
         r = session_activate(session);
         if (r < 0)
@@ -1146,7 +1253,7 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
         errno = 0;
         pw = getpwuid(uid);
         if (!pw)
-                return errno > 0 ? -errno : -ENOENT;
+                return errno_or_else(ENOENT);
 
         r = bus_verify_polkit_async(
                         message,
@@ -1163,8 +1270,7 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        mkdir_p_label("/var/lib/systemd", 0755);
-
+        (void) mkdir_p_label("/var/lib/systemd", 0755);
         r = mkdir_safe_label("/var/lib/systemd/linger", 0755, 0, 0, MKDIR_WARN_MODE);
         if (r < 0)
                 return r;
@@ -1227,7 +1333,7 @@ static int trigger_device(Manager *m, sd_device *d) {
                 if (r < 0)
                         return r;
 
-                t = strappend(p, "/uevent");
+                t = path_join(p, "uevent");
                 if (!t)
                         return -ENOMEM;
 
@@ -1251,7 +1357,7 @@ static int attach_device(Manager *m, const char *seat, const char *sysfs) {
         if (r < 0)
                 return r;
 
-        if (sd_device_has_tag(d, "seat") <= 0)
+        if (sd_device_has_current_tag(d, "seat") <= 0)
                 return -ENODEV;
 
         if (sd_device_get_property_value(d, "ID_FOR_SEAT", &id_for_seat) < 0)
@@ -1284,6 +1390,7 @@ static int flush_devices(Manager *m) {
                 struct dirent *de;
 
                 FOREACH_DIRENT_ALL(de, d, break) {
+                        dirent_ensure_type(d, de);
                         if (!dirent_is_file(de))
                                 continue;
 
@@ -1313,11 +1420,22 @@ static int method_attach_device(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
+        if (!path_is_normalized(sysfs))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Path %s is not normalized", sysfs);
         if (!path_startswith(sysfs, "/sys"))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Path %s is not in /sys", sysfs);
 
-        if (!seat_name_is_valid(seat))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Seat %s is not valid", seat);
+        if (SEAT_IS_SELF(seat) || SEAT_IS_AUTO(seat)) {
+                Seat *found;
+
+                r = manager_get_seat_from_creds(m, message, seat, error, &found);
+                if (r < 0)
+                        return r;
+
+                seat = found->id;
+
+        } else if (!seat_name_is_valid(seat)) /* Note that a seat does not have to exist yet for this operation to succeed */
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Seat name %s is not valid", seat);
 
         r = bus_verify_polkit_async(
                         message,
@@ -1377,15 +1495,14 @@ static int have_multiple_sessions(
                 uid_t uid) {
 
         Session *session;
-        Iterator i;
 
         assert(m);
 
         /* Check for other users' sessions. Greeter sessions do not
          * count, and non-login sessions do not count either. */
-        HASHMAP_FOREACH(session, m->sessions, i)
+        HASHMAP_FOREACH(session, m->sessions)
                 if (session->class == SESSION_USER &&
-                    session->user->uid != uid)
+                    session->user->user_record->uid != uid)
                         return true;
 
         return false;
@@ -1505,11 +1622,9 @@ static int execute_shutdown_or_sleep(
         if (w == INHIBIT_SHUTDOWN)
                 bus_manager_log_shutdown(m, unit_name);
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         m->bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         "StartUnit",
                         error,
                         &reply,
@@ -1600,26 +1715,26 @@ static int delay_shutdown_or_sleep(
                 const char *unit_name) {
 
         int r;
-        usec_t timeout_val;
 
         assert(m);
         assert(w >= 0);
         assert(w < _INHIBIT_WHAT_MAX);
         assert(unit_name);
 
-        timeout_val = now(CLOCK_MONOTONIC) + m->inhibit_delay_max;
-
         if (m->inhibit_timeout_source) {
-                r = sd_event_source_set_time(m->inhibit_timeout_source, timeout_val);
+                r = sd_event_source_set_time_relative(m->inhibit_timeout_source, m->inhibit_delay_max);
                 if (r < 0)
-                        return log_error_errno(r, "sd_event_source_set_time() failed: %m");
+                        return log_error_errno(r, "sd_event_source_set_time_relative() failed: %m");
 
                 r = sd_event_source_set_enabled(m->inhibit_timeout_source, SD_EVENT_ONESHOT);
                 if (r < 0)
                         return log_error_errno(r, "sd_event_source_set_enabled() failed: %m");
         } else {
-                r = sd_event_add_time(m->event, &m->inhibit_timeout_source, CLOCK_MONOTONIC,
-                                      timeout_val, 0, manager_inhibit_timeout_handler, m);
+                r = sd_event_add_time_relative(
+                                m->event,
+                                &m->inhibit_timeout_source,
+                                CLOCK_MONOTONIC, m->inhibit_delay_max, 0,
+                                manager_inhibit_timeout_handler, m);
                 if (r < 0)
                         return r;
         }
@@ -1761,7 +1876,8 @@ static int method_do_shutdown_or_sleep(
 
         /* Don't allow multiple jobs being executed at the same time */
         if (m->action_what > 0)
-                return sd_bus_error_setf(error, BUS_ERROR_OPERATION_IN_PROGRESS, "There's already a shutdown or sleep operation in progress");
+                return sd_bus_error_setf(error, BUS_ERROR_OPERATION_IN_PROGRESS,
+                                         "There's already a shutdown or sleep operation in progress");
 
         if (sleep_verb) {
                 r = can_sleep(sleep_verb);
@@ -2376,6 +2492,97 @@ static int method_can_suspend_then_hibernate(sd_bus_message *message, void *user
                         error);
 }
 
+static int property_get_reboot_parameter(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+        _cleanup_free_ char *parameter = NULL;
+        int r;
+
+        assert(bus);
+        assert(reply);
+        assert(userdata);
+
+        r = read_reboot_parameter(&parameter);
+        if (r < 0)
+                return r;
+
+        return sd_bus_message_append(reply, "s", parameter);
+}
+
+static int method_set_reboot_parameter(
+                sd_bus_message *message,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Manager *m = userdata;
+        const char *arg;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = sd_bus_message_read(message, "s", &arg);
+        if (r < 0)
+                return r;
+
+        r = detect_container();
+        if (r < 0)
+                return r;
+        if (r > 0)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                                         "Reboot parameter not supported in containers, refusing.");
+
+        r = bus_verify_polkit_async(message,
+                                    CAP_SYS_ADMIN,
+                                    "org.freedesktop.login1.set-reboot-parameter",
+                                    NULL,
+                                    false,
+                                    UID_INVALID,
+                                    &m->polkit_registry,
+                                    error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
+        r = update_reboot_parameter_and_warn(arg, false);
+        if (r < 0)
+                return r;
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
+static int method_can_reboot_parameter(
+                sd_bus_message *message,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _unused_ Manager *m = userdata;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = detect_container();
+        if (r < 0)
+                return r;
+        if (r > 0) /* Inside containers, specifying a reboot parameter, doesn't make much sense */
+                return sd_bus_reply_method_return(message, "s", "na");
+
+        return return_test_polkit(
+                        message,
+                        CAP_SYS_ADMIN,
+                        "org.freedesktop.login1.set-reboot-parameter",
+                        NULL,
+                        UID_INVALID,
+                        error);
+}
+
 static int property_get_reboot_to_firmware_setup(
                 sd_bus *bus,
                 const char *path,
@@ -2390,9 +2597,24 @@ static int property_get_reboot_to_firmware_setup(
         assert(reply);
         assert(userdata);
 
-        r = efi_get_reboot_to_firmware();
-        if (r < 0 && r != -EOPNOTSUPP)
-                log_warning_errno(r, "Failed to determine reboot-to-firmware state: %m");
+        r = getenv_bool("SYSTEMD_REBOOT_TO_FIRMWARE_SETUP");
+        if (r == -ENXIO) {
+                /* EFI case: let's see what is currently configured in the EFI variables */
+                r = efi_get_reboot_to_firmware();
+                if (r < 0 && r != -EOPNOTSUPP)
+                        log_warning_errno(r, "Failed to determine reboot-to-firmware-setup state: %m");
+        } else if (r < 0)
+                log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_FIRMWARE_SETUP: %m");
+        else if (r > 0) {
+                /* Non-EFI case: let's see whether /run/systemd/reboot-to-firmware-setup exists. */
+                if (access("/run/systemd/reboot-to-firmware-setup", F_OK) < 0) {
+                        if (errno != ENOENT)
+                                log_warning_errno(errno, "Failed to check whether /run/systemd/reboot-to-firmware-setup exists: %m");
+
+                        r = false;
+                } else
+                        r = true;
+        }
 
         return sd_bus_message_append(reply, "b", r > 0);
 }
@@ -2402,8 +2624,9 @@ static int method_set_reboot_to_firmware_setup(
                 void *userdata,
                 sd_bus_error *error) {
 
-        int b, r;
         Manager *m = userdata;
+        bool use_efi;
+        int b, r;
 
         assert(message);
         assert(m);
@@ -2411,6 +2634,29 @@ static int method_set_reboot_to_firmware_setup(
         r = sd_bus_message_read(message, "b", &b);
         if (r < 0)
                 return r;
+
+        r = getenv_bool("SYSTEMD_REBOOT_TO_FIRMWARE_SETUP");
+        if (r == -ENXIO) {
+                /* EFI case: let's see what the firmware supports */
+
+                r = efi_reboot_to_firmware_supported();
+                if (r == -EOPNOTSUPP)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Firmware does not support boot into firmware.");
+                if (r < 0)
+                        return r;
+
+                use_efi = true;
+
+        } else if (r <= 0) {
+                /* non-EFI case: $SYSTEMD_REBOOT_TO_FIRMWARE_SETUP is set to off */
+
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_FIRMWARE_SETUP: %m");
+
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Firmware does not support boot into firmware.");
+        } else
+                /* non-EFI case: $SYSTEMD_REBOOT_TO_FIRMWARE_SETUP is set to on */
+                use_efi = false;
 
         r = bus_verify_polkit_async(message,
                                     CAP_SYS_ADMIN,
@@ -2425,9 +2671,20 @@ static int method_set_reboot_to_firmware_setup(
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        r = efi_set_reboot_to_firmware(b);
-        if (r < 0)
-                return r;
+        if (use_efi) {
+                r = efi_set_reboot_to_firmware(b);
+                if (r < 0)
+                        return r;
+        } else {
+                if (b) {
+                        r = touch("/run/systemd/reboot-to-firmware-setup");
+                        if (r < 0)
+                                return r;
+                } else {
+                        if (unlink("/run/systemd/reboot-to-firmware-setup") < 0 && errno != ENOENT)
+                                return -errno;
+                }
+        }
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -2437,40 +2694,453 @@ static int method_can_reboot_to_firmware_setup(
                 void *userdata,
                 sd_bus_error *error) {
 
+        _unused_ Manager *m = userdata;
         int r;
-        bool challenge;
-        const char *result;
-        Manager *m = userdata;
 
         assert(message);
         assert(m);
 
-        r = efi_reboot_to_firmware_supported();
-        if (r < 0) {
-                if (r != -EOPNOTSUPP)
-                        log_warning_errno(r, "Failed to determine whether reboot to firmware is supported: %m");
+        r = getenv_bool("SYSTEMD_REBOOT_TO_FIRMWARE_SETUP");
+        if (r == -ENXIO) {
+                /* EFI case: let's see what the firmware supports */
+
+                r = efi_reboot_to_firmware_supported();
+                if (r < 0) {
+                        if (r != -EOPNOTSUPP)
+                                log_warning_errno(r, "Failed to determine whether reboot to firmware is supported: %m");
+
+                        return sd_bus_reply_method_return(message, "s", "na");
+                }
+
+        } else if (r <= 0) {
+                /* Non-EFI case: let's trust $SYSTEMD_REBOOT_TO_FIRMWARE_SETUP */
+
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_FIRMWARE_SETUP: %m");
 
                 return sd_bus_reply_method_return(message, "s", "na");
         }
 
-        r = bus_test_polkit(message,
-                            CAP_SYS_ADMIN,
-                            "org.freedesktop.login1.set-reboot-to-firmware-setup",
-                            NULL,
-                            UID_INVALID,
-                            &challenge,
-                            error);
+        return return_test_polkit(
+                        message,
+                        CAP_SYS_ADMIN,
+                        "org.freedesktop.login1.set-reboot-to-firmware-setup",
+                        NULL,
+                        UID_INVALID,
+                        error);
+}
+
+static int property_get_reboot_to_boot_loader_menu(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        uint64_t x = UINT64_MAX;
+        int r;
+
+        assert(bus);
+        assert(reply);
+        assert(userdata);
+
+        r = getenv_bool("SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU");
+        if (r == -ENXIO) {
+                /* EFI case: returns the current value of LoaderConfigTimeoutOneShot. Three cases are distuingished:
+                 *
+                 *     1. Variable not set, boot into boot loader menu is not enabled (we return UINT64_MAX to the user)
+                 *     2. Variable set to "0", boot into boot loader menu is enabled with no timeout (we return 0 to the user)
+                 *     3. Variable set to numeric value formatted in ASCII, boot into boot loader menu with the specified timeout in seconds
+                 */
+
+                r = efi_loader_get_config_timeout_one_shot(&x);
+                if (r < 0) {
+                        if (r != -ENOENT)
+                                log_warning_errno(r, "Failed to read LoaderConfigTimeoutOneShot variable, ignoring: %m");
+                }
+
+        } else if (r < 0)
+                log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU: %m");
+        else if (r > 0) {
+                _cleanup_free_ char *v = NULL;
+
+                /* Non-EFI case, let's process /run/systemd/reboot-to-boot-loader-menu. */
+
+                r = read_one_line_file("/run/systemd/reboot-to-boot-loader-menu", &v);
+                if (r < 0) {
+                        if (r != -ENOENT)
+                                log_warning_errno(r, "Failed to read /run/systemd/reboot-to-boot-loader-menu: %m");
+                } else {
+                        r = safe_atou64(v, &x);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to parse /run/systemd/reboot-to-boot-loader-menu: %m");
+                }
+        }
+
+        return sd_bus_message_append(reply, "t", x);
+}
+
+static int method_set_reboot_to_boot_loader_menu(
+                sd_bus_message *message,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Manager *m = userdata;
+        bool use_efi;
+        uint64_t x;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = sd_bus_message_read(message, "t", &x);
         if (r < 0)
                 return r;
 
-        if (r > 0)
-                result = "yes";
-        else if (challenge)
-                result = "challenge";
-        else
-                result = "no";
+        r = getenv_bool("SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU");
+        if (r == -ENXIO) {
+                uint64_t features;
 
-        return sd_bus_reply_method_return(message, "s", result);
+                /* EFI case: let's see if booting into boot loader menu is supported. */
+
+                r = efi_loader_get_features(&features);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to determine whether reboot to boot loader menu is supported: %m");
+                if (r < 0 || !FLAGS_SET(features, EFI_LOADER_FEATURE_CONFIG_TIMEOUT_ONE_SHOT))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Boot loader does not support boot into boot loader menu.");
+
+                use_efi = true;
+
+        } else if (r <= 0) {
+                /* non-EFI case: $SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU is set to off */
+
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU: %m");
+
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Boot loader does not support boot into boot loader menu.");
+        } else
+                /* non-EFI case: $SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU is set to on */
+                use_efi = false;
+
+        r = bus_verify_polkit_async(message,
+                                    CAP_SYS_ADMIN,
+                                    "org.freedesktop.login1.set-reboot-to-boot-loader-menu",
+                                    NULL,
+                                    false,
+                                    UID_INVALID,
+                                    &m->polkit_registry,
+                                    error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
+        if (use_efi) {
+                if (x == UINT64_MAX)
+                        r = efi_set_variable(EFI_VENDOR_LOADER, "LoaderConfigTimeoutOneShot", NULL, 0);
+                else {
+                        char buf[DECIMAL_STR_MAX(uint64_t) + 1];
+                        xsprintf(buf, "%" PRIu64, DIV_ROUND_UP(x, USEC_PER_SEC)); /* second granularity */
+
+                        r = efi_set_variable_string(EFI_VENDOR_LOADER, "LoaderConfigTimeoutOneShot", buf);
+                }
+                if (r < 0)
+                        return r;
+        } else {
+                if (x == UINT64_MAX) {
+                        if (unlink("/run/systemd/reboot-to-boot-loader-menu") < 0 && errno != ENOENT)
+                                return -errno;
+                } else {
+                        char buf[DECIMAL_STR_MAX(uint64_t) + 1];
+
+                        xsprintf(buf, "%" PRIu64, x); /* µs granularity */
+
+                        r = write_string_file_atomic_label("/run/systemd/reboot-to-boot-loader-menu", buf);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
+static int method_can_reboot_to_boot_loader_menu(
+                sd_bus_message *message,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _unused_ Manager *m = userdata;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = getenv_bool("SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU");
+        if (r == -ENXIO) {
+                uint64_t features = 0;
+
+                /* EFI case, let's see if booting into boot loader menu is supported. */
+
+                r = efi_loader_get_features(&features);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to determine whether reboot to boot loader menu is supported: %m");
+                if (r < 0 || !FLAGS_SET(features, EFI_LOADER_FEATURE_CONFIG_TIMEOUT_ONE_SHOT))
+                        return sd_bus_reply_method_return(message, "s", "na");
+
+        } else if (r <= 0) {
+                /* Non-EFI case: let's trust $SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU */
+
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_BOOT_LOADER_MENU: %m");
+
+                return sd_bus_reply_method_return(message, "s", "na");
+        }
+
+        return return_test_polkit(
+                        message,
+                        CAP_SYS_ADMIN,
+                        "org.freedesktop.login1.set-reboot-to-boot-loader-menu",
+                        NULL,
+                        UID_INVALID,
+                        error);
+}
+
+static int property_get_reboot_to_boot_loader_entry(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _cleanup_free_ char *v = NULL;
+        Manager *m = userdata;
+        const char *x = NULL;
+        int r;
+
+        assert(bus);
+        assert(reply);
+        assert(m);
+
+        r = getenv_bool("SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY");
+        if (r == -ENXIO) {
+                /* EFI case: let's read the LoaderEntryOneShot variable */
+
+                r = efi_loader_update_entry_one_shot_cache(&m->efi_loader_entry_one_shot, &m->efi_loader_entry_one_shot_stat);
+                if (r < 0) {
+                        if (r != -ENOENT)
+                                log_warning_errno(r, "Failed to read LoaderEntryOneShot variable, ignoring: %m");
+                } else
+                        x = m->efi_loader_entry_one_shot;
+
+        } else if (r < 0)
+                log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY: %m");
+        else if (r > 0) {
+
+                /* Non-EFI case, let's process /run/systemd/reboot-to-boot-loader-entry. */
+
+                r = read_one_line_file("/run/systemd/reboot-to-boot-loader-entry", &v);
+                if (r < 0) {
+                        if (r != -ENOENT)
+                                log_warning_errno(r, "Failed to read /run/systemd/reboot-to-boot-loader-entry, ignoring: %m");
+                } else if (!efi_loader_entry_name_valid(v))
+                        log_warning("/run/systemd/reboot-to-boot-loader-entry is not valid, ignoring.");
+                else
+                        x = v;
+        }
+
+        return sd_bus_message_append(reply, "s", x);
+}
+
+static int boot_loader_entry_exists(Manager *m, const char *id) {
+        _cleanup_(boot_config_free) BootConfig config = {};
+        int r;
+
+        assert(m);
+        assert(id);
+
+        r = boot_entries_load_config_auto(NULL, NULL, &config);
+        if (r < 0 && r != -ENOKEY) /* don't complain if no GPT is found, hence skip ENOKEY */
+                return r;
+
+        r = manager_read_efi_boot_loader_entries(m);
+        if (r >= 0)
+                (void) boot_entries_augment_from_loader(&config, m->efi_boot_loader_entries, true);
+
+        return boot_config_has_entry(&config, id);
+}
+
+static int method_set_reboot_to_boot_loader_entry(
+                sd_bus_message *message,
+                void *userdata,
+                sd_bus_error *error) {
+
+        Manager *m = userdata;
+        bool use_efi;
+        const char *v;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = sd_bus_message_read(message, "s", &v);
+        if (r < 0)
+                return r;
+
+        if (isempty(v))
+                v = NULL;
+        else if (efi_loader_entry_name_valid(v)) {
+                r = boot_loader_entry_exists(m, v);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Boot loader entry '%s' is not known.", v);
+        } else
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Boot loader entry name '%s' is not valid, refusing.", v);
+
+        r = getenv_bool("SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY");
+        if (r == -ENXIO) {
+                uint64_t features;
+
+                /* EFI case: let's see if booting into boot loader entry is supported. */
+
+                r = efi_loader_get_features(&features);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to determine whether reboot into boot loader entry is supported: %m");
+                if (r < 0 || !FLAGS_SET(features, EFI_LOADER_FEATURE_ENTRY_ONESHOT))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Loader does not support boot into boot loader entry.");
+
+                use_efi = true;
+
+        } else if (r <= 0) {
+                /* non-EFI case: $SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY is set to off */
+
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY: %m");
+
+                return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Loader does not support boot into boot loader entry.");
+        } else
+                /* non-EFI case: $SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY is set to on */
+                use_efi = false;
+
+        r = bus_verify_polkit_async(message,
+                                    CAP_SYS_ADMIN,
+                                    "org.freedesktop.login1.set-reboot-to-boot-loader-entry",
+                                    NULL,
+                                    false,
+                                    UID_INVALID,
+                                    &m->polkit_registry,
+                                    error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
+
+        if (use_efi) {
+                if (isempty(v))
+                        /* Delete item */
+                        r = efi_set_variable(EFI_VENDOR_LOADER, "LoaderEntryOneShot", NULL, 0);
+                else
+                        r = efi_set_variable_string(EFI_VENDOR_LOADER, "LoaderEntryOneShot", v);
+                if (r < 0)
+                        return r;
+        } else {
+                if (isempty(v)) {
+                        if (unlink("/run/systemd/reboot-to-boot-loader-entry") < 0 && errno != ENOENT)
+                                return -errno;
+                } else {
+                        r = write_string_file_atomic_label("/run/systemd/reboot-boot-to-loader-entry", v);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        return sd_bus_reply_method_return(message, NULL);
+}
+
+static int method_can_reboot_to_boot_loader_entry(
+                sd_bus_message *message,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _unused_ Manager *m = userdata;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = getenv_bool("SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY");
+        if (r == -ENXIO) {
+                uint64_t features = 0;
+
+                /* EFI case, let's see if booting into boot loader entry is supported. */
+
+                r = efi_loader_get_features(&features);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to determine whether reboot to boot loader entry is supported: %m");
+                if (r < 0 || !FLAGS_SET(features, EFI_LOADER_FEATURE_ENTRY_ONESHOT))
+                        return sd_bus_reply_method_return(message, "s", "na");
+
+        } else if (r <= 0) {
+                /* Non-EFI case: let's trust $SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY */
+
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse $SYSTEMD_REBOOT_TO_BOOT_LOADER_ENTRY: %m");
+
+                return sd_bus_reply_method_return(message, "s", "na");
+        }
+
+        return return_test_polkit(
+                        message,
+                        CAP_SYS_ADMIN,
+                        "org.freedesktop.login1.set-reboot-to-boot-loader-entry",
+                        NULL,
+                        UID_INVALID,
+                        error);
+}
+
+static int property_get_boot_loader_entries(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *error) {
+
+        _cleanup_(boot_config_free) BootConfig config = {};
+        Manager *m = userdata;
+        size_t i;
+        int r;
+
+        assert(bus);
+        assert(reply);
+        assert(m);
+
+        r = boot_entries_load_config_auto(NULL, NULL, &config);
+        if (r < 0 && r != -ENOKEY) /* don't complain if there's no GPT found */
+                return r;
+
+        r = manager_read_efi_boot_loader_entries(m);
+        if (r >= 0)
+                (void) boot_entries_augment_from_loader(&config, m->efi_boot_loader_entries, true);
+
+        r = sd_bus_message_open_container(reply, 'a', "s");
+        if (r < 0)
+                return r;
+
+        for (i = 0; i < config.n_entries; i++) {
+                BootEntry *e = config.entries + i;
+
+                r = sd_bus_message_append(reply, "s", e->id);
+                if (r < 0)
+                        return r;
+        }
+
+        return sd_bus_message_close_container(reply);
 }
 
 static int method_set_wall_message(
@@ -2489,6 +3159,12 @@ static int method_set_wall_message(
         r = sd_bus_message_read(message, "sb", &wall_message, &enable_wall_messages);
         if (r < 0)
                 return r;
+
+        /* Short-circuit the operation if the desired state is already in place, to
+         * avoid an unnecessary polkit permission check. */
+        if (streq_ptr(m->wall_message, empty_to_null(wall_message)) &&
+            m->enable_wall_messages == enable_wall_messages)
+                goto done;
 
         r = bus_verify_polkit_async(message,
                                     CAP_SYS_ADMIN,
@@ -2509,6 +3185,7 @@ static int method_set_wall_message(
 
         m->enable_wall_messages = enable_wall_messages;
 
+ done:
         return sd_bus_reply_method_return(message, NULL);
 }
 
@@ -2518,7 +3195,6 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
         _cleanup_free_ char *id = NULL;
         _cleanup_close_ int fifo_fd = -1;
         Manager *m = userdata;
-        Inhibitor *i = NULL;
         InhibitMode mm;
         InhibitWhat w;
         pid_t pid;
@@ -2534,22 +3210,26 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
 
         w = inhibit_what_from_string(what);
         if (w <= 0)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid what specification %s", what);
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Invalid what specification %s", what);
 
         mm = inhibit_mode_from_string(mode);
         if (mm < 0)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid mode specification %s", mode);
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Invalid mode specification %s", mode);
 
         /* Delay is only supported for shutdown/sleep */
         if (mm == INHIBIT_DELAY && (w & ~(INHIBIT_SHUTDOWN|INHIBIT_SLEEP)))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Delay inhibitors only supported for shutdown and sleep");
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Delay inhibitors only supported for shutdown and sleep");
 
         /* Don't allow taking delay locks while we are already
          * executing the operation. We shouldn't create the impression
          * that the lock was successful if the machine is about to go
          * down/suspend any moment. */
         if (m->action_what & w)
-                return sd_bus_error_setf(error, BUS_ERROR_OPERATION_IN_PROGRESS, "The operation inhibition has been requested for is already running");
+                return sd_bus_error_setf(error, BUS_ERROR_OPERATION_IN_PROGRESS,
+                                         "The operation inhibition has been requested for is already running");
 
         r = bus_verify_polkit_async(
                         message,
@@ -2559,6 +3239,7 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
                         w == INHIBIT_IDLE                 ? "org.freedesktop.login1.inhibit-block-idle" :
                         w == INHIBIT_HANDLE_POWER_KEY     ? "org.freedesktop.login1.inhibit-handle-power-key" :
                         w == INHIBIT_HANDLE_SUSPEND_KEY   ? "org.freedesktop.login1.inhibit-handle-suspend-key" :
+                        w == INHIBIT_HANDLE_REBOOT_KEY    ? "org.freedesktop.login1.inhibit-handle-reboot-key" :
                         w == INHIBIT_HANDLE_HIBERNATE_KEY ? "org.freedesktop.login1.inhibit-handle-hibernate-key" :
                                                             "org.freedesktop.login1.inhibit-handle-lid-switch",
                         NULL,
@@ -2584,7 +3265,9 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
                 return r;
 
         if (hashmap_size(m->inhibitors) >= m->inhibitors_max)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED, "Maximum number of inhibitors (%" PRIu64 ") reached, refusing further inhibitors.", m->inhibitors_max);
+                return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                                         "Maximum number of inhibitors (%" PRIu64 ") reached, refusing further inhibitors.",
+                                         m->inhibitors_max);
 
         do {
                 id = mfree(id);
@@ -2594,6 +3277,7 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
 
         } while (hashmap_get(m->inhibitors, id));
 
+        _cleanup_(inhibitor_freep) Inhibitor *i = NULL;
         r = manager_add_inhibitor(m, id, &i);
         if (r < 0)
                 return r;
@@ -2605,29 +3289,22 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
         i->why = strdup(why);
         i->who = strdup(who);
 
-        if (!i->why || !i->who) {
-                r = -ENOMEM;
-                goto fail;
-        }
+        if (!i->why || !i->who)
+                return -ENOMEM;
 
         fifo_fd = inhibitor_create_fifo(i);
-        if (fifo_fd < 0) {
-                r = fifo_fd;
-                goto fail;
-        }
+        if (fifo_fd < 0)
+                return fifo_fd;
 
-        inhibitor_start(i);
+        r = inhibitor_start(i);
+        if (r < 0)
+                return r;
+        TAKE_PTR(i);
 
         return sd_bus_reply_method_return(message, "h", fifo_fd);
-
-fail:
-        if (i)
-                inhibitor_free(i);
-
-        return r;
 }
 
-const sd_bus_vtable manager_vtable[] = {
+static const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
         SD_BUS_WRITABLE_PROPERTY("EnableWallMessages", "b", NULL, NULL, offsetof(Manager, enable_wall_messages), 0),
@@ -2637,7 +3314,11 @@ const sd_bus_vtable manager_vtable[] = {
         SD_BUS_PROPERTY("KillOnlyUsers", "as", NULL, offsetof(Manager, kill_only_users), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("KillExcludeUsers", "as", NULL, offsetof(Manager, kill_exclude_users), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("KillUserProcesses", "b", NULL, offsetof(Manager, kill_user_processes), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RebootParameter", "s", property_get_reboot_parameter, 0, 0),
         SD_BUS_PROPERTY("RebootToFirmwareSetup", "b", property_get_reboot_to_firmware_setup, 0, 0),
+        SD_BUS_PROPERTY("RebootToBootLoaderMenu", "t", property_get_reboot_to_boot_loader_menu, 0, 0),
+        SD_BUS_PROPERTY("RebootToBootLoaderEntry", "s", property_get_reboot_to_boot_loader_entry, 0, 0),
+        SD_BUS_PROPERTY("BootLoaderEntries", "as", property_get_boot_loader_entries, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("IdleHint", "b", property_get_idle_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHint", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("IdleSinceHintMonotonic", "t", property_get_idle_since_hint, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -2662,71 +3343,410 @@ const sd_bus_vtable manager_vtable[] = {
         SD_BUS_PROPERTY("OnExternalPower", "b", property_get_on_external_power, 0, 0),
         SD_BUS_PROPERTY("RemoveIPC", "b", bus_property_get_bool, offsetof(Manager, remove_ipc), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RuntimeDirectorySize", "t", NULL, offsetof(Manager, runtime_dir_size), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RuntimeDirectoryInodesMax", "t", NULL, offsetof(Manager, runtime_dir_inodes), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("InhibitorsMax", "t", NULL, offsetof(Manager, inhibitors_max), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("NCurrentInhibitors", "t", property_get_hashmap_size, offsetof(Manager, inhibitors), 0),
         SD_BUS_PROPERTY("SessionsMax", "t", NULL, offsetof(Manager, sessions_max), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("NCurrentSessions", "t", property_get_hashmap_size, offsetof(Manager, sessions), 0),
         SD_BUS_PROPERTY("UserTasksMax", "t", property_get_compat_user_tasks_max, 0, SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_HIDDEN),
 
-        SD_BUS_METHOD("GetSession", "s", "o", method_get_session, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetSessionByPID", "u", "o", method_get_session_by_pid, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetUser", "u", "o", method_get_user, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetUserByPID", "u", "o", method_get_user_by_pid, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetSeat", "s", "o", method_get_seat, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ListSessions", NULL, "a(susso)", method_list_sessions, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ListUsers", NULL, "a(uso)", method_list_users, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ListSeats", NULL, "a(so)", method_list_seats, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ListInhibitors", NULL, "a(ssssuu)", method_list_inhibitors, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CreateSession", "uusssssussbssa(sv)", "soshusub", method_create_session, 0),
-        SD_BUS_METHOD("ReleaseSession", "s", NULL, method_release_session, 0),
-        SD_BUS_METHOD("ActivateSession", "s", NULL, method_activate_session, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ActivateSessionOnSeat", "ss", NULL, method_activate_session_on_seat, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("LockSession", "s", NULL, method_lock_session, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("UnlockSession", "s", NULL, method_lock_session, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("LockSessions", NULL, NULL, method_lock_sessions, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("UnlockSessions", NULL, NULL, method_lock_sessions, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("KillSession", "ssi", NULL, method_kill_session, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("KillUser", "ui", NULL, method_kill_user, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("TerminateSession", "s", NULL, method_terminate_session, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("TerminateUser", "u", NULL, method_terminate_user, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("TerminateSeat", "s", NULL, method_terminate_seat, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetUserLinger", "ubb", NULL, method_set_user_linger, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("AttachDevice", "ssb", NULL, method_attach_device, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("FlushDevices", "b", NULL, method_flush_devices, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("PowerOff", "b", NULL, method_poweroff, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Reboot", "b", NULL, method_reboot, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Halt", "b", NULL, method_halt, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Suspend", "b", NULL, method_suspend, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Hibernate", "b", NULL, method_hibernate, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("HybridSleep", "b", NULL, method_hybrid_sleep, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SuspendThenHibernate", "b", NULL, method_suspend_then_hibernate, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanPowerOff", NULL, "s", method_can_poweroff, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanReboot", NULL, "s", method_can_reboot, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanHalt", NULL, "s", method_can_halt, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanSuspend", NULL, "s", method_can_suspend, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanHibernate", NULL, "s", method_can_hibernate, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanHybridSleep", NULL, "s", method_can_hybrid_sleep, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanSuspendThenHibernate", NULL, "s", method_can_suspend_then_hibernate, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("ScheduleShutdown", "st", NULL, method_schedule_shutdown, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CancelScheduledShutdown", NULL, "b", method_cancel_scheduled_shutdown, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Inhibit", "ssss", "h", method_inhibit, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CanRebootToFirmwareSetup", NULL, "s", method_can_reboot_to_firmware_setup, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetRebootToFirmwareSetup", "b", NULL, method_set_reboot_to_firmware_setup, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("SetWallMessage", "sb", NULL, method_set_wall_message, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetSession",
+                                 "s",
+                                 SD_BUS_PARAM(session_id),
+                                 "o",
+                                 SD_BUS_PARAM(object_path),
+                                 method_get_session,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetSessionByPID",
+                                 "u",
+                                 SD_BUS_PARAM(pid),
+                                 "o",
+                                 SD_BUS_PARAM(object_path),
+                                 method_get_session_by_pid,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetUser",
+                                 "u",
+                                 SD_BUS_PARAM(uid),
+                                 "o",
+                                 SD_BUS_PARAM(object_path),
+                                 method_get_user,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetUserByPID",
+                                 "u",
+                                 SD_BUS_PARAM(pid),
+                                 "o",
+                                 SD_BUS_PARAM(object_path),
+                                 method_get_user_by_pid,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetSeat",
+                                 "s",
+                                 SD_BUS_PARAM(seat_id),
+                                 "o",
+                                 SD_BUS_PARAM(object_path),
+                                 method_get_seat,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ListSessions",
+                                 NULL,,
+                                 "a(susso)",
+                                 SD_BUS_PARAM(sessions),
+                                 method_list_sessions,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ListUsers",
+                                 NULL,,
+                                 "a(uso)",
+                                 SD_BUS_PARAM(users),
+                                 method_list_users,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ListSeats",
+                                 NULL,,
+                                 "a(so)",
+                                 SD_BUS_PARAM(seats),
+                                 method_list_seats,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ListInhibitors",
+                                 NULL,,
+                                 "a(ssssuu)",
+                                 SD_BUS_PARAM(inhibitors),
+                                 method_list_inhibitors,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CreateSession",
+                                 "uusssssussbssa(sv)",
+                                 SD_BUS_PARAM(uid)
+                                 SD_BUS_PARAM(pid)
+                                 SD_BUS_PARAM(service)
+                                 SD_BUS_PARAM(type)
+                                 SD_BUS_PARAM(class)
+                                 SD_BUS_PARAM(desktop)
+                                 SD_BUS_PARAM(seat_id)
+                                 SD_BUS_PARAM(vtnr)
+                                 SD_BUS_PARAM(tty)
+                                 SD_BUS_PARAM(display)
+                                 SD_BUS_PARAM(remote)
+                                 SD_BUS_PARAM(remote_user)
+                                 SD_BUS_PARAM(remote_host)
+                                 SD_BUS_PARAM(properties),
+                                 "soshusub",
+                                 SD_BUS_PARAM(session_id)
+                                 SD_BUS_PARAM(object_path)
+                                 SD_BUS_PARAM(runtime_path)
+                                 SD_BUS_PARAM(fifo_fd)
+                                 SD_BUS_PARAM(uid)
+                                 SD_BUS_PARAM(seat_id)
+                                 SD_BUS_PARAM(vtnr)
+                                 SD_BUS_PARAM(existing),
+                                 method_create_session,
+                                 0),
+        SD_BUS_METHOD_WITH_NAMES("ReleaseSession",
+                                 "s",
+                                 SD_BUS_PARAM(session_id),
+                                 NULL,,
+                                 method_release_session,
+                                 0),
+        SD_BUS_METHOD_WITH_NAMES("ActivateSession",
+                                 "s",
+                                 SD_BUS_PARAM(session_id),
+                                 NULL,,
+                                 method_activate_session,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ActivateSessionOnSeat",
+                                 "ss",
+                                 SD_BUS_PARAM(session_id)
+                                 SD_BUS_PARAM(seat_id),
+                                 NULL,,
+                                 method_activate_session_on_seat,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("LockSession",
+                                 "s",
+                                 SD_BUS_PARAM(session_id),
+                                 NULL,,
+                                 method_lock_session,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("UnlockSession",
+                                 "s",
+                                 SD_BUS_PARAM(session_id),
+                                 NULL,,
+                                 method_lock_session,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("LockSessions",
+                      NULL,
+                      NULL,
+                      method_lock_sessions,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("UnlockSessions",
+                      NULL,
+                      NULL,
+                      method_lock_sessions,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("KillSession",
+                                 "ssi",
+                                 SD_BUS_PARAM(session_id)
+                                 SD_BUS_PARAM(who)
+                                 SD_BUS_PARAM(signal_number),
+                                 NULL,,
+                                 method_kill_session,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("KillUser",
+                                 "ui",
+                                 SD_BUS_PARAM(uid)
+                                 SD_BUS_PARAM(signal_number),
+                                 NULL,,
+                                 method_kill_user,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("TerminateSession",
+                                 "s",
+                                 SD_BUS_PARAM(session_id),
+                                 NULL,,
+                                 method_terminate_session,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("TerminateUser",
+                                 "u",
+                                 SD_BUS_PARAM(uid),
+                                 NULL,,
+                                 method_terminate_user,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("TerminateSeat",
+                                 "s",
+                                 SD_BUS_PARAM(seat_id),
+                                 NULL,,
+                                 method_terminate_seat,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetUserLinger",
+                                 "ubb",
+                                 SD_BUS_PARAM(uid)
+                                 SD_BUS_PARAM(enable)
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_set_user_linger,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("AttachDevice",
+                                 "ssb",
+                                 SD_BUS_PARAM(seat_id)
+                                 SD_BUS_PARAM(sysfs_path)
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_attach_device,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("FlushDevices",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_flush_devices,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("PowerOff",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_poweroff,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("Reboot",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_reboot,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("Halt",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_halt,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("Suspend",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_suspend,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("Hibernate",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_hibernate,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("HybridSleep",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_hybrid_sleep,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SuspendThenHibernate",
+                                 "b",
+                                 SD_BUS_PARAM(interactive),
+                                 NULL,,
+                                 method_suspend_then_hibernate,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanPowerOff",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_poweroff,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanReboot",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_reboot,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanHalt",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_halt,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanSuspend",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_suspend,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanHibernate",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_hibernate,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanHybridSleep",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_hybrid_sleep,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanSuspendThenHibernate",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_suspend_then_hibernate,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("ScheduleShutdown",
+                                 "st",
+                                 SD_BUS_PARAM(type)
+                                 SD_BUS_PARAM(usec),
+                                 NULL,,
+                                 method_schedule_shutdown,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CancelScheduledShutdown",
+                                 NULL,,
+                                 "b",
+                                 SD_BUS_PARAM(cancelled),
+                                 method_cancel_scheduled_shutdown,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("Inhibit",
+                                 "ssss",
+                                 SD_BUS_PARAM(what)
+                                 SD_BUS_PARAM(who)
+                                 SD_BUS_PARAM(why)
+                                 SD_BUS_PARAM(mode),
+                                 "h",
+                                 SD_BUS_PARAM(pipe_fd),
+                                 method_inhibit,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanRebootParameter",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_reboot_parameter,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetRebootParameter",
+                                 "s",
+                                 SD_BUS_PARAM(parameter),
+                                 NULL,,
+                                 method_set_reboot_parameter,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanRebootToFirmwareSetup",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_reboot_to_firmware_setup,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetRebootToFirmwareSetup",
+                                 "b",
+                                 SD_BUS_PARAM(enable),
+                                 NULL,,
+                                 method_set_reboot_to_firmware_setup,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanRebootToBootLoaderMenu",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_reboot_to_boot_loader_menu,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetRebootToBootLoaderMenu",
+                                 "t",
+                                 SD_BUS_PARAM(timeout),
+                                 NULL,,
+                                 method_set_reboot_to_boot_loader_menu,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CanRebootToBootLoaderEntry",
+                                 NULL,,
+                                 "s",
+                                 SD_BUS_PARAM(result),
+                                 method_can_reboot_to_boot_loader_entry,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetRebootToBootLoaderEntry",
+                                 "s",
+                                 SD_BUS_PARAM(boot_loader_entry),
+                                 NULL,,
+                                 method_set_reboot_to_boot_loader_entry,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("SetWallMessage",
+                                 "sb",
+                                 SD_BUS_PARAM(wall_message)
+                                 SD_BUS_PARAM(enable),
+                                 NULL,,
+                                 method_set_wall_message,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
 
-        SD_BUS_SIGNAL("SessionNew", "so", 0),
-        SD_BUS_SIGNAL("SessionRemoved", "so", 0),
-        SD_BUS_SIGNAL("UserNew", "uo", 0),
-        SD_BUS_SIGNAL("UserRemoved", "uo", 0),
-        SD_BUS_SIGNAL("SeatNew", "so", 0),
-        SD_BUS_SIGNAL("SeatRemoved", "so", 0),
-        SD_BUS_SIGNAL("PrepareForShutdown", "b", 0),
-        SD_BUS_SIGNAL("PrepareForSleep", "b", 0),
+        SD_BUS_SIGNAL_WITH_NAMES("SessionNew",
+                                 "so",
+                                 SD_BUS_PARAM(session_id)
+                                 SD_BUS_PARAM(object_path),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("SessionRemoved",
+                                 "so",
+                                 SD_BUS_PARAM(session_id)
+                                 SD_BUS_PARAM(object_path),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("UserNew",
+                                 "uo",
+                                 SD_BUS_PARAM(uid)
+                                 SD_BUS_PARAM(object_path),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("UserRemoved",
+                                 "uo",
+                                 SD_BUS_PARAM(uid)
+                                 SD_BUS_PARAM(object_path),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("SeatNew",
+                                 "so",
+                                 SD_BUS_PARAM(seat_id)
+                                 SD_BUS_PARAM(object_path),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("SeatRemoved",
+                                 "so",
+                                 SD_BUS_PARAM(seat_id)
+                                 SD_BUS_PARAM(object_path),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("PrepareForShutdown",
+                                 "b",
+                                 SD_BUS_PARAM(start),
+                                 0),
+        SD_BUS_SIGNAL_WITH_NAMES("PrepareForSleep",
+                                 "b",
+                                 SD_BUS_PARAM(start),
+                                 0),
 
         SD_BUS_VTABLE_END
 };
 
-static int session_jobs_reply(Session *s, const char *unit, const char *result) {
+const BusObjectImplementation manager_object = {
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+        .vtables = BUS_VTABLES(manager_vtable),
+        .children = BUS_IMPLEMENTATIONS(&seat_object,
+                                        &session_object,
+                                        &user_object),
+};
+
+static int session_jobs_reply(Session *s, uint32_t jid, const char *unit, const char *result) {
         assert(s);
         assert(unit);
 
@@ -2736,7 +3756,8 @@ static int session_jobs_reply(Session *s, const char *unit, const char *result) 
         if (result && !streq(result, "done")) {
                 _cleanup_(sd_bus_error_free) sd_bus_error e = SD_BUS_ERROR_NULL;
 
-                sd_bus_error_setf(&e, BUS_ERROR_JOB_FAILED, "Start job for unit '%s' failed with '%s'", unit, result);
+                sd_bus_error_setf(&e, BUS_ERROR_JOB_FAILED,
+                                  "Job %u for unit '%s' failed with '%s'", jid, unit, result);
                 return session_send_create_reply(s, &e);
         }
 
@@ -2776,7 +3797,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
         if (session) {
                 if (streq_ptr(path, session->scope_job)) {
                         session->scope_job = mfree(session->scope_job);
-                        (void) session_jobs_reply(session, unit, result);
+                        (void) session_jobs_reply(session, id, unit, result);
 
                         session_save(session);
                         user_save(session->user);
@@ -2791,7 +3812,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
                         user->service_job = mfree(user->service_job);
 
                         LIST_FOREACH(sessions_by_user, session, user->sessions)
-                                (void) session_jobs_reply(session, unit, NULL /* don't propagate user service failures to the client */);
+                                (void) session_jobs_reply(session, id, unit, NULL /* don't propagate user service failures to the client */);
 
                         user_save(user);
                 }
@@ -2866,7 +3887,6 @@ int match_properties_changed(sd_bus_message *message, void *userdata, sd_bus_err
 int match_reloading(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
         Session *session;
-        Iterator i;
         int b, r;
 
         assert(message);
@@ -2884,7 +3904,7 @@ int match_reloading(sd_bus_message *message, void *userdata, sd_bus_error *error
         /* systemd finished reloading, let's recheck all our sessions */
         log_debug("System manager has been reloaded, rechecking sessions...");
 
-        HASHMAP_FOREACH(session, m->sessions, i)
+        HASHMAP_FOREACH(session, m->sessions)
                 session_add_to_gc_queue(session);
 
         return 0;
@@ -2943,13 +3963,7 @@ int manager_start_scope(
         assert(pid > 1);
         assert(job);
 
-        r = sd_bus_message_new_method_call(
-                        manager->bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "StartTransientUnit");
+        r = bus_message_new_method_call(manager->bus, &m, bus_systemd_mgr, "StartTransientUnit");
         if (r < 0)
                 return r;
 
@@ -3036,11 +4050,9 @@ int manager_start_unit(Manager *manager, const char *unit, sd_bus_error *error, 
         assert(unit);
         assert(job);
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         manager->bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         "StartUnit",
                         error,
                         &reply,
@@ -3051,28 +4063,26 @@ int manager_start_unit(Manager *manager, const char *unit, sd_bus_error *error, 
         return strdup_job(reply, job);
 }
 
-int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job) {
+int manager_stop_unit(Manager *manager, const char *unit, const char *job_mode, sd_bus_error *error, char **ret_job) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         int r;
 
         assert(manager);
         assert(unit);
-        assert(job);
+        assert(ret_job);
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         manager->bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         "StopUnit",
                         error,
                         &reply,
-                        "ss", unit, "fail");
+                        "ss", unit, job_mode ?: "fail");
         if (r < 0) {
-                if (sd_bus_error_has_name(error, BUS_ERROR_NO_SUCH_UNIT) ||
-                    sd_bus_error_has_name(error, BUS_ERROR_LOAD_FAILED)) {
+                if (sd_bus_error_has_names(error, BUS_ERROR_NO_SUCH_UNIT,
+                                                  BUS_ERROR_LOAD_FAILED)) {
 
-                        *job = NULL;
+                        *ret_job = NULL;
                         sd_bus_error_free(error);
                         return 0;
                 }
@@ -3080,7 +4090,7 @@ int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, c
                 return r;
         }
 
-        return strdup_job(reply, job);
+        return strdup_job(reply, ret_job);
 }
 
 int manager_abandon_scope(Manager *manager, const char *scope, sd_bus_error *ret_error) {
@@ -3105,9 +4115,9 @@ int manager_abandon_scope(Manager *manager, const char *scope, sd_bus_error *ret
                         NULL,
                         NULL);
         if (r < 0) {
-                if (sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_UNIT) ||
-                    sd_bus_error_has_name(&error, BUS_ERROR_LOAD_FAILED) ||
-                    sd_bus_error_has_name(&error, BUS_ERROR_SCOPE_NOT_RUNNING))
+                if (sd_bus_error_has_names(&error, BUS_ERROR_NO_SUCH_UNIT,
+                                                   BUS_ERROR_LOAD_FAILED,
+                                                   BUS_ERROR_SCOPE_NOT_RUNNING))
                         return 0;
 
                 sd_bus_error_move(ret_error, &error);
@@ -3121,11 +4131,9 @@ int manager_kill_unit(Manager *manager, const char *unit, KillWho who, int signo
         assert(manager);
         assert(unit);
 
-        return sd_bus_call_method(
+        return bus_call_method(
                         manager->bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         "KillUnit",
                         error,
                         NULL,
@@ -3156,16 +4164,16 @@ int manager_unit_is_active(Manager *manager, const char *unit, sd_bus_error *ret
                         &reply,
                         "s");
         if (r < 0) {
-                /* systemd might have droppped off momentarily, let's
+                /* systemd might have dropped off momentarily, let's
                  * not make this an error */
-                if (sd_bus_error_has_name(&error, SD_BUS_ERROR_NO_REPLY) ||
-                    sd_bus_error_has_name(&error, SD_BUS_ERROR_DISCONNECTED))
+                if (sd_bus_error_has_names(&error, SD_BUS_ERROR_NO_REPLY,
+                                                   SD_BUS_ERROR_DISCONNECTED))
                         return true;
 
                 /* If the unit is already unloaded then it's not
                  * active */
-                if (sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_UNIT) ||
-                    sd_bus_error_has_name(&error, BUS_ERROR_LOAD_FAILED))
+                if (sd_bus_error_has_names(&error, BUS_ERROR_NO_SUCH_UNIT,
+                                                   BUS_ERROR_LOAD_FAILED))
                         return false;
 
                 sd_bus_error_move(ret_error, &error);
@@ -3197,8 +4205,8 @@ int manager_job_is_active(Manager *manager, const char *path, sd_bus_error *ret_
                         &reply,
                         "s");
         if (r < 0) {
-                if (sd_bus_error_has_name(&error, SD_BUS_ERROR_NO_REPLY) ||
-                    sd_bus_error_has_name(&error, SD_BUS_ERROR_DISCONNECTED))
+                if (sd_bus_error_has_names(&error, SD_BUS_ERROR_NO_REPLY,
+                                                   SD_BUS_ERROR_DISCONNECTED))
                         return true;
 
                 if (sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_OBJECT))

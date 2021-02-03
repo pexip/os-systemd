@@ -1,15 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <limits.h>
 #include <mqueue.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -25,18 +24,18 @@
 #include "process-util.h"
 #include "socket-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "util.h"
 
 #define SNDBUF_SIZE (8*1024*1024)
 
 static void unsetenv_all(bool unset_environment) {
-
         if (!unset_environment)
                 return;
 
-        unsetenv("LISTEN_PID");
-        unsetenv("LISTEN_FDS");
-        unsetenv("LISTEN_FDNAMES");
+        assert_se(unsetenv("LISTEN_PID") == 0);
+        assert_se(unsetenv("LISTEN_FDS") == 0);
+        assert_se(unsetenv("LISTEN_FDNAMES") == 0);
 }
 
 _public_ int sd_listen_fds(int unset_environment) {
@@ -101,7 +100,7 @@ _public_ int sd_listen_fds_with_names(int unset_environment, char ***names) {
 
         e = getenv("LISTEN_FDNAMES");
         if (e) {
-                n_names = strv_split_extract(&l, e, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
+                n_names = strv_split_full(&l, e, ":", EXTRACT_DONT_COALESCE_SEPARATORS);
                 if (n_names < 0) {
                         unsetenv_all(unset_environment);
                         return n_names;
@@ -445,7 +444,7 @@ _public_ int sd_pid_notify_with_fds(
                 const int *fds,
                 unsigned n_fds) {
 
-        union sockaddr_union sockaddr = {};
+        union sockaddr_union sockaddr;
         struct iovec iovec;
         struct msghdr msghdr = {
                 .msg_iov = &iovec,
@@ -456,7 +455,7 @@ _public_ int sd_pid_notify_with_fds(
         struct cmsghdr *cmsg = NULL;
         const char *e;
         bool send_ucred;
-        int r, salen;
+        int r;
 
         if (!state) {
                 r = -EINVAL;
@@ -472,11 +471,10 @@ _public_ int sd_pid_notify_with_fds(
         if (!e)
                 return 0;
 
-        salen = sockaddr_un_set_path(&sockaddr.un, e);
-        if (salen < 0) {
-                r = salen;
+        r = sockaddr_un_set_path(&sockaddr.un, e);
+        if (r < 0)
                 goto finish;
-        }
+        msghdr.msg_namelen = r;
 
         fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0);
         if (fd < 0) {
@@ -487,7 +485,6 @@ _public_ int sd_pid_notify_with_fds(
         (void) fd_inc_sndbuf(fd, SNDBUF_SIZE);
 
         iovec = IOVEC_MAKE_STRING(state);
-        msghdr.msg_namelen = salen;
 
         send_ucred =
                 (pid != 0 && pid != getpid_cached()) ||
@@ -550,9 +547,31 @@ _public_ int sd_pid_notify_with_fds(
 
 finish:
         if (unset_environment)
-                unsetenv("NOTIFY_SOCKET");
+                assert_se(unsetenv("NOTIFY_SOCKET") == 0);
 
         return r;
+}
+
+_public_ int sd_notify_barrier(int unset_environment, uint64_t timeout) {
+        _cleanup_close_pair_ int pipe_fd[2] = { -1, -1 };
+        int r;
+
+        if (pipe2(pipe_fd, O_CLOEXEC) < 0)
+                return -errno;
+
+        r = sd_pid_notify_with_fds(0, unset_environment, "BARRIER=1", &pipe_fd[1], 1);
+        if (r <= 0)
+                return r;
+
+        pipe_fd[1] = safe_close(pipe_fd[1]);
+
+        r = fd_wait_for_event(pipe_fd[0], 0 /* POLLHUP is implicit */, timeout);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -ETIMEDOUT;
+
+        return 1;
 }
 
 _public_ int sd_pid_notify(pid_t pid, int unset_environment, const char *state) {
@@ -652,9 +671,9 @@ _public_ int sd_watchdog_enabled(int unset_environment, uint64_t *usec) {
 
 finish:
         if (unset_environment && s)
-                unsetenv("WATCHDOG_USEC");
+                assert_se(unsetenv("WATCHDOG_USEC") == 0);
         if (unset_environment && p)
-                unsetenv("WATCHDOG_PID");
+                assert_se(unsetenv("WATCHDOG_PID") == 0);
 
         return r;
 }

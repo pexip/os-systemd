@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 typedef struct Service Service;
@@ -36,6 +36,7 @@ typedef enum ServiceType {
 } ServiceType;
 
 typedef enum ServiceExecCommand {
+        SERVICE_EXEC_CONDITION,
         SERVICE_EXEC_START_PRE,
         SERVICE_EXEC_START,
         SERVICE_EXEC_START_POST,
@@ -67,9 +68,19 @@ typedef enum ServiceResult {
         SERVICE_FAILURE_CORE_DUMP,
         SERVICE_FAILURE_WATCHDOG,
         SERVICE_FAILURE_START_LIMIT_HIT,
+        SERVICE_FAILURE_OOM_KILL,
+        SERVICE_SKIP_CONDITION,
         _SERVICE_RESULT_MAX,
         _SERVICE_RESULT_INVALID = -1
 } ServiceResult;
+
+typedef enum ServiceTimeoutFailureMode {
+        SERVICE_TIMEOUT_TERMINATE,
+        SERVICE_TIMEOUT_ABORT,
+        SERVICE_TIMEOUT_KILL,
+        _SERVICE_TIMEOUT_FAILURE_MODE_MAX,
+        _SERVICE_TIMEOUT_FAILURE_MODE_INVALID = -1
+} ServiceTimeoutFailureMode;
 
 struct ServiceFDStore {
         Service *service;
@@ -77,6 +88,7 @@ struct ServiceFDStore {
         int fd;
         char *fdname;
         sd_event_source *event_source;
+        bool do_poll;
 
         LIST_FIELDS(ServiceFDStore, fd_store);
 };
@@ -96,7 +108,11 @@ struct Service {
         usec_t restart_usec;
         usec_t timeout_start_usec;
         usec_t timeout_stop_usec;
+        usec_t timeout_abort_usec;
+        bool timeout_abort_set;
         usec_t runtime_max_usec;
+        ServiceTimeoutFailureMode timeout_start_failure_mode;
+        ServiceTimeoutFailureMode timeout_stop_failure_mode;
 
         dual_timestamp watchdog_timestamp;
         usec_t watchdog_usec;            /* the requested watchdog timeout in the unit file */
@@ -144,6 +160,7 @@ struct Service {
         /* If we shut down, remember why */
         ServiceResult result;
         ServiceResult reload_result;
+        ServiceResult clean_result;
 
         bool main_pid_known:1;
         bool main_pid_alien:1;
@@ -152,6 +169,7 @@ struct Service {
         /* Keep restart intention between UNIT_FAILED and UNIT_ACTIVATING */
         bool will_auto_restart:1;
         bool start_timeout_defined:1;
+        bool exec_fd_hot:1;
 
         char *bus_name;
         char *bus_name_owner; /* unique name of the current owner */
@@ -183,8 +201,19 @@ struct Service {
 
         unsigned n_restarts;
         bool flush_n_restarts;
-        bool exec_fd_hot;
+
+        OOMPolicy oom_policy;
 };
+
+static inline usec_t service_timeout_abort_usec(Service *s) {
+        assert(s);
+        return s->timeout_abort_set ? s->timeout_abort_usec : s->timeout_stop_usec;
+}
+
+static inline usec_t service_get_watchdog_usec(Service *s) {
+        assert(s);
+        return s->watchdog_override_enable ? s->watchdog_override_usec : s->watchdog_original_usec;
+}
 
 extern const UnitVTable service_vtable;
 
@@ -200,11 +229,17 @@ ServiceType service_type_from_string(const char *s) _pure_;
 const char* service_exec_command_to_string(ServiceExecCommand i) _const_;
 ServiceExecCommand service_exec_command_from_string(const char *s) _pure_;
 
+const char* service_exec_ex_command_to_string(ServiceExecCommand i) _const_;
+ServiceExecCommand service_exec_ex_command_from_string(const char *s) _pure_;
+
 const char* notify_state_to_string(NotifyState i) _const_;
 NotifyState notify_state_from_string(const char *s) _pure_;
 
 const char* service_result_to_string(ServiceResult i) _const_;
 ServiceResult service_result_from_string(const char *s) _pure_;
+
+const char* service_timeout_failure_mode_to_string(ServiceTimeoutFailureMode i) _const_;
+ServiceTimeoutFailureMode service_timeout_failure_mode_from_string(const char *s) _pure_;
 
 DEFINE_CAST(SERVICE, Service);
 

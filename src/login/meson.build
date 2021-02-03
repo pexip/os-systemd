@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 systemd_logind_sources = files('''
         logind.c
@@ -12,29 +12,35 @@ logind_gperf_c = custom_target(
         command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 liblogind_core_sources = files('''
-        logind-core.c
-        logind-device.c
-        logind-device.h
-        logind-button.c
-        logind-button.h
+        logind-acl.h
         logind-action.c
         logind-action.h
-        logind-seat.c
-        logind-seat.h
-        logind-session.c
-        logind-session.h
-        logind-session-device.c
-        logind-session-device.h
-        logind-user.c
-        logind-user.h
+        logind-brightness.c
+        logind-brightness.h
+        logind-button.c
+        logind-button.h
+        logind-core.c
+        logind-dbus.c
+        logind-dbus.h
+        logind-device.c
+        logind-device.h
         logind-inhibit.c
         logind-inhibit.h
-        logind-dbus.c
-        logind-session-dbus.c
         logind-seat-dbus.c
+        logind-seat-dbus.h
+        logind-seat.c
+        logind-seat.h
+        logind-session-dbus.c
+        logind-session-dbus.h
+        logind-session-device.c
+        logind-session-device.h
+        logind-session.c
+        logind-session.h
         logind-user-dbus.c
+        logind-user-dbus.h
+        logind-user.c
+        logind-user.h
         logind-utmp.c
-        logind-acl.h
 '''.split())
 
 liblogind_core_sources += [logind_gperf_c]
@@ -60,16 +66,18 @@ user_runtime_dir_sources = files('''
         user-runtime-dir.c
 '''.split())
 
+pam_systemd_sym = 'src/login/pam_systemd.sym'
+pam_systemd_c = files('pam_systemd.c')
+
 if conf.get('ENABLE_LOGIND') == 1
         logind_conf = configure_file(
                 input : 'logind.conf.in',
                 output : 'logind.conf',
                 configuration : substs)
-        install_data(logind_conf,
-                     install_dir : pkgsysconfdir)
-
-        pam_systemd_sym = 'src/login/pam_systemd.sym'
-        pam_systemd_c = files('pam_systemd.c')
+        if install_sysconfdir
+                install_data(logind_conf,
+                             install_dir : pkgsysconfdir)
+        endif
 
         install_data('org.freedesktop.login1.conf',
                      install_dir : dbuspolicydir)

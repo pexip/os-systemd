@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #if HAVE_VALGRIND_MEMCHECK_H
 #include <valgrind/memcheck.h>
@@ -532,7 +532,7 @@ _public_ int sd_bus_get_name_creds(
                                 if (!sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD))
                                         return r;
 
-                                /* If we got an unknown method error, fall back to the invidual calls... */
+                                /* If we got an unknown method error, fall back to the individual calls... */
                                 need_separate_calls = true;
                                 sd_bus_error_free(&error);
 
@@ -713,7 +713,7 @@ _public_ int sd_bus_get_name_creds(
                 }
 
                 r = bus_creds_add_more(c, mask, pid, 0);
-                if (r < 0)
+                if (r < 0 && r != -ESRCH) /* Return the error, but ignore ESRCH which just means the process is already gone */
                         return r;
         }
 
@@ -788,7 +788,7 @@ _public_ int sd_bus_get_owner_creds(sd_bus *bus, uint64_t mask, sd_bus_creds **r
         }
 
         r = bus_creds_add_more(c, mask, pid, 0);
-        if (r < 0)
+        if (r < 0 && r != -ESRCH) /* If the process vanished, then don't complain, just return what we got */
                 return r;
 
         *ret = TAKE_PTR(c);
@@ -803,9 +803,12 @@ _public_ int sd_bus_get_owner_creds(sd_bus *bus, uint64_t mask, sd_bus_creds **r
 
 int bus_add_match_internal(
                 sd_bus *bus,
-                const char *match) {
+                const char *match,
+                uint64_t *ret_counter) {
 
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         const char *e;
+        int r;
 
         assert(bus);
 
@@ -814,17 +817,26 @@ int bus_add_match_internal(
 
         e = append_eavesdrop(bus, match);
 
-        return sd_bus_call_method(
+        r = sd_bus_call_method(
                         bus,
                         "org.freedesktop.DBus",
                         "/org/freedesktop/DBus",
                         "org.freedesktop.DBus",
                         "AddMatch",
                         NULL,
-                        NULL,
+                        &reply,
                         "s",
                         e);
+        if (r < 0)
+                return r;
+
+        /* If the caller asked for it, return the read counter of the reply */
+        if (ret_counter)
+                *ret_counter = reply->read_counter;
+
+        return r;
 }
+
 int bus_add_match_internal_async(
                 sd_bus *bus,
                 sd_bus_slot **ret_slot,

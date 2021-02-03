@@ -1,10 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "sd-bus.h"
 #include "sd-daemon.h"
 
 #include "alloc-util.h"
-#include "bus-util.h"
+#include "bus-log-control-api.h"
+#include "bus-polkit.h"
 #include "def.h"
 #include "main-func.h"
 #include "portabled-bus.h"
@@ -81,6 +85,10 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to add image enumerator: %m");
 
+        r = bus_log_control_api_register(m->bus);
+        if (r < 0)
+                return r;
+
         r = sd_bus_request_name_async(m->bus, NULL, "org.freedesktop.portable1", 0, NULL, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
@@ -131,10 +139,8 @@ static int run(int argc, char *argv[]) {
 
         umask(0022);
 
-        if (argc != 1) {
-                log_error("This program takes no arguments.");
-                return -EINVAL;
-        }
+        if (argc != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
 
         assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGTERM, SIGINT, -1) >= 0);
 

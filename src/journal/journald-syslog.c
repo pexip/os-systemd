@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stddef.h>
 #include <sys/epoll.h>
@@ -25,27 +25,37 @@
 /* Warn once every 30s if we missed syslog message */
 #define WARN_FORWARD_SYSLOG_MISSED_USEC (30 * USEC_PER_SEC)
 
-static void forward_syslog_iovec(Server *s, const struct iovec *iovec, unsigned n_iovec, const struct ucred *ucred, const struct timeval *tv) {
+static void forward_syslog_iovec(
+                Server *s,
+                const struct iovec *iovec,
+                unsigned n_iovec,
+                const struct ucred *ucred,
+                const struct timeval *tv) {
 
-        static const union sockaddr_union sa = {
-                .un.sun_family = AF_UNIX,
-                .un.sun_path = "/run/systemd/journal/syslog",
-        };
+        union sockaddr_union sa;
+
         struct msghdr msghdr = {
                 .msg_iov = (struct iovec *) iovec,
                 .msg_iovlen = n_iovec,
-                .msg_name = (struct sockaddr*) &sa.sa,
-                .msg_namelen = SOCKADDR_UN_LEN(sa.un),
         };
         struct cmsghdr *cmsg;
-        union {
-                struct cmsghdr cmsghdr;
-                uint8_t buf[CMSG_SPACE(sizeof(struct ucred))];
-        } control;
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred))) control;
+        const char *j;
+        int r;
 
         assert(s);
         assert(iovec);
         assert(n_iovec > 0);
+
+        j = strjoina(s->runtime_directory, "/syslog");
+        r = sockaddr_un_set_path(&sa.un, j);
+        if (r < 0) {
+                log_debug_errno(r, "Forwarding socket path %s too long for AF_UNIX, not forwarding: %m", j);
+                return;
+        }
+
+        msghdr.msg_name = &sa.sa;
+        msghdr.msg_namelen = r;
 
         if (ucred) {
                 zero(control);
@@ -60,9 +70,8 @@ static void forward_syslog_iovec(Server *s, const struct iovec *iovec, unsigned 
                 msghdr.msg_controllen = cmsg->cmsg_len;
         }
 
-        /* Forward the syslog message we received via /dev/log to
-         * /run/systemd/syslog. Unfortunately we currently can't set
-         * the SO_TIMESTAMP auxiliary data, and hence we don't. */
+        /* Forward the syslog message we received via /dev/log to /run/systemd/syslog. Unfortunately we
+         * currently can't set the SO_TIMESTAMP auxiliary data, and hence we don't. */
 
         if (sendmsg(s->syslog_fd, &msghdr, MSG_NOSIGNAL) >= 0)
                 return;
@@ -143,7 +152,7 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
         /* Third: identifier and PID */
         if (ucred) {
                 if (!identifier) {
-                        get_process_comm(ucred->pid, &ident_buf);
+                        (void) get_process_comm(ucred->pid, &ident_buf);
                         identifier = ident_buf;
                 }
 
@@ -441,24 +450,28 @@ void server_process_syslog_message(
         server_dispatch_message(s, iovec, n, m, context, tv, priority, 0);
 }
 
-int server_open_syslog_socket(Server *s) {
-
-        static const union sockaddr_union sa = {
-                .un.sun_family = AF_UNIX,
-                .un.sun_path = "/run/systemd/journal/dev-log",
-        };
+int server_open_syslog_socket(Server *s, const char *syslog_socket) {
         int r;
 
         assert(s);
+        assert(syslog_socket);
 
         if (s->syslog_fd < 0) {
+                union sockaddr_union sa;
+                socklen_t sa_len;
+
+                r = sockaddr_un_set_path(&sa.un, syslog_socket);
+                if (r < 0)
+                        return log_error_errno(r, "Unable to use namespace path %s for AF_UNIX socket: %m", syslog_socket);
+                sa_len = r;
+
                 s->syslog_fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
                 if (s->syslog_fd < 0)
                         return log_error_errno(errno, "socket() failed: %m");
 
                 (void) sockaddr_un_unlink(&sa.un);
 
-                r = bind(s->syslog_fd, &sa.sa, SOCKADDR_UN_LEN(sa.un));
+                r = bind(s->syslog_fd, &sa.sa, sa_len);
                 if (r < 0)
                         return log_error_errno(errno, "bind(%s) failed: %m", sa.un.sun_path);
 
@@ -470,13 +483,11 @@ int server_open_syslog_socket(Server *s) {
         if (r < 0)
                 return log_error_errno(r, "SO_PASSCRED failed: %m");
 
-#if HAVE_SELINUX
         if (mac_selinux_use()) {
                 r = setsockopt_int(s->syslog_fd, SOL_SOCKET, SO_PASSSEC, true);
                 if (r < 0)
                         log_warning_errno(r, "SO_PASSSEC failed: %m");
         }
-#endif
 
         r = setsockopt_int(s->syslog_fd, SOL_SOCKET, SO_TIMESTAMP, true);
         if (r < 0)

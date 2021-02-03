@@ -1,12 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 
 #include "btrfs-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "format-util.h"
 #include "log.h"
-#include "parse-util.h"
 #include "string-util.h"
 #include "util.h"
 
@@ -155,7 +155,7 @@ int main(int argc, char *argv[]) {
 
         r = btrfs_subvol_snapshot("/xxxquotatest", "/xxxquotatest2", BTRFS_SNAPSHOT_RECURSIVE|BTRFS_SNAPSHOT_QUOTA);
         if (r < 0)
-                log_error_errno(r, "Failed to setup snapshot: %m");
+                log_error_errno(r, "Failed to set up snapshot: %m");
 
         r = btrfs_qgroup_get_quota("/xxxquotatest2/beneath", 0, &quota);
         if (r < 0)

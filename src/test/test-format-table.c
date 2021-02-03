@@ -1,13 +1,18 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "format-table.h"
 #include "string-util.h"
+#include "strv.h"
 #include "time-util.h"
 
 static void test_issue_9549(void) {
         _cleanup_(table_unrefp) Table *table = NULL;
         _cleanup_free_ char *formatted = NULL;
+
+        log_info("/* %s */", __func__);
 
         assert_se(table = table_new("name", "type", "ro", "usage", "created", "modified"));
         assert_se(table_set_align_percent(table, TABLE_HEADER_CELL(3), 100) >= 0);
@@ -29,11 +34,343 @@ static void test_issue_9549(void) {
                         ));
 }
 
-int main(int argc, char *argv[]) {
+static void test_multiline(void) {
+        _cleanup_(table_unrefp) Table *table = NULL;
+        _cleanup_free_ char *formatted = NULL;
 
+        log_info("/* %s */", __func__);
+
+        assert_se(table = table_new("foo", "bar"));
+
+        assert_se(table_set_align_percent(table, TABLE_HEADER_CELL(1), 100) >= 0);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRING, "three\ndifferent\nlines",
+                                 TABLE_STRING, "two\nlines\n") >= 0);
+
+        table_set_cell_height_max(table, 1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO     BAR\n"
+                        "three… two…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 2);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO          BAR\n"
+                        "three        two\n"
+                        "different… lines\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 3);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, (size_t) -1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"));
+        formatted = mfree(formatted);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRING, "short",
+                                 TABLE_STRING, "a\npair") >= 0);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRING, "short2\n",
+                                 TABLE_STRING, "a\nfour\nline\ncell") >= 0);
+
+        table_set_cell_height_max(table, 1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO     BAR\n"
+                        "three… two…\n"
+                        "short    a…\n"
+                        "short2   a…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 2);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO          BAR\n"
+                        "three        two\n"
+                        "different… lines\n"
+                        "short          a\n"
+                        "            pair\n"
+                        "short2         a\n"
+                        "           four…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 3);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"
+                        "short         a\n"
+                        "           pair\n"
+                        "short2        a\n"
+                        "           four\n"
+                        "          line…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, (size_t) -1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"
+                        "short         a\n"
+                        "           pair\n"
+                        "short2        a\n"
+                        "           four\n"
+                        "           line\n"
+                        "           cell\n"));
+        formatted = mfree(formatted);
+}
+
+static void test_strv(void) {
+        _cleanup_(table_unrefp) Table *table = NULL;
+        _cleanup_free_ char *formatted = NULL;
+
+        log_info("/* %s */", __func__);
+
+        assert_se(table = table_new("foo", "bar"));
+
+        assert_se(table_set_align_percent(table, TABLE_HEADER_CELL(1), 100) >= 0);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRV, STRV_MAKE("three", "different", "lines"),
+                                 TABLE_STRV, STRV_MAKE("two", "lines")) >= 0);
+
+        table_set_cell_height_max(table, 1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO     BAR\n"
+                        "three… two…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 2);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO          BAR\n"
+                        "three        two\n"
+                        "different… lines\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 3);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, (size_t) -1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"));
+        formatted = mfree(formatted);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRING, "short",
+                                 TABLE_STRV, STRV_MAKE("a", "pair")) >= 0);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRV, STRV_MAKE("short2"),
+                                 TABLE_STRV, STRV_MAKE("a", "four", "line", "cell")) >= 0);
+
+        table_set_cell_height_max(table, 1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO     BAR\n"
+                        "three… two…\n"
+                        "short    a…\n"
+                        "short2   a…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 2);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO          BAR\n"
+                        "three        two\n"
+                        "different… lines\n"
+                        "short          a\n"
+                        "            pair\n"
+                        "short2         a\n"
+                        "           four…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 3);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"
+                        "short         a\n"
+                        "           pair\n"
+                        "short2        a\n"
+                        "           four\n"
+                        "          line…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, (size_t) -1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO         BAR\n"
+                        "three       two\n"
+                        "different lines\n"
+                        "lines          \n"
+                        "short         a\n"
+                        "           pair\n"
+                        "short2        a\n"
+                        "           four\n"
+                        "           line\n"
+                        "           cell\n"));
+        formatted = mfree(formatted);
+}
+
+static void test_strv_wrapped(void) {
+        _cleanup_(table_unrefp) Table *table = NULL;
+        _cleanup_free_ char *formatted = NULL;
+
+        log_info("/* %s */", __func__);
+
+        assert_se(table = table_new("foo", "bar"));
+
+        assert_se(table_set_align_percent(table, TABLE_HEADER_CELL(1), 100) >= 0);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRV_WRAPPED, STRV_MAKE("three", "different", "lines"),
+                                 TABLE_STRV_WRAPPED, STRV_MAKE("two", "lines")) >= 0);
+
+        table_set_cell_height_max(table, 1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                         BAR\n"
+                        "three different lines two lines\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 2);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                         BAR\n"
+                        "three different lines two lines\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 3);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                         BAR\n"
+                        "three different lines two lines\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, (size_t) -1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                         BAR\n"
+                        "three different lines two lines\n"));
+        formatted = mfree(formatted);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRING, "short",
+                                 TABLE_STRV_WRAPPED, STRV_MAKE("a", "pair")) >= 0);
+
+        assert_se(table_add_many(table,
+                                 TABLE_STRV_WRAPPED, STRV_MAKE("short2"),
+                                 TABLE_STRV_WRAPPED, STRV_MAKE("a", "eight", "line", "ćęłł",
+                                                               "___5___", "___6___", "___7___", "___8___")) >= 0);
+
+        table_set_cell_height_max(table, 1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                             BAR\n"
+                        "three different…          two lines\n"
+                        "short                        a pair\n"
+                        "short2           a eight line ćęłł…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 2);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                           BAR\n"
+                        "three different         two lines\n"
+                        "lines                            \n"
+                        "short                      a pair\n"
+                        "short2          a eight line ćęłł\n"
+                        "                 ___5___ ___6___…\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, 3);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                           BAR\n"
+                        "three different         two lines\n"
+                        "lines                            \n"
+                        "short                      a pair\n"
+                        "short2          a eight line ćęłł\n"
+                        "                  ___5___ ___6___\n"
+                        "                  ___7___ ___8___\n"));
+        formatted = mfree(formatted);
+
+        table_set_cell_height_max(table, (size_t) -1);
+        assert_se(table_format(table, &formatted) >= 0);
+        fputs(formatted, stdout);
+        assert_se(streq(formatted,
+                        "FOO                           BAR\n"
+                        "three different         two lines\n"
+                        "lines                            \n"
+                        "short                      a pair\n"
+                        "short2          a eight line ćęłł\n"
+                        "                  ___5___ ___6___\n"
+                        "                  ___7___ ___8___\n"));
+        formatted = mfree(formatted);
+}
+
+int main(int argc, char *argv[]) {
         _cleanup_(table_unrefp) Table *t = NULL;
         _cleanup_free_ char *formatted = NULL;
 
+        assert_se(setenv("SYSTEMD_COLORS", "0", 1) >= 0);
         assert_se(setenv("COLUMNS", "40", 1) >= 0);
 
         assert_se(t = table_new("one", "two", "three"));
@@ -48,6 +385,7 @@ int main(int argc, char *argv[]) {
         assert_se(table_add_many(t,
                                  TABLE_STRING, "a long field",
                                  TABLE_STRING, "yyy",
+                                 TABLE_SET_UPPERCASE, 1,
                                  TABLE_BOOLEAN, false) >= 0);
 
         assert_se(table_format(t, &formatted) >= 0);
@@ -56,7 +394,7 @@ int main(int argc, char *argv[]) {
         assert_se(streq(formatted,
                         "ONE          TWO THREE\n"
                         "xxx          yyy   yes\n"
-                        "a long field yyy    no\n"));
+                        "a long field YYY    no\n"));
 
         formatted = mfree(formatted);
 
@@ -68,7 +406,7 @@ int main(int argc, char *argv[]) {
         assert_se(streq(formatted,
                         "ONE                TWO             THREE\n"
                         "xxx                yyy               yes\n"
-                        "a long field       yyy                no\n"));
+                        "a long field       YYY                no\n"));
 
         formatted = mfree(formatted);
 
@@ -79,7 +417,7 @@ int main(int argc, char *argv[]) {
         assert_se(streq(formatted,
                         "ONE TWO THR…\n"
                         "xxx yyy  yes\n"
-                        "a … yyy   no\n"));
+                        "a … YYY   no\n"));
 
         formatted = mfree(formatted);
 
@@ -113,7 +451,7 @@ int main(int argc, char *argv[]) {
 
         assert_se(streq(formatted,
                         "ONE          TWO THREE\n"
-                        "a long field yyy    no\n"
+                        "a long field YYY    no\n"
                         "xxx          yyy   yes\n"));
 
         formatted = mfree(formatted);
@@ -139,7 +477,7 @@ int main(int argc, char *argv[]) {
         printf("%s\n", formatted);
 
         assert_se(streq(formatted,
-                        "a long field yyy    no\n"
+                        "a long field YYY    no\n"
                         "fäää         zzz    no\n"
                         "fäää         uuu   yes\n"
                         "xxx          yyy   yes\n"
@@ -152,14 +490,25 @@ int main(int argc, char *argv[]) {
         assert_se(table_format(t, &formatted) >= 0);
         printf("%s\n", formatted);
 
-        assert_se(streq(formatted,
-                        "  no a long f…   no a long f… a long fi…\n"
-                        "  no fäää        no fäää      fäää      \n"
-                        " yes fäää       yes fäää      fäää      \n"
-                        " yes xxx        yes xxx       xxx       \n"
-                        "5min           5min                     \n"));
+        if (isatty(STDOUT_FILENO))
+                assert_se(streq(formatted,
+                                "  no a long f…   no a long f… a long fi…\n"
+                                "  no fäää        no fäää      fäää      \n"
+                                " yes fäää       yes fäää      fäää      \n"
+                                " yes xxx        yes xxx       xxx       \n"
+                                "5min           5min                     \n"));
+        else
+                assert_se(streq(formatted,
+                                "  no a long field   no a long field a long field\n"
+                                "  no fäää           no fäää         fäää        \n"
+                                " yes fäää          yes fäää         fäää        \n"
+                                " yes xxx           yes xxx          xxx         \n"
+                                "5min              5min                          \n"));
 
         test_issue_9549();
+        test_multiline();
+        test_strv();
+        test_strv_wrapped();
 
         return 0;
 }

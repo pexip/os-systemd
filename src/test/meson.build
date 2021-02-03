@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 awkscript = 'test-hashmap-ordered.awk'
 test_hashmap_ordered_c = custom_target(
@@ -11,12 +11,11 @@ test_hashmap_ordered_c = custom_target(
 
 test_include_dir = include_directories('.')
 
-path = run_command('sh', ['-c', 'echo "$PATH"']).stdout()
+path = run_command('sh', ['-c', 'echo "$PATH"']).stdout().strip()
 test_env = environment()
 test_env.set('SYSTEMD_KBD_MODEL_MAP', kbd_model_map)
 test_env.set('SYSTEMD_LANGUAGE_FALLBACK_MAP', language_fallback_map)
-test_env.set('PATH', path)
-test_env.prepend('PATH', meson.build_root())
+test_env.set('PATH', '@0@:@1@'.format(meson.build_root(), path))
 
 ############################################################
 
@@ -51,8 +50,7 @@ tests += [
          [],
          []],
 
-        [['src/test/test-engine.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-engine.c'],
          [libcore,
           libudev,
           libshared],
@@ -137,8 +135,11 @@ tests += [
          [],
          'ENABLE_EFI'],
 
-        [['src/test/test-unit-name.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-unit-file.c'],
+         [],
+         []],
+
+        [['src/test/test-unit-name.c'],
          [libcore,
           libshared],
          [threads,
@@ -148,8 +149,7 @@ tests += [
           libmount,
           libblkid]],
 
-        [['src/test/test-unit-file.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-load-fragment.c'],
          [libcore,
           libshared],
          [threads,
@@ -216,6 +216,10 @@ tests += [
          [],
          []],
 
+        [['src/test/test-format-util.c'],
+         [],
+         []],
+
         [['src/test/test-ratelimit.c'],
          [],
          []],
@@ -227,6 +231,11 @@ tests += [
         [['src/test/test-json.c'],
          [],
          []],
+
+        [['src/test/test-libmount.c'],
+         [],
+         [threads,
+          libmount]],
 
         [['src/test/test-mount-util.c'],
          [],
@@ -264,6 +273,10 @@ tests += [
          [],
          []],
 
+        [['src/test/test-umask-util.c'],
+         [],
+         []],
+
         [['src/test/test-proc-cmdline.c'],
          [],
          []],
@@ -288,7 +301,22 @@ tests += [
          [],
          []],
 
+        [['src/test/test-libcrypt-util.c'],
+         [],
+         [],
+         '', 'timeout=120'],
+
+        [['src/test/test-offline-passwd.c',
+          'src/shared/offline-passwd.c',
+          'src/shared/offline-passwd.h'],
+         [],
+         []],
+
         [['src/test/test-escape.c'],
+         [],
+         []],
+
+        [['src/test/test-exit-status.c'],
          [],
          []],
 
@@ -305,6 +333,14 @@ tests += [
          []],
 
         [['src/test/test-parse-util.c'],
+         [],
+         [libseccomp]],
+
+        [['src/test/test-sysctl-util.c'],
+         [],
+         []],
+
+        [['src/test/test-user-record.c'],
          [],
          []],
 
@@ -342,6 +378,10 @@ tests += [
          [libcap]],
 
         [['src/test/test-socket-util.c'],
+         [],
+         []],
+
+        [['src/test/test-socket-netlink.c'],
          [],
          []],
 
@@ -390,14 +430,20 @@ tests += [
          [],
          '', 'manual'],
 
-        [['src/test/test-dissect-image.c'],
-         [],
-         [libblkid],
-         '', 'manual'],
-
         [['src/test/test-signal-util.c'],
          [],
          []],
+
+        [['src/test/test-loop-block.c'],
+         [libcore,
+          libshared],
+         [threads,
+          libblkid],
+         '',
+         '',
+         [],
+         includes,
+         false],
 
         [['src/test/test-selinux.c'],
          [],
@@ -407,8 +453,7 @@ tests += [
          [libbasic],
          []],
 
-        [['src/test/test-bpf.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-bpf-devices.c'],
          [libcore,
           libshared],
          [libmount,
@@ -418,8 +463,17 @@ tests += [
           libselinux,
           libblkid]],
 
-        [['src/test/test-watch-pid.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-bpf-firewall.c'],
+         [libcore,
+          libshared],
+         [libmount,
+          threads,
+          librt,
+          libseccomp,
+          libselinux,
+          libblkid]],
+
+        [['src/test/test-watch-pid.c'],
          [libcore,
           libshared],
          [libmount,
@@ -437,6 +491,10 @@ tests += [
          '', 'timeout=90'],
 
         [['src/test/test-set.c'],
+         [libbasic],
+         []],
+
+        [['src/test/test-ordered-set.c'],
          [],
          []],
 
@@ -551,17 +609,29 @@ tests += [
          [],
          []],
 
+        [['src/test/test-coredump-util.c'],
+         [],
+         []],
+
         [['src/test/test-daemon.c'],
          [],
          []],
 
         [['src/test/test-cgroup.c'],
          [],
-         [],
-         '', 'manual'],
+         []],
 
-        [['src/test/test-cgroup-mask.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-cgroup-cpu.c'],
+         [libcore,
+          libshared],
+         []],
+
+        [['src/test/test-cgroup-unit-default.c'],
+         [libcore,
+          libshared],
+         []],
+
+        [['src/test/test-cgroup-mask.c'],
          [libcore,
           libshared],
          [threads,
@@ -571,7 +641,19 @@ tests += [
           libmount,
           libblkid]],
 
+        [['src/test/test-varlink.c'],
+         [],
+         [threads]],
+
         [['src/test/test-cgroup-util.c'],
+         [],
+         []],
+
+        [['src/test/test-cgroup-setup.c'],
+         [],
+         []],
+
+        [['src/test/test-env-file.c'],
          [],
          []],
 
@@ -591,8 +673,16 @@ tests += [
          [],
          []],
 
-        [['src/test/test-path.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-rm-rf.c'],
+         [],
+         []],
+
+        [['src/test/test-chase-symlinks.c'],
+         [],
+         [],
+         '', 'manual'],
+
+        [['src/test/test-path.c'],
          [libcore,
           libshared],
          [threads,
@@ -600,10 +690,10 @@ tests += [
           libseccomp,
           libselinux,
           libmount,
-          libblkid]],
+          libblkid],
+         '', 'timeout=120'],
 
-        [['src/test/test-execute.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-execute.c'],
          [libcore,
           libshared],
          [threads,
@@ -632,8 +722,7 @@ tests += [
          [],
          []],
 
-        [['src/test/test-sched-prio.c',
-          'src/test/test-helper.c'],
+        [['src/test/test-sched-prio.c'],
          [libcore,
           libshared],
          [threads,
@@ -683,8 +772,13 @@ tests += [
           librt,
           libblkid,
           libkmod,
-          libacl],
+          libacl,
+          libselinux],
          '', 'manual', '-DLOG_REALM=LOG_REALM_UDEV'],
+
+        [['src/test/test-udev-util.c'],
+         [],
+         []],
 
         [['src/test/test-id128.c'],
          [],
@@ -705,11 +799,10 @@ tests += [
          'ENABLE_NSS', 'manual'],
 
         [['src/test/test-umount.c',
-          'src/core/mount-setup.c',
-          'src/core/mount-setup.h',
-          'src/core/umount.c',
-          'src/core/umount.h'],
-         [],
+          'src/shutdown/umount.c',
+          'src/shutdown/umount.h'],
+         [libcore_shared,
+          libshared],
          [libmount]],
 
         [['src/test/test-bus-util.c'],
@@ -719,6 +812,22 @@ tests += [
         [['src/test/test-sd-hwdb.c'],
          [],
          []],
+
+        [['src/test/test-sd-path.c'],
+         [],
+         []],
+
+        [['src/test/test-local-addresses.c'],
+         [],
+         []],
+
+        [['src/test/test-psi-util.c'],
+         [],
+         []],
+
+        [['src/test/test-qrcode-util.c'],
+         [libshared],
+         [libdl]],
 ]
 
 ############################################################
@@ -823,12 +932,14 @@ tests += [
          [libjournal_core,
           libshared],
          [liblz4,
+          libzstd,
           libxz]],
 
         [['src/journal/test-compress-benchmark.c'],
          [libjournal_core,
           libshared],
          [liblz4,
+          libzstd,
           libxz],
          '', 'timeout=90'],
 
@@ -855,6 +966,10 @@ tests += [
           libdbus]],
 
         [['src/libsystemd/sd-bus/test-bus-signature.c'],
+         [],
+         [threads]],
+
+        [['src/libsystemd/sd-bus/test-bus-queue-ref-cycle.c'],
          [],
          [threads]],
 
@@ -888,7 +1003,8 @@ tests += [
          [],
          [threads]],
 
-        [['src/libsystemd/sd-bus/test-bus-vtable.c'],
+        [['src/libsystemd/sd-bus/test-bus-vtable.c',
+          'src/libsystemd/sd-bus/test-vtable-data.h'],
          [],
          []],
 
@@ -911,7 +1027,8 @@ tests += [
          [threads],
          '', 'manual'],
 
-        [['src/libsystemd/sd-bus/test-bus-introspect.c'],
+        [['src/libsystemd/sd-bus/test-bus-introspect.c',
+          'src/libsystemd/sd-bus/test-vtable-data.h'],
          [],
          []],
 
@@ -920,10 +1037,6 @@ tests += [
          []],
 
         [['src/libsystemd/sd-netlink/test-netlink.c'],
-         [],
-         []],
-
-        [['src/libsystemd/sd-netlink/test-local-addresses.c'],
          [],
          []],
 
@@ -1055,6 +1168,10 @@ tests += [
          [],
          []],
 
+        [['src/analyze/test-verify.c', 'src/analyze/analyze-verify.c', 'src/analyze/analyze-verify.h'],
+         [libcore, libshared],
+         []],
+
         [['src/login/test-inhibit.c'],
          [],
          [],
@@ -1064,4 +1181,14 @@ tests += [
          [liblogind_core,
           libshared],
          [threads]],
+]
+
+############################################################
+
+tests += [
+        [['src/test/test-xdg-autostart.c',
+          'src/xdg-autostart-generator/xdg-autostart-service.c',
+          'src/xdg-autostart-generator/xdg-autostart-service.h',],
+         [],
+         []],
 ]

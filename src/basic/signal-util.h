@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <signal.h>
@@ -41,3 +41,5 @@ static inline const char* signal_to_string_with_check(int n) {
 
         return signal_to_string(n);
 }
+
+int signal_is_blocked(int sig);

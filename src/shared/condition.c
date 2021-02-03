@@ -1,12 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <limits.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -21,17 +19,20 @@
 #include "cap-list.h"
 #include "cgroup-util.h"
 #include "condition.h"
-#include "efivars.h"
+#include "cpu-set-util.h"
+#include "efi-loader.h"
+#include "env-file.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "glob-util.h"
 #include "hostname-util.h"
 #include "ima-util.h"
+#include "limits-util.h"
 #include "list.h"
 #include "macro.h"
 #include "mountpoint-util.h"
-#include "env-file.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "proc-cmdline.h"
@@ -42,51 +43,58 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "tomoyo-util.h"
+#include "user-record.h"
 #include "user-util.h"
 #include "util.h"
 #include "virt.h"
 
 Condition* condition_new(ConditionType type, const char *parameter, bool trigger, bool negate) {
         Condition *c;
-        int r;
 
         assert(type >= 0);
         assert(type < _CONDITION_TYPE_MAX);
-        assert((!parameter) == (type == CONDITION_NULL));
+        assert(parameter);
 
-        c = new0(Condition, 1);
+        c = new(Condition, 1);
         if (!c)
                 return NULL;
 
-        c->type = type;
-        c->trigger = trigger;
-        c->negate = negate;
+        *c = (Condition) {
+                .type = type,
+                .trigger = trigger,
+                .negate = negate,
+        };
 
-        r = free_and_strdup(&c->parameter, parameter);
-        if (r < 0) {
-                return mfree(c);
+        if (parameter) {
+                c->parameter = strdup(parameter);
+                if (!c->parameter)
+                        return mfree(c);
         }
 
         return c;
 }
 
-void condition_free(Condition *c) {
+Condition* condition_free(Condition *c) {
         assert(c);
 
         free(c->parameter);
-        free(c);
+        return mfree(c);
 }
 
-Condition* condition_free_list(Condition *first) {
+Condition* condition_free_list_type(Condition *head, ConditionType type) {
         Condition *c, *n;
 
-        LIST_FOREACH_SAFE(conditions, c, n, first)
-                condition_free(c);
+        LIST_FOREACH_SAFE(conditions, c, n, head)
+                if (type < 0 || c->type == type) {
+                        LIST_REMOVE(conditions, head, c);
+                        condition_free(c);
+                }
 
-        return NULL;
+        assert(type >= 0 || !head);
+        return head;
 }
 
-static int condition_test_kernel_command_line(Condition *c) {
+static int condition_test_kernel_command_line(Condition *c, char **env) {
         _cleanup_free_ char *line = NULL;
         const char *p;
         bool equal;
@@ -106,7 +114,7 @@ static int condition_test_kernel_command_line(Condition *c) {
                 _cleanup_free_ char *word = NULL;
                 bool found;
 
-                r = extract_first_word(&p, &word, NULL, EXTRACT_QUOTES|EXTRACT_RELAX);
+                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE|EXTRACT_RELAX);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -128,29 +136,78 @@ static int condition_test_kernel_command_line(Condition *c) {
         return false;
 }
 
-static int condition_test_kernel_version(Condition *c) {
-        enum {
-                /* Listed in order of checking. Note that some comparators are prefixes of others, hence the longest
-                 * should be listed first. */
-                LOWER_OR_EQUAL,
-                GREATER_OR_EQUAL,
-                LOWER,
-                GREATER,
-                EQUAL,
-                _ORDER_MAX,
-        };
+typedef enum {
+        /* Listed in order of checking. Note that some comparators are prefixes of others, hence the longest
+         * should be listed first. */
+        ORDER_LOWER_OR_EQUAL,
+        ORDER_GREATER_OR_EQUAL,
+        ORDER_LOWER,
+        ORDER_GREATER,
+        ORDER_EQUAL,
+        ORDER_UNEQUAL,
+        _ORDER_MAX,
+        _ORDER_INVALID = -1
+} OrderOperator;
+
+static OrderOperator parse_order(const char **s) {
 
         static const char *const prefix[_ORDER_MAX] = {
-                [LOWER_OR_EQUAL] = "<=",
-                [GREATER_OR_EQUAL] = ">=",
-                [LOWER] = "<",
-                [GREATER] = ">",
-                [EQUAL] = "=",
+                [ORDER_LOWER_OR_EQUAL] = "<=",
+                [ORDER_GREATER_OR_EQUAL] = ">=",
+                [ORDER_LOWER] = "<",
+                [ORDER_GREATER] = ">",
+                [ORDER_EQUAL] = "=",
+                [ORDER_UNEQUAL] = "!=",
         };
-        const char *p = NULL;
+
+        OrderOperator i;
+
+        for (i = 0; i < _ORDER_MAX; i++) {
+                const char *e;
+
+                e = startswith(*s, prefix[i]);
+                if (e) {
+                        *s = e;
+                        return i;
+                }
+        }
+
+        return _ORDER_INVALID;
+}
+
+static bool test_order(int k, OrderOperator p) {
+
+        switch (p) {
+
+        case ORDER_LOWER:
+                return k < 0;
+
+        case ORDER_LOWER_OR_EQUAL:
+                return k <= 0;
+
+        case ORDER_EQUAL:
+                return k == 0;
+
+        case ORDER_UNEQUAL:
+                return k != 0;
+
+        case ORDER_GREATER_OR_EQUAL:
+                return k >= 0;
+
+        case ORDER_GREATER:
+                return k > 0;
+
+        default:
+                assert_not_reached("unknown order");
+
+        }
+}
+
+static int condition_test_kernel_version(Condition *c, char **env) {
+        OrderOperator order;
         struct utsname u;
-        size_t i;
-        int k;
+        const char *p;
+        bool first = true;
 
         assert(c);
         assert(c->parameter);
@@ -158,41 +215,103 @@ static int condition_test_kernel_version(Condition *c) {
 
         assert_se(uname(&u) >= 0);
 
-        for (i = 0; i < _ORDER_MAX; i++) {
-                p = startswith(c->parameter, prefix[i]);
-                if (p)
+        p = c->parameter;
+
+        for (;;) {
+                _cleanup_free_ char *word = NULL;
+                const char *s;
+                int r;
+
+                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to parse condition string \"%s\": %m", p);
+                if (r == 0)
                         break;
+
+                s = strstrip(word);
+                order = parse_order(&s);
+                if (order >= 0) {
+                        s += strspn(s, WHITESPACE);
+                        if (isempty(s)) {
+                                if (first) {
+                                        /* For backwards compatibility, allow whitespace between the operator and
+                                         * value, without quoting, but only in the first expression. */
+                                        word = mfree(word);
+                                        r = extract_first_word(&p, &word, NULL, 0);
+                                        if (r < 0)
+                                                return log_debug_errno(r, "Failed to parse condition string \"%s\": %m", p);
+                                        if (r == 0)
+                                                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Unexpected end of expression: %s", p);
+                                        s = word;
+                                } else
+                                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Unexpected end of expression: %s", p);
+                        }
+
+                        r = test_order(str_verscmp(u.release, s), order);
+                } else
+                        /* No prefix? Then treat as glob string */
+                        r = fnmatch(s, u.release, 0) == 0;
+
+                if (r == 0)
+                        return false;
+
+                first = false;
         }
 
-        /* No prefix? Then treat as glob string */
-        if (!p)
-                return fnmatch(skip_leading_chars(c->parameter, NULL), u.release, 0) == 0;
-
-        k = str_verscmp(u.release, skip_leading_chars(p, NULL));
-
-        switch (i) {
-
-        case LOWER:
-                return k < 0;
-
-        case LOWER_OR_EQUAL:
-                return k <= 0;
-
-        case EQUAL:
-                return k == 0;
-
-        case GREATER_OR_EQUAL:
-                return k >= 0;
-
-        case GREATER:
-                return k > 0;
-
-        default:
-                assert_not_reached("Can't compare");
-        }
+        return true;
 }
 
-static int condition_test_user(Condition *c) {
+static int condition_test_memory(Condition *c, char **env) {
+        OrderOperator order;
+        uint64_t m, k;
+        const char *p;
+        int r;
+
+        assert(c);
+        assert(c->parameter);
+        assert(c->type == CONDITION_MEMORY);
+
+        m = physical_memory();
+
+        p = c->parameter;
+        order = parse_order(&p);
+        if (order < 0)
+                order = ORDER_GREATER_OR_EQUAL; /* default to >= check, if nothing is specified. */
+
+        r = safe_atou64(p, &k);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse size: %m");
+
+        return test_order(CMP(m, k), order);
+}
+
+static int condition_test_cpus(Condition *c, char **env) {
+        OrderOperator order;
+        const char *p;
+        unsigned k;
+        int r, n;
+
+        assert(c);
+        assert(c->parameter);
+        assert(c->type == CONDITION_CPUS);
+
+        n = cpus_in_affinity_mask();
+        if (n < 0)
+                return log_debug_errno(n, "Failed to determine CPUs in affinity mask: %m");
+
+        p = c->parameter;
+        order = parse_order(&p);
+        if (order < 0)
+                order = ORDER_GREATER_OR_EQUAL; /* default to >= check, if nothing is specified. */
+
+        r = safe_atou(p, &k);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse number of CPUs: %m");
+
+        return test_order(CMP((unsigned) n, k), order);
+}
+
+static int condition_test_user(Condition *c, char **env) {
         uid_t id;
         int r;
         _cleanup_free_ char *username = NULL;
@@ -227,7 +346,7 @@ static int condition_test_user(Condition *c) {
         return id == getuid() || id == geteuid();
 }
 
-static int condition_test_control_group_controller(Condition *c) {
+static int condition_test_control_group_controller(Condition *c, char **env) {
         int r;
         CGroupMask system_mask, wanted_mask = 0;
 
@@ -251,7 +370,7 @@ static int condition_test_control_group_controller(Condition *c) {
         return FLAGS_SET(system_mask, wanted_mask);
 }
 
-static int condition_test_group(Condition *c) {
+static int condition_test_group(Condition *c, char **env) {
         gid_t id;
         int r;
 
@@ -270,7 +389,7 @@ static int condition_test_group(Condition *c) {
         return in_group(c->parameter) > 0;
 }
 
-static int condition_test_virtualization(Condition *c) {
+static int condition_test_virtualization(Condition *c, char **env) {
         int b, v;
 
         assert(c);
@@ -300,7 +419,7 @@ static int condition_test_virtualization(Condition *c) {
         return v != VIRTUALIZATION_NONE && streq(c->parameter, virtualization_to_string(v));
 }
 
-static int condition_test_architecture(Condition *c) {
+static int condition_test_architecture(Condition *c, char **env) {
         int a, b;
 
         assert(c);
@@ -322,7 +441,7 @@ static int condition_test_architecture(Condition *c) {
         return a == b;
 }
 
-static int condition_test_host(Condition *c) {
+static int condition_test_host(Condition *c, char **env) {
         _cleanup_free_ char *h = NULL;
         sd_id128_t x, y;
         int r;
@@ -347,7 +466,7 @@ static int condition_test_host(Condition *c) {
         return fnmatch(c->parameter, h, FNM_CASEFOLD) == 0;
 }
 
-static int condition_test_ac_power(Condition *c) {
+static int condition_test_ac_power(Condition *c, char **env) {
         int r;
 
         assert(c);
@@ -361,7 +480,7 @@ static int condition_test_ac_power(Condition *c) {
         return (on_ac_power() != 0) == !!r;
 }
 
-static int condition_test_security(Condition *c) {
+static int condition_test_security(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_SECURITY);
@@ -384,7 +503,7 @@ static int condition_test_security(Condition *c) {
         return false;
 }
 
-static int condition_test_capability(Condition *c) {
+static int condition_test_capability(Condition *c, char **env) {
         unsigned long long capabilities = (unsigned long long) -1;
         _cleanup_fclose_ FILE *f = NULL;
         int value, r;
@@ -427,31 +546,48 @@ static int condition_test_capability(Condition *c) {
         return !!(capabilities & (1ULL << value));
 }
 
-static int condition_test_needs_update(Condition *c) {
-        const char *p;
+static int condition_test_needs_update(Condition *c, char **env) {
         struct stat usr, other;
+        const char *p;
+        bool b;
+        int r;
 
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_NEEDS_UPDATE);
 
+        r = proc_cmdline_get_bool("systemd.condition-needs-update", &b);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse systemd.condition-needs-update= kernel command line argument, ignoring: %m");
+        if (r > 0)
+                return b;
+
+        if (!path_is_absolute(c->parameter)) {
+                log_debug("Specified condition parameter '%s' is not absolute, assuming an update is needed.", c->parameter);
+                return true;
+        }
+
         /* If the file system is read-only we shouldn't suggest an update */
-        if (path_is_read_only_fs(c->parameter) > 0)
+        r = path_is_read_only_fs(c->parameter);
+        if (r < 0)
+                log_debug_errno(r, "Failed to determine if '%s' is read-only, ignoring: %m", c->parameter);
+        if (r > 0)
                 return false;
 
-        /* Any other failure means we should allow the condition to be true,
-         * so that we rather invoke too many update tools than too
-         * few. */
-
-        if (!path_is_absolute(c->parameter))
-                return true;
+        /* Any other failure means we should allow the condition to be true, so that we rather invoke too
+         * many update tools than too few. */
 
         p = strjoina(c->parameter, "/.updated");
-        if (lstat(p, &other) < 0)
+        if (lstat(p, &other) < 0) {
+                if (errno != ENOENT)
+                        log_debug_errno(errno, "Failed to stat() '%s', assuming an update is needed: %m", p);
                 return true;
+        }
 
-        if (lstat("/usr/", &usr) < 0)
+        if (lstat("/usr/", &usr) < 0) {
+                log_debug_errno(errno, "Failed to stat() /usr/, assuming an update is needed: %m");
                 return true;
+        }
 
         /*
          * First, compare seconds as they are always accurate...
@@ -467,47 +603,84 @@ static int condition_test_needs_update(Condition *c) {
          * AND the target file's nanoseconds == 0
          * (otherwise the filesystem supports nsec timestamps, see stat(2)).
          */
-        if (usr.st_mtim.tv_nsec > 0 && other.st_mtim.tv_nsec == 0) {
-                _cleanup_free_ char *timestamp_str = NULL;
-                uint64_t timestamp;
-                int r;
+        if (usr.st_mtim.tv_nsec == 0 || other.st_mtim.tv_nsec > 0)
+                return usr.st_mtim.tv_nsec > other.st_mtim.tv_nsec;
 
-                r = parse_env_file(NULL, p, "TIMESTAMP_NSEC", &timestamp_str);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to parse timestamp file '%s', using mtime: %m", p);
-                        return true;
-                } else if (r == 0) {
-                        log_debug("No data in timestamp file '%s', using mtime", p);
-                        return true;
-                }
-
-                r = safe_atou64(timestamp_str, &timestamp);
-                if (r < 0) {
-                        log_error_errno(r, "Failed to parse timestamp value '%s' in file '%s', using mtime: %m", timestamp_str, p);
-                        return true;
-                }
-
-                timespec_store(&other.st_mtim, timestamp);
+        _cleanup_free_ char *timestamp_str = NULL;
+        r = parse_env_file(NULL, p, "TIMESTAMP_NSEC", &timestamp_str);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse timestamp file '%s', using mtime: %m", p);
+                return true;
+        } else if (r == 0) {
+                log_debug("No data in timestamp file '%s', using mtime.", p);
+                return true;
         }
 
-        return usr.st_mtim.tv_nsec > other.st_mtim.tv_nsec;
+        uint64_t timestamp;
+        r = safe_atou64(timestamp_str, &timestamp);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse timestamp value '%s' in file '%s', using mtime: %m", timestamp_str, p);
+                return true;
+        }
+
+        return timespec_load_nsec(&usr.st_mtim) > timestamp;
 }
 
-static int condition_test_first_boot(Condition *c) {
-        int r;
+static int condition_test_first_boot(Condition *c, char **env) {
+        int r, q;
+        bool b;
 
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_FIRST_BOOT);
 
+        r = proc_cmdline_get_bool("systemd.condition-first-boot", &b);
+        if (r < 0)
+                log_debug_errno(r, "Failed to parse systemd.condition-first-boot= kernel command line argument, ignoring: %m");
+        if (r > 0)
+                return b == !!r;
+
         r = parse_boolean(c->parameter);
         if (r < 0)
                 return r;
 
-        return (access("/run/systemd/first-boot", F_OK) >= 0) == !!r;
+        q = access("/run/systemd/first-boot", F_OK);
+        if (q < 0 && errno != ENOENT)
+                log_debug_errno(errno, "Failed to check if /run/systemd/first-boot exists, ignoring: %m");
+
+        return (q >= 0) == !!r;
 }
 
-static int condition_test_path_exists(Condition *c) {
+static int condition_test_environment(Condition *c, char **env) {
+        bool equal;
+        char **i;
+
+        assert(c);
+        assert(c->parameter);
+        assert(c->type == CONDITION_ENVIRONMENT);
+
+        equal = strchr(c->parameter, '=');
+
+        STRV_FOREACH(i, env) {
+                bool found;
+
+                if (equal)
+                        found = streq(c->parameter, *i);
+                else {
+                        const char *f;
+
+                        f = startswith(*i, c->parameter);
+                        found = f && IN_SET(*f, 0, '=');
+                }
+
+                if (found)
+                        return true;
+        }
+
+        return false;
+}
+
+static int condition_test_path_exists(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_EXISTS);
@@ -515,7 +688,7 @@ static int condition_test_path_exists(Condition *c) {
         return access(c->parameter, F_OK) >= 0;
 }
 
-static int condition_test_path_exists_glob(Condition *c) {
+static int condition_test_path_exists_glob(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_EXISTS_GLOB);
@@ -523,7 +696,7 @@ static int condition_test_path_exists_glob(Condition *c) {
         return glob_exists(c->parameter) > 0;
 }
 
-static int condition_test_path_is_directory(Condition *c) {
+static int condition_test_path_is_directory(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_DIRECTORY);
@@ -531,7 +704,7 @@ static int condition_test_path_is_directory(Condition *c) {
         return is_dir(c->parameter, true) > 0;
 }
 
-static int condition_test_path_is_symbolic_link(Condition *c) {
+static int condition_test_path_is_symbolic_link(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_SYMBOLIC_LINK);
@@ -539,7 +712,7 @@ static int condition_test_path_is_symbolic_link(Condition *c) {
         return is_symlink(c->parameter) > 0;
 }
 
-static int condition_test_path_is_mount_point(Condition *c) {
+static int condition_test_path_is_mount_point(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_MOUNT_POINT);
@@ -547,7 +720,7 @@ static int condition_test_path_is_mount_point(Condition *c) {
         return path_is_mount_point(c->parameter, NULL, AT_SYMLINK_FOLLOW) > 0;
 }
 
-static int condition_test_path_is_read_write(Condition *c) {
+static int condition_test_path_is_read_write(Condition *c, char **env) {
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_PATH_IS_READ_WRITE);
@@ -555,7 +728,21 @@ static int condition_test_path_is_read_write(Condition *c) {
         return path_is_read_only_fs(c->parameter) <= 0;
 }
 
-static int condition_test_directory_not_empty(Condition *c) {
+static int condition_test_path_is_encrypted(Condition *c, char **env) {
+        int r;
+
+        assert(c);
+        assert(c->parameter);
+        assert(c->type == CONDITION_PATH_IS_ENCRYPTED);
+
+        r = path_is_encrypted(c->parameter);
+        if (r < 0 && r != -ENOENT)
+                log_debug_errno(r, "Failed to determine if '%s' is encrypted: %m", c->parameter);
+
+        return r > 0;
+}
+
+static int condition_test_directory_not_empty(Condition *c, char **env) {
         int r;
 
         assert(c);
@@ -566,7 +753,7 @@ static int condition_test_directory_not_empty(Condition *c) {
         return r <= 0 && r != -ENOENT;
 }
 
-static int condition_test_file_not_empty(Condition *c) {
+static int condition_test_file_not_empty(Condition *c, char **env) {
         struct stat st;
 
         assert(c);
@@ -578,7 +765,7 @@ static int condition_test_file_not_empty(Condition *c) {
                 st.st_size > 0);
 }
 
-static int condition_test_file_is_executable(Condition *c) {
+static int condition_test_file_is_executable(Condition *c, char **env) {
         struct stat st;
 
         assert(c);
@@ -590,41 +777,35 @@ static int condition_test_file_is_executable(Condition *c) {
                 (st.st_mode & 0111));
 }
 
-static int condition_test_null(Condition *c) {
-        assert(c);
-        assert(c->type == CONDITION_NULL);
+int condition_test(Condition *c, char **env) {
 
-        /* Note that during parsing we already evaluate the string and
-         * store it in c->negate */
-        return true;
-}
-
-int condition_test(Condition *c) {
-
-        static int (*const condition_tests[_CONDITION_TYPE_MAX])(Condition *c) = {
-                [CONDITION_PATH_EXISTS] = condition_test_path_exists,
-                [CONDITION_PATH_EXISTS_GLOB] = condition_test_path_exists_glob,
-                [CONDITION_PATH_IS_DIRECTORY] = condition_test_path_is_directory,
-                [CONDITION_PATH_IS_SYMBOLIC_LINK] = condition_test_path_is_symbolic_link,
-                [CONDITION_PATH_IS_MOUNT_POINT] = condition_test_path_is_mount_point,
-                [CONDITION_PATH_IS_READ_WRITE] = condition_test_path_is_read_write,
-                [CONDITION_DIRECTORY_NOT_EMPTY] = condition_test_directory_not_empty,
-                [CONDITION_FILE_NOT_EMPTY] = condition_test_file_not_empty,
-                [CONDITION_FILE_IS_EXECUTABLE] = condition_test_file_is_executable,
-                [CONDITION_KERNEL_COMMAND_LINE] = condition_test_kernel_command_line,
-                [CONDITION_KERNEL_VERSION] = condition_test_kernel_version,
-                [CONDITION_VIRTUALIZATION] = condition_test_virtualization,
-                [CONDITION_SECURITY] = condition_test_security,
-                [CONDITION_CAPABILITY] = condition_test_capability,
-                [CONDITION_HOST] = condition_test_host,
-                [CONDITION_AC_POWER] = condition_test_ac_power,
-                [CONDITION_ARCHITECTURE] = condition_test_architecture,
-                [CONDITION_NEEDS_UPDATE] = condition_test_needs_update,
-                [CONDITION_FIRST_BOOT] = condition_test_first_boot,
-                [CONDITION_USER] = condition_test_user,
-                [CONDITION_GROUP] = condition_test_group,
+        static int (*const condition_tests[_CONDITION_TYPE_MAX])(Condition *c, char **env) = {
+                [CONDITION_PATH_EXISTS]              = condition_test_path_exists,
+                [CONDITION_PATH_EXISTS_GLOB]         = condition_test_path_exists_glob,
+                [CONDITION_PATH_IS_DIRECTORY]        = condition_test_path_is_directory,
+                [CONDITION_PATH_IS_SYMBOLIC_LINK]    = condition_test_path_is_symbolic_link,
+                [CONDITION_PATH_IS_MOUNT_POINT]      = condition_test_path_is_mount_point,
+                [CONDITION_PATH_IS_READ_WRITE]       = condition_test_path_is_read_write,
+                [CONDITION_PATH_IS_ENCRYPTED]        = condition_test_path_is_encrypted,
+                [CONDITION_DIRECTORY_NOT_EMPTY]      = condition_test_directory_not_empty,
+                [CONDITION_FILE_NOT_EMPTY]           = condition_test_file_not_empty,
+                [CONDITION_FILE_IS_EXECUTABLE]       = condition_test_file_is_executable,
+                [CONDITION_KERNEL_COMMAND_LINE]      = condition_test_kernel_command_line,
+                [CONDITION_KERNEL_VERSION]           = condition_test_kernel_version,
+                [CONDITION_VIRTUALIZATION]           = condition_test_virtualization,
+                [CONDITION_SECURITY]                 = condition_test_security,
+                [CONDITION_CAPABILITY]               = condition_test_capability,
+                [CONDITION_HOST]                     = condition_test_host,
+                [CONDITION_AC_POWER]                 = condition_test_ac_power,
+                [CONDITION_ARCHITECTURE]             = condition_test_architecture,
+                [CONDITION_NEEDS_UPDATE]             = condition_test_needs_update,
+                [CONDITION_FIRST_BOOT]               = condition_test_first_boot,
+                [CONDITION_USER]                     = condition_test_user,
+                [CONDITION_GROUP]                    = condition_test_group,
                 [CONDITION_CONTROL_GROUP_CONTROLLER] = condition_test_control_group_controller,
-                [CONDITION_NULL] = condition_test_null,
+                [CONDITION_CPUS]                     = condition_test_cpus,
+                [CONDITION_MEMORY]                   = condition_test_memory,
+                [CONDITION_ENVIRONMENT]              = condition_test_environment,
         };
 
         int r, b;
@@ -633,7 +814,7 @@ int condition_test(Condition *c) {
         assert(c->type >= 0);
         assert(c->type < _CONDITION_TYPE_MAX);
 
-        r = condition_tests[c->type](c);
+        r = condition_tests[c->type](c, env);
         if (r < 0) {
                 c->result = CONDITION_ERROR;
                 return r;
@@ -644,9 +825,62 @@ int condition_test(Condition *c) {
         return b;
 }
 
-void condition_dump(Condition *c, FILE *f, const char *prefix, const char *(*to_string)(ConditionType t)) {
+bool condition_test_list(
+                Condition *first,
+                char **env,
+                condition_to_string_t to_string,
+                condition_test_logger_t logger,
+                void *userdata) {
+
+        Condition *c;
+        int triggered = -1;
+
+        assert(!!logger == !!to_string);
+
+        /* If the condition list is empty, then it is true */
+        if (!first)
+                return true;
+
+        /* Otherwise, if all of the non-trigger conditions apply and
+         * if any of the trigger conditions apply (unless there are
+         * none) we return true */
+        LIST_FOREACH(conditions, c, first) {
+                int r;
+
+                r = condition_test(c, env);
+
+                if (logger) {
+                        if (r < 0)
+                                logger(userdata, LOG_WARNING, r, PROJECT_FILE, __LINE__, __func__,
+                                       "Couldn't determine result for %s=%s%s%s, assuming failed: %m",
+                                       to_string(c->type),
+                                       c->trigger ? "|" : "",
+                                       c->negate ? "!" : "",
+                                       c->parameter);
+                        else
+                                logger(userdata, LOG_DEBUG, 0, PROJECT_FILE, __LINE__, __func__,
+                                       "%s=%s%s%s %s.",
+                                       to_string(c->type),
+                                       c->trigger ? "|" : "",
+                                       c->negate ? "!" : "",
+                                       c->parameter,
+                                       condition_result_to_string(c->result));
+                }
+
+                if (!c->trigger && r <= 0)
+                        return false;
+
+                if (c->trigger && triggered <= 0)
+                        triggered = r > 0;
+        }
+
+        return triggered != 0;
+}
+
+void condition_dump(Condition *c, FILE *f, const char *prefix, condition_to_string_t to_string) {
         assert(c);
         assert(f);
+        assert(to_string);
 
         prefix = strempty(prefix);
 
@@ -660,7 +894,7 @@ void condition_dump(Condition *c, FILE *f, const char *prefix, const char *(*to_
                 condition_result_to_string(c->result));
 }
 
-void condition_dump_list(Condition *first, FILE *f, const char *prefix, const char *(*to_string)(ConditionType t)) {
+void condition_dump_list(Condition *first, FILE *f, const char *prefix, condition_to_string_t to_string) {
         Condition *c;
 
         LIST_FOREACH(conditions, c, first)
@@ -684,13 +918,16 @@ static const char* const condition_type_table[_CONDITION_TYPE_MAX] = {
         [CONDITION_PATH_IS_SYMBOLIC_LINK] = "ConditionPathIsSymbolicLink",
         [CONDITION_PATH_IS_MOUNT_POINT] = "ConditionPathIsMountPoint",
         [CONDITION_PATH_IS_READ_WRITE] = "ConditionPathIsReadWrite",
+        [CONDITION_PATH_IS_ENCRYPTED] = "ConditionPathIsEncrypted",
         [CONDITION_DIRECTORY_NOT_EMPTY] = "ConditionDirectoryNotEmpty",
         [CONDITION_FILE_NOT_EMPTY] = "ConditionFileNotEmpty",
         [CONDITION_FILE_IS_EXECUTABLE] = "ConditionFileIsExecutable",
         [CONDITION_USER] = "ConditionUser",
         [CONDITION_GROUP] = "ConditionGroup",
         [CONDITION_CONTROL_GROUP_CONTROLLER] = "ConditionControlGroupController",
-        [CONDITION_NULL] = "ConditionNull"
+        [CONDITION_CPUS] = "ConditionCPUs",
+        [CONDITION_MEMORY] = "ConditionMemory",
+        [CONDITION_ENVIRONMENT] = "ConditionEnvironment",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(condition_type, ConditionType);
@@ -712,13 +949,16 @@ static const char* const assert_type_table[_CONDITION_TYPE_MAX] = {
         [CONDITION_PATH_IS_SYMBOLIC_LINK] = "AssertPathIsSymbolicLink",
         [CONDITION_PATH_IS_MOUNT_POINT] = "AssertPathIsMountPoint",
         [CONDITION_PATH_IS_READ_WRITE] = "AssertPathIsReadWrite",
+        [CONDITION_PATH_IS_ENCRYPTED] = "AssertPathIsEncrypted",
         [CONDITION_DIRECTORY_NOT_EMPTY] = "AssertDirectoryNotEmpty",
         [CONDITION_FILE_NOT_EMPTY] = "AssertFileNotEmpty",
         [CONDITION_FILE_IS_EXECUTABLE] = "AssertFileIsExecutable",
         [CONDITION_USER] = "AssertUser",
         [CONDITION_GROUP] = "AssertGroup",
         [CONDITION_CONTROL_GROUP_CONTROLLER] = "AssertControlGroupController",
-        [CONDITION_NULL] = "AssertNull"
+        [CONDITION_CPUS] = "AssertCPUs",
+        [CONDITION_MEMORY] = "AssertMemory",
+        [CONDITION_ENVIRONMENT] = "AssertEnvironment",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(assert_type, ConditionType);

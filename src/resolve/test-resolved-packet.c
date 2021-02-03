@@ -1,7 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "log.h"
 #include "resolved-dns-packet.h"
+#include "tests.h"
 
 static void test_dns_packet_new(void) {
         size_t i;
@@ -23,10 +24,7 @@ static void test_dns_packet_new(void) {
 }
 
 int main(int argc, char **argv) {
-
-        log_set_max_level(LOG_DEBUG);
-        log_parse_environment();
-        log_open();
+        test_setup_logging(LOG_DEBUG);
 
         test_dns_packet_new();
 

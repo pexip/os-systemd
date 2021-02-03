@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2016 Michal Soltys <soltys@ziu.info>
 ***/
@@ -10,11 +10,12 @@
 #include <linux/tiocl.h>
 #include <linux/vt.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sysexits.h>
 #include <termios.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -85,11 +86,12 @@ static int verify_vc_kbmode(int fd) {
         return IN_SET(curr_mode, K_XLATE, K_UNICODE) ? 0 : -EBUSY;
 }
 
-static int toggle_utf8(const char *name, int fd, bool utf8) {
+static int toggle_utf8_vc(const char *name, int fd, bool utf8) {
         int r;
         struct termios tc = {};
 
         assert(name);
+        assert(fd >= 0);
 
         r = ioctl(fd, KDSKBMODE, utf8 ? K_UNICODE : K_XLATE);
         if (r < 0)
@@ -224,6 +226,7 @@ static void setup_remaining_vcs(int src_fd, unsigned src_idx, bool utf8) {
         _cleanup_free_ struct unipair* unipairs = NULL;
         _cleanup_free_ void *fontbuf = NULL;
         unsigned i;
+        int log_level;
         int r;
 
         unipairs = new(struct unipair, USHRT_MAX);
@@ -232,11 +235,20 @@ static void setup_remaining_vcs(int src_fd, unsigned src_idx, bool utf8) {
                 return;
         }
 
+        log_level = LOG_WARNING;
+
         /* get metadata of the current font (width, height, count) */
         r = ioctl(src_fd, KDFONTOP, &cfo);
-        if (r < 0)
-                log_warning_errno(errno, "KD_FONT_OP_GET failed while trying to get the font metadata: %m");
-        else {
+        if (r < 0) {
+                /* We might be called to operate on the dummy console (to setup keymap
+                 * mainly) when fbcon deferred takeover is used for example. In such case,
+                 * setting font is not supported and is expected to fail. */
+                if (errno == ENOSYS)
+                        log_level = LOG_DEBUG;
+
+                log_full_errno(log_level, errno,
+                               "KD_FONT_OP_GET failed while trying to get the font metadata: %m");
+        } else {
                 /* verify parameter sanity first */
                 if (cfo.width > 32 || cfo.height > 32 || cfo.charcount > 512)
                         log_warning("Invalid font metadata - width: %u (max 32), height: %u (max 32), count: %u (max 512)",
@@ -245,7 +257,7 @@ static void setup_remaining_vcs(int src_fd, unsigned src_idx, bool utf8) {
                         /*
                          * Console fonts supported by the kernel are limited in size to 32 x 32 and maximum 512
                          * characters. Thus with 1 bit per pixel it requires up to 65536 bytes. The height always
-                         * requries 32 per glyph, regardless of the actual height - see the comment above #define
+                         * requires 32 per glyph, regardless of the actual height - see the comment above #define
                          * max_font_size 65536 in drivers/tty/vt/vt.c for more details.
                          */
                         fontbuf = malloc_multiply((cfo.width + 7) / 8 * 32, cfo.charcount);
@@ -271,7 +283,7 @@ static void setup_remaining_vcs(int src_fd, unsigned src_idx, bool utf8) {
         }
 
         if (cfo.op != KD_FONT_OP_SET)
-                log_warning("Fonts will not be copied to remaining consoles");
+                log_full(log_level, "Fonts will not be copied to remaining consoles");
 
         for (i = 1; i <= 63; i++) {
                 char ttyname[sizeof("/dev/tty63")];
@@ -291,7 +303,7 @@ static void setup_remaining_vcs(int src_fd, unsigned src_idx, bool utf8) {
                 if (verify_vc_kbmode(fd_d) < 0)
                         continue;
 
-                toggle_utf8(ttyname, fd_d, utf8);
+                (void) toggle_utf8_vc(ttyname, fd_d, utf8);
 
                 if (cfo.op != KD_FONT_OP_SET)
                         continue;
@@ -456,7 +468,7 @@ int main(int argc, char **argv) {
                 log_warning_errno(r, "Failed to read /proc/cmdline: %m");
 
         (void) toggle_utf8_sysfs(utf8);
-        (void) toggle_utf8(vc, fd, utf8);
+        (void) toggle_utf8_vc(vc, fd, utf8);
 
         r = font_load_and_wait(vc, vc_font, vc_font_map, vc_font_unimap);
         keyboard_ok = keyboard_load_and_wait(vc, vc_keymap, vc_keymap_toggle, utf8) == 0;

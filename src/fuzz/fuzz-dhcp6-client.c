@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <unistd.h>
 
@@ -49,6 +49,9 @@ static void fuzz_client(const uint8_t *data, size_t size, bool is_information_re
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+        if (size > 65536)
+                return 0;
+
         /* This triggers client_receive_advertise */
         fuzz_client(data, size, false);
 

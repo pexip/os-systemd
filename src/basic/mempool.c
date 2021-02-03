@@ -1,10 +1,11 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdint.h>
 #include <stdlib.h>
 
 #include "env-util.h"
 #include "macro.h"
+#include "memory-util.h"
 #include "mempool.h"
 #include "process-util.h"
 #include "util.h"

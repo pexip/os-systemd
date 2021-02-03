@@ -1,16 +1,21 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
 #include <net/if.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "in-addr-util.h"
 #include "macro.h"
 #include "parse-util.h"
+#include "random-util.h"
+#include "string-util.h"
+#include "strxcpyx.h"
 #include "util.h"
 
 bool in4_addr_is_null(const struct in_addr *a) {
@@ -49,6 +54,16 @@ int in_addr_is_link_local(int family, const union in_addr_union *u) {
         return -EAFNOSUPPORT;
 }
 
+bool in6_addr_is_link_local_all_nodes(const struct in6_addr *a) {
+        assert(a);
+
+        /* ff02::1 */
+        return be32toh(a->s6_addr32[0]) == UINT32_C(0xff020000) &&
+                a->s6_addr32[1] == 0 &&
+                a->s6_addr32[2] == 0 &&
+                be32toh(a->s6_addr32[3]) == UINT32_C(0x00000001);
+}
+
 int in_addr_is_multicast(int family, const union in_addr_union *u) {
         assert(u);
 
@@ -61,11 +76,25 @@ int in_addr_is_multicast(int family, const union in_addr_union *u) {
         return -EAFNOSUPPORT;
 }
 
+bool in4_addr_is_local_multicast(const struct in_addr *a) {
+        assert(a);
+
+        return (be32toh(a->s_addr) & UINT32_C(0xffffff00)) == UINT32_C(0xe0000000);
+}
+
 bool in4_addr_is_localhost(const struct in_addr *a) {
         assert(a);
 
         /* All of 127.x.x.x is localhost. */
         return (be32toh(a->s_addr) & UINT32_C(0xFF000000)) == UINT32_C(127) << 24;
+}
+
+bool in4_addr_is_non_local(const struct in_addr *a) {
+        /* Whether the address is not null and not localhost.
+         *
+         * As such, it is suitable to configure as DNS/NTP server from DHCP. */
+        return !in4_addr_is_null(a) &&
+               !in4_addr_is_localhost(a);
 }
 
 int in_addr_is_localhost(int family, const union in_addr_union *u) {
@@ -80,19 +109,22 @@ int in_addr_is_localhost(int family, const union in_addr_union *u) {
         return -EAFNOSUPPORT;
 }
 
+bool in4_addr_equal(const struct in_addr *a, const struct in_addr *b) {
+        assert(a);
+        assert(b);
+
+        return a->s_addr == b->s_addr;
+}
+
 int in_addr_equal(int family, const union in_addr_union *a, const union in_addr_union *b) {
         assert(a);
         assert(b);
 
         if (family == AF_INET)
-                return a->in.s_addr == b->in.s_addr;
+                return in4_addr_equal(&a->in, &b->in);
 
         if (family == AF_INET6)
-                return
-                        a->in6.s6_addr32[0] == b->in6.s6_addr32[0] &&
-                        a->in6.s6_addr32[1] == b->in6.s6_addr32[1] &&
-                        a->in6.s6_addr32[2] == b->in6.s6_addr32[2] &&
-                        a->in6.s6_addr32[3] == b->in6.s6_addr32[3];
+                return IN6_ARE_ADDR_EQUAL(&a->in6, &b->in6);
 
         return -EAFNOSUPPORT;
 }
@@ -158,47 +190,89 @@ int in_addr_prefix_next(int family, union in_addr_union *u, unsigned prefixlen) 
         assert(u);
 
         /* Increases the network part of an address by one. Returns
-         * positive it that succeeds, or 0 if this overflows. */
+         * positive if that succeeds, or -ERANGE if this overflows. */
+
+        return in_addr_prefix_nth(family, u, prefixlen, 1);
+}
+
+/*
+ * Calculates the nth prefix of size prefixlen starting from the address denoted by u.
+ *
+ * On success 1 will be returned and the calculated prefix will be available in
+ * u. In the case nth == 0 the input will be left unchanged and 1 will be returned.
+ * In case the calculation cannot be performed (invalid prefix length,
+ * overflows would occur) -ERANGE is returned. If the address family given isn't
+ * supported -EAFNOSUPPORT will be returned.
+ *
+ *
+ * Examples:
+ *   - in_addr_prefix_nth(AF_INET, 192.168.0.0, 24, 2), returns 1, writes 192.168.2.0 to u
+ *   - in_addr_prefix_nth(AF_INET, 192.168.0.0, 24, 0), returns 1, no data written
+ *   - in_addr_prefix_nth(AF_INET, 255.255.255.0, 24, 1), returns -ERANGE, no data written
+ *   - in_addr_prefix_nth(AF_INET, 255.255.255.0, 0, 1), returns -ERANGE, no data written
+ *   - in_addr_prefix_nth(AF_INET6, 2001:db8, 64, 0xff00) returns 1, writes 2001:0db8:0000:ff00:: to u
+ */
+int in_addr_prefix_nth(int family, union in_addr_union *u, unsigned prefixlen, uint64_t nth) {
+        assert(u);
 
         if (prefixlen <= 0)
-                return 0;
+                return -ERANGE;
+
+        if (nth == 0)
+                return 1;
 
         if (family == AF_INET) {
-                uint32_t c, n;
-
+                uint32_t c, n, t;
                 if (prefixlen > 32)
                         prefixlen = 32;
 
                 c = be32toh(u->in.s_addr);
-                n = c + (1UL << (32 - prefixlen));
-                if (n < c)
-                        return 0;
-                n &= 0xFFFFFFFFUL << (32 - prefixlen);
 
+                t = nth << (32 - prefixlen);
+
+                /* Check for wrap */
+                if (c > UINT32_MAX - t)
+                        return -ERANGE;
+
+                n = c + t;
+
+                n &= UINT32_C(0xFFFFFFFF) << (32 - prefixlen);
                 u->in.s_addr = htobe32(n);
                 return 1;
         }
 
         if (family == AF_INET6) {
-                struct in6_addr add = {}, result;
+                struct in6_addr result = {};
                 uint8_t overflow = 0;
-                unsigned i;
+                uint64_t delta;  /* this assumes that we only ever have to up to 1<<64 subnets */
+                unsigned start_byte = (prefixlen - 1) / 8;
 
                 if (prefixlen > 128)
                         prefixlen = 128;
 
                 /* First calculate what we have to add */
-                add.s6_addr[(prefixlen-1) / 8] = 1 << (7 - (prefixlen-1) % 8);
+                delta = nth << ((128 - prefixlen) % 8);
 
-                for (i = 16; i > 0; i--) {
+                for (unsigned i = 16; i > 0; i--) {
                         unsigned j = i - 1;
+                        unsigned d = 0;
 
-                        result.s6_addr[j] = u->in6.s6_addr[j] + add.s6_addr[j] + overflow;
-                        overflow = (result.s6_addr[j] < u->in6.s6_addr[j]);
+                        if (j <= start_byte) {
+                                int16_t t;
+
+                                d = delta & 0xFF;
+                                delta >>= 8;
+
+                                t = u->in6.s6_addr[j] + d + overflow;
+                                overflow = t > UINT8_MAX ? t - UINT8_MAX : 0;
+
+                                result.s6_addr[j] = (uint8_t)t;
+                        } else
+                                result.s6_addr[j] = u->in6.s6_addr[j];
                 }
 
-                if (overflow)
-                        return 0;
+                if (overflow || delta != 0)
+                        return -ERANGE;
 
                 u->in6 = result;
                 return 1;
@@ -207,8 +281,85 @@ int in_addr_prefix_next(int family, union in_addr_union *u, unsigned prefixlen) 
         return -EAFNOSUPPORT;
 }
 
+int in_addr_random_prefix(
+                int family,
+                union in_addr_union *u,
+                unsigned prefixlen_fixed_part,
+                unsigned prefixlen) {
+
+        assert(u);
+
+        /* Random network part of an address by one. */
+
+        if (prefixlen <= 0)
+                return 0;
+
+        if (family == AF_INET) {
+                uint32_t c, n;
+
+                if (prefixlen_fixed_part > 32)
+                        prefixlen_fixed_part = 32;
+                if (prefixlen > 32)
+                        prefixlen = 32;
+                if (prefixlen_fixed_part >= prefixlen)
+                        return -EINVAL;
+
+                c = be32toh(u->in.s_addr);
+                c &= ((UINT32_C(1) << prefixlen_fixed_part) - 1) << (32 - prefixlen_fixed_part);
+
+                random_bytes(&n, sizeof(n));
+                n &= ((UINT32_C(1) << (prefixlen - prefixlen_fixed_part)) - 1) << (32 - prefixlen);
+
+                u->in.s_addr = htobe32(n | c);
+                return 1;
+        }
+
+        if (family == AF_INET6) {
+                struct in6_addr n;
+                unsigned i, j;
+
+                if (prefixlen_fixed_part > 128)
+                        prefixlen_fixed_part = 128;
+                if (prefixlen > 128)
+                        prefixlen = 128;
+                if (prefixlen_fixed_part >= prefixlen)
+                        return -EINVAL;
+
+                random_bytes(&n, sizeof(n));
+
+                for (i = 0; i < 16; i++) {
+                        uint8_t mask_fixed_part = 0, mask = 0;
+
+                        if (i < (prefixlen_fixed_part + 7) / 8) {
+                                if (i < prefixlen_fixed_part / 8)
+                                        mask_fixed_part = 0xffu;
+                                else {
+                                        j = prefixlen_fixed_part % 8;
+                                        mask_fixed_part = ((UINT8_C(1) << (j + 1)) - 1) << (8 - j);
+                                }
+                        }
+
+                        if (i < (prefixlen + 7) / 8) {
+                                if (i < prefixlen / 8)
+                                        mask = 0xffu ^ mask_fixed_part;
+                                else {
+                                        j = prefixlen % 8;
+                                        mask = (((UINT8_C(1) << (j + 1)) - 1) << (8 - j)) ^ mask_fixed_part;
+                                }
+                        }
+
+                        u->in6.s6_addr[i] &= mask_fixed_part;
+                        u->in6.s6_addr[i] |= n.s6_addr[i] & mask;
+                }
+
+                return 1;
+        }
+
+        return -EAFNOSUPPORT;
+}
+
 int in_addr_to_string(int family, const union in_addr_union *u, char **ret) {
-        char *x;
+        _cleanup_free_ char *x = NULL;
         size_t l;
 
         assert(u);
@@ -226,55 +377,100 @@ int in_addr_to_string(int family, const union in_addr_union *u, char **ret) {
                 return -ENOMEM;
 
         errno = 0;
-        if (!inet_ntop(family, u, x, l)) {
-                free(x);
-                return errno > 0 ? -errno : -EINVAL;
-        }
+        if (!inet_ntop(family, u, x, l))
+                return errno_or_else(EINVAL);
 
-        *ret = x;
+        *ret = TAKE_PTR(x);
         return 0;
 }
 
-int in_addr_ifindex_to_string(int family, const union in_addr_union *u, int ifindex, char **ret) {
+int in_addr_prefix_to_string(int family, const union in_addr_union *u, unsigned prefixlen, char **ret) {
+        _cleanup_free_ char *x = NULL;
+        char *p;
         size_t l;
-        char *x;
+
+        assert(u);
+        assert(ret);
+
+        if (family == AF_INET)
+                l = INET_ADDRSTRLEN + 3;
+        else if (family == AF_INET6)
+                l = INET6_ADDRSTRLEN + 4;
+        else
+                return -EAFNOSUPPORT;
+
+        if (prefixlen > FAMILY_ADDRESS_SIZE(family) * 8)
+                return -EINVAL;
+
+        x = new(char, l);
+        if (!x)
+                return -ENOMEM;
+
+        errno = 0;
+        if (!inet_ntop(family, u, x, l))
+                return errno_or_else(EINVAL);
+
+        p = x + strlen(x);
+        l -= strlen(x);
+        (void) strpcpyf(&p, l, "/%u", prefixlen);
+
+        *ret = TAKE_PTR(x);
+        return 0;
+}
+
+int in_addr_port_ifindex_name_to_string(int family, const union in_addr_union *u, uint16_t port, int ifindex, const char *server_name, char **ret) {
+        _cleanup_free_ char *ip_str = NULL, *x = NULL;
         int r;
 
+        assert(IN_SET(family, AF_INET, AF_INET6));
         assert(u);
         assert(ret);
 
         /* Much like in_addr_to_string(), but optionally appends the zone interface index to the address, to properly
          * handle IPv6 link-local addresses. */
 
-        if (family != AF_INET6)
-                goto fallback;
-        if (ifindex <= 0)
-                goto fallback;
-
-        r = in_addr_is_link_local(family, u);
+        r = in_addr_to_string(family, u, &ip_str);
         if (r < 0)
                 return r;
-        if (r == 0)
-                goto fallback;
 
-        l = INET6_ADDRSTRLEN + 1 + DECIMAL_STR_MAX(ifindex) + 1;
-        x = new(char, l);
-        if (!x)
-                return -ENOMEM;
+        if (family == AF_INET6) {
+                r = in_addr_is_link_local(family, u);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        ifindex = 0;
+        } else
+                ifindex = 0; /* For IPv4 address, ifindex is always ignored. */
 
-        errno = 0;
-        if (!inet_ntop(family, u, x, l)) {
-                free(x);
-                return errno > 0 ? -errno : -EINVAL;
+        if (port == 0 && ifindex == 0 && isempty(server_name)) {
+                *ret = TAKE_PTR(ip_str);
+                return 0;
         }
 
-        sprintf(strchr(x, 0), "%%%i", ifindex);
-        *ret = x;
+        const char *separator = isempty(server_name) ? "" : "#";
+        server_name = strempty(server_name);
 
+        if (port > 0) {
+                if (family == AF_INET6) {
+                        if (ifindex > 0)
+                                r = asprintf(&x, "[%s]:%"PRIu16"%%%i%s%s", ip_str, port, ifindex, separator, server_name);
+                        else
+                                r = asprintf(&x, "[%s]:%"PRIu16"%s%s", ip_str, port, separator, server_name);
+                } else
+                        r = asprintf(&x, "%s:%"PRIu16"%s%s", ip_str, port, separator, server_name);
+        } else {
+                if (ifindex > 0)
+                        r = asprintf(&x, "%s%%%i%s%s", ip_str, ifindex, separator, server_name);
+                else {
+                        x = strjoin(ip_str, separator, server_name);
+                        r = x ? 0 : -ENOMEM;
+                }
+        }
+        if (r < 0)
+                return -ENOMEM;
+
+        *ret = TAKE_PTR(x);
         return 0;
-
-fallback:
-        return in_addr_to_string(family, u, ret);
 }
 
 int in_addr_from_string(int family, const char *s, union in_addr_union *ret) {
@@ -286,7 +482,7 @@ int in_addr_from_string(int family, const char *s, union in_addr_union *ret) {
 
         errno = 0;
         if (inet_pton(family, s, ret ?: &buffer) <= 0)
-                return errno > 0 ? -errno : -EINVAL;
+                return errno_or_else(EINVAL);
 
         return 0;
 }
@@ -311,52 +507,6 @@ int in_addr_from_string_auto(const char *s, int *ret_family, union in_addr_union
         }
 
         return -EINVAL;
-}
-
-int in_addr_ifindex_from_string_auto(const char *s, int *family, union in_addr_union *ret, int *ifindex) {
-        _cleanup_free_ char *buf = NULL;
-        const char *suffix;
-        int r, ifi = 0;
-
-        assert(s);
-        assert(family);
-        assert(ret);
-
-        /* Similar to in_addr_from_string_auto() but also parses an optionally appended IPv6 zone suffix ("scope id")
-         * if one is found. */
-
-        suffix = strchr(s, '%');
-        if (suffix) {
-
-                if (ifindex) {
-                        /* If we shall return the interface index, try to parse it */
-                        r = parse_ifindex(suffix + 1, &ifi);
-                        if (r < 0) {
-                                unsigned u;
-
-                                u = if_nametoindex(suffix + 1);
-                                if (u <= 0)
-                                        return -errno;
-
-                                ifi = (int) u;
-                        }
-                }
-
-                buf = strndup(s, suffix - s);
-                if (!buf)
-                        return -ENOMEM;
-
-                s = buf;
-        }
-
-        r = in_addr_from_string_auto(s, family, ret);
-        if (r < 0)
-                return r;
-
-        if (ifindex)
-                *ifindex = ifi;
-
-        return r;
 }
 
 unsigned char in4_addr_netmask_to_prefixlen(const struct in_addr *addr) {
@@ -620,3 +770,15 @@ static int in_addr_data_compare_func(const struct in_addr_data *x, const struct 
 }
 
 DEFINE_HASH_OPS(in_addr_data_hash_ops, struct in_addr_data, in_addr_data_hash_func, in_addr_data_compare_func);
+
+void in6_addr_hash_func(const struct in6_addr *addr, struct siphash *state) {
+        assert(addr);
+
+        siphash24_compress(addr, sizeof(*addr), state);
+}
+
+int in6_addr_compare_func(const struct in6_addr *a, const struct in6_addr *b) {
+        return memcmp(a, b, sizeof(*a));
+}
+
+DEFINE_HASH_OPS(in6_addr_hash_ops, struct in6_addr, in6_addr_hash_func, in6_addr_compare_func);

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <inttypes.h>
@@ -29,8 +29,17 @@ typedef struct triple_timestamp {
         usec_t boottime;
 } triple_timestamp;
 
-#define USEC_INFINITY ((usec_t) -1)
-#define NSEC_INFINITY ((nsec_t) -1)
+typedef enum TimestampStyle {
+        TIMESTAMP_PRETTY,
+        TIMESTAMP_US,
+        TIMESTAMP_UTC,
+        TIMESTAMP_US_UTC,
+        _TIMESTAMP_STYLE_MAX,
+        _TIMESTAMP_STYLE_INVALID = -1,
+} TimestampStyle;
+
+#define USEC_INFINITY ((usec_t) UINT64_MAX)
+#define NSEC_INFINITY ((nsec_t) UINT64_MAX)
 
 #define MSEC_PER_SEC  1000ULL
 #define USEC_PER_SEC  ((usec_t) 1000000ULL)
@@ -54,10 +63,10 @@ typedef struct triple_timestamp {
 
 /* We assume a maximum timezone length of 6. TZNAME_MAX is not defined on Linux, but glibc internally initializes this
  * to 6. Let's rely on that. */
-#define FORMAT_TIMESTAMP_MAX (3+1+10+1+8+1+6+1+6+1)
-#define FORMAT_TIMESTAMP_WIDTH 28 /* when outputting, assume this width */
-#define FORMAT_TIMESTAMP_RELATIVE_MAX 256
-#define FORMAT_TIMESPAN_MAX 64
+#define FORMAT_TIMESTAMP_MAX (3U+1U+10U+1U+8U+1U+6U+1U+6U+1U)
+#define FORMAT_TIMESTAMP_WIDTH 28U /* when outputting, assume this width */
+#define FORMAT_TIMESTAMP_RELATIVE_MAX 256U
+#define FORMAT_TIMESPAN_MAX 64U
 
 #define TIME_T_MAX (time_t)((UINTMAX_C(1) << ((sizeof(time_t) << 3) - 1)) - 1)
 
@@ -66,6 +75,8 @@ typedef struct triple_timestamp {
 
 usec_t now(clockid_t clock);
 nsec_t now_nsec(clockid_t clock);
+
+usec_t map_clock_usec(usec_t from, clockid_t from_clock, clockid_t to_clock);
 
 dual_timestamp* dual_timestamp_get(dual_timestamp *ts);
 dual_timestamp* dual_timestamp_from_realtime(dual_timestamp *ts, usec_t u);
@@ -81,15 +92,19 @@ triple_timestamp* triple_timestamp_from_realtime(triple_timestamp *ts, usec_t u)
 #define TRIPLE_TIMESTAMP_HAS_CLOCK(clock)                               \
         IN_SET(clock, CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM)
 
+static inline bool timestamp_is_set(usec_t timestamp) {
+        return timestamp > 0 && timestamp != USEC_INFINITY;
+}
+
 static inline bool dual_timestamp_is_set(const dual_timestamp *ts) {
-        return ((ts->realtime > 0 && ts->realtime != USEC_INFINITY) ||
-                (ts->monotonic > 0 && ts->monotonic != USEC_INFINITY));
+        return timestamp_is_set(ts->realtime) ||
+               timestamp_is_set(ts->monotonic);
 }
 
 static inline bool triple_timestamp_is_set(const triple_timestamp *ts) {
-        return ((ts->realtime > 0 && ts->realtime != USEC_INFINITY) ||
-                (ts->monotonic > 0 && ts->monotonic != USEC_INFINITY) ||
-                (ts->boottime > 0 && ts->boottime != USEC_INFINITY));
+        return timestamp_is_set(ts->realtime) ||
+               timestamp_is_set(ts->monotonic) ||
+               timestamp_is_set(ts->boottime);
 }
 
 usec_t triple_timestamp_by_clock(triple_timestamp *ts, clockid_t clock);
@@ -97,21 +112,24 @@ usec_t triple_timestamp_by_clock(triple_timestamp *ts, clockid_t clock);
 usec_t timespec_load(const struct timespec *ts) _pure_;
 nsec_t timespec_load_nsec(const struct timespec *ts) _pure_;
 struct timespec *timespec_store(struct timespec *ts, usec_t u);
+struct timespec *timespec_store_nsec(struct timespec *ts, nsec_t n);
 
 usec_t timeval_load(const struct timeval *tv) _pure_;
 struct timeval *timeval_store(struct timeval *tv, usec_t u);
 
-char *format_timestamp(char *buf, size_t l, usec_t t);
-char *format_timestamp_utc(char *buf, size_t l, usec_t t);
-char *format_timestamp_us(char *buf, size_t l, usec_t t);
-char *format_timestamp_us_utc(char *buf, size_t l, usec_t t);
+char *format_timestamp_style(char *buf, size_t l, usec_t t, TimestampStyle style);
 char *format_timestamp_relative(char *buf, size_t l, usec_t t);
 char *format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy);
+
+static inline char *format_timestamp(char *buf, size_t l, usec_t t) {
+        return format_timestamp_style(buf, l, t, TIMESTAMP_PRETTY);
+}
 
 int parse_timestamp(const char *t, usec_t *usec);
 
 int parse_sec(const char *t, usec_t *usec);
 int parse_sec_fix_0(const char *t, usec_t *usec);
+int parse_sec_def_infinity(const char *t, usec_t *usec);
 int parse_time(const char *t, usec_t *usec, usec_t default_unit);
 int parse_nsec(const char *t, nsec_t *nsec);
 
@@ -131,7 +149,8 @@ int get_timezone(char **timezone);
 time_t mktime_or_timegm(struct tm *tm, bool utc);
 struct tm *localtime_or_gmtime_r(const time_t *t, struct tm *tm, bool utc);
 
-unsigned long usec_to_jiffies(usec_t usec);
+uint32_t usec_to_jiffies(usec_t usec);
+usec_t jiffies_to_usec(uint32_t jiffies);
 
 bool in_utc_timezone(void);
 
@@ -177,3 +196,6 @@ static inline usec_t usec_sub_signed(usec_t timestamp, int64_t delta) {
 #endif
 
 int time_change_fd(void);
+
+const char* timestamp_style_to_string(TimestampStyle t) _const_;
+TimestampStyle timestamp_style_from_string(const char *s) _pure_;

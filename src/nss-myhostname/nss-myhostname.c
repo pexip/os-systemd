@@ -1,20 +1,19 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <nss.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "hostname-util.h"
 #include "local-addresses.h"
 #include "macro.h"
 #include "nss-util.h"
 #include "signal-util.h"
 #include "string-util.h"
-#include "util.h"
 
 /* We use 127.0.0.2 as IPv4 address. This has the advantage over
  * 127.0.0.1 that it can be translated back to the local hostname. For
@@ -64,10 +63,8 @@ enum nss_status _nss_myhostname_gethostbyname4_r(
         } else if (is_gateway_hostname(name)) {
 
                 n_addresses = local_gateways(NULL, 0, AF_UNSPEC, &addresses);
-                if (n_addresses <= 0) {
-                        *h_errnop = HOST_NOT_FOUND;
-                        return NSS_STATUS_NOTFOUND;
-                }
+                if (n_addresses <= 0)
+                        goto not_found;
 
                 canonical = "_gateway";
 
@@ -80,11 +77,9 @@ enum nss_status _nss_myhostname_gethostbyname4_r(
                         return NSS_STATUS_TRYAGAIN;
                 }
 
-                /* We respond to our local host name, our hostname suffixed with a single dot. */
-                if (!streq(name, hn) && !streq_ptr(startswith(name, hn), ".")) {
-                        *h_errnop = HOST_NOT_FOUND;
-                        return NSS_STATUS_NOTFOUND;
-                }
+                /* We respond to our local hostname, our hostname suffixed with a single dot. */
+                if (!streq(name, hn) && !streq_ptr(startswith(name, hn), "."))
+                        goto not_found;
 
                 n_addresses = local_addresses(NULL, 0, AF_UNSPEC, &addresses);
                 if (n_addresses < 0)
@@ -164,6 +159,10 @@ enum nss_status _nss_myhostname_gethostbyname4_r(
         h_errno = 0;
 
         return NSS_STATUS_SUCCESS;
+
+not_found:
+        *h_errnop = HOST_NOT_FOUND;
+        return NSS_STATUS_NOTFOUND;
 }
 
 static enum nss_status fill_in_hostent(
@@ -339,10 +338,8 @@ enum nss_status _nss_myhostname_gethostbyname3_r(
         } else if (is_gateway_hostname(name)) {
 
                 n_addresses = local_gateways(NULL, 0, af, &addresses);
-                if (n_addresses <= 0) {
-                        *h_errnop = HOST_NOT_FOUND;
-                        return NSS_STATUS_NOTFOUND;
-                }
+                if (n_addresses <= 0)
+                        goto not_found;
 
                 canonical = "_gateway";
 
@@ -355,10 +352,8 @@ enum nss_status _nss_myhostname_gethostbyname3_r(
                         return NSS_STATUS_TRYAGAIN;
                 }
 
-                if (!streq(name, hn) && !streq_ptr(startswith(name, hn), ".")) {
-                        *h_errnop = HOST_NOT_FOUND;
-                        return NSS_STATUS_NOTFOUND;
-                }
+                if (!streq(name, hn) && !streq_ptr(startswith(name, hn), "."))
+                        goto not_found;
 
                 n_addresses = local_addresses(NULL, 0, af, &addresses);
                 if (n_addresses < 0)
@@ -381,6 +376,10 @@ enum nss_status _nss_myhostname_gethostbyname3_r(
                         errnop, h_errnop,
                         ttlp,
                         canonp);
+
+not_found:
+        *h_errnop = HOST_NOT_FOUND;
+        return NSS_STATUS_NOTFOUND;
 }
 
 enum nss_status _nss_myhostname_gethostbyaddr2_r(

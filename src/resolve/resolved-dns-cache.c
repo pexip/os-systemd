@@ -1,10 +1,11 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <net/if.h>
 
 #include "af-list.h"
 #include "alloc-util.h"
 #include "dns-domain.h"
+#include "format-util.h"
 #include "resolved-dns-answer.h"
 #include "resolved-dns-cache.h"
 #include "resolved-dns-packet.h"
@@ -19,7 +20,7 @@
 
 /* How long to cache strange rcodes, i.e. rcodes != SUCCESS and != NXDOMAIN (specifically: that's only SERVFAIL for
  * now) */
-#define CACHE_TTL_STRANGE_RCODE_USEC (30 * USEC_PER_SEC)
+#define CACHE_TTL_STRANGE_RCODE_USEC (10 * USEC_PER_SEC)
 
 typedef enum DnsCacheItemType DnsCacheItemType;
 typedef struct DnsCacheItem DnsCacheItem;
@@ -390,7 +391,7 @@ static int dns_cache_put_positive(
 
         _cleanup_(dns_cache_item_freep) DnsCacheItem *i = NULL;
         DnsCacheItem *existing;
-        char key_str[DNS_RESOURCE_KEY_STRING_MAX], ifname[IF_NAMESIZE];
+        char key_str[DNS_RESOURCE_KEY_STRING_MAX];
         int r, k;
 
         assert(c);
@@ -435,20 +436,22 @@ static int dns_cache_put_positive(
 
         dns_cache_make_space(c, 1);
 
-        i = new0(DnsCacheItem, 1);
+        i = new(DnsCacheItem, 1);
         if (!i)
                 return -ENOMEM;
 
-        i->type = DNS_CACHE_POSITIVE;
-        i->key = dns_resource_key_ref(rr->key);
-        i->rr = dns_resource_record_ref(rr);
-        i->until = calculate_until(rr, (uint32_t) -1, timestamp, false);
-        i->authenticated = authenticated;
-        i->shared_owner = shared_owner;
-        i->ifindex = ifindex;
-        i->owner_family = owner_family;
-        i->owner_address = *owner_address;
-        i->prioq_idx = PRIOQ_IDX_NULL;
+        *i = (DnsCacheItem) {
+                .type = DNS_CACHE_POSITIVE,
+                .key = dns_resource_key_ref(rr->key),
+                .rr = dns_resource_record_ref(rr),
+                .until = calculate_until(rr, (uint32_t) -1, timestamp, false),
+                .authenticated = authenticated,
+                .shared_owner = shared_owner,
+                .ifindex = ifindex,
+                .owner_family = owner_family,
+                .owner_address = *owner_address,
+                .prioq_idx = PRIOQ_IDX_NULL,
+        };
 
         r = dns_cache_link_item(c, i);
         if (r < 0)
@@ -456,6 +459,7 @@ static int dns_cache_put_positive(
 
         if (DEBUG_LOGGING) {
                 _cleanup_free_ char *t = NULL;
+                char ifname[IF_NAMESIZE + 1];
 
                 (void) in_addr_to_string(i->owner_family, &i->owner_address, &t);
 
@@ -464,7 +468,7 @@ static int dns_cache_put_positive(
                           i->shared_owner ? " shared" : "",
                           dns_resource_key_to_string(i->key, key_str, sizeof key_str),
                           (i->until - timestamp) / USEC_PER_SEC,
-                          i->ifindex == 0 ? "*" : strna(if_indextoname(i->ifindex, ifname)),
+                          i->ifindex == 0 ? "*" : strna(format_ifname(i->ifindex, ifname)),
                           af_to_name_short(i->owner_family),
                           strna(t));
         }
@@ -519,21 +523,24 @@ static int dns_cache_put_negative(
 
         dns_cache_make_space(c, 1);
 
-        i = new0(DnsCacheItem, 1);
+        i = new(DnsCacheItem, 1);
         if (!i)
                 return -ENOMEM;
 
-        i->type =
-                rcode == DNS_RCODE_SUCCESS ? DNS_CACHE_NODATA :
-                rcode == DNS_RCODE_NXDOMAIN ? DNS_CACHE_NXDOMAIN : DNS_CACHE_RCODE;
+        *i = (DnsCacheItem) {
+                .type =
+                        rcode == DNS_RCODE_SUCCESS ? DNS_CACHE_NODATA :
+                        rcode == DNS_RCODE_NXDOMAIN ? DNS_CACHE_NXDOMAIN : DNS_CACHE_RCODE,
+                .authenticated = authenticated,
+                .owner_family = owner_family,
+                .owner_address = *owner_address,
+                .prioq_idx = PRIOQ_IDX_NULL,
+                .rcode = rcode,
+        };
+
         i->until =
                 i->type == DNS_CACHE_RCODE ? timestamp + CACHE_TTL_STRANGE_RCODE_USEC :
                 calculate_until(soa, nsec_ttl, timestamp, true);
-        i->authenticated = authenticated;
-        i->owner_family = owner_family;
-        i->owner_address = *owner_address;
-        i->prioq_idx = PRIOQ_IDX_NULL;
-        i->rcode = rcode;
 
         if (i->type == DNS_CACHE_NXDOMAIN) {
                 /* NXDOMAIN entries should apply equally to all types, so we use ANY as
@@ -619,6 +626,7 @@ static bool rr_eligible(DnsResourceRecord *rr) {
 
 int dns_cache_put(
                 DnsCache *c,
+                DnsCacheMode cache_mode,
                 DnsResourceKey *key,
                 int rcode,
                 DnsAnswer *answer,
@@ -724,6 +732,13 @@ int dns_cache_put(
                  * signed */
                 if (authenticated && (flags & DNS_ANSWER_AUTHENTICATED) == 0)
                         return 0;
+        }
+
+        if (cache_mode == DNS_CACHE_MODE_NO_NEGATIVE) {
+                char key_str[DNS_RESOURCE_KEY_STRING_MAX];
+                log_debug("Not caching negative entry for: %s, cache mode set to no-negative",
+                        dns_resource_key_to_string(key, key_str, sizeof key_str));
+                return 0;
         }
 
         r = dns_cache_put_negative(
@@ -1005,14 +1020,13 @@ int dns_cache_check_conflicts(DnsCache *cache, DnsResourceRecord *rr, int owner_
 
 int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p) {
         unsigned ancount = 0;
-        Iterator iterator;
         DnsCacheItem *i;
         int r;
 
         assert(cache);
         assert(p);
 
-        HASHMAP_FOREACH(i, cache->by_key, iterator) {
+        HASHMAP_FOREACH(i, cache->by_key) {
                 DnsCacheItem *j;
 
                 LIST_FOREACH(by_key, j, i) {
@@ -1053,7 +1067,6 @@ int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p) {
 }
 
 void dns_cache_dump(DnsCache *cache, FILE *f) {
-        Iterator iterator;
         DnsCacheItem *i;
 
         if (!cache)
@@ -1062,7 +1075,7 @@ void dns_cache_dump(DnsCache *cache, FILE *f) {
         if (!f)
                 f = stdout;
 
-        HASHMAP_FOREACH(i, cache->by_key, iterator) {
+        HASHMAP_FOREACH(i, cache->by_key) {
                 DnsCacheItem *j;
 
                 LIST_FOREACH(by_key, j, i) {

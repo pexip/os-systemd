@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdio.h>
@@ -59,16 +59,10 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
 
         assert_se(arg_dest = dest);
 
-        if (check_executable(RC_LOCAL_SCRIPT_PATH_START) >= 0) {
+        if (check_executable(RC_LOCAL_PATH) >= 0) {
                 log_debug("Automatically adding rc-local.service.");
 
                 r = add_symlink("rc-local.service", "multi-user.target");
-        }
-
-        if (check_executable(RC_LOCAL_SCRIPT_PATH_STOP) >= 0) {
-                log_debug("Automatically adding halt-local.service.");
-
-                k = add_symlink("halt-local.service", "final.target");
         }
 
         return r < 0 ? r : k;

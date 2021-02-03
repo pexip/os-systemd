@@ -1,9 +1,12 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
 #pragma once
 
 #include <inttypes.h>
 
 #include "sd-event.h"
 #include "sd-journal.h"
+
 #include "time-util.h"
 
 typedef enum {

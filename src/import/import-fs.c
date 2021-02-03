@@ -1,17 +1,18 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
+#include <locale.h>
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "hostname-util.h"
 #include "import-common.h"
 #include "import-util.h"
 #include "machine-image.h"
 #include "mkdir.h"
-#include "parse-util.h"
 #include "ratelimit.h"
 #include "rm-rf.h"
 #include "string-util.h"
@@ -116,21 +117,19 @@ static int import_fs(int argc, char *argv[], void *userdata) {
 
         if (argc >= 2)
                 path = argv[1];
-        if (isempty(path) || streq(path, "-"))
-                path = NULL;
+        path = empty_or_dash_to_null(path);
 
         if (argc >= 3)
                 local = argv[2];
         else if (path)
                 local = basename(path);
-        if (isempty(local) || streq(local, "-"))
-                local = NULL;
+        local = empty_or_dash_to_null(local);
 
         if (local) {
-                if (!machine_name_is_valid(local)) {
-                        log_error("Local image name '%s' is not valid.", local);
-                        return -EINVAL;
-                }
+                if (!machine_name_is_valid(local))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Local image name '%s' is not valid.",
+                                               local);
 
                 if (!arg_force) {
                         r = image_find(IMAGE_MACHINE, local, NULL);
@@ -138,8 +137,9 @@ static int import_fs(int argc, char *argv[], void *userdata) {
                                 if (r != -ENOENT)
                                         return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
                         } else {
-                                log_error("Image '%s' already exists.", local);
-                                return -EEXIST;
+                                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                                       "Image '%s' already exists.",
+                                                       local);
                         }
                 }
         } else
@@ -162,7 +162,7 @@ static int import_fs(int argc, char *argv[], void *userdata) {
                 log_info("Importing '%s', saving as '%s'.", strempty(pretty), local);
         }
 
-        final_path = strjoina(arg_image_root, "/", local);
+        final_path = prefix_roota(arg_image_root, local);
 
         r = tempfn_random(final_path, NULL, &temp_path);
         if (r < 0)
@@ -170,11 +170,11 @@ static int import_fs(int argc, char *argv[], void *userdata) {
 
         (void) mkdir_parents_label(temp_path, 0700);
 
-        RATELIMIT_INIT(progress.limit, 200*USEC_PER_MSEC, 1);
+        progress.limit = (RateLimit) { 200*USEC_PER_MSEC, 1 };
 
         /* Hook into SIGINT/SIGTERM, so that we can cancel things then */
-        assert(sigaction(SIGINT, &sa, &old_sigint_sa) >= 0);
-        assert(sigaction(SIGTERM, &sa, &old_sigterm_sa) >= 0);
+        assert_se(sigaction(SIGINT, &sa, &old_sigint_sa) >= 0);
+        assert_se(sigaction(SIGTERM, &sa, &old_sigterm_sa) >= 0);
 
         r = btrfs_subvol_snapshot_fd_full(
                         fd,
@@ -221,8 +221,8 @@ static int import_fs(int argc, char *argv[], void *userdata) {
 
 finish:
         /* Put old signal handlers into place */
-        assert(sigaction(SIGINT, &old_sigint_sa, NULL) >= 0);
-        assert(sigaction(SIGTERM, &old_sigterm_sa, NULL) >= 0);
+        assert_se(sigaction(SIGINT, &old_sigint_sa, NULL) >= 0);
+        assert_se(sigaction(SIGTERM, &old_sigterm_sa, NULL) >= 0);
 
         return 0;
 }
