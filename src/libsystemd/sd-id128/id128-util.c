@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -10,8 +10,9 @@
 #include "id128-util.h"
 #include "io-util.h"
 #include "stdio-util.h"
+#include "string-util.h"
 
-char *id128_to_uuid_string(sd_id128_t id, char s[37]) {
+char *id128_to_uuid_string(sd_id128_t id, char s[static ID128_UUID_STRING_MAX]) {
         unsigned n, k = 0;
 
         assert(s);
@@ -97,6 +98,11 @@ int id128_read_fd(int fd, Id128Format f, sd_id128_t *ret) {
 
         switch (l) {
 
+        case 13:
+        case 14:
+                /* Treat an "uninitialized" id file like an empty one */
+                return f == ID128_PLAIN_OR_UNINIT && strneq(buffer, "uninitialized\n", l) ? -ENOMEDIUM : -EINVAL;
+
         case 33: /* plain UUID with trailing newline */
                 if (buffer[32] != '\n')
                         return -EINVAL;
@@ -115,7 +121,7 @@ int id128_read_fd(int fd, Id128Format f, sd_id128_t *ret) {
 
                 _fallthrough_;
         case 36: /* RFC UUID without trailing newline */
-                if (f == ID128_PLAIN)
+                if (IN_SET(f, ID128_PLAIN, ID128_PLAIN_OR_UNINIT))
                         return -EINVAL;
 
                 buffer[36] = 0;
@@ -188,6 +194,19 @@ void id128_hash_func(const sd_id128_t *p, struct siphash *state) {
 
 int id128_compare_func(const sd_id128_t *a, const sd_id128_t *b) {
         return memcmp(a, b, 16);
+}
+
+sd_id128_t id128_make_v4_uuid(sd_id128_t id) {
+        /* Stolen from generate_random_uuid() of drivers/char/random.c
+         * in the kernel sources */
+
+        /* Set UUID version to 4 --- truly random generation */
+        id.bytes[6] = (id.bytes[6] & 0x0F) | 0x40;
+
+        /* Set the UUID variant to DCE */
+        id.bytes[8] = (id.bytes[8] & 0x3F) | 0x80;
+
+        return id;
 }
 
 DEFINE_HASH_OPS(id128_hash_ops, sd_id128_t, id128_hash_func, id128_compare_func);

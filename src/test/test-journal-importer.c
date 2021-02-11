@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -21,11 +21,11 @@ static void assert_iovec_entry(const struct iovec *iovec, const char* content) {
         "0::/user.slice/user-1002.slice/user@1002.service/gnome-terminal-server.service\n"
 
 static void test_basic_parsing(void) {
-        _cleanup_(journal_importer_cleanup) JournalImporter imp = {};
+        _cleanup_(journal_importer_cleanup) JournalImporter imp = JOURNAL_IMPORTER_INIT(-1);
         _cleanup_free_ char *journal_data_path = NULL;
         int r;
 
-        journal_data_path = path_join(get_testdata_dir(), "journal-data/journal-1.txt");
+        assert_se(get_testdata_dir("journal-data/journal-1.txt", &journal_data_path) >= 0);
         imp.fd = open(journal_data_path, O_RDONLY|O_CLOEXEC);
         assert_se(imp.fd >= 0);
 
@@ -52,11 +52,11 @@ static void test_basic_parsing(void) {
 }
 
 static void test_bad_input(void) {
-        _cleanup_(journal_importer_cleanup) JournalImporter imp = {};
+        _cleanup_(journal_importer_cleanup) JournalImporter imp = JOURNAL_IMPORTER_INIT(-1);
         _cleanup_free_ char *journal_data_path = NULL;
         int r;
 
-        journal_data_path = path_join(get_testdata_dir(), "journal-data/journal-2.txt");
+        assert_se(get_testdata_dir("journal-data/journal-1.txt", &journal_data_path) >= 0);
         imp.fd = open(journal_data_path, O_RDONLY|O_CLOEXEC);
         assert_se(imp.fd >= 0);
 

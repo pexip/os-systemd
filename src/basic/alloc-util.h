@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <alloca.h>
@@ -7,6 +7,10 @@
 #include <string.h>
 
 #include "macro.h"
+
+#if HAS_FEATURE_MEMORY_SANITIZER
+#  include <sanitizer/msan_interface.h>
+#endif
 
 typedef void (*free_func_t)(void *p);
 
@@ -23,7 +27,7 @@ typedef void (*free_func_t)(void *p);
                 size_t _n_ = n;                                         \
                 assert(!size_multiply_overflow(sizeof(t), _n_));        \
                 assert(sizeof(t)*_n_ <= ALLOCA_MAX);                    \
-                (t*) alloca(sizeof(t)*_n_);                             \
+                (t*) alloca((sizeof(t)*_n_) ?: 1);                      \
         })
 
 #define newa0(t, n)                                                     \
@@ -31,14 +35,14 @@ typedef void (*free_func_t)(void *p);
                 size_t _n_ = n;                                         \
                 assert(!size_multiply_overflow(sizeof(t), _n_));        \
                 assert(sizeof(t)*_n_ <= ALLOCA_MAX);                    \
-                (t*) alloca0(sizeof(t)*_n_);                            \
+                (t*) alloca0((sizeof(t)*_n_) ?: 1);                     \
         })
 
 #define newdup(t, p, n) ((t*) memdup_multiply(p, sizeof(t), (n)))
 
 #define newdup_suffix0(t, p, n) ((t*) memdup_suffix0_multiply(p, sizeof(t), (n)))
 
-#define malloc0(n) (calloc(1, (n)))
+#define malloc0(n) (calloc(1, (n) ?: 1))
 
 static inline void *mfree(void *memory) {
         free(memory);
@@ -54,14 +58,14 @@ static inline void *mfree(void *memory) {
         })
 
 void* memdup(const void *p, size_t l) _alloc_(2);
-void* memdup_suffix0(const void *p, size_t l) _alloc_(2);
+void* memdup_suffix0(const void *p, size_t l); /* We can't use _alloc_() here, since we return a buffer one byte larger than the specified size */
 
 #define memdupa(p, l)                           \
         ({                                      \
                 void *_q_;                      \
                 size_t _l_ = l;                 \
                 assert(_l_ <= ALLOCA_MAX);      \
-                _q_ = alloca(_l_);              \
+                _q_ = alloca(_l_ ?: 1);         \
                 memcpy(_q_, p, _l_);            \
         })
 
@@ -108,7 +112,9 @@ _alloc_(2, 3) static inline void *memdup_multiply(const void *p, size_t size, si
         return memdup(p, size * need);
 }
 
-_alloc_(2, 3) static inline void *memdup_suffix0_multiply(const void *p, size_t size, size_t need) {
+/* Note that we can't decorate this function with _alloc_() since the returned memory area is one byte larger
+ * than the product of its parameters. */
+static inline void *memdup_suffix0_multiply(const void *p, size_t size, size_t need) {
         if (size_multiply_overflow(size, need))
                 return NULL;
 
@@ -129,7 +135,7 @@ void* greedy_realloc0(void **p, size_t *allocated, size_t need, size_t size);
                 char *_new_;                            \
                 size_t _len_ = n;                       \
                 assert(_len_ <= ALLOCA_MAX);            \
-                _new_ = alloca(_len_);                  \
+                _new_ = alloca(_len_ ?: 1);             \
                 (void *) memset(_new_, 0, _len_);       \
         })
 
@@ -140,7 +146,7 @@ void* greedy_realloc0(void **p, size_t *allocated, size_t need, size_t size);
                 size_t _mask_ = (align) - 1;                            \
                 size_t _size_ = size;                                   \
                 assert(_size_ <= ALLOCA_MAX);                           \
-                _ptr_ = alloca(_size_ + _mask_);                        \
+                _ptr_ = alloca((_size_ + _mask_) ?: 1);                 \
                 (void*)(((uintptr_t)_ptr_ + _mask_) & ~_mask_);         \
         })
 
@@ -152,11 +158,17 @@ void* greedy_realloc0(void **p, size_t *allocated, size_t need, size_t size);
                 (void*)memset(_new_, 0, _xsize_);                       \
         })
 
-/* Takes inspiration from Rusts's Option::take() method: reads and returns a pointer, but at the same time resets it to
- * NULL. See: https://doc.rust-lang.org/std/option/enum.Option.html#method.take */
+/* Takes inspiration from Rust's Option::take() method: reads and returns a pointer, but at the same time
+ * resets it to NULL. See: https://doc.rust-lang.org/std/option/enum.Option.html#method.take */
 #define TAKE_PTR(ptr)                           \
         ({                                      \
                 typeof(ptr) _ptr_ = (ptr);      \
                 (ptr) = NULL;                   \
                 _ptr_;                          \
         })
+
+#if HAS_FEATURE_MEMORY_SANITIZER
+#  define msan_unpoison(r, s) __msan_unpoison(r, s)
+#else
+#  define msan_unpoison(r, s)
+#endif

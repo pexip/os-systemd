@@ -1,18 +1,21 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
 
 #include "macro.h"
 
+/* The enum order is used to order unit jobs in the job queue
+ * when other criteria (cpu weight, nice level) are identical.
+ * In this case service units have the highest priority. */
 typedef enum UnitType {
-        UNIT_SERVICE = 0,
+        UNIT_SERVICE,
+        UNIT_MOUNT,
+        UNIT_SWAP,
         UNIT_SOCKET,
         UNIT_TARGET,
         UNIT_DEVICE,
-        UNIT_MOUNT,
         UNIT_AUTOMOUNT,
-        UNIT_SWAP,
         UNIT_TIMER,
         UNIT_PATH,
         UNIT_SLICE,
@@ -22,7 +25,7 @@ typedef enum UnitType {
 } UnitType;
 
 typedef enum UnitLoadState {
-        UNIT_STUB = 0,
+        UNIT_STUB,
         UNIT_LOADED,
         UNIT_NOT_FOUND,    /* error condition #1: unit file not found */
         UNIT_BAD_SETTING,  /* error condition #2: we couldn't parse some essential unit file setting */
@@ -40,9 +43,19 @@ typedef enum UnitActiveState {
         UNIT_FAILED,
         UNIT_ACTIVATING,
         UNIT_DEACTIVATING,
+        UNIT_MAINTENANCE,
         _UNIT_ACTIVE_STATE_MAX,
         _UNIT_ACTIVE_STATE_INVALID = -1
 } UnitActiveState;
+
+typedef enum FreezerState {
+        FREEZER_RUNNING,
+        FREEZER_FREEZING,
+        FREEZER_FROZEN,
+        FREEZER_THAWING,
+        _FREEZER_STATE_MAX,
+        _FREEZER_STATE_INVALID = -1
+} FreezerState;
 
 typedef enum AutomountState {
         AUTOMOUNT_DEAD,
@@ -75,6 +88,7 @@ typedef enum MountState {
         MOUNT_UNMOUNTING_SIGTERM,
         MOUNT_UNMOUNTING_SIGKILL,
         MOUNT_FAILED,
+        MOUNT_CLEANING,
         _MOUNT_STATE_MAX,
         _MOUNT_STATE_INVALID = -1
 } MountState;
@@ -101,6 +115,7 @@ typedef enum ScopeState {
 
 typedef enum ServiceState {
         SERVICE_DEAD,
+        SERVICE_CONDITION,
         SERVICE_START_PRE,
         SERVICE_START,
         SERVICE_START_POST,
@@ -112,10 +127,12 @@ typedef enum ServiceState {
         SERVICE_STOP_SIGTERM,
         SERVICE_STOP_SIGKILL,
         SERVICE_STOP_POST,
+        SERVICE_FINAL_WATCHDOG,    /* In case the STOP_POST executable needs to be aborted. */
         SERVICE_FINAL_SIGTERM,     /* In case the STOP_POST executable hangs, we shoot that down, too */
         SERVICE_FINAL_SIGKILL,
         SERVICE_FAILED,
         SERVICE_AUTO_RESTART,
+        SERVICE_CLEANING,
         _SERVICE_STATE_MAX,
         _SERVICE_STATE_INVALID = -1
 } ServiceState;
@@ -141,6 +158,7 @@ typedef enum SocketState {
         SOCKET_FINAL_SIGTERM,
         SOCKET_FINAL_SIGKILL,
         SOCKET_FAILED,
+        SOCKET_CLEANING,
         _SOCKET_STATE_MAX,
         _SOCKET_STATE_INVALID = -1
 } SocketState;
@@ -154,6 +172,7 @@ typedef enum SwapState {
         SWAP_DEACTIVATING_SIGTERM,
         SWAP_DEACTIVATING_SIGKILL,
         SWAP_FAILED,
+        SWAP_CLEANING,
         _SWAP_STATE_MAX,
         _SWAP_STATE_INVALID = -1
 } SwapState;
@@ -243,6 +262,9 @@ UnitLoadState unit_load_state_from_string(const char *s) _pure_;
 
 const char *unit_active_state_to_string(UnitActiveState i) _const_;
 UnitActiveState unit_active_state_from_string(const char *s) _pure_;
+
+const char *freezer_state_to_string(FreezerState i) _const_;
+FreezerState freezer_state_from_string(const char *s) _pure_;
 
 const char* automount_state_to_string(AutomountState i) _const_;
 AutomountState automount_state_from_string(const char *s) _pure_;

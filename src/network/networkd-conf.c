@@ -1,9 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2014 Vinay Kulkarni <kulkarniv@vmware.com>
  ***/
 
 #include <ctype.h>
+#include <netinet/ip.h>
 
 #include "conf-parser.h"
 #include "def.h"
@@ -11,17 +12,38 @@
 #include "extract-word.h"
 #include "hexdecoct.h"
 #include "networkd-conf.h"
+#include "networkd-manager.h"
 #include "networkd-network.h"
+#include "networkd-speed-meter.h"
+#include "networkd-dhcp4.h"
 #include "string-table.h"
 
 int manager_parse_config_file(Manager *m) {
+        int r;
+
         assert(m);
 
-        return config_parse_many_nulstr(PKGSYSCONFDIR "/networkd.conf",
-                                        CONF_PATHS_NULSTR("systemd/networkd.conf.d"),
-                                        "DHCP\0",
-                                        config_item_perf_lookup, networkd_gperf_lookup,
-                                        CONFIG_PARSE_WARN, m);
+        r = config_parse_many_nulstr(
+                        PKGSYSCONFDIR "/networkd.conf",
+                        CONF_PATHS_NULSTR("systemd/networkd.conf.d"),
+                        "Network\0"
+                        "DHCP\0",
+                        config_item_perf_lookup, networkd_gperf_lookup,
+                        CONFIG_PARSE_WARN,
+                        m,
+                        NULL);
+        if (r < 0)
+                return r;
+
+        if (m->use_speed_meter && m->speed_meter_interval_usec < SPEED_METER_MINIMUM_TIME_INTERVAL) {
+                char buf[FORMAT_TIMESPAN_MAX];
+
+                log_warning("SpeedMeterIntervalSec= is too small, using %s.",
+                            format_timespan(buf, sizeof buf, SPEED_METER_MINIMUM_TIME_INTERVAL, USEC_PER_SEC));
+                m->speed_meter_interval_usec = SPEED_METER_MINIMUM_TIME_INTERVAL;
+        }
+
+        return 0;
 }
 
 static const char* const duid_type_table[_DUID_TYPE_MAX] = {
@@ -122,26 +144,29 @@ int config_parse_duid_rawdata(
         assert(ret);
 
         /* RawData contains DUID in format "NN:NN:NN..." */
-        for (;;) {
+        for (const char *p = rvalue;;) {
                 int n1, n2, len, r;
                 uint32_t byte;
                 _cleanup_free_ char *cbyte = NULL;
 
-                r = extract_first_word(&rvalue, &cbyte, ":", 0);
+                r = extract_first_word(&p, &cbyte, ":", 0);
+                if (r == -ENOMEM)
+                        return log_oom();
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r, "Failed to read DUID, ignoring assignment: %s.", rvalue);
+                        log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to read DUID, ignoring assignment: %s.", rvalue);
                         return 0;
                 }
                 if (r == 0)
                         break;
+
                 if (count >= MAX_DUID_LEN) {
-                        log_syntax(unit, LOG_ERR, filename, line, 0, "Max DUID length exceeded, ignoring assignment: %s.", rvalue);
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Max DUID length exceeded, ignoring assignment: %s.", rvalue);
                         return 0;
                 }
 
                 len = strlen(cbyte);
                 if (!IN_SET(len, 1, 2)) {
-                        log_syntax(unit, LOG_ERR, filename, line, 0, "Invalid length - DUID byte: %s, ignoring assignment: %s.", cbyte, rvalue);
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid length - DUID byte: %s, ignoring assignment: %s.", cbyte, rvalue);
                         return 0;
                 }
                 n1 = unhexchar(cbyte[0]);
@@ -151,7 +176,7 @@ int config_parse_duid_rawdata(
                         n2 = 0;
 
                 if (n1 < 0 || n2 < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, 0, "Invalid DUID byte: %s. Ignoring assignment: %s.", cbyte, rvalue);
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid DUID byte: %s. Ignoring assignment: %s.", cbyte, rvalue);
                         return 0;
                 }
 

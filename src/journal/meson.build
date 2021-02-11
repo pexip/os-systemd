@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 journal_client_sources = files('''
         audit-type.c
@@ -101,30 +101,33 @@ journald_gperf_c = custom_target(
 
 systemd_cat_sources = files('cat.c')
 
-journalctl_sources = files('journalctl.c')
+journalctl_sources = files('''
+        journalctl.c
+        pcre2-dlopen.c
+        pcre2-dlopen.h
+'''.split())
 
-if conf.get('HAVE_QRENCODE') == 1
-        journalctl_sources += files('journal-qrcode.c',
-                                    'journal-qrcode.h')
+if install_sysconfdir
+        install_data('journald.conf',
+                     install_dir : pkgsysconfdir)
 endif
 
-install_data('journald.conf',
-             install_dir : pkgsysconfdir)
-
-meson.add_install_script(
-        'sh', '-c',
-        mkdir_p.format('/var/log/journal'))
-meson.add_install_script(
-        'sh', '-c',
-        '''chown 0:0 $DESTDIR/var/log/journal &&
-         chmod 755 $DESTDIR/var/log/journal || :''')
-if get_option('adm-group')
+if get_option('create-log-dirs')
         meson.add_install_script(
                 'sh', '-c',
-                'setfacl -nm g:adm:rx,d:g:adm:rx $DESTDIR/var/log/journal || :')
-endif
-if get_option('wheel-group')
+                mkdir_p.format('/var/log/journal'))
         meson.add_install_script(
                 'sh', '-c',
-                'setfacl -nm g:wheel:rx,d:g:wheel:rx $DESTDIR/var/log/journal || :')
+                '''chown 0:0 $DESTDIR/var/log/journal &&
+                   chmod 755 $DESTDIR/var/log/journal || :''')
+        if get_option('adm-group')
+                meson.add_install_script(
+                        'sh', '-c',
+                        'setfacl -nm g:adm:rx,d:g:adm:rx $DESTDIR/var/log/journal || :')
+        endif
+        if get_option('wheel-group')
+                meson.add_install_script(
+                        'sh', '-c',
+                        'setfacl -nm g:wheel:rx,d:g:wheel:rx $DESTDIR/var/log/journal || :')
+        endif
 endif

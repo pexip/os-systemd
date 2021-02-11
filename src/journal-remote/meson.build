@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 systemd_journal_upload_sources = files('''
         journal-upload.h
@@ -48,8 +48,10 @@ if conf.get('ENABLE_REMOTE') ==1 and conf.get('HAVE_LIBCURL') == 1
                 input : 'journal-upload.conf.in',
                 output : 'journal-upload.conf',
                 configuration : substs)
-        install_data(journal_upload_conf,
-                     install_dir : pkgsysconfdir)
+        if install_sysconfdir
+                install_data(journal_upload_conf,
+                             install_dir : pkgsysconfdir)
+        endif
 endif
 
 if conf.get('ENABLE_REMOTE') == 1 and conf.get('HAVE_MICROHTTPD') == 1
@@ -57,15 +59,19 @@ if conf.get('ENABLE_REMOTE') == 1 and conf.get('HAVE_MICROHTTPD') == 1
                 input : 'journal-remote.conf.in',
                 output : 'journal-remote.conf',
                 configuration : substs)
-        install_data(journal_remote_conf,
-                     install_dir : pkgsysconfdir)
+        if install_sysconfdir
+                install_data(journal_remote_conf,
+                             install_dir : pkgsysconfdir)
+        endif
 
         install_data('browse.html',
                      install_dir : join_paths(pkgdatadir, 'gatewayd'))
 
-        meson.add_install_script('sh', '-c',
-                                 mkdir_p.format('/var/log/journal/remote'))
-        meson.add_install_script('sh', '-c',
-                                 '''chown 0:0 $DESTDIR/var/log/journal/remote &&
-                                    chmod 755 $DESTDIR/var/log/journal/remote || :''')
+        if get_option('create-log-dirs')
+                meson.add_install_script('sh', '-c',
+                                         mkdir_p.format('/var/log/journal/remote'))
+                meson.add_install_script('sh', '-c',
+                                         '''chown 0:0 $DESTDIR/var/log/journal/remote &&
+                                            chmod 755 $DESTDIR/var/log/journal/remote || :''')
+        endif
 endif

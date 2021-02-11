@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-path.h"
 
@@ -7,7 +7,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "missing.h"
+#include "path-lookup.h"
 #include "path-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -58,10 +58,7 @@ static int from_home_dir(const char *envname, const char *suffix, char **buffer,
         if (r < 0)
                 return r;
 
-        if (endswith(h, "/"))
-                cc = strappend(h, suffix);
-        else
-                cc = strjoin(h, "/", suffix);
+        cc = path_join(h, suffix);
         if (!cc)
                 return -ENOMEM;
 
@@ -86,7 +83,7 @@ static int from_user_dir(const char *field, char **buffer, const char **ret) {
         if (r < 0)
                 return r;
 
-        fn = strappend(c, "/user-dirs.dirs");
+        fn = path_join(c, "user-dirs.dirs");
         if (!fn)
                 return -ENOMEM;
 
@@ -144,7 +141,7 @@ static int from_user_dir(const char *field, char **buffer, const char **ret) {
                         if (r < 0)
                                 return r;
 
-                        cc = strappend(h, p+5);
+                        cc = path_join(h, p+5);
                         if (!cc)
                                 return -ENOMEM;
 
@@ -182,7 +179,7 @@ fallback:
                 if (r < 0)
                         return r;
 
-                cc = strappend(h, "/Desktop");
+                cc = path_join(h, "Desktop");
                 if (!cc)
                         return -ENOMEM;
 
@@ -322,70 +319,128 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
 
         case SD_PATH_USER_DESKTOP:
                 return from_user_dir("XDG_DESKTOP_DIR", buffer, ret);
+
+        case SD_PATH_SYSTEMD_UTIL:
+                *ret = ROOTPREFIX_NOSLASH "/lib/systemd";
+                return 0;
+
+        case SD_PATH_SYSTEMD_SYSTEM_UNIT:
+                *ret = SYSTEM_DATA_UNIT_PATH;
+                return 0;
+
+        case SD_PATH_SYSTEMD_SYSTEM_PRESET:
+                *ret = ROOTPREFIX_NOSLASH "/lib/systemd/system-preset";
+                return 0;
+
+        case SD_PATH_SYSTEMD_USER_UNIT:
+                *ret = USER_DATA_UNIT_DIR;
+                return 0;
+
+        case SD_PATH_SYSTEMD_USER_PRESET:
+                *ret = ROOTPREFIX_NOSLASH "/lib/systemd/user-preset";
+                return 0;
+
+        case SD_PATH_SYSTEMD_SYSTEM_CONF:
+                *ret = SYSTEM_CONFIG_UNIT_DIR;
+                return 0;
+
+        case SD_PATH_SYSTEMD_USER_CONF:
+                *ret = USER_CONFIG_UNIT_DIR;
+                return 0;
+
+        case SD_PATH_SYSTEMD_SYSTEM_GENERATOR:
+                *ret = SYSTEM_GENERATOR_DIR;
+                return 0;
+
+        case SD_PATH_SYSTEMD_USER_GENERATOR:
+                *ret = USER_GENERATOR_DIR;
+                return 0;
+
+        case SD_PATH_SYSTEMD_SLEEP:
+                *ret = ROOTPREFIX_NOSLASH "/lib/systemd/system-sleep";
+                return 0;
+
+        case SD_PATH_SYSTEMD_SHUTDOWN:
+                *ret = ROOTPREFIX_NOSLASH "/lib/systemd/system-shutdown";
+                return 0;
+
+        case SD_PATH_TMPFILES:
+                *ret = "/usr/lib/tmpfiles.d";
+                return 0;
+
+        case SD_PATH_SYSUSERS:
+                *ret = ROOTPREFIX_NOSLASH "/lib/sysusers.d";
+                return 0;
+
+        case SD_PATH_SYSCTL:
+                *ret = ROOTPREFIX_NOSLASH "/lib/sysctl.d";
+                return 0;
+
+        case SD_PATH_BINFMT:
+                *ret = ROOTPREFIX_NOSLASH "/lib/binfmt.d";
+                return 0;
+
+        case SD_PATH_MODULES_LOAD:
+                *ret = ROOTPREFIX_NOSLASH "/lib/modules-load.d";
+                return 0;
+
+        case SD_PATH_CATALOG:
+                *ret = "/usr/lib/systemd/catalog";
+                return 0;
         }
 
         return -EOPNOTSUPP;
 }
 
-_public_ int sd_path_home(uint64_t type, const char *suffix, char **path) {
-        char *buffer = NULL, *cc;
+static int get_path_alloc(uint64_t type, const char *suffix, char **path) {
+        _cleanup_free_ char *buffer = NULL;
+        char *buffer2 = NULL;
         const char *ret;
         int r;
 
-        assert_return(path, -EINVAL);
-
-        if (IN_SET(type,
-                   SD_PATH_SEARCH_BINARIES,
-                   SD_PATH_SEARCH_BINARIES_DEFAULT,
-                   SD_PATH_SEARCH_LIBRARY_PRIVATE,
-                   SD_PATH_SEARCH_LIBRARY_ARCH,
-                   SD_PATH_SEARCH_SHARED,
-                   SD_PATH_SEARCH_CONFIGURATION_FACTORY,
-                   SD_PATH_SEARCH_STATE_FACTORY,
-                   SD_PATH_SEARCH_CONFIGURATION)) {
-
-                _cleanup_strv_free_ char **l = NULL;
-
-                r = sd_path_search(type, suffix, &l);
-                if (r < 0)
-                        return r;
-
-                buffer = strv_join(l, ":");
-                if (!buffer)
-                        return -ENOMEM;
-
-                *path = buffer;
-                return 0;
-        }
+        assert(path);
 
         r = get_path(type, &buffer, &ret);
         if (r < 0)
                 return r;
 
-        if (!suffix) {
-                if (!buffer) {
-                        buffer = strdup(ret);
-                        if (!buffer)
-                                return -ENOMEM;
-                }
-
-                *path = buffer;
-                return 0;
+        if (suffix) {
+                suffix += strspn(suffix, "/");
+                buffer2 = path_join(ret, suffix);
+                if (!buffer2)
+                        return -ENOMEM;
+        } else if (!buffer) {
+                buffer = strdup(ret);
+                if (!buffer)
+                        return -ENOMEM;
         }
 
-        suffix += strspn(suffix, "/");
+        *path = buffer2 ?: TAKE_PTR(buffer);
+        return 0;
+}
 
-        if (endswith(ret, "/"))
-                cc = strappend(ret, suffix);
-        else
-                cc = strjoin(ret, "/", suffix);
+_public_ int sd_path_lookup(uint64_t type, const char *suffix, char **path) {
+        int r;
 
-        free(buffer);
+        assert_return(path, -EINVAL);
 
-        if (!cc)
+        r = get_path_alloc(type, suffix, path);
+        if (r != -EOPNOTSUPP)
+                return r;
+
+        /* Fall back to sd_path_lookup_strv */
+        _cleanup_strv_free_ char **l = NULL;
+        char *buffer;
+
+        r = sd_path_lookup_strv(type, suffix, &l);
+        if (r < 0)
+                return r;
+
+        buffer = strv_join(l, ":");
+        if (!buffer)
                 return -ENOMEM;
 
-        *path = cc;
+        *path = buffer;
         return 0;
 }
 
@@ -397,9 +452,9 @@ static int search_from_environment(
                 bool env_search_sufficient,
                 const char *first, ...) {
 
+        _cleanup_strv_free_ char **l = NULL;
         const char *e;
         char *h = NULL;
-        char **l = NULL;
         int r;
 
         assert(list);
@@ -412,7 +467,7 @@ static int search_from_environment(
                                 return -ENOMEM;
 
                         if (env_search_sufficient) {
-                                *list = l;
+                                *list = TAKE_PTR(l);
                                 return 0;
                         }
                 }
@@ -433,37 +488,27 @@ static int search_from_environment(
                 e = secure_getenv(env_home);
                 if (e && path_is_absolute(e)) {
                         h = strdup(e);
-                        if (!h) {
-                                strv_free(l);
+                        if (!h)
                                 return -ENOMEM;
-                        }
                 }
         }
 
         if (!h && home_suffix) {
                 e = secure_getenv("HOME");
                 if (e && path_is_absolute(e)) {
-                        if (endswith(e, "/"))
-                                h = strappend(e, home_suffix);
-                        else
-                                h = strjoin(e, "/", home_suffix);
-
-                        if (!h) {
-                                strv_free(l);
+                        h = path_join(e, home_suffix);
+                        if (!h)
                                 return -ENOMEM;
-                        }
                 }
         }
 
         if (h) {
                 r = strv_consume_prepend(&l, h);
-                if (r < 0) {
-                        strv_free(l);
+                if (r < 0)
                         return -ENOMEM;
-                }
         }
 
-        *list = l;
+        *list = TAKE_PTR(l);
         return 0;
 }
 
@@ -474,6 +519,7 @@ static int search_from_environment(
 #endif
 
 static int get_search(uint64_t type, char ***list) {
+        int r;
 
         assert(list);
 
@@ -556,58 +602,69 @@ static int get_search(uint64_t type, char ***list) {
                                                "/etc",
                                                NULL);
 
-        case SD_PATH_SEARCH_BINARIES_DEFAULT: {
-                char **t;
+        case SD_PATH_SEARCH_BINARIES_DEFAULT:
+                return strv_from_nulstr(list, DEFAULT_PATH_NULSTR);
 
-                t = strv_split_nulstr(DEFAULT_PATH_NULSTR);
+        case SD_PATH_SYSTEMD_SEARCH_SYSTEM_UNIT:
+        case SD_PATH_SYSTEMD_SEARCH_USER_UNIT: {
+                _cleanup_(lookup_paths_free) LookupPaths lp = {};
+                const UnitFileScope scope = type == SD_PATH_SYSTEMD_SEARCH_SYSTEM_UNIT ?
+                                                    UNIT_FILE_SYSTEM : UNIT_FILE_USER;
+
+                r = lookup_paths_init(&lp, scope, 0, NULL);
+                if (r < 0)
+                        return r;
+
+                *list = TAKE_PTR(lp.search_path);
+                return 0;
+        }
+
+        case SD_PATH_SYSTEMD_SEARCH_SYSTEM_GENERATOR:
+        case SD_PATH_SYSTEMD_SEARCH_USER_GENERATOR: {
+                char **t;
+                const UnitFileScope scope = type == SD_PATH_SYSTEMD_SEARCH_SYSTEM_GENERATOR ?
+                                                    UNIT_FILE_SYSTEM : UNIT_FILE_USER;
+
+                t = generator_binary_paths(scope);
                 if (!t)
                         return -ENOMEM;
 
                 *list = t;
                 return 0;
-        }}
+        }
+
+        case SD_PATH_SYSTEMD_SEARCH_NETWORK:
+                return strv_from_nulstr(list, NETWORK_DIRS_NULSTR);
+
+        }
 
         return -EOPNOTSUPP;
 }
 
-_public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
-        char **i, **j;
+_public_ int sd_path_lookup_strv(uint64_t type, const char *suffix, char ***paths) {
         _cleanup_strv_free_ char **l = NULL, **n = NULL;
         int r;
 
         assert_return(paths, -EINVAL);
 
-        if (!IN_SET(type,
-                    SD_PATH_SEARCH_BINARIES,
-                    SD_PATH_SEARCH_BINARIES_DEFAULT,
-                    SD_PATH_SEARCH_LIBRARY_PRIVATE,
-                    SD_PATH_SEARCH_LIBRARY_ARCH,
-                    SD_PATH_SEARCH_SHARED,
-                    SD_PATH_SEARCH_CONFIGURATION_FACTORY,
-                    SD_PATH_SEARCH_STATE_FACTORY,
-                    SD_PATH_SEARCH_CONFIGURATION)) {
+        r = get_search(type, &l);
+        if (r == -EOPNOTSUPP) {
+                _cleanup_free_ char *t = NULL;
 
-                char *p;
-
-                r = sd_path_home(type, suffix, &p);
+                r = get_path_alloc(type, suffix, &t);
                 if (r < 0)
                         return r;
 
                 l = new(char*, 2);
-                if (!l) {
-                        free(p);
+                if (!l)
                         return -ENOMEM;
-                }
-
-                l[0] = p;
+                l[0] = TAKE_PTR(t);
                 l[1] = NULL;
 
                 *paths = TAKE_PTR(l);
                 return 0;
-        }
 
-        r = get_search(type, &l);
-        if (r < 0)
+        } else if (r < 0)
                 return r;
 
         if (!suffix) {
@@ -619,21 +676,16 @@ _public_ int sd_path_search(uint64_t type, const char *suffix, char ***paths) {
         if (!n)
                 return -ENOMEM;
 
-        j = n;
+        char **i, **j = n;
         STRV_FOREACH(i, l) {
-
-                if (endswith(*i, "/"))
-                        *j = strappend(*i, suffix);
-                else
-                        *j = strjoin(*i, "/", suffix);
-
+                *j = path_join(*i, suffix);
                 if (!*j)
                         return -ENOMEM;
 
                 j++;
         }
-
         *j = NULL;
+
         *paths = TAKE_PTR(n);
         return 0;
 }

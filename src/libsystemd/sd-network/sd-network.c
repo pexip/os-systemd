@@ -1,8 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <poll.h>
-#include <string.h>
 #include <sys/inotify.h>
 
 #include "sd-network.h"
@@ -18,13 +17,13 @@
 #include "strv.h"
 #include "util.h"
 
-_public_ int sd_network_get_operational_state(char **state) {
+static int network_get_string(const char *field, char **ret) {
         _cleanup_free_ char *s = NULL;
         int r;
 
-        assert_return(state, -EINVAL);
+        assert_return(ret, -EINVAL);
 
-        r = parse_env_file(NULL, "/run/systemd/netif/state", "OPER_STATE", &s);
+        r = parse_env_file(NULL, "/run/systemd/netif/state", field, &s);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
@@ -32,9 +31,21 @@ _public_ int sd_network_get_operational_state(char **state) {
         if (isempty(s))
                 return -ENODATA;
 
-        *state = TAKE_PTR(s);
+        *ret = TAKE_PTR(s);
 
         return 0;
+}
+
+_public_ int sd_network_get_operational_state(char **state) {
+        return network_get_string("OPER_STATE", state);
+}
+
+_public_ int sd_network_get_carrier_state(char **state) {
+        return network_get_string("CARRIER_STATE", state);
+}
+
+_public_ int sd_network_get_address_state(char **state) {
+        return network_get_string("ADDRESS_STATE", state);
 }
 
 static int network_get_strv(const char *key, char ***ret) {
@@ -149,6 +160,22 @@ _public_ int sd_network_link_get_operational_state(int ifindex, char **state) {
         return network_link_get_string(ifindex, "OPER_STATE", state);
 }
 
+_public_ int sd_network_link_get_carrier_state(int ifindex, char **state) {
+        return network_link_get_string(ifindex, "CARRIER_STATE", state);
+}
+
+_public_ int sd_network_link_get_address_state(int ifindex, char **state) {
+        return network_link_get_string(ifindex, "ADDRESS_STATE", state);
+}
+
+_public_ int sd_network_link_get_dhcp6_client_iaid_string(int ifindex, char **iaid) {
+        return network_link_get_string(ifindex, "DHCP6_CLIENT_IAID", iaid);
+}
+
+_public_ int sd_network_link_get_dhcp6_client_duid_string(int ifindex, char **duid) {
+        return network_link_get_string(ifindex, "DHCP6_CLIENT_DUID", duid);
+}
+
 _public_ int sd_network_link_get_required_for_online(int ifindex) {
         _cleanup_free_ char *s = NULL;
         int r;
@@ -162,6 +189,27 @@ _public_ int sd_network_link_get_required_for_online(int ifindex) {
         }
 
         return parse_boolean(s);
+}
+
+_public_ int sd_network_link_get_required_operstate_for_online(int ifindex, char **state) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert_return(state, -EINVAL);
+
+        r = network_link_get_string(ifindex, "REQUIRED_OPER_STATE_FOR_ONLINE", &s);
+        if (r < 0) {
+                if (r != -ENODATA)
+                        return r;
+
+                /* For compatibility, assuming degraded. */
+                s = strdup("degraded");
+                if (!s)
+                        return -ENOMEM;
+        }
+
+        *state = TAKE_PTR(s);
+        return 0;
 }
 
 _public_ int sd_network_link_get_llmnr(int ifindex, char **llmnr) {
@@ -184,16 +232,16 @@ _public_ int sd_network_link_get_dnssec_negative_trust_anchors(int ifindex, char
         return network_link_get_strv(ifindex, "DNSSEC_NTA", nta);
 }
 
-_public_ int sd_network_link_get_timezone(int ifindex, char **ret) {
-        return network_link_get_string(ifindex, "TIMEZONE", ret);
-}
-
 _public_ int sd_network_link_get_dns(int ifindex, char ***ret) {
         return network_link_get_strv(ifindex, "DNS", ret);
 }
 
 _public_ int sd_network_link_get_ntp(int ifindex, char ***ret) {
         return network_link_get_strv(ifindex, "NTP", ret);
+}
+
+_public_ int sd_network_link_get_sip(int ifindex, char ***ret) {
+        return network_link_get_strv(ifindex, "SIP", ret);
 }
 
 _public_ int sd_network_link_get_search_domains(int ifindex, char ***ret) {
@@ -228,7 +276,6 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
         _cleanup_free_ int *ifis = NULL;
         _cleanup_free_ char *s = NULL;
         size_t allocated = 0, c = 0;
-        const char *x;
         int r;
 
         assert_return(ifindex > 0, -EINVAL);
@@ -241,7 +288,7 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
         if (r < 0)
                 return r;
 
-        for (x = s;;) {
+        for (const char *x = s;;) {
                 _cleanup_free_ char *word = NULL;
 
                 r = extract_first_word(&x, &word, NULL, 0);
@@ -250,14 +297,12 @@ static int network_link_get_ifindexes(int ifindex, const char *key, int **ret) {
                 if (r == 0)
                         break;
 
-                r = parse_ifindex(word, &ifindex);
-                if (r < 0)
-                        return r;
-
                 if (!GREEDY_REALLOC(ifis, allocated, c + 2))
                         return -ENOMEM;
 
-                ifis[c++] = ifindex;
+                r = ifis[c++] = parse_ifindex(word);
+                if (r < 0)
+                        return r;
         }
 
         if (ifis)
@@ -328,19 +373,13 @@ _public_ int sd_network_monitor_new(sd_network_monitor **m, const char *category
         if (!good)
                 return -EINVAL;
 
-        *m = FD_TO_MONITOR(fd);
-        fd = -1;
-
+        *m = FD_TO_MONITOR(TAKE_FD(fd));
         return 0;
 }
 
 _public_ sd_network_monitor* sd_network_monitor_unref(sd_network_monitor *m) {
-        int fd;
-
-        if (m) {
-                fd = MONITOR_TO_FD(m);
-                close_nointr(fd);
-        }
+        if (m)
+                close_nointr(MONITOR_TO_FD(m));
 
         return NULL;
 }

@@ -1,9 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2010 Maarten Lankhorst
 ***/
 
-#include "bus-util.h"
+#include "bus-get-properties.h"
 #include "dbus-cgroup.h"
 #include "dbus-execute.h"
 #include "dbus-swap.h"
@@ -12,16 +12,23 @@
 #include "unit.h"
 
 static int swap_get_priority(Swap *s) {
-        if (s->from_proc_swaps)
+        assert(s);
+
+        if (s->from_proc_swaps && s->parameters_proc_swaps.priority_set)
                 return s->parameters_proc_swaps.priority;
-        if (s->from_fragment)
+
+        if (s->from_fragment && s->parameters_fragment.priority_set)
                 return s->parameters_fragment.priority;
+
         return -1;
 }
 
 static const char *swap_get_options(Swap *s) {
+        assert(s);
+
         if (s->from_fragment)
                 return s->parameters_fragment.options;
+
         return NULL;
 }
 
@@ -63,7 +70,6 @@ int bus_swap_set_property(
 int bus_swap_commit_properties(Unit *u) {
         assert(u);
 
-        unit_invalidate_cgroup_members_masks(u);
         unit_realize_cgroup(u);
 
         return 0;

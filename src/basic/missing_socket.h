@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <sys/socket.h>
@@ -32,6 +32,10 @@ struct sockaddr_vm {
 #define SO_PEERGROUPS 59
 #endif
 
+#ifndef SO_BINDTOIFINDEX
+#define SO_BINDTOIFINDEX 62
+#endif
+
 #ifndef SOL_NETLINK
 #define SOL_NETLINK 270
 #endif
@@ -57,4 +61,13 @@ struct sockaddr_vm {
 
 #ifndef IP_TRANSPARENT
 #define IP_TRANSPARENT 19
+#endif
+
+#ifndef IPV6_FREEBIND
+#define IPV6_FREEBIND 78
+#endif
+
+/* linux/sockios.h */
+#ifndef SIOCGSKNS
+#define SIOCGSKNS 0x894C
 #endif

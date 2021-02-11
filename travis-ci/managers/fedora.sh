@@ -9,16 +9,50 @@
 # export CONT_NAME="my-fancy-container"
 # travis-ci/managers/fedora.sh SETUP RUN CLEANUP
 
-PHASES=(${@:-SETUP RUN RUN_ASAN CLEANUP})
+PHASES=(${@:-SETUP RUN RUN_ASAN_UBSAN CLEANUP})
 FEDORA_RELEASE="${FEDORA_RELEASE:-rawhide}"
-CONT_NAME="${CONT_NAME:-fedora-$FEDORA_RELEASE-$RANDOM}"
+CONT_NAME="${CONT_NAME:-systemd-fedora-$FEDORA_RELEASE}"
 DOCKER_EXEC="${DOCKER_EXEC:-docker exec -it $CONT_NAME}"
 DOCKER_RUN="${DOCKER_RUN:-docker run}"
 REPO_ROOT="${REPO_ROOT:-$PWD}"
-ADDITIONAL_DEPS=(dnf-plugins-core python2 iputils hostname libasan python3-pyparsing python3-evdev libubsan clang llvm)
+ADDITIONAL_DEPS=(
+    clang
+    dnf-plugins-core
+    hostname
+    iputils
+    jq
+    libasan
+    libfdisk-devel
+    libfido2-devel
+    libpwquality-devel
+    libubsan
+    libzstd-devel
+    llvm
+    openssl-devel
+    p11-kit-devel
+    perl
+    python3-evdev
+    python3-pyparsing
+)
 
-function info() {
+info() {
     echo -e "\033[33;1m$1\033[0m"
+}
+
+# Simple wrapper which retries given command up to five times
+_retry() {
+    local EC=1
+
+    for i in {1..5}; do
+        if "$@"; then
+            EC=0
+            break
+        fi
+
+        sleep $((i * 5))
+    done
+
+    return $EC
 }
 
 set -e
@@ -31,34 +65,35 @@ for phase in "${PHASES[@]}"; do
             info "Setup phase"
             info "Using Fedora $FEDORA_RELEASE"
             # Pull a Docker image and start a new container
-            docker pull fedora:$FEDORA_RELEASE
+            printf "FROM fedora:$FEDORA_RELEASE\nRUN bash -c 'dnf install -y systemd'\n" | docker build -t fedora-with-systemd/latest -
             info "Starting container $CONT_NAME"
             $DOCKER_RUN -v $REPO_ROOT:/build:rw \
                         -w /build --privileged=true --name $CONT_NAME \
-                        -dit --net=host fedora:$FEDORA_RELEASE /sbin/init
-            # Beautiful workaround for Fedora's version of Docker
-            sleep 1
-            $DOCKER_EXEC dnf makecache
+                        -dit --net=host fedora-with-systemd/latest /sbin/init
+            # Wait for the container to properly boot up, otherwise we were
+            # running following dnf commands during the initializing/starting
+            # (early/late bootup) phase, which caused nasty race conditions
+            $DOCKER_EXEC bash -c 'systemctl is-system-running --wait || :'
+            _retry $DOCKER_EXEC dnf makecache
             # Install necessary build/test requirements
-            $DOCKER_EXEC dnf -y --exclude selinux-policy\* upgrade
-            $DOCKER_EXEC dnf -y install "${ADDITIONAL_DEPS[@]}"
-            $DOCKER_EXEC dnf -y builddep systemd
+            _retry $DOCKER_EXEC dnf -y --exclude selinux-policy\* upgrade
+            _retry $DOCKER_EXEC dnf -y install "${ADDITIONAL_DEPS[@]}"
+            _retry $DOCKER_EXEC dnf -y builddep systemd
             ;;
         RUN)
             info "Run phase"
             # Build systemd
-            $DOCKER_EXEC meson --werror -Dtests=unsafe -Dslow-tests=true build
+            $DOCKER_EXEC meson --werror -Dtests=unsafe -Dslow-tests=true -Dfuzz-tests=true build
             $DOCKER_EXEC ninja -v -C build
             $DOCKER_EXEC ninja -C build test
-            $DOCKER_EXEC tools/check-directives.sh
             ;;
         RUN_CLANG)
-            docker exec -e CC=clang -e CXX=clang++ -it $CONT_NAME meson --werror -Dtests=unsafe -Dslow-tests=true build
+            docker exec -e CC=clang -e CXX=clang++ -it $CONT_NAME meson --werror -Dtests=unsafe -Dslow-tests=true -Dfuzz-tests=true -Dman=true build
             $DOCKER_EXEC ninja -v -C build
             $DOCKER_EXEC ninja -C build test
             ;;
-        RUN_ASAN|RUN_CLANG_ASAN)
-            if [[ "$phase" = "RUN_CLANG_ASAN" ]]; then
+        RUN_ASAN|RUN_GCC_ASAN_UBSAN|RUN_CLANG_ASAN_UBSAN)
+            if [[ "$phase" = "RUN_CLANG_ASAN_UBSAN" ]]; then
                 ENV_VARS="-e CC=clang -e CXX=clang++"
                 MESON_ARGS="-Db_lundef=false" # See https://github.com/mesonbuild/meson/issues/764
             fi
@@ -79,7 +114,7 @@ for phase in "${PHASES[@]}"; do
             docker rm -f $CONT_NAME
             ;;
         *)
-            echo >&2 "Unknown phase '$phase'"
+            error "Unknown phase '$phase'"
             exit 1
     esac
 done

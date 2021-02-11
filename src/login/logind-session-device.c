@@ -1,20 +1,21 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <linux/input.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 
 #include "sd-device.h"
+#include "sd-daemon.h"
 
 #include "alloc-util.h"
 #include "bus-util.h"
 #include "fd-util.h"
+#include "logind-session-dbus.h"
 #include "logind-session-device.h"
-#include "missing.h"
+#include "missing_drm.h"
+#include "missing_input.h"
 #include "parse-util.h"
-#include "sd-daemon.h"
 #include "util.h"
 
 enum SessionDeviceNotifications {
@@ -156,7 +157,7 @@ static int session_device_open(SessionDevice *sd, bool active) {
 
         case DEVICE_TYPE_UNKNOWN:
         default:
-                /* fallback for devices wihout synchronizations */
+                /* fallback for devices without synchronizations */
                 break;
         }
 
@@ -194,8 +195,7 @@ static int session_device_start(SessionDevice *sd) {
 
                 /* For evdev devices, the file descriptor might be left uninitialized. This might happen while resuming
                  * into a session and logind has been restarted right before. */
-                safe_close(sd->fd);
-                sd->fd = r;
+                CLOSE_AND_REPLACE(sd->fd, r);
                 break;
 
         case DEVICE_TYPE_UNKNOWN:
@@ -387,21 +387,11 @@ void session_device_free(SessionDevice *sd) {
         assert(sd);
 
         /* Make sure to remove the pushed fd. */
-        if (sd->pushed_fd) {
-                _cleanup_free_ char *m = NULL;
-                const char *id;
-                int r;
-
-                /* Session ID does not contain separators. */
-                id = sd->session->id;
-                assert(*(id + strcspn(id, "-\n")) == '\0');
-
-                r = asprintf(&m, "FDSTOREREMOVE=1\n"
-                                 "FDNAME=session-%s-device-%u-%u\n",
-                                 id, major(sd->dev), minor(sd->dev));
-                if (r >= 0)
-                        (void) sd_notify(false, m);
-        }
+        if (sd->pushed_fd)
+                (void) sd_notifyf(false,
+                                  "FDSTOREREMOVE=1\n"
+                                  "FDNAME=session-%s-device-%u-%u",
+                                  sd->session->id, major(sd->dev), minor(sd->dev));
 
         session_device_stop(sd);
         session_device_notify(sd, SESSION_DEVICE_RELEASE);
@@ -417,7 +407,6 @@ void session_device_free(SessionDevice *sd) {
 
 void session_device_complete_pause(SessionDevice *sd) {
         SessionDevice *iter;
-        Iterator i;
 
         if (!sd->active)
                 return;
@@ -425,7 +414,7 @@ void session_device_complete_pause(SessionDevice *sd) {
         session_device_stop(sd);
 
         /* if not all devices are paused, wait for further completion events */
-        HASHMAP_FOREACH(iter, sd->session->devices, i)
+        HASHMAP_FOREACH(iter, sd->session->devices)
                 if (iter->active)
                         return;
 
@@ -435,11 +424,10 @@ void session_device_complete_pause(SessionDevice *sd) {
 
 void session_device_resume_all(Session *s) {
         SessionDevice *sd;
-        Iterator i;
 
         assert(s);
 
-        HASHMAP_FOREACH(sd, s->devices, i) {
+        HASHMAP_FOREACH(sd, s->devices) {
                 if (sd->active)
                         continue;
 
@@ -454,11 +442,10 @@ void session_device_resume_all(Session *s) {
 
 void session_device_pause_all(Session *s) {
         SessionDevice *sd;
-        Iterator i;
 
         assert(s);
 
-        HASHMAP_FOREACH(sd, s->devices, i) {
+        HASHMAP_FOREACH(sd, s->devices) {
                 if (!sd->active)
                         continue;
 
@@ -470,11 +457,10 @@ void session_device_pause_all(Session *s) {
 unsigned session_device_try_pause_all(Session *s) {
         unsigned num_pending = 0;
         SessionDevice *sd;
-        Iterator i;
 
         assert(s);
 
-        HASHMAP_FOREACH(sd, s->devices, i) {
+        HASHMAP_FOREACH(sd, s->devices) {
                 if (!sd->active)
                         continue;
 

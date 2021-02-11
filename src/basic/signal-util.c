@@ -1,8 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdarg.h>
-#include <stdio.h>
 
 #include "macro.h"
 #include "parse-util.h"
@@ -26,7 +25,7 @@ int reset_all_signal_handlers(void) {
 
                 /* On Linux the first two RT signals are reserved by
                  * glibc, and sigaction() will return EINVAL for them. */
-                if ((sigaction(sig, &sa, NULL) < 0))
+                if (sigaction(sig, &sa, NULL) < 0)
                         if (errno != EINVAL && r >= 0)
                                 r = -errno;
         }
@@ -50,16 +49,7 @@ static int sigaction_many_ap(const struct sigaction *sa, int sig, va_list ap) {
         int r = 0;
 
         /* negative signal ends the list. 0 signal is skipped. */
-
-        if (sig < 0)
-                return 0;
-
-        if (sig > 0) {
-                if (sigaction(sig, sa, NULL) < 0)
-                        r = -errno;
-        }
-
-        while ((sig = va_arg(ap, int)) >= 0) {
+        for (; sig >= 0; sig = va_arg(ap, int)) {
 
                 if (sig == 0)
                         continue;
@@ -287,4 +277,19 @@ int signal_from_string(const char *s) {
 
 void nop_signal_handler(int sig) {
         /* nothing here */
+}
+
+int signal_is_blocked(int sig) {
+        sigset_t ss;
+        int r;
+
+        r = pthread_sigmask(SIG_SETMASK, NULL, &ss);
+        if (r != 0)
+                return -r;
+
+        r = sigismember(&ss, sig);
+        if (r < 0)
+                return -errno;
+
+        return r;
 }

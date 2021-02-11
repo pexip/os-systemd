@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -10,6 +10,7 @@
 #include "log.h"
 #include "resolved-etc-hosts.h"
 #include "strv.h"
+#include "tests.h"
 #include "tmpfile-util.h"
 
 static void test_parse_etc_hosts_system(void) {
@@ -64,7 +65,7 @@ static void test_parse_etc_hosts(void) {
               "1::2::3 multi.colon\n"
 
               "::0 some.where some.other\n"
-              "0.0.0.0 black.listed\n"
+              "0.0.0.0 deny.listed\n"
               "::5\t\t\t \tsome.where\tsome.other foobar.foo.foo\t\t\t\n"
               "        \n", f);
         assert_se(fflush_and_check(f) >= 0);
@@ -122,7 +123,7 @@ static void test_parse_etc_hosts(void) {
 
         assert_se( set_contains(hosts.no_address, "some.where"));
         assert_se( set_contains(hosts.no_address, "some.other"));
-        assert_se( set_contains(hosts.no_address, "black.listed"));
+        assert_se( set_contains(hosts.no_address, "deny.listed"));
         assert_se(!set_contains(hosts.no_address, "foobar.foo.foo"));
 }
 
@@ -137,9 +138,7 @@ static void test_parse_file(const char *fname) {
 }
 
 int main(int argc, char **argv) {
-        log_set_max_level(LOG_DEBUG);
-        log_parse_environment();
-        log_open();
+        test_setup_logging(LOG_DEBUG);
 
         if (argc == 1) {
                 test_parse_etc_hosts_system();

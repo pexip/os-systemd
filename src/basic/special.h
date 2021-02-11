@@ -1,7 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #define SPECIAL_DEFAULT_TARGET "default.target"
+#define SPECIAL_INITRD_TARGET "initrd.target"
 
 /* Shutdown targets */
 #define SPECIAL_UMOUNT_TARGET "umount.target"
@@ -76,9 +77,12 @@
 
 /* Magic early boot services */
 #define SPECIAL_FSCK_SERVICE "systemd-fsck@.service"
+#define SPECIAL_FSCK_ROOT_SERVICE "systemd-fsck-root.service"
 #define SPECIAL_QUOTACHECK_SERVICE "systemd-quotacheck.service"
 #define SPECIAL_QUOTAON_SERVICE "quotaon.service"
 #define SPECIAL_REMOUNT_FS_SERVICE "systemd-remount-fs.service"
+#define SPECIAL_VOLATILE_ROOT_SERVICE "systemd-volatile-root.service"
+#define SPECIAL_UDEVD_SERVICE "systemd-udevd.service"
 
 /* Services systemd relies on */
 #define SPECIAL_DBUS_SERVICE "dbus.service"
@@ -103,3 +107,8 @@
 
 /* The root directory. */
 #define SPECIAL_ROOT_MOUNT "-.mount"
+
+/* Special slices valid for the user instance */
+#define SPECIAL_SESSION_SLICE "session.slice"
+#define SPECIAL_APP_SLICE "app.slice"
+#define SPECIAL_BACKGROUND_SLICE "background.slice"

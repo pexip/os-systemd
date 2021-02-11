@@ -1,10 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/ioctl.h>
 #include <linux/input.h>
 
@@ -89,7 +87,7 @@ static int map_keycode(sd_device *dev, int fd, int scancode, const char *keycode
         return 0;
 }
 
-static char* parse_token(const char *current, int32_t *val_out) {
+static const char* parse_token(const char *current, int32_t *val_out) {
         char *next;
         int32_t val;
 
@@ -111,11 +109,9 @@ static char* parse_token(const char *current, int32_t *val_out) {
 
 static int override_abs(sd_device *dev, int fd, unsigned evcode, const char *value) {
         struct input_absinfo absinfo;
-        char *next;
-        int r;
+        const char *next;
 
-        r = ioctl(fd, EVIOCGABS(evcode), &absinfo);
-        if (r < 0)
+        if (ioctl(fd, EVIOCGABS(evcode), &absinfo) < 0)
                 return log_device_error_errno(dev, errno, "Failed to call EVIOCGABS");
 
         next = parse_token(value, &absinfo.minimum);
@@ -124,12 +120,12 @@ static int override_abs(sd_device *dev, int fd, unsigned evcode, const char *val
         next = parse_token(next, &absinfo.fuzz);
         next = parse_token(next, &absinfo.flat);
         if (!next)
-                return log_device_error(dev, "Failed to parse EV_ABS override '%s'", value);
+                return log_device_error_errno(dev, SYNTHETIC_ERRNO(EINVAL),
+                                              "Failed to parse EV_ABS override '%s'", value);
 
         log_device_debug(dev, "keyboard: %x overridden with %"PRIi32"/%"PRIi32"/%"PRIi32"/%"PRIi32"/%"PRIi32,
                          evcode, absinfo.minimum, absinfo.maximum, absinfo.resolution, absinfo.fuzz, absinfo.flat);
-        r = ioctl(fd, EVIOCSABS(evcode), &absinfo);
-        if (r < 0)
+        if (ioctl(fd, EVIOCSABS(evcode), &absinfo) < 0)
                 return log_device_error_errno(dev, errno, "Failed to call EVIOCSABS");
 
         return 0;
@@ -251,7 +247,7 @@ static int builtin_keyboard(sd_device *dev, int argc, char *argv[], bool test) {
         return 0;
 }
 
-const struct udev_builtin udev_builtin_keyboard = {
+const UdevBuiltin udev_builtin_keyboard = {
         .name = "keyboard",
         .cmd = builtin_keyboard,
         .help = "Keyboard scan code to key mapping",

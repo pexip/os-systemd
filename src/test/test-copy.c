@@ -1,5 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -7,6 +8,7 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "hexdecoct.h"
 #include "log.h"
 #include "macro.h"
 #include "mkdir.h"
@@ -18,6 +20,7 @@
 #include "tmpfile-util.h"
 #include "user-util.h"
 #include "util.h"
+#include "xattr-util.h"
 
 static void test_copy_file(void) {
         _cleanup_free_ char *buf = NULL;
@@ -38,7 +41,7 @@ static void test_copy_file(void) {
 
         assert_se(write_string_file(fn, "foo bar bar bar foo", WRITE_STRING_FILE_CREATE) == 0);
 
-        assert_se(copy_file(fn, fn_copy, 0, 0644, 0, COPY_REFLINK) == 0);
+        assert_se(copy_file(fn, fn_copy, 0, 0644, 0, 0, COPY_REFLINK) == 0);
 
         assert_se(read_full_file(fn_copy, &buf, &sz) == 0);
         assert_se(streq(buf, "foo bar bar bar foo\n"));
@@ -52,8 +55,8 @@ static void test_copy_file_fd(void) {
         char in_fn[] = "/tmp/test-copy-file-fd-XXXXXX";
         char out_fn[] = "/tmp/test-copy-file-fd-XXXXXX";
         _cleanup_close_ int in_fd = -1, out_fd = -1;
-        char text[] = "boohoo\nfoo\n\tbar\n";
-        char buf[64] = {0};
+        const char *text = "boohoo\nfoo\n\tbar\n";
+        char buf[64] = {};
 
         log_info("%s", __func__);
 
@@ -67,7 +70,7 @@ static void test_copy_file_fd(void) {
         assert_se(copy_file_fd(in_fn, out_fd, COPY_REFLINK) >= 0);
         assert_se(lseek(out_fd, SEEK_SET, 0) == 0);
 
-        assert_se(read(out_fd, buf, sizeof(buf)) == sizeof(text) - 1);
+        assert_se(read(out_fd, buf, sizeof buf) == (ssize_t) strlen(text));
         assert_se(streq(buf, text));
 
         unlink(in_fn);
@@ -78,11 +81,15 @@ static void test_copy_tree(void) {
         char original_dir[] = "/tmp/test-copy_tree/";
         char copy_dir[] = "/tmp/test-copy_tree-copy/";
         char **files = STRV_MAKE("file", "dir1/file", "dir1/dir2/file", "dir1/dir2/dir3/dir4/dir5/file");
-        char **links = STRV_MAKE("link", "file",
-                                 "link2", "dir1/file");
-        char **p, **link;
+        char **symlinks = STRV_MAKE("link", "file",
+                                    "link2", "dir1/file");
+        char **hardlinks = STRV_MAKE("hlink", "file",
+                                     "hlink2", "dir1/file");
         const char *unixsockp;
+        char **p, **ll;
         struct stat st;
+        int xattr_worked = -1; /* xattr support is optional in temporary directories, hence use it if we can,
+                                * but don't fail if we can't */
 
         log_info("%s", __func__);
 
@@ -90,48 +97,90 @@ static void test_copy_tree(void) {
         (void) rm_rf(original_dir, REMOVE_ROOT|REMOVE_PHYSICAL);
 
         STRV_FOREACH(p, files) {
-                _cleanup_free_ char *f;
+                _cleanup_free_ char *f, *c;
+                int k;
 
-                assert_se(f = strappend(original_dir, *p));
+                assert_se(f = path_join(original_dir, *p));
 
                 assert_se(mkdir_parents(f, 0755) >= 0);
                 assert_se(write_string_file(f, "file", WRITE_STRING_FILE_CREATE) == 0);
+
+                assert_se(base64mem(*p, strlen(*p), &c) >= 0);
+
+                k = setxattr(f, "user.testxattr", c, strlen(c), 0);
+                assert_se(xattr_worked < 0 || ((k >= 0) == !!xattr_worked));
+                xattr_worked = k >= 0;
         }
 
-        STRV_FOREACH_PAIR(link, p, links) {
+        STRV_FOREACH_PAIR(ll, p, symlinks) {
                 _cleanup_free_ char *f, *l;
 
-                assert_se(f = strappend(original_dir, *p));
-                assert_se(l = strappend(original_dir, *link));
+                assert_se(f = path_join(original_dir, *p));
+                assert_se(l = path_join(original_dir, *ll));
 
                 assert_se(mkdir_parents(l, 0755) >= 0);
                 assert_se(symlink(f, l) == 0);
         }
 
+        STRV_FOREACH_PAIR(ll, p, hardlinks) {
+                _cleanup_free_ char *f, *l;
+
+                assert_se(f = path_join(original_dir, *p));
+                assert_se(l = path_join(original_dir, *ll));
+
+                assert_se(mkdir_parents(l, 0755) >= 0);
+                assert_se(link(f, l) == 0);
+        }
+
         unixsockp = strjoina(original_dir, "unixsock");
         assert_se(mknod(unixsockp, S_IFSOCK|0644, 0) >= 0);
 
-        assert_se(copy_tree(original_dir, copy_dir, UID_INVALID, GID_INVALID, COPY_REFLINK|COPY_MERGE) == 0);
+        assert_se(copy_tree(original_dir, copy_dir, UID_INVALID, GID_INVALID, COPY_REFLINK|COPY_MERGE|COPY_HARDLINKS) == 0);
 
         STRV_FOREACH(p, files) {
-                _cleanup_free_ char *buf, *f;
+                _cleanup_free_ char *buf, *f, *c = NULL;
                 size_t sz;
+                int k;
 
-                assert_se(f = strappend(copy_dir, *p));
+                assert_se(f = path_join(copy_dir, *p));
 
                 assert_se(access(f, F_OK) == 0);
                 assert_se(read_full_file(f, &buf, &sz) == 0);
                 assert_se(streq(buf, "file\n"));
+
+                k = getxattr_malloc(f, "user.testxattr", &c, false);
+                assert_se(xattr_worked < 0 || ((k >= 0) == !!xattr_worked));
+
+                if (k >= 0) {
+                        _cleanup_free_ char *d = NULL;
+
+                        assert_se(base64mem(*p, strlen(*p), &d) >= 0);
+                        assert_se(streq(d, c));
+                }
         }
 
-        STRV_FOREACH_PAIR(link, p, links) {
+        STRV_FOREACH_PAIR(ll, p, symlinks) {
                 _cleanup_free_ char *target, *f, *l;
 
                 assert_se(f = strjoin(original_dir, *p));
-                assert_se(l = strjoin(copy_dir, *link));
+                assert_se(l = strjoin(copy_dir, *ll));
 
-                assert_se(chase_symlinks(l, NULL, 0, &target) == 1);
+                assert_se(chase_symlinks(l, NULL, 0, &target, NULL) == 1);
                 assert_se(path_equal(f, target));
+        }
+
+        STRV_FOREACH_PAIR(ll, p, hardlinks) {
+                _cleanup_free_ char *f, *l;
+                struct stat a, b;
+
+                assert_se(f = strjoin(copy_dir, *p));
+                assert_se(l = strjoin(copy_dir, *ll));
+
+                assert_se(lstat(f, &a) >= 0);
+                assert_se(lstat(l, &b) >= 0);
+
+                assert_se(a.st_ino == b.st_ino);
+                assert_se(a.st_dev == b.st_dev);
         }
 
         unixsockp = strjoina(copy_dir, "unixsock");
@@ -246,13 +295,13 @@ static void test_copy_atomic(void) {
 
         q = strjoina(p, "/fstab");
 
-        r = copy_file_atomic("/etc/fstab", q, 0644, 0, COPY_REFLINK);
-        if (r == -ENOENT)
+        r = copy_file_atomic("/etc/fstab", q, 0644, 0, 0, COPY_REFLINK);
+        if (r == -ENOENT || ERRNO_IS_PRIVILEGE(r))
                 return;
 
-        assert_se(copy_file_atomic("/etc/fstab", q, 0644, 0, COPY_REFLINK) == -EEXIST);
+        assert_se(copy_file_atomic("/etc/fstab", q, 0644, 0, 0, COPY_REFLINK) == -EEXIST);
 
-        assert_se(copy_file_atomic("/etc/fstab", q, 0644, 0, COPY_REPLACE) >= 0);
+        assert_se(copy_file_atomic("/etc/fstab", q, 0644, 0, 0, COPY_REPLACE) >= 0);
 }
 
 int main(int argc, char *argv[]) {

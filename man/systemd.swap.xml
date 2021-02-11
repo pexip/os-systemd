@@ -1,10 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-
-<!--
-  SPDX-License-Identifier: LGPL-2.1+
--->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd.swap"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -57,11 +54,14 @@
     unit.</para>
 
     <para>Swap units must be named after the devices or files they control. Example: the swap device <filename
-    noindex='true'>/dev/sda5</filename> must be configured in a unit file <filename>dev-sda5.swap</filename>. For
+    index="false">/dev/sda5</filename> must be configured in a unit file <filename>dev-sda5.swap</filename>. For
     details about the escaping logic used to convert a file system path to a unit name, see
     <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>. Note that swap
     units cannot be templated, nor is possible to add multiple names to a swap unit by creating additional symlinks to
     it.</para>
+
+    <para>Note that swap support on Linux is privileged, swap units are hence only available in the system
+    service manager (and root's user service manager), but not in unprivileged user's service manager.</para>
   </refsect1>
 
   <refsect1>
@@ -151,7 +151,7 @@
 
         <listitem><para>The swap structure will be initialized on the device. If the device is not
         "empty", i.e. it contains any signature, the operation will be skipped. It is hence expected
-        that this option remains set even after the device has been initalized.</para>
+        that this option remains set even after the device has been initialized.</para>
 
         <para>Note that this option can only be used in <filename>/etc/fstab</filename>, and will be
         ignored when part of the <varname>Options=</varname> setting in a unit file.</para>
@@ -169,7 +169,7 @@
   <refsect1>
     <title>Options</title>
 
-    <para>Swap files must include a [Swap] section, which carries
+    <para>Swap unit files must include a [Swap] section, which carries
     information about the swap device it supervises. A number of
     options that may be used in this section are shared with other
     unit types. These options are documented in
@@ -187,11 +187,13 @@
         project='man-pages'><refentrytitle>swapon</refentrytitle><manvolnum>8</manvolnum></citerefentry> for
         details. If this refers to a device node, a dependency on the respective device unit is automatically
         created. (See
-        <citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry> for more
-        information.) If this refers to a file, a dependency on the respective mount unit is automatically
-        created. (See <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>
-        for more information.) This option is mandatory. Note that the usual specifier expansion is applied to this
-        setting, literal percent characters should hence be written as <literal>%%</literal>.</para></listitem>
+        <citerefentry><refentrytitle>systemd.device</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        for more information.) If this refers to a file, a dependency on the respective mount unit is
+        automatically created. (See
+        <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+        more information.) This option is mandatory. Note that the usual specifier expansion is applied to
+        this setting, literal percent characters should hence be written as
+        <literal class='specifiers'>%%</literal>.</para></listitem>
       </varlistentry>
 
       <varlistentry>

@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -17,11 +17,13 @@ DynamicUser=yes
 ExecStart=@rootlibexecdir@/systemd-journal-gatewayd
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateNetwork=yes
+ProtectProc=invisible
 ProtectControlGroups=yes
 ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

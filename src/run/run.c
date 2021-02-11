@@ -1,17 +1,23 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "sd-bus.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-locator.h"
+#include "bus-map-properties.h"
 #include "bus-unit-util.h"
-#include "bus-util.h"
+#include "bus-wait-for-jobs.h"
 #include "calendarspec.h"
 #include "env-util.h"
+#include "exit-status.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "main-func.h"
@@ -36,6 +42,7 @@ static bool arg_wait = false;
 static const char *arg_unit = NULL;
 static const char *arg_description = NULL;
 static const char *arg_slice = NULL;
+static bool arg_slice_inherit = false;
 static bool arg_send_sighup = false;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 static const char *arg_host = NULL;
@@ -56,7 +63,7 @@ static enum {
 static char **arg_path_property = NULL;
 static char **arg_socket_property = NULL;
 static char **arg_timer_property = NULL;
-static bool with_timer = false;
+static bool arg_with_timer = false;
 static bool arg_quiet = false;
 static bool arg_aggressive_gc = false;
 static char *arg_working_directory = NULL;
@@ -79,8 +86,8 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...] {COMMAND} [ARGS...]\n\n"
-               "Run the specified command in a transient scope or service.\n\n"
+        printf("%s [OPTIONS...] COMMAND [ARGUMENTS...]\n"
+               "\n%sRun the specified command in a transient scope or service.%s\n\n"
                "  -h --help                       Show this help\n"
                "     --version                    Show package version\n"
                "     --no-ask-password            Do not prompt for password\n"
@@ -88,10 +95,11 @@ static int help(void) {
                "  -H --host=[USER@]HOST           Operate on remote host\n"
                "  -M --machine=CONTAINER          Operate on local container\n"
                "     --scope                      Run this as scope rather than service\n"
-               "     --unit=UNIT                  Run under the specified unit name\n"
+               "  -u --unit=UNIT                  Run under the specified unit name\n"
                "  -p --property=NAME=VALUE        Set service or scope unit property\n"
                "     --description=TEXT           Description for unit\n"
                "     --slice=SLICE                Run in the specified slice\n"
+               "     --slice-inherit              Inherit the slice\n"
                "     --no-block                   Do not wait until operation finished\n"
                "  -r --remain-after-exit          Leave service around until explicitly stopped\n"
                "     --wait                       Wait until service stopped again\n"
@@ -120,9 +128,12 @@ static int help(void) {
                "     --on-unit-active=SECONDS     Run SECONDS after the last activation\n"
                "     --on-unit-inactive=SECONDS   Run SECONDS after the last deactivation\n"
                "     --on-calendar=SPEC           Realtime timer\n"
+               "     --on-timezone-change         Run when the timezone changes\n"
+               "     --on-clock-change            Run when the realtime clock jumps\n"
                "     --timer-property=NAME=VALUE  Set timer unit property\n"
                "\nSee the %s for details.\n"
                , program_invocation_short_name
+               , ansi_highlight(), ansi_normal()
                , link
         );
 
@@ -152,9 +163,9 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_USER,
                 ARG_SYSTEM,
                 ARG_SCOPE,
-                ARG_UNIT,
                 ARG_DESCRIPTION,
                 ARG_SLICE,
+                ARG_SLICE_INHERIT,
                 ARG_SEND_SIGHUP,
                 ARG_SERVICE_TYPE,
                 ARG_EXEC_USER,
@@ -166,6 +177,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_ON_UNIT_ACTIVE,
                 ARG_ON_UNIT_INACTIVE,
                 ARG_ON_CALENDAR,
+                ARG_ON_TIMEZONE_CHANGE,
+                ARG_ON_CLOCK_CHANGE,
                 ARG_TIMER_PROPERTY,
                 ARG_PATH_PROPERTY,
                 ARG_SOCKET_PROPERTY,
@@ -182,9 +195,10 @@ static int parse_argv(int argc, char *argv[]) {
                 { "user",              no_argument,       NULL, ARG_USER              },
                 { "system",            no_argument,       NULL, ARG_SYSTEM            },
                 { "scope",             no_argument,       NULL, ARG_SCOPE             },
-                { "unit",              required_argument, NULL, ARG_UNIT              },
+                { "unit",              required_argument, NULL, 'u'                   },
                 { "description",       required_argument, NULL, ARG_DESCRIPTION       },
                 { "slice",             required_argument, NULL, ARG_SLICE             },
+                { "slice-inherit",     no_argument,       NULL, ARG_SLICE_INHERIT     },
                 { "remain-after-exit", no_argument,       NULL, 'r'                   },
                 { "send-sighup",       no_argument,       NULL, ARG_SEND_SIGHUP       },
                 { "host",              required_argument, NULL, 'H'                   },
@@ -206,6 +220,8 @@ static int parse_argv(int argc, char *argv[]) {
                 { "on-unit-active",    required_argument, NULL, ARG_ON_UNIT_ACTIVE    },
                 { "on-unit-inactive",  required_argument, NULL, ARG_ON_UNIT_INACTIVE  },
                 { "on-calendar",       required_argument, NULL, ARG_ON_CALENDAR       },
+                { "on-timezone-change",no_argument,       NULL, ARG_ON_TIMEZONE_CHANGE},
+                { "on-clock-change",   no_argument,       NULL, ARG_ON_CLOCK_CHANGE   },
                 { "timer-property",    required_argument, NULL, ARG_TIMER_PROPERTY    },
                 { "path-property",     required_argument, NULL, ARG_PATH_PROPERTY     },
                 { "socket-property",   required_argument, NULL, ARG_SOCKET_PROPERTY   },
@@ -224,7 +240,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "+hrH:M:E:p:tPqGdS", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "+hrH:M:E:p:tPqGdSu:", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -250,7 +266,7 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_scope = true;
                         break;
 
-                case ARG_UNIT:
+                case 'u':
                         arg_unit = optarg;
                         break;
 
@@ -260,6 +276,10 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_SLICE:
                         arg_slice = optarg;
+                        break;
+
+                case ARG_SLICE_INHERIT:
+                        arg_slice_inherit = true;
                         break;
 
                 case ARG_SEND_SIGHUP:
@@ -335,7 +355,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return r;
 
-                        with_timer = true;
+                        arg_with_timer = true;
                         break;
 
                 case ARG_ON_BOOT:
@@ -343,7 +363,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return r;
 
-                        with_timer = true;
+                        arg_with_timer = true;
                         break;
 
                 case ARG_ON_STARTUP:
@@ -351,7 +371,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return r;
 
-                        with_timer = true;
+                        arg_with_timer = true;
                         break;
 
                 case ARG_ON_UNIT_ACTIVE:
@@ -359,7 +379,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return r;
 
-                        with_timer = true;
+                        arg_with_timer = true;
                         break;
 
                 case ARG_ON_UNIT_INACTIVE:
@@ -367,15 +387,49 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return r;
 
-                        with_timer = true;
+                        arg_with_timer = true;
                         break;
 
-                case ARG_ON_CALENDAR:
+                case ARG_ON_CALENDAR: {
+                        _cleanup_(calendar_spec_freep) CalendarSpec *cs = NULL;
+
+                        r = calendar_spec_from_string(optarg, &cs);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse calendar event specification: %m");
+
+                        /* Let's make sure the given calendar event is not in the past */
+                        r = calendar_spec_next_usec(cs, now(CLOCK_REALTIME), NULL);
+                        if (r == -ENOENT)
+                                /* The calendar event is in the past — let's warn about this, but install it
+                                 * anyway as is. The service manager will trigger the service right away.
+                                 * Moreover, the server side might have a different clock or timezone than we
+                                 * do, hence it should decide when or whether to run something. */
+                                log_warning("Specified calendar expression is in the past, proceeding anyway.");
+                        else if (r < 0)
+                                return log_error_errno(r, "Failed to calculate next time calendar expression elapses: %m");
+
                         r = add_timer_property("OnCalendar", optarg);
                         if (r < 0)
                                 return r;
 
-                        with_timer = true;
+                        arg_with_timer = true;
+                        break;
+                }
+
+                case ARG_ON_TIMEZONE_CHANGE:
+                        r = add_timer_property("OnTimezoneChange", "yes");
+                        if (r < 0)
+                                return r;
+
+                        arg_with_timer = true;
+                        break;
+
+                case ARG_ON_CLOCK_CHANGE:
+                        r = add_timer_property("OnClockChange", "yes");
+                        if (r < 0)
+                                return r;
+
+                        arg_with_timer = true;
                         break;
 
                 case ARG_TIMER_PROPERTY:
@@ -383,7 +437,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (strv_extend(&arg_timer_property, optarg) < 0)
                                 return log_oom();
 
-                        with_timer = with_timer ||
+                        arg_with_timer = arg_with_timer ||
                                 STARTSWITH_SET(optarg,
                                                "OnActiveSec=",
                                                "OnBootSec=",
@@ -451,10 +505,10 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached("Unhandled option");
                 }
 
-        with_trigger = !!arg_path_property || !!arg_socket_property || with_timer;
+        with_trigger = !!arg_path_property || !!arg_socket_property || arg_with_timer;
 
         /* currently, only single trigger (path, socket, timer) unit can be created simultaneously */
-        if ((int) !!arg_path_property + (int) !!arg_socket_property + (int) with_timer > 1)
+        if ((int) !!arg_path_property + (int) !!arg_socket_property + (int) arg_with_timer > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Only single trigger (path, socket, timer) unit can be created.");
 
@@ -484,14 +538,13 @@ static int parse_argv(int argc, char *argv[]) {
                 arg_aggressive_gc = true;
         }
 
-        if (arg_stdio == ARG_STDIO_AUTO) {
+        if (arg_stdio == ARG_STDIO_AUTO)
                 /* If we both --pty and --pipe are specified we'll automatically pick --pty if we are connected fully
                  * to a TTY and pick direct fd passing otherwise. This way, we automatically adapt to usage in a shell
                  * pipeline, but we are neatly interactive with tty-level isolation otherwise. */
                 arg_stdio = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) && isatty(STDERR_FILENO) ?
                         ARG_STDIO_PTY :
                         ARG_STDIO_DIRECT;
-        }
 
         if (argc > optind) {
                 char **l;
@@ -550,7 +603,7 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Path, socket or timer options are not supported in --scope mode.");
 
-        if (arg_timer_property && !with_timer)
+        if (arg_timer_property && !arg_with_timer)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--timer-property= has no effect without any other timer options.");
 
@@ -592,20 +645,49 @@ static int transient_unit_set_properties(sd_bus_message *m, UnitType t, char **p
 }
 
 static int transient_cgroup_set_properties(sd_bus_message *m) {
+        _cleanup_free_ char *name = NULL;
+        _cleanup_free_ char *slice = NULL;
         int r;
         assert(m);
 
-        if (!isempty(arg_slice)) {
-                _cleanup_free_ char *slice = NULL;
+        if (arg_slice_inherit) {
+                char *end;
 
-                r = unit_name_mangle_with_suffix(arg_slice, arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN, ".slice", &slice);
+                if (arg_user)
+                        r = cg_pid_get_user_slice(0, &name);
+                else
+                        r = cg_pid_get_slice(0, &name);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to mangle name '%s': %m", arg_slice);
+                        return log_error_errno(r, "Failed to get PID slice: %m");
 
-                r = sd_bus_message_append(m, "(sv)", "Slice", "s", slice);
-                if (r < 0)
-                        return bus_log_create_error(r);
+                end = endswith(name, ".slice");
+                if (!end)
+                        return -ENXIO;
+                *end = 0;
         }
+
+        if (!isempty(arg_slice)) {
+                if (name) {
+                        char *j = strjoin(name, "-", arg_slice);
+                        free_and_replace(name, j);
+                } else
+                        name = strdup(arg_slice);
+                if (!name)
+                        return log_oom();
+        }
+
+        if (!name)
+                return 0;
+
+        r = unit_name_mangle_with_suffix(name, "as slice",
+                                         arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN,
+                                         ".slice", &slice);
+        if (r < 0)
+                return log_error_errno(r, "Failed to mangle name '%s': %m", arg_slice);
+
+        r = sd_bus_message_append(m, "(sv)", "Slice", "s", slice);
+        if (r < 0)
+                return bus_log_create_error(r);
 
         return 0;
 }
@@ -896,14 +978,19 @@ typedef struct RunContext {
         PTYForward *forward;
         sd_bus_slot *match;
 
-        /* The exit data of the unit */
+        /* Current state of the unit */
         char *active_state;
+        bool has_job;
+
+        /* The exit data of the unit */
         uint64_t inactive_exit_usec;
         uint64_t inactive_enter_usec;
         char *result;
         uint64_t cpu_usage_nsec;
         uint64_t ip_ingress_bytes;
         uint64_t ip_egress_bytes;
+        uint64_t io_read_bytes;
+        uint64_t io_write_bytes;
         uint32_t exit_code;
         uint32_t exit_status;
 } RunContext;
@@ -926,7 +1013,7 @@ static void run_context_check_done(RunContext *c) {
         assert(c);
 
         if (c->match)
-                done = STRPTR_IN_SET(c->active_state, "inactive", "failed");
+                done = STRPTR_IN_SET(c->active_state, "inactive", "failed") && !c->has_job;
         else
                 done = true;
 
@@ -937,18 +1024,35 @@ static void run_context_check_done(RunContext *c) {
                 sd_event_exit(c->event, EXIT_SUCCESS);
 }
 
+static int map_job(sd_bus *bus, const char *member, sd_bus_message *m, sd_bus_error *error, void *userdata) {
+        bool *b = userdata;
+        const char *job;
+        uint32_t id;
+        int r;
+
+        r = sd_bus_message_read(m, "(uo)", &id, &job);
+        if (r < 0)
+                return r;
+
+        *b = id != 0 || !streq(job, "/");
+        return 0;
+}
+
 static int run_context_update(RunContext *c, const char *path) {
 
         static const struct bus_properties_map map[] = {
-                { "ActiveState",                      "s", NULL, offsetof(RunContext, active_state)        },
-                { "InactiveExitTimestampMonotonic",   "t", NULL, offsetof(RunContext, inactive_exit_usec)  },
-                { "InactiveEnterTimestampMonotonic",  "t", NULL, offsetof(RunContext, inactive_enter_usec) },
-                { "Result",                           "s", NULL, offsetof(RunContext, result)              },
-                { "ExecMainCode",                     "i", NULL, offsetof(RunContext, exit_code)           },
-                { "ExecMainStatus",                   "i", NULL, offsetof(RunContext, exit_status)         },
-                { "CPUUsageNSec",                     "t", NULL, offsetof(RunContext, cpu_usage_nsec)      },
-                { "IPIngressBytes",                   "t", NULL, offsetof(RunContext, ip_ingress_bytes)    },
-                { "IPEgressBytes",                    "t", NULL, offsetof(RunContext, ip_egress_bytes)     },
+                { "ActiveState",                     "s",    NULL,    offsetof(RunContext, active_state)        },
+                { "InactiveExitTimestampMonotonic",  "t",    NULL,    offsetof(RunContext, inactive_exit_usec)  },
+                { "InactiveEnterTimestampMonotonic", "t",    NULL,    offsetof(RunContext, inactive_enter_usec) },
+                { "Result",                          "s",    NULL,    offsetof(RunContext, result)              },
+                { "ExecMainCode",                    "i",    NULL,    offsetof(RunContext, exit_code)           },
+                { "ExecMainStatus",                  "i",    NULL,    offsetof(RunContext, exit_status)         },
+                { "CPUUsageNSec",                    "t",    NULL,    offsetof(RunContext, cpu_usage_nsec)      },
+                { "IPIngressBytes",                  "t",    NULL,    offsetof(RunContext, ip_ingress_bytes)    },
+                { "IPEgressBytes",                   "t",    NULL,    offsetof(RunContext, ip_egress_bytes)     },
+                { "IOReadBytes",                     "t",    NULL,    offsetof(RunContext, io_read_bytes)       },
+                { "IOWriteBytes",                    "t",    NULL,    offsetof(RunContext, io_write_bytes)      },
+                { "Job",                             "(uo)", map_job, offsetof(RunContext, has_job)             },
                 {}
         };
 
@@ -1041,7 +1145,7 @@ static int start_transient_service(
                                                &pty_reply,
                                                "s", arg_host);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to get machine PTY: %s", bus_error_message(&error, -r));
+                                return log_error_errno(r, "Failed to get machine PTY: %s", bus_error_message(&error, r));
 
                         r = sd_bus_message_read(pty_reply, "hs", &master, &s);
                         if (r < 0)
@@ -1058,14 +1162,20 @@ static int start_transient_service(
                         assert_not_reached("Can't allocate tty via ssh");
         }
 
-        if (!arg_no_block) {
+        /* Optionally, wait for the start job to complete. If we are supposed to read the service's stdin
+         * lets skip this however, because we should start that already when the start job is running, and
+         * there's little point in waiting for the start job to complete in that case anyway, as we'll wait
+         * for EOF anyway, which is going to be much later. */
+        if (!arg_no_block && arg_stdio == ARG_STDIO_NONE) {
                 r = bus_wait_for_jobs_new(bus, &w);
                 if (r < 0)
                         return log_error_errno(r, "Could not watch jobs: %m");
         }
 
         if (arg_unit) {
-                r = unit_name_mangle_with_suffix(arg_unit, arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN, ".service", &service);
+                r = unit_name_mangle_with_suffix(arg_unit, "as unit",
+                                                 arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN,
+                                                 ".service", &service);
                 if (r < 0)
                         return log_error_errno(r, "Failed to mangle unit name: %m");
         } else {
@@ -1074,13 +1184,7 @@ static int start_transient_service(
                         return r;
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "StartTransientUnit");
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "StartTransientUnit");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1137,6 +1241,8 @@ static int start_transient_service(
                         .cpu_usage_nsec = NSEC_INFINITY,
                         .ip_ingress_bytes = UINT64_MAX,
                         .ip_egress_bytes = UINT64_MAX,
+                        .io_read_bytes = UINT64_MAX,
+                        .io_write_bytes = UINT64_MAX,
                         .inactive_exit_usec = USEC_INFINITY,
                         .inactive_enter_usec = USEC_INFINITY,
                 };
@@ -1203,7 +1309,7 @@ static int start_transient_service(
 
                 if (arg_wait && !arg_quiet) {
 
-                        /* Explicitly destroy the PTY forwarder, so that the PTY device is usable again, in its
+                        /* Explicitly destroy the PTY forwarder, so that the PTY device is usable again, with its
                          * original settings (i.e. proper line breaks), so that we can show the summary in a pretty
                          * way. */
                         c.forward = pty_forward_free(c.forward);
@@ -1212,35 +1318,52 @@ static int start_transient_service(
                                 log_info("Finished with result: %s", strna(c.result));
 
                         if (c.exit_code == CLD_EXITED)
-                                log_info("Main processes terminated with: code=%s/status=%i", sigchld_code_to_string(c.exit_code), c.exit_status);
+                                log_info("Main processes terminated with: code=%s/status=%i",
+                                         sigchld_code_to_string(c.exit_code), c.exit_status);
                         else if (c.exit_code > 0)
-                                log_info("Main processes terminated with: code=%s/status=%s", sigchld_code_to_string(c.exit_code), signal_to_string(c.exit_status));
+                                log_info("Main processes terminated with: code=%s/status=%s",
+                                         sigchld_code_to_string(c.exit_code), signal_to_string(c.exit_status));
 
-                        if (c.inactive_enter_usec > 0 && c.inactive_enter_usec != USEC_INFINITY &&
-                            c.inactive_exit_usec > 0 && c.inactive_exit_usec != USEC_INFINITY &&
+                        if (timestamp_is_set(c.inactive_enter_usec) &&
+                            timestamp_is_set(c.inactive_exit_usec) &&
                             c.inactive_enter_usec > c.inactive_exit_usec) {
                                 char ts[FORMAT_TIMESPAN_MAX];
-                                log_info("Service runtime: %s", format_timespan(ts, sizeof(ts), c.inactive_enter_usec - c.inactive_exit_usec, USEC_PER_MSEC));
+                                log_info("Service runtime: %s",
+                                         format_timespan(ts, sizeof ts, c.inactive_enter_usec - c.inactive_exit_usec, USEC_PER_MSEC));
                         }
 
                         if (c.cpu_usage_nsec != NSEC_INFINITY) {
                                 char ts[FORMAT_TIMESPAN_MAX];
-                                log_info("CPU time consumed: %s", format_timespan(ts, sizeof(ts), (c.cpu_usage_nsec + NSEC_PER_USEC - 1) / NSEC_PER_USEC, USEC_PER_MSEC));
+                                log_info("CPU time consumed: %s",
+                                         format_timespan(ts, sizeof ts, DIV_ROUND_UP(c.cpu_usage_nsec, NSEC_PER_USEC), USEC_PER_MSEC));
                         }
 
                         if (c.ip_ingress_bytes != UINT64_MAX) {
                                 char bytes[FORMAT_BYTES_MAX];
-                                log_info("IP traffic received: %s", format_bytes(bytes, sizeof(bytes), c.ip_ingress_bytes));
+                                log_info("IP traffic received: %s", format_bytes(bytes, sizeof bytes, c.ip_ingress_bytes));
                         }
                         if (c.ip_egress_bytes != UINT64_MAX) {
                                 char bytes[FORMAT_BYTES_MAX];
-                                log_info("IP traffic sent: %s", format_bytes(bytes, sizeof(bytes), c.ip_egress_bytes));
+                                log_info("IP traffic sent: %s", format_bytes(bytes, sizeof bytes, c.ip_egress_bytes));
+                        }
+                        if (c.io_read_bytes != UINT64_MAX) {
+                                char bytes[FORMAT_BYTES_MAX];
+                                log_info("IO bytes read: %s", format_bytes(bytes, sizeof bytes, c.io_read_bytes));
+                        }
+                        if (c.io_write_bytes != UINT64_MAX) {
+                                char bytes[FORMAT_BYTES_MAX];
+                                log_info("IO bytes written: %s", format_bytes(bytes, sizeof bytes, c.io_write_bytes));
                         }
                 }
 
-                /* Try to propagate the service's return value */
-                if (c.result && STR_IN_SET(c.result, "success", "exit-code") && c.exit_code == CLD_EXITED)
+                /* Try to propagate the service's return value. But if the service defines
+                 * e.g. SuccessExitStatus, honour this, and return 0 to mean "success". */
+                if (streq_ptr(c.result, "success"))
+                        *retval = 0;
+                else if (streq_ptr(c.result, "exit-code") && c.exit_status > 0)
                         *retval = c.exit_status;
+                else if (streq_ptr(c.result, "signal"))
+                        *retval = EXIT_EXCEPTION;
                 else
                         *retval = EXIT_FAILURE;
         }
@@ -1298,7 +1421,9 @@ static int start_transient_scope(sd_bus *bus) {
                 return log_oom();
 
         if (arg_unit) {
-                r = unit_name_mangle_with_suffix(arg_unit, arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN, ".scope", &scope);
+                r = unit_name_mangle_with_suffix(arg_unit, "as unit",
+                                                 arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN,
+                                                 ".scope", &scope);
                 if (r < 0)
                         return log_error_errno(r, "Failed to mangle scope name: %m");
         } else {
@@ -1307,13 +1432,7 @@ static int start_transient_scope(sd_bus *bus) {
                         return r;
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "StartTransientUnit");
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "StartTransientUnit");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1348,7 +1467,7 @@ static int start_transient_scope(sd_bus *bus) {
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
-                return log_error_errno(r, "Failed to start transient scope unit: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to start transient scope unit: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "o", &object);
         if (r < 0)
@@ -1473,11 +1592,15 @@ static int start_transient_trigger(
                         break;
 
                 default:
-                        r = unit_name_mangle_with_suffix(arg_unit, arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN, ".service", &service);
+                        r = unit_name_mangle_with_suffix(arg_unit, "as unit",
+                                                         arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN,
+                                                         ".service", &service);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to mangle unit name: %m");
 
-                        r = unit_name_mangle_with_suffix(arg_unit, arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN, suffix, &trigger);
+                        r = unit_name_mangle_with_suffix(arg_unit, "as trigger",
+                                                         arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN,
+                                                         suffix, &trigger);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to mangle unit name: %m");
 
@@ -1493,13 +1616,7 @@ static int start_transient_trigger(
                         return log_error_errno(r, "Failed to change unit suffix: %m");
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "StartTransientUnit");
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "StartTransientUnit");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1570,7 +1687,7 @@ static int start_transient_trigger(
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
-                return log_error_errno(r, "Failed to start transient %s unit: %s", suffix + 1, bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to start transient %s unit: %s", suffix + 1, bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "o", &object);
         if (r < 0)
@@ -1594,6 +1711,7 @@ static int run(int argc, char* argv[]) {
         _cleanup_free_ char *description = NULL;
         int r, retval = EXIT_SUCCESS;
 
+        log_show_color(true);
         log_parse_environment();
         log_open();
 
@@ -1601,12 +1719,16 @@ static int run(int argc, char* argv[]) {
         if (r <= 0)
                 return r;
 
-        if (!strv_isempty(arg_cmdline) && arg_transport == BUS_TRANSPORT_LOCAL) {
+        if (!strv_isempty(arg_cmdline) &&
+            arg_transport == BUS_TRANSPORT_LOCAL &&
+            !strv_find_startswith(arg_property, "RootDirectory=") &&
+            !strv_find_startswith(arg_property, "RootImage=")) {
+                /* Patch in an absolute path to fail early for user convenience, but only when we can do it
+                 * (i.e. we will be running from the same file system). This also uses the user's $PATH,
+                 * while we use a fixed search path in the manager. */
+
                 _cleanup_free_ char *command = NULL;
-
-                /* Patch in an absolute path */
-
-                r = find_binary(arg_cmdline[0], &command);
+                r = find_executable(arg_cmdline[0], &command);
                 if (r < 0)
                         return log_error_errno(r, "Failed to find executable %s: %m", arg_cmdline[0]);
 
@@ -1634,7 +1756,7 @@ static int run(int argc, char* argv[]) {
         else
                 r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
         if (r < 0)
-                return log_error_errno(r, "Failed to create bus connection: %m");
+                return bus_log_connect_error(r);
 
         if (arg_scope)
                 r = start_transient_scope(bus);
@@ -1642,7 +1764,7 @@ static int run(int argc, char* argv[]) {
                 r = start_transient_trigger(bus, ".path");
         else if (arg_socket_property)
                 r = start_transient_trigger(bus, ".socket");
-        else if (with_timer)
+        else if (arg_with_timer)
                 r = start_transient_trigger(bus, ".timer");
         else
                 r = start_transient_service(bus, &retval);

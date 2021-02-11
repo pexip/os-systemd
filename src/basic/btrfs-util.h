@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -34,6 +34,7 @@ typedef enum BtrfsSnapshotFlags {
         BTRFS_SNAPSHOT_QUOTA              = 1 << 3,
         BTRFS_SNAPSHOT_FALLBACK_DIRECTORY = 1 << 4, /* If the destination doesn't support subvolumes, reflink/copy instead */
         BTRFS_SNAPSHOT_FALLBACK_IMMUTABLE = 1 << 5, /* When we can't create a subvolume, use the FS_IMMUTABLE attribute for indicating read-only */
+        BTRFS_SNAPSHOT_SIGINT             = 1 << 6, /* Check for SIGINT regularly, and return EINTR if seen */
 } BtrfsSnapshotFlags;
 
 typedef enum BtrfsRemoveFlags {
@@ -64,6 +65,8 @@ int btrfs_quota_scan_ongoing(int fd);
 
 int btrfs_subvol_make(const char *path);
 int btrfs_subvol_make_fd(int fd, const char *subvolume);
+
+int btrfs_subvol_make_fallback(const char *path, mode_t);
 
 int btrfs_subvol_snapshot_fd_full(int old_fd, const char *new_path, BtrfsSnapshotFlags flags, copy_progress_path_t progress_path, copy_progress_bytes_t progress_bytes, void *userdata);
 static inline int btrfs_subvol_snapshot_fd(int old_fd, const char *new_path, BtrfsSnapshotFlags flags) {
@@ -118,3 +121,9 @@ int btrfs_qgroup_find_parents(int fd, uint64_t qgroupid, uint64_t **ret);
 
 int btrfs_qgroup_get_quota_fd(int fd, uint64_t qgroupid, BtrfsQuotaInfo *quota);
 int btrfs_qgroup_get_quota(const char *path, uint64_t qgroupid, BtrfsQuotaInfo *quota);
+
+static inline int btrfs_log_dev_root(int level, int ret, const char *p) {
+        return log_full_errno(level, ret,
+                              "File system behind %s is reported by btrfs to be backed by pseudo-device /dev/root, which is not a valid userspace accessible device node. "
+                              "Cannot determine correct backing block device.", p);
+}

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <getopt.h>
@@ -158,6 +158,7 @@ static int run(int argc, char *argv[]) {
         char **p;
         int r;
 
+        log_show_color(true);
         log_parse_environment();
         log_open();
 

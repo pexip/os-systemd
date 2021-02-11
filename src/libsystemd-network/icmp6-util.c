@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2014 Intel Corporation. All rights reserved.
 ***/
@@ -9,7 +9,6 @@
 #include <netinet/ip6.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <net/if.h>
@@ -31,9 +30,8 @@
 
 static int icmp6_bind_router_message(const struct icmp6_filter *filter,
                                      const struct ipv6_mreq *mreq) {
-        int index = mreq->ipv6mr_interface;
+        int ifindex = mreq->ipv6mr_interface;
         _cleanup_close_ int s = -1;
-        char ifname[IF_NAMESIZE] = "";
         int r;
 
         s = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_ICMPV6);
@@ -52,7 +50,7 @@ static int icmp6_bind_router_message(const struct icmp6_filter *filter,
            IPV6_PKTINFO socket option also applies for ICMPv6 multicast.
            Empirical experiments indicates otherwise and therefore an
            IPV6_MULTICAST_IF socket option is used here instead */
-        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_MULTICAST_IF, index);
+        r = setsockopt_int(s, IPPROTO_IPV6, IPV6_MULTICAST_IF, ifindex);
         if (r < 0)
                 return r;
 
@@ -76,21 +74,18 @@ static int icmp6_bind_router_message(const struct icmp6_filter *filter,
         if (r < 0)
                 return r;
 
-        if (if_indextoname(index, ifname) == 0)
-                return -errno;
-
-        r = setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
+        r = socket_bind_to_ifindex(s, ifindex);
         if (r < 0)
-                return -errno;
+                return r;
 
         return TAKE_FD(s);
 }
 
-int icmp6_bind_router_solicitation(int index) {
+int icmp6_bind_router_solicitation(int ifindex) {
         struct icmp6_filter filter = {};
         struct ipv6_mreq mreq = {
                 .ipv6mr_multiaddr = IN6ADDR_ALL_NODES_MULTICAST_INIT,
-                .ipv6mr_interface = index,
+                .ipv6mr_interface = ifindex,
         };
 
         ICMP6_FILTER_SETBLOCKALL(&filter);
@@ -99,11 +94,11 @@ int icmp6_bind_router_solicitation(int index) {
         return icmp6_bind_router_message(&filter, &mreq);
 }
 
-int icmp6_bind_router_advertisement(int index) {
+int icmp6_bind_router_advertisement(int ifindex) {
         struct icmp6_filter filter = {};
         struct ipv6_mreq mreq = {
                 .ipv6mr_multiaddr = IN6ADDR_ALL_ROUTERS_MULTICAST_INIT,
-                .ipv6mr_interface = index,
+                .ipv6mr_interface = ifindex,
         };
 
         ICMP6_FILTER_SETBLOCKALL(&filter);
@@ -152,11 +147,9 @@ int icmp6_send_router_solicitation(int s, const struct ether_addr *ether_addr) {
 
 int icmp6_receive(int fd, void *buffer, size_t size, struct in6_addr *dst,
                   triple_timestamp *timestamp) {
-        union {
-                struct cmsghdr cmsghdr;
-                uint8_t buf[CMSG_SPACE(sizeof(int)) + /* ttl */
-                            CMSG_SPACE(sizeof(struct timeval))];
-        } control = {};
+
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(int)) + /* ttl */
+                         CMSG_SPACE(sizeof(struct timeval))) control;
         struct iovec iov = {};
         union sockaddr_union sa = {};
         struct msghdr msg = {
@@ -172,9 +165,9 @@ int icmp6_receive(int fd, void *buffer, size_t size, struct in6_addr *dst,
 
         iov = IOVEC_MAKE(buffer, size);
 
-        len = recvmsg(fd, &msg, MSG_DONTWAIT);
+        len = recvmsg_safe(fd, &msg, MSG_DONTWAIT);
         if (len < 0)
-                return -errno;
+                return (int) len;
 
         if ((size_t) len != size)
                 return -EINVAL;

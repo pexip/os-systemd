@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <linux/magic.h>
@@ -31,4 +31,9 @@
 /* Not exposed yet (4.20). Defined at ipc/mqueue.c */
 #ifndef MQUEUE_MAGIC
 #define MQUEUE_MAGIC 0x19800202
+#endif
+
+/* Not exposed yet (as of Linux 5.4). Defined in fs/xfs/libxfs/xfs_format.h */
+#ifndef XFS_SB_MAGIC
+#define XFS_SB_MAGIC 0x58465342
 #endif

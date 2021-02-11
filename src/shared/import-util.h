@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -23,3 +23,5 @@ int tar_strip_suffixes(const char *name, char **ret);
 int raw_strip_suffixes(const char *name, char **ret);
 
 int import_assign_pool_quota_and_warn(const char *path);
+
+int import_set_nocow_and_log(int fd, const char *path);

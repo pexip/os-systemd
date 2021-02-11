@@ -1,7 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
-#include <string.h>
 
 #include "sd-device.h"
 
@@ -169,7 +168,6 @@ int devnode_acl_all(const char *seat,
         _cleanup_closedir_ DIR *dir = NULL;
         struct dirent *dent;
         sd_device *d;
-        Iterator i;
         char *n;
         int r;
 
@@ -196,6 +194,10 @@ int devnode_acl_all(const char *seat,
         FOREACH_DEVICE(e, d) {
                 const char *node, *sn;
 
+                /* Make sure the tag is still in place */
+                if (sd_device_has_current_tag(d, "uaccess") <= 0)
+                        continue;
+
                 if (sd_device_get_property_value(d, "ID_SEAT", &sn) < 0 || isempty(sn))
                         sn = "seat0";
 
@@ -207,7 +209,7 @@ int devnode_acl_all(const char *seat,
                         continue;
 
                 log_device_debug(d, "Found udev node %s for seat %s", node, seat);
-                r = set_put_strdup(nodes, node);
+                r = set_put_strdup(&nodes, node);
                 if (r < 0)
                         return r;
         }
@@ -222,7 +224,7 @@ int devnode_acl_all(const char *seat,
                         if (cunescape(dent->d_name, UNESCAPE_RELAX, &unescaped_devname) < 0)
                                 return -ENOMEM;
 
-                        n = strappend("/dev/", unescaped_devname);
+                        n = path_join("/dev", unescaped_devname);
                         if (!n)
                                 return -ENOMEM;
 
@@ -236,7 +238,7 @@ int devnode_acl_all(const char *seat,
         }
 
         r = 0;
-        SET_FOREACH(n, nodes, i) {
+        SET_FOREACH(n, nodes) {
                 int k;
 
                 log_debug("Changing ACLs at %s for seat %s (uid "UID_FMT"→"UID_FMT"%s%s)",

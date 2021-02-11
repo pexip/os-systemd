@@ -1,7 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
-#include <string.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
 
@@ -13,13 +12,16 @@
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
+#include "bus-get-properties.h"
 #include "bus-internal.h"
 #include "bus-label.h"
-#include "bus-util.h"
+#include "bus-locator.h"
+#include "bus-polkit.h"
 #include "copy.h"
 #include "env-file.h"
 #include "env-util.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "in-addr-util.h"
@@ -29,6 +31,8 @@
 #include "machine.h"
 #include "missing_capability.h"
 #include "mkdir.h"
+#include "mount-util.h"
+#include "namespace-util.h"
 #include "os-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -59,6 +63,34 @@ static int property_get_netif(
         assert_cc(sizeof(int) == sizeof(int32_t));
 
         return sd_bus_message_append_array(reply, 'i', m->netif, m->n_netif * sizeof(int));
+}
+
+int bus_machine_method_unregister(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Machine *m = userdata;
+        int r;
+
+        assert(message);
+        assert(m);
+
+        r = bus_verify_polkit_async(
+                        message,
+                        CAP_KILL,
+                        "org.freedesktop.machine1.manage-machines",
+                        NULL,
+                        false,
+                        UID_INVALID,
+                        &m->manager->polkit_registry,
+                        error);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return 1; /* Will call us back */
+
+        r = machine_finalize(m);
+        if (r < 0)
+                return r;
+
+        return sd_bus_reply_method_return(message, NULL);
 }
 
 int bus_machine_method_terminate(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -370,11 +402,9 @@ int bus_machine_method_get_os_release(sd_bus_message *message, void *userdata, s
 
                 pair[1] = safe_close(pair[1]);
 
-                f = fdopen(pair[0], "r");
+                f = take_fdopen(&pair[0], "r");
                 if (!f)
                         return -errno;
-
-                pair[0] = -1;
 
                 r = load_env_file_pairs(f, "/etc/os-release", &l);
                 if (r < 0)
@@ -422,13 +452,9 @@ int bus_machine_method_open_pty(sd_bus_message *message, void *userdata, sd_bus_
         if (r == 0)
                 return 1; /* Will call us back */
 
-        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC, &pty_name);
         if (master < 0)
                 return master;
-
-        r = ptsname_namespace(master, &pty_name);
-        if (r < 0)
-                return r;
 
         r = sd_bus_message_new_method_return(message, &reply);
         if (r < 0)
@@ -513,17 +539,12 @@ int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bu
         if (r == 0)
                 return 1; /* Will call us back */
 
-        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC, &pty_name);
         if (master < 0)
                 return master;
 
-        r = ptsname_namespace(master, &pty_name);
-        if (r < 0)
-                return r;
-
         p = path_startswith(pty_name, "/dev/pts/");
-        if (!p)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "PTS name %s is invalid", pty_name);
+        assert(p);
 
         r = container_bus_new(m, error, &allocated_bus);
         if (r < 0)
@@ -533,14 +554,7 @@ int bus_machine_method_open_login(sd_bus_message *message, void *userdata, sd_bu
 
         getty = strjoina("container-getty@", p, ".service");
 
-        r = sd_bus_call_method(
-                        container_bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "StartUnit",
-                        error, NULL,
-                        "ss", getty, "replace");
+        r = bus_call_method(container_bus, bus_systemd_mgr, "StartUnit", error, NULL, "ss", getty, "replace");
         if (r < 0)
                 return r;
 
@@ -572,7 +586,7 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         r = sd_bus_message_read(message, "ss", &user, &path);
         if (r < 0)
                 return r;
-        user = empty_to_null(user);
+        user = isempty(user) ? "root" : user;
         r = sd_bus_message_read_strv(message, &args_wire);
         if (r < 0)
                 return r;
@@ -591,7 +605,7 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
                 r = asprintf(&args[2],
                              "shell=$(getent passwd %s 2>/dev/null | { IFS=: read _ _ _ _ _ _ x; echo \"$x\"; })\n"\
                              "exec \"${shell:-/bin/sh}\" -l", /* -l is means --login */
-                             isempty(user) ? "root" : user);
+                             user);
                 if (r < 0) {
                         args[2] = NULL;
                         return -ENOMEM;
@@ -615,11 +629,18 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         if (!strv_env_is_valid(env))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid environment assignments");
 
+        const char *details[] = {
+                "machine", m->name,
+                "user", user,
+                "program", path,
+                NULL
+        };
+
         r = bus_verify_polkit_async(
                         message,
                         CAP_SYS_ADMIN,
                         m->class == MACHINE_HOST ? "org.freedesktop.machine1.host-shell" : "org.freedesktop.machine1.shell",
-                        NULL,
+                        details,
                         false,
                         UID_INVALID,
                         &m->manager->polkit_registry,
@@ -629,13 +650,9 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         if (r == 0)
                 return 1; /* Will call us back */
 
-        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        master = machine_openpt(m, O_RDWR|O_NOCTTY|O_CLOEXEC, &pty_name);
         if (master < 0)
                 return master;
-
-        r = ptsname_namespace(master, &pty_name);
-        if (r < 0)
-                return r;
 
         p = path_startswith(pty_name, "/dev/pts/");
         assert(p);
@@ -653,13 +670,7 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
 
         container_bus = allocated_bus ?: m->manager->bus;
 
-        r = sd_bus_message_new_method_call(
-                        container_bus,
-                        &tm,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "StartTransientUnit");
+        r = bus_message_new_method_call(container_bus, &tm, bus_systemd_mgr, "StartTransientUnit");
         if (r < 0)
                 return r;
 
@@ -674,7 +685,7 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
-        description = strjoina("Shell for User ", isempty(user) ? "root" : user);
+        description = strjoina("Shell for User ", user);
         r = sd_bus_message_append(tm,
                                   "(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)(sv)",
                                   "Description", "s", description,
@@ -692,7 +703,7 @@ int bus_machine_method_open_shell(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
-        r = sd_bus_message_append(tm, "(sv)", "User", "s", isempty(user) ? "root" : user);
+        r = sd_bus_message_append(tm, "(sv)", "User", "s", user);
         if (r < 0)
                 return r;
 
@@ -858,7 +869,7 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         if (laccess(p, F_OK) < 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED, "Container does not allow propagation of mount points.");
 
-        r = chase_symlinks(src, NULL, CHASE_TRAIL_SLASH, &chased_src);
+        r = chase_symlinks(src, NULL, CHASE_TRAIL_SLASH, &chased_src, NULL);
         if (r < 0)
                 return sd_bus_error_set_errnof(error, r, "Failed to resolve source path: %m");
 
@@ -881,15 +892,17 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
 
         mount_slave_created = true;
 
-        if (mount(mount_slave, mount_slave, NULL, MS_BIND, NULL) < 0) {
-                r = sd_bus_error_set_errnof(error, errno, "Failed to make bind mount %s: %m", mount_slave);
+        r = mount_nofollow_verbose(LOG_DEBUG, mount_slave, mount_slave, NULL, MS_BIND, NULL);
+        if (r < 0) {
+                sd_bus_error_set_errnof(error, r, "Failed to make bind mount %s: %m", mount_slave);
                 goto finish;
         }
 
         mount_slave_mounted = true;
 
-        if (mount(NULL, mount_slave, NULL, MS_SLAVE, NULL) < 0) {
-                r = sd_bus_error_set_errnof(error, errno, "Failed to remount slave %s: %m", mount_slave);
+        r = mount_nofollow_verbose(LOG_DEBUG, NULL, mount_slave, NULL, MS_SLAVE, NULL);
+        if (r < 0) {
+                sd_bus_error_set_errnof(error, r, "Failed to remount slave %s: %m", mount_slave);
                 goto finish;
         }
 
@@ -900,25 +913,28 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
         else
                 r = touch(mount_tmp);
         if (r < 0) {
-                sd_bus_error_set_errnof(error, errno, "Failed to create temporary mount point %s: %m", mount_tmp);
+                sd_bus_error_set_errnof(error, r, "Failed to create temporary mount point %s: %m", mount_tmp);
                 goto finish;
         }
 
         mount_tmp_created = true;
 
-        if (mount(chased_src, mount_tmp, NULL, MS_BIND, NULL) < 0) {
-                r = sd_bus_error_set_errnof(error, errno, "Failed to mount %s: %m", chased_src);
+        r = mount_nofollow_verbose(LOG_DEBUG, chased_src, mount_tmp, NULL, MS_BIND, NULL);
+        if (r < 0) {
+                sd_bus_error_set_errnof(error, r, "Failed to mount %s: %m", chased_src);
                 goto finish;
         }
 
         mount_tmp_mounted = true;
 
         /* Third, we remount the new bind mount read-only if requested. */
-        if (read_only)
-                if (mount(NULL, mount_tmp, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY, NULL) < 0) {
-                        r = sd_bus_error_set_errnof(error, errno, "Failed to remount read-only %s: %m", mount_tmp);
+        if (read_only) {
+                r = mount_nofollow_verbose(LOG_DEBUG, NULL, mount_tmp, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY, NULL);
+                if (r < 0) {
+                        sd_bus_error_set_errnof(error, r, "Failed to remount read-only %s: %m", mount_tmp);
                         goto finish;
                 }
+        }
 
         /* Fourth, we move the new bind mount into the propagation directory. This way it will appear there read-only
          * right-away. */
@@ -931,14 +947,15 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                 safe_close(r);
         }
         if (r < 0) {
-                sd_bus_error_set_errnof(error, errno, "Cannot create propagation file or directory %s: %m", mount_outside);
+                sd_bus_error_set_errnof(error, r, "Cannot create propagation file or directory %s: %m", mount_outside);
                 goto finish;
         }
 
         mount_outside_created = true;
 
-        if (mount(mount_tmp, mount_outside, NULL, MS_MOVE, NULL) < 0) {
-                r = sd_bus_error_set_errnof(error, errno, "Failed to move %s to %s: %m", mount_tmp, mount_outside);
+        r = mount_nofollow_verbose(LOG_DEBUG, mount_tmp, mount_outside, NULL, MS_MOVE, NULL);
+        if (r < 0) {
+                sd_bus_error_set_errnof(error, r, "Failed to move %s to %s: %m", mount_tmp, mount_outside);
                 goto finish;
         }
 
@@ -951,7 +968,7 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                 (void) unlink(mount_tmp);
         mount_tmp_created = false;
 
-        (void) umount(mount_slave);
+        (void) umount_verbose(LOG_DEBUG, mount_slave, UMOUNT_NOFOLLOW);
         mount_slave_mounted = false;
 
         (void) rmdir(mount_slave);
@@ -968,9 +985,8 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                 goto finish;
         }
         if (r == 0) {
-                const char *mount_inside;
+                const char *mount_inside, *q;
                 int mntfd;
-                const char *q;
 
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
 
@@ -991,16 +1007,14 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
                                 (void) mkdir_p(dest, 0755);
                         else {
                                 (void) mkdir_parents(dest, 0755);
-                                safe_close(open(dest, O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC|O_NOCTTY, 0600));
+                                (void) mknod(dest, S_IFREG|0600, 0);
                         }
                 }
 
-                /* Fifth, move the mount to the right place inside */
-                mount_inside = strjoina("/run/systemd/nspawn/incoming/", basename(mount_outside));
-                if (mount(mount_inside, dest, NULL, MS_MOVE, NULL) < 0) {
-                        r = log_error_errno(errno, "Failed to mount: %m");
+                mount_inside = strjoina("/run/host/incoming/", basename(mount_outside));
+                r = mount_nofollow_verbose(LOG_ERR, mount_inside, dest, NULL, MS_MOVE, NULL);
+                if (r < 0)
                         goto child_fail;
-                }
 
                 _exit(EXIT_SUCCESS);
 
@@ -1030,7 +1044,7 @@ int bus_machine_method_bind_mount(sd_bus_message *message, void *userdata, sd_bu
 
 finish:
         if (mount_outside_mounted)
-                (void) umount(mount_outside);
+                (void) umount_verbose(LOG_DEBUG, mount_outside, UMOUNT_NOFOLLOW);
         if (mount_outside_created) {
                 if (S_ISDIR(st.st_mode))
                         (void) rmdir(mount_outside);
@@ -1039,7 +1053,7 @@ finish:
         }
 
         if (mount_tmp_mounted)
-                (void) umount(mount_tmp);
+                (void) umount_verbose(LOG_DEBUG, mount_tmp, UMOUNT_NOFOLLOW);
         if (mount_tmp_created) {
                 if (S_ISDIR(st.st_mode))
                         (void) rmdir(mount_tmp);
@@ -1048,7 +1062,7 @@ finish:
         }
 
         if (mount_slave_mounted)
-                (void) umount(mount_slave);
+                (void) umount_verbose(LOG_DEBUG, mount_slave, UMOUNT_NOFOLLOW);
         if (mount_slave_created)
                 (void) rmdir(mount_slave);
 
@@ -1058,7 +1072,7 @@ finish:
 int bus_machine_method_copy(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         const char *src, *dest, *host_path, *container_path, *host_basename, *container_basename, *container_dirname;
         _cleanup_close_pair_ int errno_pipe_fd[2] = { -1, -1 };
-        CopyFlags copy_flags = COPY_REFLINK|COPY_MERGE;
+        CopyFlags copy_flags = COPY_REFLINK|COPY_MERGE|COPY_HARDLINKS;
         _cleanup_close_ int hostfd = -1;
         Machine *m = userdata;
         bool copy_from;
@@ -1306,35 +1320,7 @@ int bus_machine_method_get_uid_shift(sd_bus_message *message, void *userdata, sd
         return sd_bus_reply_method_return(message, "u", (uint32_t) shift);
 }
 
-const sd_bus_vtable machine_vtable[] = {
-        SD_BUS_VTABLE_START(0),
-        SD_BUS_PROPERTY("Name", "s", NULL, offsetof(Machine, name), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Id", "ay", bus_property_get_id128, offsetof(Machine, id), SD_BUS_VTABLE_PROPERTY_CONST),
-        BUS_PROPERTY_DUAL_TIMESTAMP("Timestamp", offsetof(Machine, timestamp), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Service", "s", NULL, offsetof(Machine, service), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Unit", "s", NULL, offsetof(Machine, unit), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Scope", "s", NULL, offsetof(Machine, unit), SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_HIDDEN),
-        SD_BUS_PROPERTY("Leader", "u", NULL, offsetof(Machine, leader), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("Class", "s", property_get_class, offsetof(Machine, class), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("RootDirectory", "s", NULL, offsetof(Machine, root_directory), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("NetworkInterfaces", "ai", property_get_netif, 0, SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("State", "s", property_get_state, 0, 0),
-        SD_BUS_METHOD("Terminate", NULL, NULL, bus_machine_method_terminate, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("Kill", "si", NULL, bus_machine_method_kill, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetAddresses", NULL, "a(iay)", bus_machine_method_get_addresses, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetOSRelease", NULL, "a{ss}", bus_machine_method_get_os_release, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetUIDShift", NULL, "u", bus_machine_method_get_uid_shift, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("OpenPTY", NULL, "hs", bus_machine_method_open_pty, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("OpenLogin", NULL, "hs", bus_machine_method_open_login, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("OpenShell", "ssasas", "hs", bus_machine_method_open_shell, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("BindMount", "ssbb", NULL, bus_machine_method_bind_mount, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CopyFrom", "ss", NULL, bus_machine_method_copy, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("CopyTo", "ss", NULL, bus_machine_method_copy, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("OpenRootDirectory", NULL, "h", bus_machine_method_open_root_directory, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_VTABLE_END
-};
-
-int machine_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
+static int machine_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
         Manager *m = userdata;
         Machine *machine;
         int r;
@@ -1395,21 +1381,20 @@ char *machine_bus_path(Machine *m) {
         if (!e)
                 return NULL;
 
-        return strappend("/org/freedesktop/machine1/machine/", e);
+        return strjoin("/org/freedesktop/machine1/machine/", e);
 }
 
-int machine_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
+static int machine_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_strv_free_ char **l = NULL;
         Machine *machine = NULL;
         Manager *m = userdata;
-        Iterator i;
         int r;
 
         assert(bus);
         assert(path);
         assert(nodes);
 
-        HASHMAP_FOREACH(machine, m->machines, i) {
+        HASHMAP_FOREACH(machine, m->machines) {
                 char *p;
 
                 p = machine_bus_path(machine);
@@ -1425,6 +1410,115 @@ int machine_node_enumerator(sd_bus *bus, const char *path, void *userdata, char 
 
         return 1;
 }
+
+static const sd_bus_vtable machine_vtable[] = {
+        SD_BUS_VTABLE_START(0),
+        SD_BUS_PROPERTY("Name", "s", NULL, offsetof(Machine, name), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Id", "ay", bus_property_get_id128, offsetof(Machine, id), SD_BUS_VTABLE_PROPERTY_CONST),
+        BUS_PROPERTY_DUAL_TIMESTAMP("Timestamp", offsetof(Machine, timestamp), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Service", "s", NULL, offsetof(Machine, service), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Unit", "s", NULL, offsetof(Machine, unit), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Scope", "s", NULL, offsetof(Machine, unit), SD_BUS_VTABLE_PROPERTY_CONST|SD_BUS_VTABLE_HIDDEN),
+        SD_BUS_PROPERTY("Leader", "u", NULL, offsetof(Machine, leader), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("Class", "s", property_get_class, offsetof(Machine, class), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("RootDirectory", "s", NULL, offsetof(Machine, root_directory), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("NetworkInterfaces", "ai", property_get_netif, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("State", "s", property_get_state, 0, 0),
+
+        SD_BUS_METHOD("Terminate",
+                      NULL,
+                      NULL,
+                      bus_machine_method_terminate,
+                      SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("Kill",
+                                 "si",
+                                 SD_BUS_PARAM(who)
+                                 SD_BUS_PARAM(signal),
+                                 NULL,,
+                                 bus_machine_method_kill,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetAddresses",
+                                 NULL,,
+                                 "a(iay)",
+                                 SD_BUS_PARAM(addresses),
+                                 bus_machine_method_get_addresses,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetOSRelease",
+                                 NULL,,
+                                 "a{ss}",
+                                 SD_BUS_PARAM(fields),
+                                 bus_machine_method_get_os_release,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("GetUIDShift",
+                                 NULL,,
+                                 "u",
+                                 SD_BUS_PARAM(shift),
+                                 bus_machine_method_get_uid_shift,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("OpenPTY",
+                                 NULL,,
+                                 "hs",
+                                 SD_BUS_PARAM(pty)
+                                 SD_BUS_PARAM(pty_path),
+                                 bus_machine_method_open_pty,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("OpenLogin",
+                                 NULL,,
+                                 "hs",
+                                 SD_BUS_PARAM(pty)
+                                 SD_BUS_PARAM(pty_path),
+                                 bus_machine_method_open_login,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("OpenShell",
+                                 "ssasas",
+                                 SD_BUS_PARAM(user)
+                                 SD_BUS_PARAM(path)
+                                 SD_BUS_PARAM(args)
+                                 SD_BUS_PARAM(environment),
+                                 "hs",
+                                 SD_BUS_PARAM(pty)
+                                 SD_BUS_PARAM(pty_path),
+                                 bus_machine_method_open_shell,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("BindMount",
+                                 "ssbb",
+                                 SD_BUS_PARAM(source)
+                                 SD_BUS_PARAM(destination)
+                                 SD_BUS_PARAM(read_only)
+                                 SD_BUS_PARAM(mkdir),
+                                 NULL,,
+                                 bus_machine_method_bind_mount,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CopyFrom",
+                                 "ss",
+                                 SD_BUS_PARAM(source)
+                                 SD_BUS_PARAM(destination),
+                                 NULL,,
+                                 bus_machine_method_copy,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("CopyTo",
+                                 "ss",
+                                 SD_BUS_PARAM(source)
+                                 SD_BUS_PARAM(destination),
+                                 NULL,,
+                                 bus_machine_method_copy,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD_WITH_NAMES("OpenRootDirectory",
+                                 NULL,,
+                                 "h",
+                                 SD_BUS_PARAM(fd),
+                                 bus_machine_method_open_root_directory,
+                                 SD_BUS_VTABLE_UNPRIVILEGED),
+
+        SD_BUS_VTABLE_END
+};
+
+const BusObjectImplementation machine_object = {
+        "/org/freedesktop/machine1/machine",
+        "org.freedesktop.machine1.Machine",
+        .fallback_vtables = BUS_FALLBACK_VTABLES({machine_vtable, machine_object_find}),
+        .node_enumerator = machine_node_enumerator,
+};
 
 int machine_send_signal(Machine *m, bool new_machine) {
         _cleanup_free_ char *p = NULL;

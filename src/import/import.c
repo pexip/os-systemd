@@ -1,6 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
+#include <locale.h>
 
 #include "sd-event.h"
 #include "sd-id128.h"
@@ -48,15 +49,13 @@ static int import_tar(int argc, char *argv[], void *userdata) {
 
         if (argc >= 2)
                 path = argv[1];
-        if (isempty(path) || streq(path, "-"))
-                path = NULL;
+        path = empty_or_dash_to_null(path);
 
         if (argc >= 3)
                 local = argv[2];
         else if (path)
                 local = basename(path);
-        if (isempty(local) || streq(local, "-"))
-                local = NULL;
+        local = empty_or_dash_to_null(local);
 
         if (local) {
                 r = tar_strip_suffixes(local, &ll);
@@ -65,10 +64,10 @@ static int import_tar(int argc, char *argv[], void *userdata) {
 
                 local = ll;
 
-                if (!machine_name_is_valid(local)) {
-                        log_error("Local image name '%s' is not valid.", local);
-                        return -EINVAL;
-                }
+                if (!machine_name_is_valid(local))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Local image name '%s' is not valid.",
+                                               local);
 
                 if (!arg_force) {
                         r = image_find(IMAGE_MACHINE, local, NULL);
@@ -76,8 +75,9 @@ static int import_tar(int argc, char *argv[], void *userdata) {
                                 if (r != -ENOENT)
                                         return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
                         } else {
-                                log_error("Image '%s' already exists.", local);
-                                return -EEXIST;
+                                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                                       "Image '%s' already exists.",
+                                                       local);
                         }
                 }
         } else
@@ -144,15 +144,13 @@ static int import_raw(int argc, char *argv[], void *userdata) {
 
         if (argc >= 2)
                 path = argv[1];
-        if (isempty(path) || streq(path, "-"))
-                path = NULL;
+        path = empty_or_dash_to_null(path);
 
         if (argc >= 3)
                 local = argv[2];
         else if (path)
                 local = basename(path);
-        if (isempty(local) || streq(local, "-"))
-                local = NULL;
+        local = empty_or_dash_to_null(local);
 
         if (local) {
                 r = raw_strip_suffixes(local, &ll);
@@ -161,10 +159,10 @@ static int import_raw(int argc, char *argv[], void *userdata) {
 
                 local = ll;
 
-                if (!machine_name_is_valid(local)) {
-                        log_error("Local image name '%s' is not valid.", local);
-                        return -EINVAL;
-                }
+                if (!machine_name_is_valid(local))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Local image name '%s' is not valid.",
+                                               local);
 
                 if (!arg_force) {
                         r = image_find(IMAGE_MACHINE, local, NULL);
@@ -172,8 +170,9 @@ static int import_raw(int argc, char *argv[], void *userdata) {
                                 if (r != -ENOENT)
                                         return log_error_errno(r, "Failed to check whether image '%s' exists: %m", local);
                         } else {
-                                log_error("Image '%s' already exists.", local);
-                                return -EEXIST;
+                                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                                       "Image '%s' already exists.",
+                                                       local);
                         }
                 }
         } else

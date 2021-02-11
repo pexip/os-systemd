@@ -1,10 +1,7 @@
 <?xml version='1.0'?>
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
-"http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-
-<!--
-  SPDX-License-Identifier: LGPL-2.1+
--->
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="networkctl" conditional='ENABLE_NETWORKD'
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -45,31 +42,6 @@
   </refsect1>
 
   <refsect1>
-    <title>Options</title>
-
-    <para>The following options are understood:</para>
-
-    <variablelist>
-      <varlistentry>
-        <term>
-          <option>-a</option>
-          <option>--all</option>
-        </term>
-
-        <listitem>
-          <para>Show all links with <command>status</command>.</para>
-        </listitem>
-      </varlistentry>
-
-      <xi:include href="standard-options.xml" xpointer="help" />
-      <xi:include href="standard-options.xml" xpointer="version" />
-      <xi:include href="standard-options.xml" xpointer="no-legend" />
-      <xi:include href="standard-options.xml" xpointer="no-pager" />
-
-    </variablelist>
-  </refsect1>
-
-  <refsect1>
     <title>Commands</title>
 
     <para>The following commands are understood:</para>
@@ -78,11 +50,13 @@
       <varlistentry>
         <term>
           <command>list</command>
-          <optional><replaceable>LINK…</replaceable></optional>
+          <optional><replaceable>PATTERN…</replaceable></optional>
         </term>
 
         <listitem>
-          <para>Show a list of existing links and their status. If no further arguments are specified shows all links,
+          <para>Show a list of existing links and their status. If one ore more
+          <replaceable>PATTERN</replaceable>s are specified, only links matching one of them are shown.
+          If no further arguments are specified shows all links,
           otherwise just the specified links. Produces output similar to:
 
           <programlisting>IDX LINK         TYPE     OPERATIONAL SETUP
@@ -95,6 +69,12 @@
 
         <para>The operational status is one of the following:
             <variablelist>
+              <varlistentry>
+                <term>missing</term>
+                <listitem>
+                    <para>the device is missing</para>
+                </listitem>
+              </varlistentry>
               <varlistentry>
                 <term>off</term>
                 <listitem>
@@ -114,15 +94,29 @@
                 </listitem>
               </varlistentry>
               <varlistentry>
+                <term>degraded-carrier</term>
+                <listitem>
+                  <para>for bond or bridge master, one of the bonding or bridge slave network interfaces is
+                  in off, no-carrier, or dormant state</para>
+                </listitem>
+              </varlistentry>
+              <varlistentry>
                 <term>carrier</term>
                 <listitem>
-                  <para>the link has a carrier</para>
+                  <para>the link has a carrier, or for bond or bridge master, all bonding or bridge slave
+                  network interfaces are enslaved to the master.</para>
                 </listitem>
               </varlistentry>
               <varlistentry>
                 <term>degraded</term>
                 <listitem>
                   <para>the link has carrier and addresses valid on the local link configured</para>
+                </listitem>
+              </varlistentry>
+              <varlistentry>
+                <term>enslaved</term>
+                <listitem>
+                  <para>the link has carrier and is enslaved to bond or bridge master network interface</para>
                 </listitem>
               </varlistentry>
               <varlistentry>
@@ -180,13 +174,13 @@
       <varlistentry>
         <term>
           <command>status</command>
-          <optional><replaceable>LINK…</replaceable></optional>
+          <optional><replaceable>PATTERN…</replaceable></optional>
         </term>
 
         <listitem>
-          <para>Show information about the specified links: type,
-          state, kernel module driver, hardware and IP address,
-          configured DNS servers, etc.</para>
+          <para>Show information about the specified links: type, state, kernel module driver, hardware and
+          IP address, configured DNS servers, etc. If one ore more <replaceable>PATTERN</replaceable>s are
+          specified, only links matching one of them are shown.</para>
 
           <para>When no links are specified, an overall network status is shown. Also see the option
           <option>--all</option>.</para>
@@ -208,13 +202,14 @@
       <varlistentry>
         <term>
           <command>lldp</command>
-          <optional><replaceable>LINK…</replaceable></optional>
+          <optional><replaceable>PATTERN…</replaceable></optional>
         </term>
 
         <listitem>
-          <para>Show discovered LLDP (Link Layer Discovery Protocol) neighbors. If one or more link names are specified
-          only neighbors on those interfaces are shown. Otherwise shows discovered neighbors on all interfaces. Note
-          that for this feature to work, <varname>LLDP=</varname> must be turned on for the specific interface, see
+          <para>Show discovered LLDP (Link Layer Discovery Protocol) neighbors. If one or more
+          <replaceable>PATTERN</replaceable>s are specified only neighbors on those interfaces are shown.
+          Otherwise shows discovered neighbors on all interfaces. Note that for this feature to work,
+          <varname>LLDP=</varname> must be turned on for the specific interface, see
           <citerefentry><refentrytitle>systemd.network</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
           details.</para>
 
@@ -238,7 +233,7 @@ s - Service VLAN, m - Two-port MAC Relay (TPMR)
 
         <listitem><para>Show numerical address labels that can be used for address selection.
         This is the same information that
-        <citerefentry><refentrytitle>ip-addrlabel</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        <citerefentry project='die-net'><refentrytitle>ip-addrlabel</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         shows. See <ulink url="https://tools.ietf.org/html/rfc3484">RFC 3484</ulink>
         for a discussion of address labels.</para>
 
@@ -256,6 +251,126 @@ s - Service VLAN, m - Two-port MAC Relay (TPMR)
        ::1/128                                0</programlisting></para>
         </listitem>
       </varlistentry>
+
+       <varlistentry>
+        <term>
+          <command>delete</command>
+          <replaceable>DEVICE…</replaceable>
+        </term>
+        <listitem><para>Deletes virtual netdevs. Takes interface name or index number.</para></listitem>
+      </varlistentry>
+
+       <varlistentry>
+        <term>
+          <command>up</command>
+          <replaceable>DEVICE…</replaceable>
+        </term>
+        <listitem><para>Bring devices up. Takes interface name or index number.</para></listitem>
+      </varlistentry>
+
+       <varlistentry>
+        <term>
+          <command>down</command>
+          <replaceable>DEVICE…</replaceable>
+        </term>
+        <listitem><para>Bring devices down. Takes interface name or index number.</para></listitem>
+      </varlistentry>
+
+       <varlistentry>
+        <term>
+          <command>renew</command>
+          <replaceable>DEVICE…</replaceable>
+        </term>
+        <listitem><para>Renew dynamic configurations e.g. addresses received from DHCP server.
+        Takes interface name or index number.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <command>forcerenew</command>
+          <replaceable>DEVICE…</replaceable>
+        </term>
+        <listitem><para>Send a FORCERENEW message to all connected clients, triggering DHCP reconfiguration.
+        Takes interface name or index number.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <command>reconfigure</command>
+          <replaceable>DEVICE…</replaceable>
+        </term>
+        <listitem><para>Reconfigure network interfaces. Takes interface name or index number. Note that
+        this does not reload <filename>.netdev</filename> or <filename>.network</filename>
+        corresponding to the specified interface. So, if you edit config files, it is necessary to call
+        <command>networkctl reload</command> first to apply new settings.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <command>reload</command>
+        </term>
+        <listitem><para>Reload <filename>.netdev</filename> and <filename>.network</filename> files.
+        If a new <filename>.netdev</filename> file is found, then the corresponding netdev is created.
+        Note that even if an existing <filename>.netdev</filename> is modified or removed,
+        <command>systemd-networkd</command> does not update or remove the netdev.
+        If a new, modified or removed <filename>.network</filename> file is found, then all interfaces
+        which match the file are reconfigured.</para></listitem>
+      </varlistentry>
+
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>Options</title>
+
+    <para>The following options are understood:</para>
+
+    <variablelist>
+      <varlistentry>
+        <term>
+          <option>-a</option>
+          <option>--all</option>
+        </term>
+
+        <listitem>
+          <para>Show all links with <command>status</command>.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option>-s</option>
+          <option>--stats</option>
+        </term>
+
+        <listitem>
+          <para>Show link statistics with <command>status</command>.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-l</option></term>
+        <term><option>--full</option></term>
+
+        <listitem>
+          <para>Do not ellipsize the output.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-n</option></term>
+        <term><option>--lines=</option></term>
+
+        <listitem>
+          <para>When used with <command>status</command>, controls the number of journal lines to show,
+          counting from the most recent ones. Takes a positive integer argument. Defaults to 10.</para>
+        </listitem>
+      </varlistentry>
+
+      <xi:include href="standard-options.xml" xpointer="help" />
+      <xi:include href="standard-options.xml" xpointer="version" />
+      <xi:include href="standard-options.xml" xpointer="no-legend" />
+      <xi:include href="standard-options.xml" xpointer="no-pager" />
 
     </variablelist>
   </refsect1>

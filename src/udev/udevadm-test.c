@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Copyright © 2003-2004 Greg Kroah-Hartman <greg@kroah.com>
  */
@@ -17,10 +17,11 @@
 #include "device-private.h"
 #include "device-util.h"
 #include "libudev-util.h"
+#include "path-util.h"
 #include "string-util.h"
 #include "strxcpyx.h"
 #include "udev-builtin.h"
-#include "udev.h"
+#include "udev-event.h"
 #include "udevadm.h"
 
 static const char *arg_action = "add";
@@ -33,7 +34,7 @@ static int help(void) {
                "Test an event run.\n\n"
                "  -h --help                            Show this help\n"
                "  -V --version                         Show package version\n"
-               "  -a --action=ACTION                   Set action string\n"
+               "  -a --action=ACTION|help              Set action string\n"
                "  -N --resolve-names=early|late|never  When to resolve names\n"
                , program_invocation_short_name);
 
@@ -53,9 +54,22 @@ static int parse_argv(int argc, char *argv[]) {
 
         while ((c = getopt_long(argc, argv, "a:N:Vh", options, NULL)) >= 0)
                 switch (c) {
-                case 'a':
+                case 'a': {
+                        DeviceAction a;
+
+                        if (streq(optarg, "help")) {
+                                dump_device_action_table();
+                                return 0;
+                        }
+
+                        a = device_action_from_string(optarg);
+                        if (a < 0)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Invalid action '%s'", optarg);
+
                         arg_action = optarg;
                         break;
+                }
                 case 'N':
                         arg_resolve_name_timing = resolve_name_timing_from_string(optarg);
                         if (arg_resolve_name_timing < 0)
@@ -77,7 +91,7 @@ static int parse_argv(int argc, char *argv[]) {
                                        "syspath parameter missing.");
 
         /* add /sys if needed */
-        if (!startswith(argv[optind], "/sys"))
+        if (!path_startswith(argv[optind], "/sys"))
                 strscpyl(arg_syspath, sizeof(arg_syspath), "/sys", argv[optind], NULL);
         else
                 strscpy(arg_syspath, sizeof(arg_syspath), argv[optind]);
@@ -91,7 +105,6 @@ int test_main(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         const char *cmd, *key, *value;
         sigset_t mask, sigmask_orig;
-        Iterator i;
         void *val;
         int r;
 
@@ -110,7 +123,7 @@ int test_main(int argc, char *argv[], void *userdata) {
 
         udev_builtin_init();
 
-        r = udev_rules_new(&rules, arg_resolve_name_timing);
+        r = udev_rules_load(&rules, arg_resolve_name_timing);
         if (r < 0) {
                 log_error_errno(r, "Failed to read udev rules: %m");
                 goto out;
@@ -130,15 +143,15 @@ int test_main(int argc, char *argv[], void *userdata) {
         assert_se(sigfillset(&mask) >= 0);
         assert_se(sigprocmask(SIG_SETMASK, &mask, &sigmask_orig) >= 0);
 
-        udev_event_execute_rules(event, 60 * USEC_PER_SEC, NULL, rules);
+        udev_event_execute_rules(event, 60 * USEC_PER_SEC, SIGKILL, NULL, rules);
 
         FOREACH_DEVICE_PROPERTY(dev, key, value)
                 printf("%s=%s\n", key, value);
 
-        HASHMAP_FOREACH_KEY(val, cmd, event->run_list, i) {
+        ORDERED_HASHMAP_FOREACH_KEY(val, cmd, event->run_list) {
                 char program[UTIL_PATH_SIZE];
 
-                udev_event_apply_format(event, cmd, program, sizeof(program), false);
+                (void) udev_event_apply_format(event, cmd, program, sizeof(program), false);
                 printf("run: '%s'\n", program);
         }
 

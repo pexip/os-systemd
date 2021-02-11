@@ -2,9 +2,15 @@
 expression e;
 expression list args;
 @@
+(
+/* Ignore one specific case in src/shared/bootspec.c where we want to stick
+ * with the log_debug() + return pattern */
+log_debug("Found no default boot entry :(");
+|
 - log_debug(args);
 - return -e;
 + return log_debug_errno(SYNTHETIC_ERRNO(e), args);
+)
 @@
 expression e;
 expression list args;
@@ -38,5 +44,5 @@ identifier log_LEVEL_errno =~ "^log_(debug|info|notice|warning|error|emergency)_
 identifier ERRNO =~ "^E[A-Z]+$";
 expression list args;
 @@
-- return log_LEVEL_errno(ERRNO, args);
-+ return log_LEVEL_errno(SYNTHETIC_ERRNO(ERRNO), args);
+- log_LEVEL_errno(ERRNO, args);
++ log_LEVEL_errno(SYNTHETIC_ERRNO(ERRNO), args);

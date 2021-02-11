@@ -1,12 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "alloc-util.h"
+#include "sort-util.h"
 #include "strbuf.h"
-#include "util.h"
 
 /*
  * Strbuf stores given strings in a single continuous allocated memory

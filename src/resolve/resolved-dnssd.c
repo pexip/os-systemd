@@ -1,21 +1,16 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "conf-files.h"
 #include "conf-parser.h"
+#include "def.h"
 #include "resolved-dnssd.h"
 #include "resolved-dns-rr.h"
 #include "resolved-manager.h"
+#include "resolved-conf.h"
 #include "specifier.h"
 #include "strv.h"
 
-const char* const dnssd_service_dirs[] = {
-        "/etc/systemd/dnssd",
-        "/run/systemd/dnssd",
-        "/usr/lib/systemd/dnssd",
-#if HAVE_SPLIT_USR
-        "/lib/systemd/dnssd",
-#endif
-    NULL
-};
+#define DNSSD_SERVICE_DIRS ((const char* const*) CONF_PATHS_STRV("systemd/dnssd"))
 
 DnssdTxtData *dnssd_txtdata_free(DnssdTxtData *txt_data) {
         if (!txt_data)
@@ -92,22 +87,25 @@ static int dnssd_service_load(Manager *manager, const char *filename) {
 
         dropin_dirname = strjoina(service->name, ".dnssd.d");
 
-        r = config_parse_many(filename, dnssd_service_dirs, dropin_dirname,
-                              "Service\0",
-                              config_item_perf_lookup, resolved_dnssd_gperf_lookup,
-                              false, service);
+        r = config_parse_many(
+                        filename, DNSSD_SERVICE_DIRS, dropin_dirname,
+                        "Service\0",
+                        config_item_perf_lookup, resolved_dnssd_gperf_lookup,
+                        CONFIG_PARSE_WARN,
+                        service,
+                        NULL);
         if (r < 0)
                 return r;
 
-        if (!service->name_template) {
-                log_error("%s doesn't define service instance name", service->name);
-                return -EINVAL;
-        }
+        if (!service->name_template)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "%s doesn't define service instance name",
+                                       service->name);
 
-        if (!service->type) {
-                log_error("%s doesn't define service type", service->name);
-                return -EINVAL;
-        }
+        if (!service->type)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "%s doesn't define service type",
+                                       service->name);
 
         if (LIST_IS_EMPTY(service->txt_data_items)) {
                 txt_data = new0(DnssdTxtData, 1);
@@ -159,10 +157,15 @@ static int specifier_dnssd_host_name(char specifier, const void *data, const voi
 
 int dnssd_render_instance_name(DnssdService *s, char **ret_name) {
         static const Specifier specifier_table[] = {
+                { 'a', specifier_architecture,    NULL },
                 { 'b', specifier_boot_id,         NULL },
+                { 'B', specifier_os_build_id,     NULL },
                 { 'H', specifier_dnssd_host_name, NULL },
                 { 'm', specifier_machine_id,      NULL },
+                { 'o', specifier_os_id,           NULL },
                 { 'v', specifier_kernel_release,  NULL },
+                { 'w', specifier_os_version_id,   NULL },
+                { 'W', specifier_os_variant_id,   NULL },
                 {}
         };
         _cleanup_free_ char *name = NULL;
@@ -195,7 +198,7 @@ int dnssd_load(Manager *manager) {
         if (manager->mdns_support != RESOLVE_SUPPORT_YES)
                 return 0;
 
-        r = conf_files_list_strv(&files, ".dnssd", NULL, 0, dnssd_service_dirs);
+        r = conf_files_list_strv(&files, ".dnssd", NULL, 0, DNSSD_SERVICE_DIRS);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate .dnssd files: %m");
 
@@ -331,11 +334,10 @@ int dnssd_txt_item_new_from_data(const char *key, const void *data, const size_t
 }
 
 void dnssd_signal_conflict(Manager *manager, const char *name) {
-        Iterator i;
         DnssdService *s;
         int r;
 
-        HASHMAP_FOREACH(s, manager->dnssd_services, i) {
+        HASHMAP_FOREACH(s, manager->dnssd_services) {
                 if (s->withdrawn)
                         continue;
 

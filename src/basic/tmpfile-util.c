@@ -1,9 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/mman.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
 #include "macro.h"
@@ -18,49 +19,58 @@
 #include "tmpfile-util.h"
 #include "umask-util.h"
 
-int fopen_temporary(const char *path, FILE **_f, char **_temp_path) {
-        FILE *f;
-        char *t;
-        int r, fd;
+int fopen_temporary(const char *path, FILE **ret_f, char **ret_temp_path) {
+        _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_free_ char *t = NULL;
+        _cleanup_close_ int fd = -1;
+        int r;
 
-        assert(path);
-        assert(_f);
-        assert(_temp_path);
+        if (path) {
+                r = tempfn_xxxxxx(path, NULL, &t);
+                if (r < 0)
+                        return r;
+        } else {
+                const char *d;
 
-        r = tempfn_xxxxxx(path, NULL, &t);
-        if (r < 0)
-                return r;
+                r = tmp_dir(&d);
+                if (r < 0)
+                        return r;
+
+                t = path_join(d, "XXXXXX");
+                if (!t)
+                        return -ENOMEM;
+        }
 
         fd = mkostemp_safe(t);
-        if (fd < 0) {
-                free(t);
+        if (fd < 0)
                 return -errno;
+
+        /* This assumes that returned FILE object is short-lived and used within the same single-threaded
+         * context and never shared externally, hence locking is not necessary. */
+
+        r = take_fdopen_unlocked(&fd, "w", &f);
+        if (r < 0) {
+                (void) unlink(t);
+                return r;
         }
 
-        f = fdopen(fd, "w");
-        if (!f) {
-                unlink_noerrno(t);
-                free(t);
-                safe_close(fd);
-                return -errno;
-        }
+        if (ret_f)
+                *ret_f = TAKE_PTR(f);
 
-        *_f = f;
-        *_temp_path = t;
+        if (ret_temp_path)
+                *ret_temp_path = TAKE_PTR(t);
 
         return 0;
 }
 
 /* This is much like mkostemp() but is subject to umask(). */
 int mkostemp_safe(char *pattern) {
-        _cleanup_umask_ mode_t u = 0;
-        int fd;
+        int fd = -1; /* avoid false maybe-uninitialized warning */
 
         assert(pattern);
 
-        u = umask(077);
-
-        fd = mkostemp(pattern, O_CLOEXEC);
+        RUN_WITH_UMASK(0077)
+                fd = mkostemp(pattern, O_CLOEXEC);
         if (fd < 0)
                 return -errno;
 
@@ -68,18 +78,16 @@ int mkostemp_safe(char *pattern) {
 }
 
 int fmkostemp_safe(char *pattern, const char *mode, FILE **ret_f) {
-        int fd;
+        _cleanup_close_ int fd = -1;
         FILE *f;
 
         fd = mkostemp_safe(pattern);
         if (fd < 0)
                 return fd;
 
-        f = fdopen(fd, mode);
-        if (!f) {
-                safe_close(fd);
+        f = take_fdopen(&fd, mode);
+        if (!f)
                 return -errno;
-        }
 
         *ret_f = f;
         return 0;
@@ -249,7 +257,7 @@ int open_tmpfile_linkable(const char *target, int flags, char **ret_path) {
         assert((flags & O_EXCL) == 0);
 
         /* Creates a temporary file, that shall be renamed to "target" later. If possible, this uses O_TMPFILE – in
-         * which case "ret_path" will be returned as NULL. If not possible a the tempoary path name used is returned in
+         * which case "ret_path" will be returned as NULL. If not possible the temporary path name used is returned in
          * "ret_path". Use link_tmpfile() below to rename the result after writing the file in full. */
 
         fd = open_parent(target, O_TMPFILE|flags, 0640);
@@ -317,7 +325,7 @@ int mkdtemp_malloc(const char *template, char **ret) {
                 if (r < 0)
                         return r;
 
-                p = strjoin(tmp, "/XXXXXX");
+                p = path_join(tmp, "XXXXXX");
         }
         if (!p)
                 return -ENOMEM;

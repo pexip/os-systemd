@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-path.h"
 
@@ -8,24 +8,32 @@
 #include "escape.h"
 #include "log.h"
 #include "path-lookup.h"
+#include "strv.h"
 
 static int environment_dirs(char ***ret) {
         _cleanup_strv_free_ char **dirs = NULL;
         _cleanup_free_ char *c = NULL;
         int r;
 
-        dirs = strv_split_nulstr(CONF_PATHS_NULSTR("environment.d"));
+        dirs = strv_new(CONF_PATHS_USR("environment.d"), NULL);
         if (!dirs)
                 return -ENOMEM;
 
         /* ~/.config/systemd/environment.d */
-        r = sd_path_home(SD_PATH_USER_CONFIGURATION, "environment.d", &c);
+        r = sd_path_lookup(SD_PATH_USER_CONFIGURATION, "environment.d", &c);
         if (r < 0)
                 return r;
 
         r = strv_extend_front(&dirs, c);
         if (r < 0)
                 return r;
+
+        if (DEBUG_LOGGING) {
+                _cleanup_free_ char *t;
+
+                t = strv_join(dirs, "\n\t");
+                log_debug("Looking for environment.d files in (higher priority first):\n\t%s", strna(t));
+        }
 
         *ret = TAKE_PTR(dirs);
         return 0;
@@ -48,6 +56,8 @@ static int load_and_print(void) {
          * that in case of failure, a partial update is better than none. */
 
         STRV_FOREACH(i, files) {
+                log_debug("Reading %s…", *i);
+
                 r = merge_env_file(&env, NULL, *i);
                 if (r == -ENOMEM)
                         return r;

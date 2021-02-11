@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -12,8 +12,9 @@
 
 #define CAP_ALL (uint64_t) -1
 
-unsigned long cap_last_cap(void);
+unsigned cap_last_cap(void);
 int have_effective_cap(int value);
+int capability_gain_cap_setpcap(cap_t *return_caps);
 int capability_bounding_set_drop(uint64_t keep, bool right_now);
 int capability_bounding_set_drop_usermode(uint64_t keep);
 
@@ -33,10 +34,12 @@ static inline void cap_free_charpp(char **p) {
 }
 #define _cleanup_cap_free_charp_ _cleanup_(cap_free_charpp)
 
+static inline uint64_t all_capabilities(void) {
+        return UINT64_MAX >> (63 - cap_last_cap());
+}
+
 static inline bool cap_test_all(uint64_t caps) {
-        uint64_t m;
-        m = (UINT64_C(1) << (cap_last_cap() + 1)) - 1;
-        return FLAGS_SET(caps, m);
+        return FLAGS_SET(caps, all_capabilities());
 }
 
 bool ambient_capabilities_supported(void);
@@ -66,5 +69,10 @@ static inline bool capability_quintet_is_set(const CapabilityQuintet *q) {
                 q->permitted != (uint64_t) -1 ||
                 q->ambient != (uint64_t) -1;
 }
+
+/* Mangles the specified caps quintet taking the current bounding set into account:
+ * drops all caps from all five sets if our bounding set doesn't allow them.
+ * Returns true if the quintet was modified. */
+bool capability_quintet_mangle(CapabilityQuintet *q);
 
 int capability_quintet_enforce(const CapabilityQuintet *q);

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <stdlib.h>
@@ -75,7 +75,7 @@ int cescape_char(char c, char *buf) {
         return buf - buf_old;
 }
 
-char *cescape_length(const char *s, size_t n) {
+char* cescape_length(const char *s, size_t n) {
         const char *f;
         char *r, *t;
 
@@ -96,13 +96,13 @@ char *cescape_length(const char *s, size_t n) {
         return r;
 }
 
-char *cescape(const char *s) {
+char* cescape(const char *s) {
         assert(s);
 
         return cescape_length(s, strlen(s));
 }
 
-int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) {
+int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit, bool accept_nul) {
         int r = 1;
 
         assert(p);
@@ -171,7 +171,7 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) 
                         return -EINVAL;
 
                 /* Don't allow NUL bytes */
-                if (a == 0 && b == 0)
+                if (a == 0 && b == 0 && !accept_nul)
                         return -EINVAL;
 
                 *ret = (a << 4U) | b;
@@ -199,7 +199,7 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) 
                 c = ((uint32_t) a[0] << 12U) | ((uint32_t) a[1] << 8U) | ((uint32_t) a[2] << 4U) | (uint32_t) a[3];
 
                 /* Don't allow 0 chars */
-                if (c == 0)
+                if (c == 0 && !accept_nul)
                         return -EINVAL;
 
                 *ret = c;
@@ -227,7 +227,7 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) 
                     ((uint32_t) a[4] << 12U) | ((uint32_t) a[5] <<  8U) | ((uint32_t) a[6] <<  4U) |  (uint32_t) a[7];
 
                 /* Don't allow 0 chars */
-                if (c == 0)
+                if (c == 0 && !accept_nul)
                         return -EINVAL;
 
                 /* Don't allow invalid code points */
@@ -267,7 +267,7 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit) 
                         return -EINVAL;
 
                 /* don't allow NUL bytes */
-                if (a == 0 && b == 0 && c == 0)
+                if (a == 0 && b == 0 && c == 0 && !accept_nul)
                         return -EINVAL;
 
                 /* Don't allow bytes above 255 */
@@ -333,7 +333,7 @@ int cunescape_length_with_prefix(const char *s, size_t length, const char *prefi
                         return -EINVAL;
                 }
 
-                k = cunescape_one(f + 1, remaining - 1, &u, &eight_bit);
+                k = cunescape_one(f + 1, remaining - 1, &u, &eight_bit, flags & UNESCAPE_ACCEPT_NUL);
                 if (k < 0) {
                         if (flags & UNESCAPE_RELAX) {
                                 /* Invalid escape code, let's take it literal then */
@@ -360,44 +360,81 @@ int cunescape_length_with_prefix(const char *s, size_t length, const char *prefi
         return t - r;
 }
 
-int cunescape_length(const char *s, size_t length, UnescapeFlags flags, char **ret) {
-        return cunescape_length_with_prefix(s, length, NULL, flags, ret);
-}
-
-int cunescape(const char *s, UnescapeFlags flags, char **ret) {
-        return cunescape_length(s, strlen(s), flags, ret);
-}
-
-char *xescape(const char *s, const char *bad) {
-        char *r, *t;
+char* xescape_full(const char *s, const char *bad, size_t console_width, bool eight_bits) {
+        char *ans, *t, *prev, *prev2;
         const char *f;
 
-        /* Escapes all chars in bad, in addition to \ and all special
-         * chars, in \xFF style escaping. May be reversed with
-         * cunescape(). */
+        /* Escapes all chars in bad, in addition to \ and all special chars, in \xFF style escaping. May be
+         * reversed with cunescape(). If eight_bits is true, characters >= 127 are let through unchanged.
+         * This corresponds to non-ASCII printable characters in pre-unicode encodings.
+         *
+         * If console_width is reached, output is truncated and "..." is appended. */
 
-        r = new(char, strlen(s) * 4 + 1);
-        if (!r)
+        if (console_width == 0)
+                return strdup("");
+
+        ans = new(char, MIN(strlen(s), console_width) * 4 + 1);
+        if (!ans)
                 return NULL;
 
-        for (f = s, t = r; *f; f++) {
+        memset(ans, '_', MIN(strlen(s), console_width) * 4);
+        ans[MIN(strlen(s), console_width) * 4] = 0;
 
-                if ((*f < ' ') || (*f >= 127) ||
-                    (*f == '\\') || strchr(bad, *f)) {
+        for (f = s, t = prev = prev2 = ans; ; f++) {
+                char *tmp_t = t;
+
+                if (!*f) {
+                        *t = 0;
+                        return ans;
+                }
+
+                if ((unsigned char) *f < ' ' || (!eight_bits && (unsigned char) *f >= 127) ||
+                    *f == '\\' || strchr(bad, *f)) {
+                        if ((size_t) (t - ans) + 4 > console_width)
+                                break;
+
                         *(t++) = '\\';
                         *(t++) = 'x';
                         *(t++) = hexchar(*f >> 4);
                         *(t++) = hexchar(*f);
-                } else
+                } else {
+                        if ((size_t) (t - ans) + 1 > console_width)
+                                break;
+
                         *(t++) = *f;
+                }
+
+                /* We might need to go back two cycles to fit three dots, so remember two positions */
+                prev2 = prev;
+                prev = tmp_t;
         }
 
-        *t = 0;
+        /* We can just write where we want, since chars are one-byte */
+        size_t c = MIN(console_width, 3u); /* If the console is too narrow, write fewer dots */
+        size_t off;
+        if (console_width - c >= (size_t) (t - ans))
+                off = (size_t) (t - ans);
+        else if (console_width - c >= (size_t) (prev - ans))
+                off = (size_t) (prev - ans);
+        else if (console_width - c >= (size_t) (prev2 - ans))
+                off = (size_t) (prev2 - ans);
+        else
+                off = console_width - c;
+        assert(off <= (size_t) (t - ans));
 
-        return r;
+        memcpy(ans + off, "...", c);
+        ans[off + c] = '\0';
+        return ans;
 }
 
-char *octescape(const char *s, size_t len) {
+char* escape_non_printable_full(const char *str, size_t console_width, bool eight_bit) {
+        if (eight_bit)
+                return xescape_full(str, "", console_width, true);
+        else
+                return utf8_escape_non_printable_full(str, console_width);
+}
+
+char* octescape(const char *s, size_t len) {
         char *r, *t;
         const char *f;
 
@@ -425,7 +462,7 @@ char *octescape(const char *s, size_t len) {
 
 }
 
-static char *strcpy_backslash_escaped(char *t, const char *s, const char *bad, bool escape_tab_nl) {
+static char* strcpy_backslash_escaped(char *t, const char *s, const char *bad, bool escape_tab_nl) {
         assert(bad);
 
         for (; *s; s++) {
@@ -444,7 +481,7 @@ static char *strcpy_backslash_escaped(char *t, const char *s, const char *bad, b
         return t;
 }
 
-char *shell_escape(const char *s, const char *bad) {
+char* shell_escape(const char *s, const char *bad) {
         char *r, *t;
 
         r = new(char, strlen(s)*2+1);
@@ -481,22 +518,28 @@ char* shell_maybe_quote(const char *s, EscapeStyle style) {
                 return NULL;
 
         t = r;
-        if (style == ESCAPE_BACKSLASH)
+        switch (style) {
+        case ESCAPE_BACKSLASH:
+        case ESCAPE_BACKSLASH_ONELINE:
                 *(t++) = '"';
-        else if (style == ESCAPE_POSIX) {
+                break;
+        case ESCAPE_POSIX:
                 *(t++) = '$';
                 *(t++) = '\'';
-        } else
+                break;
+        default:
                 assert_not_reached("Bad EscapeStyle");
+        }
 
         t = mempcpy(t, s, p - s);
 
-        if (style == ESCAPE_BACKSLASH)
-                t = strcpy_backslash_escaped(t, p, SHELL_NEED_ESCAPE, false);
+        if (IN_SET(style, ESCAPE_BACKSLASH, ESCAPE_BACKSLASH_ONELINE))
+                t = strcpy_backslash_escaped(t, p, SHELL_NEED_ESCAPE,
+                                             style == ESCAPE_BACKSLASH_ONELINE);
         else
                 t = strcpy_backslash_escaped(t, p, SHELL_NEED_ESCAPE_POSIX, true);
 
-        if (style == ESCAPE_BACKSLASH)
+        if (IN_SET(style, ESCAPE_BACKSLASH, ESCAPE_BACKSLASH_ONELINE))
                 *(t++) = '"';
         else
                 *(t++) = '\'';

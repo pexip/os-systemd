@@ -1,10 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <getopt.h>
 #include <locale.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
@@ -18,6 +17,7 @@
 #include "def.h"
 #include "fd-util.h"
 #include "fs-util.h"
+#include "glob-util.h"
 #include "journal-internal.h"
 #include "journal-util.h"
 #include "log.h"
@@ -45,12 +45,15 @@ static usec_t arg_since = USEC_INFINITY, arg_until = USEC_INFINITY;
 static const char* arg_field = NULL;
 static const char *arg_debugger = NULL;
 static const char *arg_directory = NULL;
+static char **arg_file = NULL;
 static PagerFlags arg_pager_flags = 0;
 static int arg_no_legend = false;
 static int arg_one = false;
 static const char* arg_output = NULL;
 static bool arg_reverse = false;
 static bool arg_quiet = false;
+
+STATIC_DESTRUCTOR_REGISTER(arg_file, strv_freep);
 
 static int add_match(sd_journal *j, const char *match) {
         _cleanup_free_ char *p = NULL;
@@ -112,6 +115,10 @@ static int acquire_journal(sd_journal **ret, char **matches) {
                 r = sd_journal_open_directory(&j, arg_directory, 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to open journals in directory: %s: %m", arg_directory);
+        } else if (arg_file) {
+                r = sd_journal_open_files(&j, (const char**)arg_file, 0);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to open journal files: %m");
         } else {
                 r = sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY);
                 if (r < 0)
@@ -146,9 +153,14 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...]\n\n"
-               "List or retrieve coredumps from the journal.\n\n"
-               "Flags:\n"
+        printf("%s [OPTIONS...] COMMAND ...\n\n"
+               "%sList or retrieve coredumps from the journal.%s\n"
+               "\nCommands:\n"
+               "  list [MATCHES...]  List available coredumps (default)\n"
+               "  info [MATCHES...]  Show detailed information about one or more coredumps\n"
+               "  dump [MATCHES...]  Print first matching coredump to stdout\n"
+               "  debug [MATCHES...] Start a debugger for the first matching coredump\n"
+               "\nOptions:\n"
                "  -h --help              Show this help\n"
                "     --version           Print version string\n"
                "     --no-pager          Do not pipe output into a pager\n"
@@ -160,15 +172,13 @@ static int help(void) {
                "  -r --reverse           Show the newest entries first\n"
                "  -F --field=FIELD       List all values a certain field takes\n"
                "  -o --output=FILE       Write output to FILE\n"
+               "     --file=PATH         Use journal file\n"
                "  -D --directory=DIR     Use journal files from directory\n\n"
                "  -q --quiet             Do not show info messages and privilege warning\n"
-               "Commands:\n"
-               "  list [MATCHES...]  List available coredumps (default)\n"
-               "  info [MATCHES...]  Show detailed information about one or more coredumps\n"
-               "  dump [MATCHES...]  Print first matching coredump to stdout\n"
-               "  debug [MATCHES...] Start a debugger for the first matching coredump\n"
                "\nSee the %s for details.\n"
                , program_invocation_short_name
+               , ansi_highlight()
+               , ansi_normal()
                , link
         );
 
@@ -181,6 +191,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NO_PAGER,
                 ARG_NO_LEGEND,
                 ARG_DEBUGGER,
+                ARG_FILE,
         };
 
         int c, r;
@@ -193,6 +204,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "debugger",     required_argument, NULL, ARG_DEBUGGER  },
                 { "output",       required_argument, NULL, 'o'           },
                 { "field",        required_argument, NULL, 'F'           },
+                { "file",         required_argument, NULL, ARG_FILE      },
                 { "directory",    required_argument, NULL, 'D'           },
                 { "reverse",      no_argument,       NULL, 'r'           },
                 { "since",        required_argument, NULL, 'S'           },
@@ -222,6 +234,12 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_DEBUGGER:
                         arg_debugger = optarg;
+                        break;
+
+                case ARG_FILE:
+                        r = glob_extend(&arg_file, optarg, GLOB_NOCHECK);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to add paths: %m");
                         break;
 
                 case 'o':
@@ -305,9 +323,7 @@ static int retrieve(const void *data,
         if (!v)
                 return log_oom();
 
-        free(*var);
-        *var = v;
-
+        free_and_replace(*var, v);
         return 1;
 }
 
@@ -321,7 +337,7 @@ static int print_field(FILE* file, sd_journal *j) {
         assert(arg_field);
 
         /* A (user-specified) field may appear more than once for a given entry.
-         * We will print all of the occurences.
+         * We will print all of the occurrences.
          * This is different below for fields that systemd-coredump uses,
          * because they cannot meaningfully appear more than once.
          */
@@ -740,9 +756,22 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
 
         /* Look for a coredump on disk first. */
         r = sd_journal_get_data(j, "COREDUMP_FILENAME", (const void**) &data, &len);
-        if (r == 0)
-                retrieve(data, len, "COREDUMP_FILENAME", &filename);
-        else {
+        if (r == 0) {
+                r = retrieve(data, len, "COREDUMP_FILENAME", &filename);
+                if (r < 0)
+                        return r;
+                assert(r > 0);
+
+                if (access(filename, R_OK) < 0)
+                        return log_error_errno(errno, "File \"%s\" is not readable: %m", filename);
+
+                if (path && !ENDSWITH_SET(filename, ".xz", ".lz4", ".zst")) {
+                        *path = TAKE_PTR(filename);
+
+                        return 0;
+                }
+
+        } else {
                 if (r != -ENOENT)
                         return log_error_errno(r, "Failed to retrieve COREDUMP_FILENAME field: %m");
                 /* Check that we can have a COREDUMP field. We still haven't set a high
@@ -756,17 +785,6 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
                         return log_error_errno(r, "Failed to retrieve COREDUMP field: %m");
         }
 
-        if (filename) {
-                if (access(filename, R_OK) < 0)
-                        return log_error_errno(errno, "File \"%s\" is not readable: %m", filename);
-
-                if (path && !endswith(filename, ".xz") && !endswith(filename, ".lz4")) {
-                        *path = TAKE_PTR(filename);
-
-                        return 0;
-                }
-        }
-
         if (path) {
                 const char *vt;
 
@@ -776,7 +794,7 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
                 if (r < 0)
                         return log_error_errno(r, "Failed to acquire temporary directory path: %m");
 
-                temp = strjoin(vt, "/coredump-XXXXXX");
+                temp = path_join(vt, "coredump-XXXXXX");
                 if (!temp)
                         return log_oom();
 
@@ -790,7 +808,7 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
                 /* If neither path or file are specified, we will write to stdout. Let's now check
                  * if stdout is connected to a tty. We checked that the file exists, or that the
                  * core might be stored in the journal. In this second case, if we found the entry,
-                 * in all likelyhood we will be able to access the COREDUMP= field.  In either case,
+                 * in all likelihood we will be able to access the COREDUMP= field.  In either case,
                  * we stop before doing any "real" work, i.e. before starting decompression or
                  * reading from the file or creating temporary files.
                  */
@@ -806,7 +824,7 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
         }
 
         if (filename) {
-#if HAVE_XZ || HAVE_LZ4
+#if HAVE_COMPRESSION
                 _cleanup_close_ int fdf;
 
                 fdf = open(filename, O_RDONLY | O_CLOEXEC);
@@ -821,8 +839,8 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
                         goto error;
                 }
 #else
-                log_error("Cannot decompress file. Compiled without compression support.");
-                r = -EOPNOTSUPP;
+                r = log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                    "Cannot decompress file. Compiled without compression support.");
                 goto error;
 #endif
         } else {
@@ -859,7 +877,7 @@ static int save_core(sd_journal *j, FILE *file, char **path, bool *unlink_temp) 
 
 error:
         if (temp) {
-                unlink(temp);
+                (void) unlink(temp);
                 log_debug("Removed temporary file %s", temp);
         }
         return r;
@@ -870,10 +888,9 @@ static int dump_core(int argc, char **argv, void *userdata) {
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
-        if (arg_field) {
-                log_error("Option --field/-F only makes sense with list");
-                return -EINVAL;
-        }
+        if (arg_field)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Option --field/-F only makes sense with list");
 
         r = acquire_journal(&j, argv + 1);
         if (r < 0)
@@ -904,7 +921,7 @@ static int dump_core(int argc, char **argv, void *userdata) {
 
 static int run_debug(int argc, char **argv, void *userdata) {
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
-        _cleanup_free_ char *exe = NULL, *path = NULL;
+        _cleanup_free_ char *exe = NULL, *path = NULL, *debugger = NULL;
         bool unlink_path = false;
         const char *data, *fork_name;
         size_t len;
@@ -921,10 +938,13 @@ static int run_debug(int argc, char **argv, void *userdata) {
                         arg_debugger = "gdb";
         }
 
-        if (arg_field) {
-                log_error("Option --field/-F only makes sense with list");
-                return -EINVAL;
-        }
+        debugger = strdup(arg_debugger);
+        if (!debugger)
+                return -ENOMEM;
+
+        if (arg_field)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Option --field/-F only makes sense with list");
 
         r = acquire_journal(&j, argv + 1);
         if (r < 0)
@@ -949,15 +969,13 @@ static int run_debug(int argc, char **argv, void *userdata) {
         if (!exe)
                 return log_oom();
 
-        if (endswith(exe, " (deleted)")) {
-                log_error("Binary already deleted.");
-                return -ENOENT;
-        }
+        if (endswith(exe, " (deleted)"))
+                return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
+                                       "Binary already deleted.");
 
-        if (!path_is_absolute(exe)) {
-                log_error("Binary is not an absolute path.");
-                return -ENOENT;
-        }
+        if (!path_is_absolute(exe))
+                return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
+                                       "Binary is not an absolute path.");
 
         r = save_core(j, NULL, &path, &unlink_path);
         if (r < 0)
@@ -966,26 +984,26 @@ static int run_debug(int argc, char **argv, void *userdata) {
         /* Don't interfere with gdb and its handling of SIGINT. */
         (void) ignore_signals(SIGINT, -1);
 
-        fork_name = strjoina("(", arg_debugger, ")");
+        fork_name = strjoina("(", debugger, ")");
 
         r = safe_fork(fork_name, FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
         if (r < 0)
                 goto finish;
         if (r == 0) {
-                execlp(arg_debugger, arg_debugger, exe, "-c", path, NULL);
+                execlp(debugger, debugger, exe, "-c", path, NULL);
                 log_open();
-                log_error_errno(errno, "Failed to invoke %s: %m", arg_debugger);
+                log_error_errno(errno, "Failed to invoke %s: %m", debugger);
                 _exit(EXIT_FAILURE);
         }
 
-        r = wait_for_terminate_and_check(arg_debugger, pid, WAIT_LOG_ABNORMAL);
+        r = wait_for_terminate_and_check(debugger, pid, WAIT_LOG_ABNORMAL);
 
 finish:
         (void) default_signals(SIGINT, -1);
 
         if (unlink_path) {
                 log_debug("Removed temporary file %s", path);
-                unlink(path);
+                (void) unlink(path);
         }
 
         return r;
@@ -1069,8 +1087,7 @@ static int run(int argc, char *argv[]) {
         int r, units_active;
 
         setlocale(LC_ALL, "");
-        log_parse_environment();
-        log_open();
+        log_setup_cli();
 
         /* The journal merging logic potentially needs a lot of fds. */
         (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
@@ -1090,6 +1107,7 @@ static int run(int argc, char *argv[]) {
                        ansi_highlight_red(),
                        units_active, units_active == 1 ? "unit is running" : "units are running",
                        ansi_normal());
+
         return r;
 }
 

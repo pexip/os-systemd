@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "journal-file.h"
@@ -28,6 +28,7 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Writer*, writer_unref);
 int writer_write(Writer *s,
                  struct iovec_wrapper *iovw,
                  dual_timestamp *ts,
+                 sd_id128_t *boot_id,
                  bool compress,
                  bool seal);
 

@@ -1,7 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <inttypes.h>
+#include <sys/uio.h>
 
 #if HAVE_GCRYPT
 #  include <gcrypt.h>
@@ -12,9 +13,9 @@
 
 #include "hashmap.h"
 #include "journal-def.h"
-#include "macro.h"
 #include "mmap-cache.h"
 #include "sparse-endian.h"
+#include "time-util.h"
 
 typedef struct JournalMetrics {
         /* For all these: -1 means "pick automatically", and 0 means "no limit enforced" */
@@ -66,10 +67,12 @@ typedef struct JournalFile {
         bool writable:1;
         bool compress_xz:1;
         bool compress_lz4:1;
+        bool compress_zstd:1;
         bool seal:1;
         bool defrag_on_close:1;
         bool close_fd:1;
         bool archive:1;
+        bool keyed_hash:1;
 
         direction_t last_direction;
         LocationType location_type;
@@ -104,7 +107,7 @@ typedef struct JournalFile {
         unsigned last_seen_generation;
 
         uint64_t compress_threshold_bytes;
-#if HAVE_XZ || HAVE_LZ4
+#if HAVE_COMPRESSION
         void *compress_buffer;
         size_t compress_buffer_size;
 #endif
@@ -144,6 +147,8 @@ int journal_file_open(
 int journal_file_set_offline(JournalFile *f, bool wait);
 bool journal_file_is_offlining(JournalFile *f);
 JournalFile* journal_file_close(JournalFile *j);
+int journal_file_fstat(JournalFile *f);
+DEFINE_TRIVIAL_CLEANUP_FUNC(JournalFile*, journal_file_close);
 
 int journal_file_open_reliably(
                 const char *fname,
@@ -184,13 +189,19 @@ static inline bool VALID_EPOCH(uint64_t u) {
         (le64toh((h)->header_size) >= offsetof(Header, field) + sizeof((h)->field))
 
 #define JOURNAL_HEADER_SEALED(h) \
-        (!!(le32toh((h)->compatible_flags) & HEADER_COMPATIBLE_SEALED))
+        FLAGS_SET(le32toh((h)->compatible_flags), HEADER_COMPATIBLE_SEALED)
 
 #define JOURNAL_HEADER_COMPRESSED_XZ(h) \
-        (!!(le32toh((h)->incompatible_flags) & HEADER_INCOMPATIBLE_COMPRESSED_XZ))
+        FLAGS_SET(le32toh((h)->incompatible_flags), HEADER_INCOMPATIBLE_COMPRESSED_XZ)
 
 #define JOURNAL_HEADER_COMPRESSED_LZ4(h) \
-        (!!(le32toh((h)->incompatible_flags) & HEADER_INCOMPATIBLE_COMPRESSED_LZ4))
+        FLAGS_SET(le32toh((h)->incompatible_flags), HEADER_INCOMPATIBLE_COMPRESSED_LZ4)
+
+#define JOURNAL_HEADER_COMPRESSED_ZSTD(h) \
+        FLAGS_SET(le32toh((h)->incompatible_flags), HEADER_INCOMPATIBLE_COMPRESSED_ZSTD)
+
+#define JOURNAL_HEADER_KEYED_HASH(h) \
+        FLAGS_SET(le32toh((h)->incompatible_flags), HEADER_INCOMPATIBLE_KEYED_HASH)
 
 int journal_file_move_to_object(JournalFile *f, ObjectType type, uint64_t offset, Object **ret);
 
@@ -257,5 +268,9 @@ int journal_file_map_field_hash_table(JournalFile *f);
 
 static inline bool JOURNAL_FILE_COMPRESS(JournalFile *f) {
         assert(f);
-        return f->compress_xz || f->compress_lz4;
+        return f->compress_xz || f->compress_lz4 || f->compress_zstd;
 }
+
+uint64_t journal_file_hash_data(JournalFile *f, const void *data, size_t sz);
+
+bool journal_field_valid(const char *p, size_t l, bool allow_protected);

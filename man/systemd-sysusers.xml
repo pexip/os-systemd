@@ -1,10 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-
-<!--
-  SPDX-License-Identifier: LGPL-2.1+
--->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-sysusers"
     xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -72,6 +69,19 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>--image=<replaceable>image</replaceable></option></term>
+
+        <listitem><para>Takes a path to a disk image file or block device node. If specified all operations
+        are applied to file system in the indicated disk image. This is similar to <option>--root=</option>
+        but operates on file systems stored in disk images or block devices. The disk image should either
+        contain just a file system or a set of file systems within a GPT partition table, following the
+        <ulink url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions
+        Specification</ulink>. For further information on supported disk images, see
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>'s
+        switch of the same name.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>--replace=<replaceable>PATH</replaceable></option></term>
         <listitem><para>When this option is given, one ore more positional arguments
         must be specified. All configuration files found in the directories listed in
@@ -98,7 +108,7 @@
           placing <filename>/etc/sysusers.d/radvd.conf</filename> or even
           <filename>/etc/sysusers.d/00-overrides.conf</filename>.</para>
 
-          <para>Note that this is the expanded from, and when used in a package, this
+          <para>Note that this is the expanded form, and when used in a package, this
           would be written using a macro with "radvd" and a file containing the
           configuration line as arguments.</para>
         </example>

@@ -1,8 +1,15 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "bus-common-errors.h"
+#include "bus-get-properties.h"
 #include "bus-label.h"
+#include "bus-polkit.h"
 #include "bus-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -73,11 +80,9 @@ static int append_fd(sd_bus_message *m, PortableMetadata *d) {
         assert(d);
         assert(d->fd >= 0);
 
-        f = fdopen(d->fd, "r");
+        f = take_fdopen(&d->fd, "r");
         if (!f)
                 return -errno;
-
-        d->fd = -1;
 
         r = read_full_stream(f, &buf, &n);
         if (r < 0)
@@ -523,7 +528,7 @@ const sd_bus_vtable image_vtable[] = {
         SD_BUS_PROPERTY("UsageExclusive", "t", NULL, offsetof(Image, usage_exclusive), 0),
         SD_BUS_PROPERTY("LimitExclusive", "t", NULL, offsetof(Image, limit_exclusive), 0),
         SD_BUS_METHOD("GetOSRelease", NULL, "a{ss}", bus_image_method_get_os_release, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetMedatadata", "as", "saya{say}", bus_image_method_get_metadata, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("GetMetadata", "as", "saya{say}", bus_image_method_get_metadata, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetState", NULL, "s", bus_image_method_get_state, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Attach", "assbs", "a(sss)", bus_image_method_attach, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("Detach", "b", "a(sss)", bus_image_method_detach, SD_BUS_VTABLE_UNPRIVILEGED),
@@ -699,7 +704,6 @@ int bus_image_node_enumerator(sd_bus *bus, const char *path, void *userdata, cha
         size_t n_allocated = 0, n = 0;
         Manager *m = userdata;
         Image *image;
-        Iterator i;
         int r;
 
         assert(bus);
@@ -714,7 +718,7 @@ int bus_image_node_enumerator(sd_bus *bus, const char *path, void *userdata, cha
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(image, images, i) {
+        HASHMAP_FOREACH(image, images) {
                 char *p;
 
                 r = bus_image_path(image, &p);

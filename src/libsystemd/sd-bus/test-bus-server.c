@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -9,7 +9,7 @@
 #include "bus-util.h"
 #include "log.h"
 #include "macro.h"
-#include "util.h"
+#include "memory-util.h"
 
 struct context {
         int fds[2];
@@ -108,7 +108,7 @@ fail:
 static int client(struct context *c) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
-        sd_bus_error error = SD_BUS_ERROR_NULL;
+        _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         int r;
 
         assert_se(sd_bus_new(&bus) >= 0);
@@ -129,7 +129,7 @@ static int client(struct context *c) {
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
-                return log_error_errno(r, "Failed to issue method call: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to issue method call: %s", bus_error_message(&error, r));
 
         return 0;
 }

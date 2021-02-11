@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "fd-util.h"
 #include "fs-util.h"
@@ -18,7 +18,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (size != 0)
                 assert_se(fwrite(data, size, 1, f) == 1);
 
-        rewind(f);
+        fflush(f);
         assert_se(manager_new(&manager) >= 0);
         (void) netdev_load_one(manager, netdev_config);
         return 0;

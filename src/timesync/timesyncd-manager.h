@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <sys/timex.h>
@@ -23,6 +23,9 @@ typedef struct Manager Manager;
  */
 #define NTP_POLL_INTERVAL_MIN_USEC      (32 * USEC_PER_SEC)
 #define NTP_POLL_INTERVAL_MAX_USEC      (2048 * USEC_PER_SEC)
+
+#define NTP_RETRY_INTERVAL_MIN_USEC     (15 * USEC_PER_SEC)
+#define NTP_RETRY_INTERVAL_MAX_USEC     (6 * 60 * USEC_PER_SEC) /* 6 minutes */
 
 struct Manager {
         sd_bus *bus;

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <unistd.h>
 
@@ -6,6 +6,7 @@
 
 #include "parse-util.h"
 #include "strv.h"
+#include "time-util.h"
 
 int main(int argc, char *argv[]) {
         _cleanup_strv_free_ char **l = NULL;

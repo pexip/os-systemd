@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 udevadm_sources = files('''
         udevadm.c
@@ -13,18 +13,18 @@ udevadm_sources = files('''
         udevadm-trigger.c
         udevadm-util.c
         udevadm-util.h
+        udevd.c
 '''.split())
 
-systemd_udevd_sources = files('udevd.c')
-
 libudev_core_sources = '''
-        udev.h
         udev-ctrl.c
         udev-ctrl.h
         udev-event.c
+        udev-event.h
         udev-node.c
         udev-node.h
         udev-rules.c
+        udev-rules.h
         udev-watch.c
         udev-watch.h
         udev-builtin.c
@@ -39,10 +39,6 @@ libudev_core_sources = '''
         udev-builtin-usb_id.c
         net/link-config.c
         net/link-config.h
-        net/ethtool-util.c
-        net/ethtool-util.h
-        net/naming-scheme.c
-        net/naming-scheme.h
 '''.split()
 
 if conf.get('HAVE_KMOD') == 1
@@ -117,7 +113,6 @@ libudev_basic = static_library(
 
 libudev_static = static_library(
         'udev_static',
-        'udev.h',
         include_directories : includes,
         link_with : udev_link_with,
         link_whole : libudev_basic)
@@ -167,6 +162,9 @@ libudev_core = static_library(
 
 foreach prog : [['ata_id/ata_id.c'],
                 ['cdrom_id/cdrom_id.c'],
+                ['fido_id/fido_id.c',
+                 'fido_id/fido_id_desc.c',
+                 'fido_id/fido_id_desc.h'],
                 ['scsi_id/scsi_id.c',
                  'scsi_id/scsi_id.h',
                  'scsi_id/scsi_serial.c',
@@ -180,14 +178,17 @@ foreach prog : [['ata_id/ata_id.c'],
                    prog,
                    include_directories : includes,
                    c_args : ['-DLOG_REALM=LOG_REALM_UDEV'],
+                   dependencies : [versiondep],
                    link_with : [libudev_static],
                    install_rpath : udev_rpath,
                    install : true,
                    install_dir : udevlibexecdir)
 endforeach
 
-install_data('udev.conf',
-             install_dir : join_paths(sysconfdir, 'udev'))
+if install_sysconfdir
+        install_data('udev.conf',
+                     install_dir : join_paths(sysconfdir, 'udev'))
+endif
 
 configure_file(
         input : 'udev.pc.in',
@@ -195,5 +196,30 @@ configure_file(
         configuration : substs,
         install_dir : pkgconfigdatadir == 'no' ? '' : pkgconfigdatadir)
 
-meson.add_install_script('sh', '-c',
-                         mkdir_p.format(join_paths(sysconfdir, 'udev/rules.d')))
+if install_sysconfdir
+        meson.add_install_script('sh', '-c',
+                                 mkdir_p.format(join_paths(sysconfdir, 'udev/rules.d')))
+endif
+
+fuzzers += [
+        [['src/udev/net/fuzz-link-parser.c',
+          'src/fuzz/fuzz.h'],
+         [libudev_core,
+          libudev_static,
+          libsystemd_network,
+          libshared],
+         [threads,
+          libacl]],
+
+        [['src/udev/fido_id/fuzz-fido-id-desc.c',
+          'src/udev/fido_id/fido_id_desc.c'],
+         [],
+         []],
+        ]
+
+tests += [
+        [['src/udev/fido_id/test-fido-id-desc.c',
+          'src/udev/fido_id/fido_id_desc.c'],
+         [],
+         []],
+        ]

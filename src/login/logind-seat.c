@@ -1,21 +1,24 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdio_ext.h>
-#include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "logind-acl.h"
+#include "logind-seat-dbus.h"
 #include "logind-seat.h"
+#include "logind-session-dbus.h"
 #include "mkdir.h"
 #include "parse-util.h"
+#include "path-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "terminal-util.h"
@@ -41,7 +44,7 @@ int seat_new(Seat** ret, Manager *m, const char *id) {
                 .manager = m,
         };
 
-        s->state_file = strappend("/run/systemd/seats/", id);
+        s->state_file = path_join("/run/systemd/seats", id);
         if (!s->state_file)
                 return -ENOMEM;
 
@@ -96,17 +99,15 @@ int seat_save(Seat *s) {
         if (r < 0)
                 goto fail;
 
-        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
         (void) fchmod(fileno(f), 0644);
 
         fprintf(f,
                 "# This is private data. Do not parse.\n"
                 "IS_SEAT0=%i\n"
-                "CAN_MULTI_SESSION=%i\n"
+                "CAN_MULTI_SESSION=1\n"
                 "CAN_TTY=%i\n"
                 "CAN_GRAPHICAL=%i\n",
                 seat_is_seat0(s),
-                seat_can_multi_session(s),
                 seat_can_tty(s),
                 seat_can_graphical(s));
 
@@ -117,7 +118,7 @@ int seat_save(Seat *s) {
                         "ACTIVE=%s\n"
                         "ACTIVE_UID="UID_FMT"\n",
                         s->active->id,
-                        s->active->user->uid);
+                        s->active->user->user_record->uid);
         }
 
         if (s->sessions) {
@@ -135,7 +136,7 @@ int seat_save(Seat *s) {
                 LIST_FOREACH(sessions_by_seat, i, s->sessions)
                         fprintf(f,
                                 UID_FMT"%c",
-                                i->user->uid,
+                                i->user->user_record->uid,
                                 i->sessions_by_seat_next ? ' ' : '\n');
         }
 
@@ -188,13 +189,13 @@ int seat_preallocate_vts(Seat *s) {
         assert(s);
         assert(s->manager);
 
-        log_debug("Preallocating VTs...");
-
         if (s->manager->n_autovts <= 0)
                 return 0;
 
         if (!seat_has_vts(s))
                 return 0;
+
+        log_debug("Preallocating VTs...");
 
         for (i = 1; i <= s->manager->n_autovts; i++) {
                 int q;
@@ -214,8 +215,8 @@ int seat_apply_acls(Seat *s, Session *old_active) {
 
         r = devnode_acl_all(s->id,
                             false,
-                            !!old_active, old_active ? old_active->user->uid : 0,
-                            !!s->active, s->active ? s->active->user->uid : 0);
+                            !!old_active, old_active ? old_active->user->user_record->uid : 0,
+                            !!s->active, s->active ? s->active->user->user_record->uid : 0);
 
         if (r < 0)
                 return log_error_errno(r, "Failed to apply ACLs: %m");
@@ -376,7 +377,7 @@ int seat_read_active_vt(Seat *s) {
 
         k = read(s->manager->console_active_fd, t, sizeof(t)-1);
         if (k <= 0) {
-                log_error("Failed to read current console: %s", k < 0 ? strerror(errno) : "EOF");
+                log_error("Failed to read current console: %s", k < 0 ? strerror_safe(errno) : "EOF");
                 return k < 0 ? -errno : -EIO;
         }
 
@@ -554,12 +555,6 @@ bool seat_is_seat0(Seat *s) {
         assert(s);
 
         return s->manager->seat0 == s;
-}
-
-bool seat_can_multi_session(Seat *s) {
-        assert(s);
-
-        return seat_has_vts(s);
 }
 
 bool seat_can_tty(Seat *s) {

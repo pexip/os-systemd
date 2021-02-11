@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <sys/epoll.h>
@@ -10,6 +10,7 @@
 #include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-internal.h"
+#include "bus-polkit.h"
 #include "bus-util.h"
 #include "dbus-automount.h"
 #include "dbus-cgroup.h"
@@ -32,7 +33,6 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "log.h"
-#include "missing.h"
 #include "mkdir.h"
 #include "process-util.h"
 #include "selinux-access.h"
@@ -177,7 +177,7 @@ static int signal_activation_request(sd_bus_message *message, void *userdata, sd
                 goto failed;
         }
 
-        r = manager_add_job(m, JOB_START, u, JOB_REPLACE, &error, NULL);
+        r = manager_add_job(m, JOB_START, u, JOB_REPLACE, NULL, &error, NULL);
         if (r < 0)
                 goto failed;
 
@@ -273,25 +273,6 @@ static int mac_selinux_filter(sd_bus_message *message, void *userdata, sd_bus_er
         return 0;
 }
 #endif
-
-static int bus_job_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
-        Manager *m = userdata;
-        Job *j;
-        int r;
-
-        assert(bus);
-        assert(path);
-        assert(interface);
-        assert(found);
-        assert(m);
-
-        r = manager_get_job_from_dbus_path(m, path, &j);
-        if (r < 0)
-                return 0;
-
-        *found = j;
-        return 1;
-}
 
 static int find_unit(Manager *m, sd_bus *bus, const char *path, Unit **unit, sd_bus_error *error) {
         Unit *u = NULL;  /* just to appease gcc, initialization is not really necessary */
@@ -472,44 +453,17 @@ static int bus_kill_context_find(sd_bus *bus, const char *path, const char *inte
         return 1;
 }
 
-static int bus_job_enumerate(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
-        _cleanup_strv_free_ char **l = NULL;
-        Manager *m = userdata;
-        unsigned k = 0;
-        Iterator i;
-        Job *j;
-
-        l = new0(char*, hashmap_size(m->jobs)+1);
-        if (!l)
-                return -ENOMEM;
-
-        HASHMAP_FOREACH(j, m->jobs, i) {
-                l[k] = job_dbus_path(j);
-                if (!l[k])
-                        return -ENOMEM;
-
-                k++;
-        }
-
-        assert(hashmap_size(m->jobs) == k);
-
-        *nodes = TAKE_PTR(l);
-
-        return k;
-}
-
 static int bus_unit_enumerate(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_strv_free_ char **l = NULL;
         Manager *m = userdata;
         unsigned k = 0;
-        Iterator i;
         Unit *u;
 
         l = new0(char*, hashmap_size(m->units)+1);
         if (!l)
                 return -ENOMEM;
 
-        HASHMAP_FOREACH(u, m->units, i) {
+        HASHMAP_FOREACH(u, m->units) {
                 l[k] = unit_dbus_path(u);
                 if (!l[k])
                         return -ENOMEM;
@@ -522,8 +476,147 @@ static int bus_unit_enumerate(sd_bus *bus, const char *path, void *userdata, cha
         return k;
 }
 
+static const BusObjectImplementation unit_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Unit",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_unit_vtable,        bus_unit_find }),
+        .node_enumerator = bus_unit_enumerate,
+};
+
+static const BusObjectImplementation bus_automount_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Automount",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_automount_vtable,   bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_device_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Device",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_device_vtable,      bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_mount_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Mount",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_mount_vtable,       bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_path_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Path",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_path_vtable,        bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_scope_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Scope",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_scope_vtable,       bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_service_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Service",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_service_vtable,     bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_slice_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Slice",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_slice_vtable,       bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find }),
+};
+
+static const BusObjectImplementation bus_socket_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Socket",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_socket_vtable,      bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_swap_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Swap",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_swap_vtable,        bus_unit_interface_find },
+                { bus_unit_cgroup_vtable, bus_unit_cgroup_find },
+                { bus_cgroup_vtable,      bus_cgroup_context_find },
+                { bus_exec_vtable,        bus_exec_context_find },
+                { bus_kill_vtable,        bus_kill_context_find }),
+};
+
+static const BusObjectImplementation bus_target_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Target",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_target_vtable,      bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_timer_object = {
+        "/org/freedesktop/systemd1/unit",
+        "org.freedesktop.systemd1.Timer",
+        .fallback_vtables = BUS_FALLBACK_VTABLES(
+                { bus_timer_vtable,       bus_unit_interface_find }),
+};
+
+static const BusObjectImplementation bus_manager_object = {
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        .vtables = BUS_VTABLES(bus_manager_vtable),
+        .children = BUS_IMPLEMENTATIONS(
+                        &job_object,
+                        &unit_object,
+                        &bus_automount_object,
+                        &bus_device_object,
+                        &bus_mount_object,
+                        &bus_path_object,
+                        &bus_scope_object,
+                        &bus_service_object,
+                        &bus_slice_object,
+                        &bus_socket_object,
+                        &bus_swap_object,
+                        &bus_target_object,
+                        &bus_timer_object),
+};
+
+static const BusObjectImplementation manager_log_control_object = {
+        "/org/freedesktop/LogControl1",
+        "org.freedesktop.LogControl1",
+        .vtables = BUS_VTABLES(bus_manager_log_control_vtable),
+};
+
+int bus_manager_introspect_implementations(FILE *out, const char *pattern) {
+        return bus_introspect_implementations(
+                        out,
+                        pattern,
+                        BUS_IMPLEMENTATIONS(&bus_manager_object,
+                                            &manager_log_control_object));
+}
+
 static int bus_setup_api_vtables(Manager *m, sd_bus *bus) {
-        UnitType t;
         int r;
 
         assert(m);
@@ -535,59 +628,11 @@ static int bus_setup_api_vtables(Manager *m, sd_bus *bus) {
                 return log_error_errno(r, "Failed to add SELinux access filter: %m");
 #endif
 
-        r = sd_bus_add_object_vtable(bus, NULL, "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", bus_manager_vtable, m);
+        r = bus_add_implementation(bus, &bus_manager_object, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to register Manager vtable: %m");
+                return r;
 
-        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/job", "org.freedesktop.systemd1.Job", bus_job_vtable, bus_job_find, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to register Job vtable: %m");
-
-        r = sd_bus_add_node_enumerator(bus, NULL, "/org/freedesktop/systemd1/job", bus_job_enumerate, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add job enumerator: %m");
-
-        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", "org.freedesktop.systemd1.Unit", bus_unit_vtable, bus_unit_find, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to register Unit vtable: %m");
-
-        r = sd_bus_add_node_enumerator(bus, NULL, "/org/freedesktop/systemd1/unit", bus_unit_enumerate, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add job enumerator: %m");
-
-        for (t = 0; t < _UNIT_TYPE_MAX; t++) {
-                const char *interface;
-
-                assert_se(interface = unit_dbus_interface_from_type(t));
-
-                r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, unit_vtable[t]->bus_vtable, bus_unit_interface_find, m);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to register type specific vtable for %s: %m", interface);
-
-                if (unit_vtable[t]->cgroup_context_offset > 0) {
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_unit_cgroup_vtable, bus_unit_cgroup_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register control group unit vtable for %s: %m", interface);
-
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_cgroup_vtable, bus_cgroup_context_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register control group vtable for %s: %m", interface);
-                }
-
-                if (unit_vtable[t]->exec_context_offset > 0) {
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_exec_vtable, bus_exec_context_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register execute vtable for %s: %m", interface);
-                }
-
-                if (unit_vtable[t]->kill_context_offset > 0) {
-                        r = sd_bus_add_fallback_vtable(bus, NULL, "/org/freedesktop/systemd1/unit", interface, bus_kill_vtable, bus_kill_context_find, m);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to register kill vtable for %s: %m", interface);
-                }
-        }
-
-        return 0;
+        return bus_add_implementation(bus, &manager_log_control_object, m);
 }
 
 static int bus_setup_disconnected_match(Manager *m, sd_bus *bus) {
@@ -622,6 +667,9 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
 
         nfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK|SOCK_CLOEXEC);
         if (nfd < 0) {
+                if (ERRNO_IS_ACCEPT_AGAIN(errno))
+                        return 0;
+
                 log_warning_errno(errno, "Failed to accept private connection, ignoring: %m");
                 return 0;
         }
@@ -717,116 +765,7 @@ static int bus_on_connection(sd_event_source *s, int fd, uint32_t revents, void 
         return 0;
 }
 
-static int manager_dispatch_sync_bus_names(sd_event_source *es, void *userdata) {
-        _cleanup_strv_free_ char **names = NULL;
-        Manager *m = userdata;
-        const char *name;
-        Iterator i;
-        Unit *u;
-        int r;
-
-        assert(es);
-        assert(m);
-        assert(m->sync_bus_names_event_source == es);
-
-        /* First things first, destroy the defer event so that we aren't triggered again */
-        m->sync_bus_names_event_source = sd_event_source_unref(m->sync_bus_names_event_source);
-
-        /* Let's see if there's anything to do still? */
-        if (!m->api_bus)
-                return 0;
-        if (hashmap_isempty(m->watch_bus))
-                return 0;
-
-        /* OK, let's sync up the names. Let's see which names are currently on the bus. */
-        r = sd_bus_list_names(m->api_bus, &names, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get initial list of names: %m");
-
-        /* We have to synchronize the current bus names with the
-         * list of active services. To do this, walk the list of
-         * all units with bus names. */
-        HASHMAP_FOREACH_KEY(u, name, m->watch_bus, i) {
-                Service *s = SERVICE(u);
-
-                assert(s);
-
-                if (!streq_ptr(s->bus_name, name)) {
-                        log_unit_warning(u, "Bus name has changed from %s → %s, ignoring.", s->bus_name, name);
-                        continue;
-                }
-
-                /* Check if a service's bus name is in the list of currently
-                 * active names */
-                if (strv_contains(names, name)) {
-                        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
-                        const char *unique;
-
-                        /* If it is, determine its current owner */
-                        r = sd_bus_get_name_creds(m->api_bus, name, SD_BUS_CREDS_UNIQUE_NAME, &creds);
-                        if (r < 0) {
-                                log_full_errno(r == -ENXIO ? LOG_DEBUG : LOG_ERR, r, "Failed to get bus name owner %s: %m", name);
-                                continue;
-                        }
-
-                        r = sd_bus_creds_get_unique_name(creds, &unique);
-                        if (r < 0) {
-                                log_full_errno(r == -ENXIO ? LOG_DEBUG : LOG_ERR, r, "Failed to get unique name for %s: %m", name);
-                                continue;
-                        }
-
-                        /* Now, let's compare that to the previous bus owner, and
-                         * if it's still the same, all is fine, so just don't
-                         * bother the service. Otherwise, the name has apparently
-                         * changed, so synthesize a name owner changed signal. */
-
-                        if (!streq_ptr(unique, s->bus_name_owner))
-                                UNIT_VTABLE(u)->bus_name_owner_change(u, name, s->bus_name_owner, unique);
-                } else {
-                        /* So, the name we're watching is not on the bus.
-                         * This either means it simply hasn't appeared yet,
-                         * or it was lost during the daemon reload.
-                         * Check if the service has a stored name owner,
-                         * and synthesize a name loss signal in this case. */
-
-                        if (s->bus_name_owner)
-                                UNIT_VTABLE(u)->bus_name_owner_change(u, name, s->bus_name_owner, NULL);
-                }
-        }
-
-        return 0;
-}
-
-int manager_enqueue_sync_bus_names(Manager *m) {
-        int r;
-
-        assert(m);
-
-        /* Enqueues a request to synchronize the bus names in a later event loop iteration. The callers generally don't
-         * want us to invoke ->bus_name_owner_change() unit calls from their stack frames as this might result in event
-         * dispatching on its own creating loops, hence we simply create a defer event for the event loop and exit. */
-
-        if (m->sync_bus_names_event_source)
-                return 0;
-
-        r = sd_event_add_defer(m->event, &m->sync_bus_names_event_source, manager_dispatch_sync_bus_names, m);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create bus name synchronization event: %m");
-
-        r = sd_event_source_set_priority(m->sync_bus_names_event_source, SD_EVENT_PRIORITY_IDLE);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set event priority: %m");
-
-        r = sd_event_source_set_enabled(m->sync_bus_names_event_source, SD_EVENT_ONESHOT);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set even to oneshot: %m");
-
-        (void) sd_event_source_set_description(m->sync_bus_names_event_source, "manager-sync-bus-names");
-        return 0;
-}
-
 static int bus_setup_api(Manager *m, sd_bus *bus) {
-        Iterator i;
         char *name;
         Unit *u;
         int r;
@@ -846,7 +785,7 @@ static int bus_setup_api(Manager *m, sd_bus *bus) {
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH_KEY(u, name, m->watch_bus, i) {
+        HASHMAP_FOREACH_KEY(u, name, m->watch_bus) {
                 r = unit_install_bus_match(u, bus, name);
                 if (r < 0)
                         log_error_errno(r, "Failed to subscribe to NameOwnerChanged signal for '%s': %m", name);
@@ -907,10 +846,6 @@ int bus_init_api(Manager *m) {
                 return log_error_errno(r, "Failed to set up API bus: %m");
 
         m->api_bus = TAKE_PTR(bus);
-
-        r = manager_enqueue_sync_bus_names(m);
-        if (r < 0)
-                return r;
 
         return 0;
 }
@@ -974,9 +909,10 @@ int bus_init_system(Manager *m) {
 
 int bus_init_private(Manager *m) {
         _cleanup_close_ int fd = -1;
-        union sockaddr_union sa = {};
+        union sockaddr_union sa;
+        socklen_t sa_len;
         sd_event_source *s;
-        int r, salen;
+        int r;
 
         assert(m);
 
@@ -989,7 +925,7 @@ int bus_init_private(Manager *m) {
                 if (getpid_cached() != 1)
                         return 0;
 
-                salen = sockaddr_un_set_path(&sa.un, "/run/systemd/private");
+                r = sockaddr_un_set_path(&sa.un, "/run/systemd/private");
         } else {
                 const char *e, *joined;
 
@@ -999,10 +935,11 @@ int bus_init_private(Manager *m) {
                                                "XDG_RUNTIME_DIR is not set, refusing.");
 
                 joined = strjoina(e, "/systemd/private");
-                salen = sockaddr_un_set_path(&sa.un, joined);
+                r = sockaddr_un_set_path(&sa.un, joined);
         }
-        if (salen < 0)
-                return log_error_errno(salen, "Can't set path for AF_UNIX socket to bind to: %m");
+        if (r < 0)
+                return log_error_errno(r, "Can't set path for AF_UNIX socket to bind to: %m");
+        sa_len = r;
 
         (void) mkdir_parents_label(sa.un.sun_path, 0755);
         (void) sockaddr_un_unlink(&sa.un);
@@ -1011,7 +948,7 @@ int bus_init_private(Manager *m) {
         if (fd < 0)
                 return log_error_errno(errno, "Failed to allocate private socket: %m");
 
-        r = bind(fd, &sa.sa, salen);
+        r = bind(fd, &sa.sa, sa_len);
         if (r < 0)
                 return log_error_errno(errno, "Failed to bind private socket: %m");
 
@@ -1037,7 +974,6 @@ int bus_init_private(Manager *m) {
 }
 
 static void destroy_bus(Manager *m, sd_bus **bus) {
-        Iterator i;
         Unit *u;
         Job *j;
 
@@ -1048,27 +984,29 @@ static void destroy_bus(Manager *m, sd_bus **bus) {
                 return;
 
         /* Make sure all bus slots watching names are released. */
-        HASHMAP_FOREACH(u, m->watch_bus, i) {
-                if (!u->match_bus_slot)
-                        continue;
-
-                if (sd_bus_slot_get_bus(u->match_bus_slot) != *bus)
-                        continue;
-
-                u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
+        HASHMAP_FOREACH(u, m->watch_bus) {
+                if (u->match_bus_slot && sd_bus_slot_get_bus(u->match_bus_slot) == *bus)
+                        u->match_bus_slot = sd_bus_slot_unref(u->match_bus_slot);
+                if (u->get_name_owner_slot && sd_bus_slot_get_bus(u->get_name_owner_slot) == *bus)
+                        u->get_name_owner_slot = sd_bus_slot_unref(u->get_name_owner_slot);
         }
 
         /* Get rid of tracked clients on this bus */
         if (m->subscribed && sd_bus_track_get_bus(m->subscribed) == *bus)
                 m->subscribed = sd_bus_track_unref(m->subscribed);
 
-        HASHMAP_FOREACH(j, m->jobs, i)
+        HASHMAP_FOREACH(j, m->jobs)
                 if (j->bus_track && sd_bus_track_get_bus(j->bus_track) == *bus)
                         j->bus_track = sd_bus_track_unref(j->bus_track);
 
-        HASHMAP_FOREACH(u, m->units, i)
+        HASHMAP_FOREACH(u, m->units) {
                 if (u->bus_track && sd_bus_track_get_bus(u->bus_track) == *bus)
                         u->bus_track = sd_bus_track_unref(u->bus_track);
+
+                /* Get rid of pending freezer messages on this bus */
+                if (u->pending_freezer_message && sd_bus_message_get_bus(u->pending_freezer_message) == *bus)
+                        u->pending_freezer_message = sd_bus_message_unref(u->pending_freezer_message);
+        }
 
         /* Get rid of queued message on this bus */
         if (m->pending_reload_message && sd_bus_message_get_bus(m->pending_reload_message) == *bus)
@@ -1119,7 +1057,6 @@ void bus_done(Manager *m) {
 }
 
 int bus_fdset_add_all(Manager *m, FDSet *fds) {
-        Iterator i;
         sd_bus *b;
         int fd;
 
@@ -1142,7 +1079,7 @@ int bus_fdset_add_all(Manager *m, FDSet *fds) {
                 }
         }
 
-        SET_FOREACH(b, m->private_buses, i) {
+        SET_FOREACH(b, m->private_buses) {
                 fd = sd_bus_get_fd(b);
                 if (fd >= 0) {
                         fd = fdset_put_dup(fds, fd);
@@ -1164,14 +1101,13 @@ int bus_foreach_bus(
                 int (*send_message)(sd_bus *bus, void *userdata),
                 void *userdata) {
 
-        Iterator i;
         sd_bus *b;
         int r, ret = 0;
 
         /* Send to all direct buses, unconditionally */
-        SET_FOREACH(b, m->private_buses, i) {
+        SET_FOREACH(b, m->private_buses) {
 
-                /* Don't bother with enqueing these messages to clients that haven't started yet */
+                /* Don't bother with enqueuing these messages to clients that haven't started yet */
                 if (sd_bus_is_ready(b) <= 0)
                         continue;
 
@@ -1208,7 +1144,7 @@ void bus_track_serialize(sd_bus_track *t, FILE *f, const char *prefix) {
 }
 
 int bus_track_coldplug(Manager *m, sd_bus_track **t, bool recursive, char **l) {
-        int r = 0;
+        int r;
 
         assert(m);
         assert(t);
@@ -1250,13 +1186,12 @@ int bus_verify_set_environment_async(Manager *m, sd_bus_message *call, sd_bus_er
 
 uint64_t manager_bus_n_queued_write(Manager *m) {
         uint64_t c = 0;
-        Iterator i;
         sd_bus *b;
         int r;
 
-        /* Returns the total number of messages queued for writing on all our direct and API busses. */
+        /* Returns the total number of messages queued for writing on all our direct and API buses. */
 
-        SET_FOREACH(b, m->private_buses, i) {
+        SET_FOREACH(b, m->private_buses) {
                 uint64_t k;
 
                 r = sd_bus_get_n_queued_write(b, &k);

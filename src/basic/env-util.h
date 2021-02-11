@@ -1,12 +1,19 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include "macro.h"
 #include "string.h"
+
+static inline size_t sc_arg_max(void) {
+        long l = sysconf(_SC_ARG_MAX);
+        assert(l > 0);
+        return (size_t) l;
+}
 
 bool env_name_is_valid(const char *e);
 bool env_value_is_valid(const char *e);
@@ -45,3 +52,6 @@ char *strv_env_get(char **x, const char *n) _pure_;
 
 int getenv_bool(const char *p);
 int getenv_bool_secure(const char *p);
+
+/* Like setenv, but calls unsetenv if value == NULL. */
+int set_unset_env(const char *name, const char *value, bool overwrite);

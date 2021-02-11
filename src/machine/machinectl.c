@@ -1,14 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
-#include <locale.h>
 #include <math.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <string.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -18,8 +16,12 @@
 #include "alloc-util.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
+#include "bus-locator.h"
+#include "bus-map-properties.h"
+#include "bus-print-properties.h"
+#include "bus-unit-procs.h"
 #include "bus-unit-util.h"
-#include "bus-util.h"
+#include "bus-wait-for-jobs.h"
 #include "cgroup-show.h"
 #include "cgroup-util.h"
 #include "copy.h"
@@ -35,6 +37,7 @@
 #include "macro.h"
 #include "main-func.h"
 #include "mkdir.h"
+#include "nulstr-util.h"
 #include "pager.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -44,17 +47,18 @@
 #include "rlimit-util.h"
 #include "sigbus.h"
 #include "signal-util.h"
+#include "sort-util.h"
+#include "spawn-ask-password-agent.h"
 #include "spawn-polkit-agent.h"
 #include "stdio-util.h"
 #include "string-table.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "unit-name.h"
-#include "util.h"
 #include "verbs.h"
 #include "web-util.h"
 
-#define ALL_IP_ADDRESSES -1
+#define ALL_ADDRESSES -1
 
 static char **arg_property = NULL;
 static bool arg_all = false;
@@ -77,7 +81,7 @@ static ImportVerify arg_verify = IMPORT_VERIFY_SIGNATURE;
 static const char* arg_format = NULL;
 static const char *arg_uid = NULL;
 static char **arg_setenv = NULL;
-static int arg_addrs = 1;
+static int arg_max_addresses = 1;
 
 STATIC_DESTRUCTOR_REGISTER(arg_property, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_setenv, strv_freep);
@@ -106,14 +110,7 @@ static int call_get_os_release(sd_bus *bus, const char *method, const char *name
                 awaited_args++;
         query_res = newa0(const char *, awaited_args);
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        method,
-                        &error,
-                        &reply, "s", name);
+        r = bus_call_method(bus, bus_machine_mgr, method, &error, &reply, "s", name);
         if (r < 0)
                 return log_debug_errno(r, "Failed to call '%s()': %s", method, bus_error_message(&error, r));
 
@@ -158,12 +155,17 @@ static int call_get_os_release(sd_bus *bus, const char *method, const char *name
         return 0;
 }
 
-static int call_get_addresses(sd_bus *bus, const char *name, int ifi, const char *prefix, const char *prefix2, int n_addr, char **ret) {
+static int call_get_addresses(
+                sd_bus *bus,
+                const char *name,
+                int ifi,
+                const char *prefix,
+                const char *prefix2,
+                char **ret) {
 
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_free_ char *addresses = NULL;
-        bool truncate = false;
         unsigned n = 0;
         int r;
 
@@ -172,14 +174,7 @@ static int call_get_addresses(sd_bus *bus, const char *name, int ifi, const char
         assert(prefix);
         assert(prefix2);
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.machine1",
-                               "/org/freedesktop/machine1",
-                               "org.freedesktop.machine1.Manager",
-                               "GetMachineAddresses",
-                               NULL,
-                               &reply,
-                               "s", name);
+        r = bus_call_method(bus, bus_machine_mgr, "GetMachineAddresses", NULL, &reply, "s", name);
         if (r < 0)
                 return log_debug_errno(r, "Could not get addresses: %s", bus_error_message(&error, r));
 
@@ -206,25 +201,19 @@ static int call_get_addresses(sd_bus *bus, const char *name, int ifi, const char
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                if (n_addr != 0) {
-                        if (family == AF_INET6 && ifi > 0)
-                                xsprintf(buf_ifi, "%%%i", ifi);
-                        else
-                                strcpy(buf_ifi, "");
+                if (family == AF_INET6 && ifi > 0)
+                        xsprintf(buf_ifi, "%%%i", ifi);
+                else
+                        strcpy(buf_ifi, "");
 
-                        if (!strextend(&addresses, prefix, inet_ntop(family, a, buffer, sizeof(buffer)), buf_ifi, NULL))
-                                return log_oom();
-                } else
-                        truncate = true;
+                if (!strextend(&addresses, prefix, inet_ntop(family, a, buffer, sizeof(buffer)), buf_ifi, NULL))
+                        return log_oom();
 
                 r = sd_bus_message_exit_container(reply);
                 if (r < 0)
                         return bus_log_parse_error(r);
 
                 prefix = prefix2;
-
-                if (n_addr > 0)
-                        n_addr --;
 
                 n++;
         }
@@ -234,13 +223,6 @@ static int call_get_addresses(sd_bus *bus, const char *name, int ifi, const char
         r = sd_bus_message_exit_container(reply);
         if (r < 0)
                 return bus_log_parse_error(r);
-
-        if (truncate) {
-
-                if (!strextend(&addresses, special_glyph(SPECIAL_GLYPH_ELLIPSIS), NULL))
-                        return -ENOMEM;
-
-        }
 
         *ret = TAKE_PTR(addresses);
         return (int) n;
@@ -252,10 +234,10 @@ static int show_table(Table *table, const char *word) {
         assert(table);
         assert(word);
 
-        if (table_get_rows(table) > 1) {
+        if (table_get_rows(table) > 1 || OUTPUT_MODE_IS_JSON(arg_output)) {
                 r = table_set_sort(table, (size_t) 0, (size_t) -1);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to sort table: %m");
+                        return table_log_sort_error(r);
 
                 table_set_header(table, arg_legend);
 
@@ -264,7 +246,7 @@ static int show_table(Table *table, const char *word) {
                 else
                         r = table_print(table, NULL);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to show table: %m");
+                        return table_log_print_error(r);
         }
 
         if (arg_legend) {
@@ -289,20 +271,20 @@ static int list_machines(int argc, char *argv[], void *userdata) {
 
         (void) pager_open(arg_pager_flags);
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.machine1",
-                               "/org/freedesktop/machine1",
-                               "org.freedesktop.machine1.Manager",
-                               "ListMachines",
-                               &error,
-                               &reply,
-                               NULL);
+        r = bus_call_method(bus, bus_machine_mgr, "ListMachines", &error, &reply, NULL);
         if (r < 0)
                 return log_error_errno(r, "Could not get machines: %s", bus_error_message(&error, r));
 
         table = table_new("machine", "class", "service", "os", "version", "addresses");
         if (!table)
                 return log_oom();
+
+        table_set_empty_string(table, "-");
+        if (!arg_full && arg_max_addresses != ALL_ADDRESSES)
+                table_set_cell_height_max(table, arg_max_addresses);
+
+        if (arg_full)
+                table_set_width(table, 0);
 
         r = sd_bus_message_enter_container(reply, 'a', "(ssso)");
         if (r < 0)
@@ -335,19 +317,18 @@ static int list_machines(int argc, char *argv[], void *userdata) {
                                 name,
                                 0,
                                 "",
-                                " ",
-                                arg_addrs,
+                                "\n",
                                 &addresses);
 
                 r = table_add_many(table,
-                                   TABLE_STRING, name,
-                                   TABLE_STRING, class,
-                                   TABLE_STRING, empty_to_dash(service),
-                                   TABLE_STRING, empty_to_dash(os),
-                                   TABLE_STRING, empty_to_dash(version_id),
-                                   TABLE_STRING, empty_to_dash(addresses));
+                                   TABLE_STRING, empty_to_null(name),
+                                   TABLE_STRING, empty_to_null(class),
+                                   TABLE_STRING, empty_to_null(service),
+                                   TABLE_STRING, empty_to_null(os),
+                                   TABLE_STRING, empty_to_null(version_id),
+                                   TABLE_STRING, empty_to_null(addresses));
                 if (r < 0)
-                        return log_error_errno(r, "Failed to add table row: %m");
+                        return table_log_add_error(r);
         }
 
         r = sd_bus_message_exit_container(reply);
@@ -369,20 +350,16 @@ static int list_images(int argc, char *argv[], void *userdata) {
 
         (void) pager_open(arg_pager_flags);
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.machine1",
-                               "/org/freedesktop/machine1",
-                               "org.freedesktop.machine1.Manager",
-                               "ListImages",
-                               &error,
-                               &reply,
-                               NULL);
+        r = bus_call_method(bus, bus_machine_mgr, "ListImages", &error, &reply, NULL);
         if (r < 0)
                 return log_error_errno(r, "Could not get images: %s", bus_error_message(&error, r));
 
         table = table_new("name", "type", "ro", "usage", "created", "modified");
         if (!table)
                 return log_oom();
+
+        if (arg_full)
+                table_set_width(table, 0);
 
         (void) table_set_align_percent(table, TABLE_HEADER_CELL(3), 100);
 
@@ -393,8 +370,6 @@ static int list_images(int argc, char *argv[], void *userdata) {
         for (;;) {
                 uint64_t crtime, mtime, size;
                 const char *name, *type;
-                TableCell *cell;
-                bool ro_bool;
                 int ro_int;
 
                 r = sd_bus_message_read(reply, "(ssbttto)", &name, &type, &ro_int, &crtime, &mtime, &size, NULL);
@@ -408,27 +383,14 @@ static int list_images(int argc, char *argv[], void *userdata) {
 
                 r = table_add_many(table,
                                    TABLE_STRING, name,
-                                   TABLE_STRING, type);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add table row: %m");
-
-                ro_bool = ro_int;
-                r = table_add_cell(table, &cell, TABLE_BOOLEAN, &ro_bool);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add table cell: %m");
-
-                if (ro_bool) {
-                        r = table_set_color(table, cell, ansi_highlight_red());
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to set table cell color: %m");
-                }
-
-                r = table_add_many(table,
+                                   TABLE_STRING, type,
+                                   TABLE_BOOLEAN, ro_int,
+                                   TABLE_SET_COLOR, ro_int ? ansi_highlight_red() : NULL,
                                    TABLE_SIZE, size,
                                    TABLE_TIMESTAMP, crtime,
                                    TABLE_TIMESTAMP, mtime);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to add table row: %m");
+                        return table_log_add_error(r);
         }
 
         r = sd_bus_message_exit_container(reply);
@@ -505,14 +467,7 @@ static int print_uid_shift(sd_bus *bus, const char *name) {
         assert(bus);
         assert(name);
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.machine1",
-                               "/org/freedesktop/machine1",
-                               "org.freedesktop.machine1.Manager",
-                               "GetMachineUIDShift",
-                               &error,
-                               &reply,
-                               "s", name);
+        r = bus_call_method(bus, bus_machine_mgr, "GetMachineUIDShift", &error, &reply, "s", name);
         if (r < 0)
                 return log_debug_errno(r, "Failed to query UID/GID shift: %s", bus_error_message(&error, r));
 
@@ -598,14 +553,12 @@ static void print_machine_status_info(sd_bus *bus, MachineStatusInfo *i) {
                 printf("\t    Root: %s\n", i->root_directory);
 
         if (i->n_netif > 0) {
-                size_t c;
-
                 fputs("\t   Iface:", stdout);
 
-                for (c = 0; c < i->n_netif; c++) {
-                        char name[IF_NAMESIZE+1] = "";
+                for (size_t c = 0; c < i->n_netif; c++) {
+                        char name[IF_NAMESIZE+1];
 
-                        if (if_indextoname(i->netif[c], name)) {
+                        if (format_ifname(i->netif[c], name)) {
                                 fputc(' ', stdout);
                                 fputs(name, stdout);
 
@@ -621,7 +574,7 @@ static void print_machine_status_info(sd_bus *bus, MachineStatusInfo *i) {
         }
 
         if (call_get_addresses(bus, i->name, ifi,
-                               "\t Address: ", "\n\t          ", ALL_IP_ADDRESSES,
+                               "\t Address: ", "\n\t          ",
                                &addresses) > 0) {
                 fputs(addresses, stdout);
                 fputc('\n', stdout);
@@ -640,6 +593,7 @@ static void print_machine_status_info(sd_bus *bus, MachineStatusInfo *i) {
                         show_journal_by_unit(
                                         stdout,
                                         i->unit,
+                                        NULL,
                                         arg_output,
                                         0,
                                         i->timestamp.monotonic,
@@ -744,7 +698,7 @@ static int show_machine(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         bool properties, new_line = false;
         sd_bus *bus = userdata;
-        int r = 0, i;
+        int r = 0;
 
         assert(bus);
 
@@ -761,19 +715,12 @@ static int show_machine(int argc, char *argv[], void *userdata) {
                         return r;
         }
 
-        for (i = 1; i < argc; i++) {
+        for (int i = 1; i < argc; i++) {
                 const char *path = NULL;
 
-                r = sd_bus_call_method(bus,
-                                       "org.freedesktop.machine1",
-                                       "/org/freedesktop/machine1",
-                                       "org.freedesktop.machine1.Manager",
-                                       "GetMachine",
-                                       &error,
-                                       &reply,
-                                       "s", argv[i]);
+                r = bus_call_method(bus, bus_machine_mgr, "GetMachine", &error, &reply, "s", argv[i]);
                 if (r < 0)
-                        return log_error_errno(r, "Could not get path to machine: %s", bus_error_message(&error, -r));
+                        return log_error_errno(r, "Could not get path to machine: %s", bus_error_message(&error, r));
 
                 r = sd_bus_message_read(reply, "o", &path);
                 if (r < 0)
@@ -793,13 +740,7 @@ static int print_image_hostname(sd_bus *bus, const char *name) {
         const char *hn;
         int r;
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "GetImageHostname",
-                        NULL, &reply, "s", name);
+        r = bus_call_method(bus, bus_machine_mgr, "GetImageHostname", NULL, &reply, "s", name);
         if (r < 0)
                 return r;
 
@@ -820,13 +761,7 @@ static int print_image_machine_id(sd_bus *bus, const char *name) {
         size_t size;
         int r;
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "GetImageMachineID",
-                        NULL, &reply, "s", name);
+        r = bus_call_method(bus, bus_machine_mgr, "GetImageMachineID", NULL, &reply, "s", name);
         if (r < 0)
                 return r;
 
@@ -847,13 +782,7 @@ static int print_image_machine_info(sd_bus *bus, const char *name) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         int r;
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "GetImageMachineInfo",
-                        NULL, &reply, "s", name);
+        r = bus_call_method(bus, bus_machine_mgr, "GetImageMachineInfo", NULL, &reply, "s", name);
         if (r < 0)
                 return r;
 
@@ -1082,7 +1011,7 @@ static int show_image(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         bool properties, new_line = false;
         sd_bus *bus = userdata;
-        int r = 0, i;
+        int r = 0;
 
         assert(bus);
 
@@ -1103,20 +1032,12 @@ static int show_image(int argc, char *argv[], void *userdata) {
                         return r;
         }
 
-        for (i = 1; i < argc; i++) {
+        for (int i = 1; i < argc; i++) {
                 const char *path = NULL;
 
-                r = sd_bus_call_method(
-                                bus,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
-                                "GetImage",
-                                &error,
-                                &reply,
-                                "s", argv[i]);
+                r = bus_call_method(bus, bus_machine_mgr, "GetImage", &error, &reply, "s", argv[i]);
                 if (r < 0)
-                        return log_error_errno(r, "Could not get path to image: %s", bus_error_message(&error, -r));
+                        return log_error_errno(r, "Could not get path to image: %s", bus_error_message(&error, r));
 
                 r = sd_bus_message_read(reply, "o", &path);
                 if (r < 0)
@@ -1134,7 +1055,7 @@ static int show_image(int argc, char *argv[], void *userdata) {
 static int kill_machine(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
-        int r, i;
+        int r;
 
         assert(bus);
 
@@ -1143,18 +1064,16 @@ static int kill_machine(int argc, char *argv[], void *userdata) {
         if (!arg_kill_who)
                 arg_kill_who = "all";
 
-        for (i = 1; i < argc; i++) {
-                r = sd_bus_call_method(
+        for (int i = 1; i < argc; i++) {
+                r = bus_call_method(
                                 bus,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
+                                bus_machine_mgr,
                                 "KillMachine",
                                 &error,
                                 NULL,
                                 "ssi", argv[i], arg_kill_who, arg_signal);
                 if (r < 0)
-                        return log_error_errno(r, "Could not kill machine: %s", bus_error_message(&error, -r));
+                        return log_error_errno(r, "Could not kill machine: %s", bus_error_message(&error, r));
         }
 
         return 0;
@@ -1177,24 +1096,16 @@ static int poweroff_machine(int argc, char *argv[], void *userdata) {
 static int terminate_machine(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
-        int r, i;
+        int r;
 
         assert(bus);
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        for (i = 1; i < argc; i++) {
-                r = sd_bus_call_method(
-                                bus,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
-                                "TerminateMachine",
-                                &error,
-                                NULL,
-                                "s", argv[i]);
+        for (int i = 1; i < argc; i++) {
+                r = bus_call_method(bus, bus_machine_mgr, "TerminateMachine", &error, NULL, "s", argv[i]);
                 if (r < 0)
-                        return log_error_errno(r, "Could not terminate machine: %s", bus_error_message(&error, -r));
+                        return log_error_errno(r, "Could not terminate machine: %s", bus_error_message(&error, r));
         }
 
         return 0;
@@ -1226,12 +1137,10 @@ static int copy_files(int argc, char *argv[], void *userdata) {
                 host_path = abs_host_path;
         }
 
-        r = sd_bus_message_new_method_call(
+        r = bus_message_new_method_call(
                         bus,
                         &m,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
+                        bus_machine_mgr,
                         copy_from ? "CopyFromMachine" : "CopyToMachine");
         if (r < 0)
                 return bus_log_create_error(r);
@@ -1262,11 +1171,9 @@ static int bind_mount(int argc, char *argv[], void *userdata) {
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
+                        bus_machine_mgr,
                         "BindMountMachine",
                         &error,
                         NULL,
@@ -1277,7 +1184,7 @@ static int bind_mount(int argc, char *argv[], void *userdata) {
                         arg_read_only,
                         arg_mkdir);
         if (r < 0)
-                return log_error_errno(r, "Failed to bind mount: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to bind mount: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -1405,15 +1312,13 @@ static int login_machine(int argc, char *argv[], void *userdata) {
 
         assert(bus);
 
-        if (!strv_isempty(arg_setenv) || arg_uid) {
-                log_error("--setenv= and --uid= are not supported for 'login'. Use 'shell' instead.");
-                return -EINVAL;
-        }
+        if (!strv_isempty(arg_setenv) || arg_uid)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "--setenv= and --uid= are not supported for 'login'. Use 'shell' instead.");
 
-        if (!IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE)) {
-                log_error("Login only supported on local machines.");
-                return -EOPNOTSUPP;
-        }
+        if (!IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE))
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                       "Login only supported on local machines.");
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
@@ -1438,17 +1343,9 @@ static int login_machine(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to request machine removal match: %m");
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "OpenMachineLogin",
-                        &error,
-                        &reply,
-                        "s", machine);
+        r = bus_call_method(bus, bus_machine_mgr, "OpenMachineLogin", &error, &reply, "s", machine);
         if (r < 0)
-                return log_error_errno(r, "Failed to get login PTY: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to get login PTY: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "hs", &master, NULL);
         if (r < 0)
@@ -1470,10 +1367,9 @@ static int shell_machine(int argc, char *argv[], void *userdata) {
 
         assert(bus);
 
-        if (!IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE)) {
-                log_error("Shell only supported on local machines.");
-                return -EOPNOTSUPP;
-        }
+        if (!IN_SET(arg_transport, BUS_TRANSPORT_LOCAL, BUS_TRANSPORT_MACHINE))
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                       "Shell only supported on local machines.");
 
         /* Pass $TERM to shell session, if not explicitly specified. */
         if (!strv_find_prefix(arg_setenv, "TERM=")) {
@@ -1511,13 +1407,7 @@ static int shell_machine(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to request machine removal match: %m");
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "OpenMachineShell");
+        r = bus_message_new_method_call(bus, &m, bus_machine_mgr, "OpenMachineShell");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1537,7 +1427,7 @@ static int shell_machine(int argc, char *argv[], void *userdata) {
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
-                return log_error_errno(r, "Failed to get shell PTY: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to get shell PTY: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "hs", &master, NULL);
         if (r < 0)
@@ -1548,23 +1438,17 @@ static int shell_machine(int argc, char *argv[], void *userdata) {
 
 static int remove_image(int argc, char *argv[], void *userdata) {
         sd_bus *bus = userdata;
-        int r, i;
+        int r;
 
         assert(bus);
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        for (i = 1; i < argc; i++) {
+        for (int i = 1; i < argc; i++) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
 
-                r = sd_bus_message_new_method_call(
-                                bus,
-                                &m,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
-                                "RemoveImage");
+                r = bus_message_new_method_call(bus, &m, bus_machine_mgr, "RemoveImage");
                 if (r < 0)
                         return bus_log_create_error(r);
 
@@ -1590,17 +1474,15 @@ static int rename_image(int argc, char *argv[], void *userdata) {
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
+                        bus_machine_mgr,
                         "RenameImage",
                         &error,
                         NULL,
                         "ss", argv[1], argv[2]);
         if (r < 0)
-                return log_error_errno(r, "Could not rename image: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Could not rename image: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -1615,13 +1497,7 @@ static int clone_image(int argc, char *argv[], void *userdata) {
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "CloneImage");
+        r = bus_message_new_method_call(bus, &m, bus_machine_mgr, "CloneImage");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -1646,25 +1522,17 @@ static int read_only_image(int argc, char *argv[], void *userdata) {
 
         if (argc > 2) {
                 b = parse_boolean(argv[2]);
-                if (b < 0) {
-                        log_error("Failed to parse boolean argument: %s", argv[2]);
-                        return -EINVAL;
-                }
+                if (b < 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Failed to parse boolean argument: %s",
+                                               argv[2]);
         }
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "MarkImageReadOnly",
-                        &error,
-                        NULL,
-                        "sb", argv[1], b);
+        r = bus_call_method(bus, bus_machine_mgr, "MarkImageReadOnly", &error, NULL, "sb", argv[1], b);
         if (r < 0)
-                return log_error_errno(r, "Could not mark image read-only: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Could not mark image read-only: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -1676,20 +1544,12 @@ static int image_exists(sd_bus *bus, const char *name) {
         assert(bus);
         assert(name);
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "GetImage",
-                        &error,
-                        NULL,
-                        "s", name);
+        r = bus_call_method(bus, bus_machine_mgr, "GetImage", &error, NULL, "s", name);
         if (r < 0) {
                 if (sd_bus_error_has_name(&error, BUS_ERROR_NO_SUCH_IMAGE))
                         return 0;
 
-                return log_error_errno(r, "Failed to check whether image %s exists: %s", name, bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to check whether image %s exists: %s", name, bus_error_message(&error, r));
         }
 
         return 1;
@@ -1716,17 +1576,18 @@ static int start_machine(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
         sd_bus *bus = userdata;
-        int r, i;
+        int r;
 
         assert(bus);
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        ask_password_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_wait_for_jobs_new(bus, &w);
         if (r < 0)
                 return log_oom();
 
-        for (i = 1; i < argc; i++) {
+        for (int i = 1; i < argc; i++) {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
                 _cleanup_free_ char *unit = NULL;
                 const char *object;
@@ -1738,10 +1599,10 @@ static int start_machine(int argc, char *argv[], void *userdata) {
                 r = image_exists(bus, argv[i]);
                 if (r < 0)
                         return r;
-                if (r == 0) {
-                        log_error("Machine image '%s' does not exist.", argv[i]);
-                        return -ENXIO;
-                }
+                if (r == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENXIO),
+                                               "Machine image '%s' does not exist.",
+                                               argv[i]);
 
                 r = sd_bus_call_method(
                                 bus,
@@ -1753,7 +1614,7 @@ static int start_machine(int argc, char *argv[], void *userdata) {
                                 &reply,
                                 "ss", unit, "fail");
                 if (r < 0)
-                        return log_error_errno(r, "Failed to start unit: %s", bus_error_message(&error, -r));
+                        return log_error_errno(r, "Failed to start unit: %s", bus_error_message(&error, r));
 
                 r = sd_bus_message_read(reply, "o", &object);
                 if (r < 0)
@@ -1778,7 +1639,7 @@ static int enable_machine(int argc, char *argv[], void *userdata) {
         size_t n_changes = 0;
         const char *method = NULL;
         sd_bus *bus = userdata;
-        int r, i;
+        int r;
 
         assert(bus);
 
@@ -1800,7 +1661,7 @@ static int enable_machine(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_create_error(r);
 
-        for (i = 1; i < argc; i++) {
+        for (int i = 1; i < argc; i++) {
                 _cleanup_free_ char *unit = NULL;
 
                 r = make_service_name(argv[i], &unit);
@@ -1810,10 +1671,10 @@ static int enable_machine(int argc, char *argv[], void *userdata) {
                 r = image_exists(bus, argv[i]);
                 if (r < 0)
                         return r;
-                if (r == 0) {
-                        log_error("Machine image '%s' does not exist.", argv[i]);
-                        return -ENXIO;
-                }
+                if (r == 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENXIO),
+                                               "Machine image '%s' does not exist.",
+                                               argv[i]);
 
                 r = sd_bus_message_append(m, "s", unit);
                 if (r < 0)
@@ -1833,7 +1694,7 @@ static int enable_machine(int argc, char *argv[], void *userdata) {
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
-                return log_error_errno(r, "Failed to enable or disable unit: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to enable or disable unit: %s", bus_error_message(&error, r));
 
         if (streq(argv[0], "enable")) {
                 r = sd_bus_message_read(reply, "b", NULL);
@@ -1855,7 +1716,7 @@ static int enable_machine(int argc, char *argv[], void *userdata) {
                         NULL,
                         NULL);
         if (r < 0) {
-                log_error("Failed to reload daemon: %s", bus_error_message(&error, -r));
+                log_error("Failed to reload daemon: %s", bus_error_message(&error, r));
                 goto finish;
         }
 
@@ -1945,12 +1806,10 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
-        r = sd_bus_match_signal_async(
+        r = bus_match_signal_async(
                         bus,
                         &slot_job_removed,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
+                        bus_import_mgr,
                         "TransferRemoved",
                         match_transfer_removed, NULL, &path);
         if (r < 0)
@@ -1969,7 +1828,7 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
-                return log_error_errno(r, "Failed to transfer image: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Failed to transfer image: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_read(reply, "uo", &id, &path);
         if (r < 0)
@@ -1990,16 +1849,6 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
         return -r;
 }
 
-static const char *nullify_dash(const char *p) {
-        if (isempty(p))
-                return NULL;
-
-        if (streq(p, "-"))
-                return NULL;
-
-        return p;
-}
-
 static int import_tar(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_free_ char *ll = NULL, *fn = NULL;
@@ -2011,10 +1860,10 @@ static int import_tar(int argc, char *argv[], void *userdata) {
         assert(bus);
 
         if (argc >= 2)
-                path = nullify_dash(argv[1]);
+                path = empty_or_dash_to_null(argv[1]);
 
         if (argc >= 3)
-                local = nullify_dash(argv[2]);
+                local = empty_or_dash_to_null(argv[2]);
         else if (path) {
                 r = path_extract_filename(path, &fn);
                 if (r < 0)
@@ -2022,10 +1871,9 @@ static int import_tar(int argc, char *argv[], void *userdata) {
 
                 local = fn;
         }
-        if (!local) {
-                log_error("Need either path or local name.");
-                return -EINVAL;
-        }
+        if (!local)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Need either path or local name.");
 
         r = tar_strip_suffixes(local, &ll);
         if (r < 0)
@@ -2033,10 +1881,10 @@ static int import_tar(int argc, char *argv[], void *userdata) {
 
         local = ll;
 
-        if (!machine_name_is_valid(local)) {
-                log_error("Local name %s is not a suitable machine name.", local);
-                return -EINVAL;
-        }
+        if (!machine_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Local name %s is not a suitable machine name.",
+                                       local);
 
         if (path) {
                 fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY);
@@ -2044,13 +1892,7 @@ static int import_tar(int argc, char *argv[], void *userdata) {
                         return log_error_errno(errno, "Failed to open %s: %m", path);
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
-                        "ImportTar");
+        r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportTar");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2078,10 +1920,10 @@ static int import_raw(int argc, char *argv[], void *userdata) {
         assert(bus);
 
         if (argc >= 2)
-                path = nullify_dash(argv[1]);
+                path = empty_or_dash_to_null(argv[1]);
 
         if (argc >= 3)
-                local = nullify_dash(argv[2]);
+                local = empty_or_dash_to_null(argv[2]);
         else if (path) {
                 r = path_extract_filename(path, &fn);
                 if (r < 0)
@@ -2089,10 +1931,9 @@ static int import_raw(int argc, char *argv[], void *userdata) {
 
                 local = fn;
         }
-        if (!local) {
-                log_error("Need either path or local name.");
-                return -EINVAL;
-        }
+        if (!local)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Need either path or local name.");
 
         r = raw_strip_suffixes(local, &ll);
         if (r < 0)
@@ -2100,10 +1941,10 @@ static int import_raw(int argc, char *argv[], void *userdata) {
 
         local = ll;
 
-        if (!machine_name_is_valid(local)) {
-                log_error("Local name %s is not a suitable machine name.", local);
-                return -EINVAL;
-        }
+        if (!machine_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Local name %s is not a suitable machine name.",
+                                       local);
 
         if (path) {
                 fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY);
@@ -2111,13 +1952,7 @@ static int import_raw(int argc, char *argv[], void *userdata) {
                         return log_error_errno(errno, "Failed to open %s: %m", path);
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
-                        "ImportRaw");
+        r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportRaw");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2145,10 +1980,10 @@ static int import_fs(int argc, char *argv[], void *userdata) {
         assert(bus);
 
         if (argc >= 2)
-                path = nullify_dash(argv[1]);
+                path = empty_or_dash_to_null(argv[1]);
 
         if (argc >= 3)
-                local = nullify_dash(argv[2]);
+                local = empty_or_dash_to_null(argv[2]);
         else if (path) {
                 r = path_extract_filename(path, &fn);
                 if (r < 0)
@@ -2156,15 +1991,14 @@ static int import_fs(int argc, char *argv[], void *userdata) {
 
                 local = fn;
         }
-        if (!local) {
-                log_error("Need either path or local name.");
-                return -EINVAL;
-        }
+        if (!local)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Need either path or local name.");
 
-        if (!machine_name_is_valid(local)) {
-                log_error("Local name %s is not a suitable machine name.", local);
-                return -EINVAL;
-        }
+        if (!machine_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Local name %s is not a suitable machine name.",
+                                       local);
 
         if (path) {
                 fd = open(path, O_DIRECTORY|O_RDONLY|O_CLOEXEC);
@@ -2172,13 +2006,7 @@ static int import_fs(int argc, char *argv[], void *userdata) {
                         return log_error_errno(errno, "Failed to open directory '%s': %m", path);
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
-                        "ImportFileSystem");
+        r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportFileSystem");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2220,15 +2048,13 @@ static int export_tar(int argc, char *argv[], void *userdata) {
         assert(bus);
 
         local = argv[1];
-        if (!machine_name_is_valid(local)) {
-                log_error("Machine name %s is not valid.", local);
-                return -EINVAL;
-        }
+        if (!machine_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Machine name %s is not valid.", local);
 
         if (argc >= 3)
                 path = argv[2];
-        if (isempty(path) || streq(path, "-"))
-                path = NULL;
+        path = empty_or_dash_to_null(path);
 
         if (path) {
                 determine_compression_from_filename(path);
@@ -2238,13 +2064,7 @@ static int export_tar(int argc, char *argv[], void *userdata) {
                         return log_error_errno(errno, "Failed to open %s: %m", path);
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
-                        "ExportTar");
+        r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportTar");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2270,15 +2090,13 @@ static int export_raw(int argc, char *argv[], void *userdata) {
         assert(bus);
 
         local = argv[1];
-        if (!machine_name_is_valid(local)) {
-                log_error("Machine name %s is not valid.", local);
-                return -EINVAL;
-        }
+        if (!machine_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Machine name %s is not valid.", local);
 
         if (argc >= 3)
                 path = argv[2];
-        if (isempty(path) || streq(path, "-"))
-                path = NULL;
+        path = empty_or_dash_to_null(path);
 
         if (path) {
                 determine_compression_from_filename(path);
@@ -2288,13 +2106,7 @@ static int export_raw(int argc, char *argv[], void *userdata) {
                         return log_error_errno(errno, "Failed to open %s: %m", path);
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
-                        "ExportRaw");
+        r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportRaw");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2320,10 +2132,9 @@ static int pull_tar(int argc, char *argv[], void *userdata) {
         assert(bus);
 
         remote = argv[1];
-        if (!http_url_is_valid(remote)) {
-                log_error("URL '%s' is not valid.", remote);
-                return -EINVAL;
-        }
+        if (!http_url_is_valid(remote))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "URL '%s' is not valid.", remote);
 
         if (argc >= 3)
                 local = argv[2];
@@ -2335,8 +2146,7 @@ static int pull_tar(int argc, char *argv[], void *userdata) {
                 local = l;
         }
 
-        if (isempty(local) || streq(local, "-"))
-                local = NULL;
+        local = empty_or_dash_to_null(local);
 
         if (local) {
                 r = tar_strip_suffixes(local, &ll);
@@ -2345,19 +2155,13 @@ static int pull_tar(int argc, char *argv[], void *userdata) {
 
                 local = ll;
 
-                if (!machine_name_is_valid(local)) {
-                        log_error("Local name %s is not a suitable machine name.", local);
-                        return -EINVAL;
-                }
+                if (!machine_name_is_valid(local))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Local name %s is not a suitable machine name.",
+                                               local);
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
-                        "PullTar");
+        r = bus_message_new_method_call(bus, &m, bus_import_mgr, "PullTar");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2384,10 +2188,9 @@ static int pull_raw(int argc, char *argv[], void *userdata) {
         assert(bus);
 
         remote = argv[1];
-        if (!http_url_is_valid(remote)) {
-                log_error("URL '%s' is not valid.", remote);
-                return -EINVAL;
-        }
+        if (!http_url_is_valid(remote))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "URL '%s' is not valid.", remote);
 
         if (argc >= 3)
                 local = argv[2];
@@ -2399,8 +2202,7 @@ static int pull_raw(int argc, char *argv[], void *userdata) {
                 local = l;
         }
 
-        if (isempty(local) || streq(local, "-"))
-                local = NULL;
+        local = empty_or_dash_to_null(local);
 
         if (local) {
                 r = raw_strip_suffixes(local, &ll);
@@ -2409,19 +2211,13 @@ static int pull_raw(int argc, char *argv[], void *userdata) {
 
                 local = ll;
 
-                if (!machine_name_is_valid(local)) {
-                        log_error("Local name %s is not a suitable machine name.", local);
-                        return -EINVAL;
-                }
+                if (!machine_name_is_valid(local))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Local name %s is not a suitable machine name.",
+                                               local);
         }
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.import1",
-                        "/org/freedesktop/import1",
-                        "org.freedesktop.import1.Manager",
-                        "PullRaw");
+        r = bus_message_new_method_call(bus, &m, bus_import_mgr, "PullRaw");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2455,7 +2251,7 @@ static int list_transfers(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_free_ TransferInfo *transfers = NULL;
-        size_t n_transfers = 0, n_allocated = 0, j;
+        size_t n_transfers = 0, n_allocated = 0;
         const char *type, *remote, *local;
         sd_bus *bus = userdata;
         uint32_t id, max_id = 0;
@@ -2464,16 +2260,9 @@ static int list_transfers(int argc, char *argv[], void *userdata) {
 
         (void) pager_open(arg_pager_flags);
 
-        r = sd_bus_call_method(bus,
-                               "org.freedesktop.import1",
-                               "/org/freedesktop/import1",
-                               "org.freedesktop.import1.Manager",
-                               "ListTransfers",
-                               &error,
-                               &reply,
-                               NULL);
+        r = bus_call_method(bus, bus_import_mgr, "ListTransfers", &error, &reply, NULL);
         if (r < 0)
-                return log_error_errno(r, "Could not get transfers: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Could not get transfers: %s", bus_error_message(&error, r));
 
         r = sd_bus_message_enter_container(reply, 'a', "(usssdo)");
         if (r < 0)
@@ -2525,7 +2314,7 @@ static int list_transfers(int argc, char *argv[], void *userdata) {
                        (int) max_local, "LOCAL",
                        (int) max_remote, "REMOTE");
 
-        for (j = 0; j < n_transfers; j++)
+        for (size_t j = 0; j < n_transfers; j++)
 
                 if (transfers[j].progress < 0)
                         printf("%*" PRIu32 " %*s %-*s %-*s %-*s\n",
@@ -2555,30 +2344,22 @@ static int list_transfers(int argc, char *argv[], void *userdata) {
 static int cancel_transfer(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = userdata;
-        int r, i;
+        int r;
 
         assert(bus);
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        for (i = 1; i < argc; i++) {
+        for (int i = 1; i < argc; i++) {
                 uint32_t id;
 
                 r = safe_atou32(argv[i], &id);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse transfer id: %s", argv[i]);
 
-                r = sd_bus_call_method(
-                                bus,
-                                "org.freedesktop.import1",
-                                "/org/freedesktop/import1",
-                                "org.freedesktop.import1.Manager",
-                                "CancelTransfer",
-                                &error,
-                                NULL,
-                                "u", id);
+                r = bus_call_method(bus, bus_import_mgr, "CancelTransfer", &error, NULL, "u", id);
                 if (r < 0)
-                        return log_error_errno(r, "Could not cancel transfer: %s", bus_error_message(&error, -r));
+                        return log_error_errno(r, "Could not cancel transfer: %s", bus_error_message(&error, r));
         }
 
         return 0;
@@ -2603,26 +2384,10 @@ static int set_limit(int argc, char *argv[], void *userdata) {
         if (argc > 2)
                 /* With two arguments changes the quota limit of the
                  * specified image */
-                r = sd_bus_call_method(
-                                bus,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
-                                "SetImageLimit",
-                                &error,
-                                NULL,
-                                "st", argv[1], limit);
+                r = bus_call_method(bus, bus_machine_mgr, "SetImageLimit", &error, NULL, "st", argv[1], limit);
         else
                 /* With one argument changes the pool quota limit */
-                r = sd_bus_call_method(
-                                bus,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
-                                "SetPoolLimit",
-                                &error,
-                                NULL,
-                                "t", limit);
+                r = bus_call_method(bus, bus_machine_mgr, "SetPoolLimit", &error, NULL, "t", limit);
 
         if (r < 0)
                 return log_error_errno(r, "Could not set limit: %s", bus_error_message(&error, r));
@@ -2642,13 +2407,7 @@ static int clean_images(int argc, char *argv[], void *userdata) {
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "CleanPool");
+        r = bus_message_new_method_call(bus, &m, bus_machine_mgr, "CleanPool");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -2666,10 +2425,15 @@ static int clean_images(int argc, char *argv[], void *userdata) {
                 return bus_log_parse_error(r);
 
         while ((r = sd_bus_message_read(reply, "(st)", &name, &usage)) > 0) {
-                log_info("Removed image '%s'. Freed exclusive disk space: %s",
-                         name, format_bytes(fb, sizeof(fb), usage));
-
-                total += usage;
+                if (usage == UINT64_MAX) {
+                        log_info("Removed image '%s'", name);
+                        total = UINT64_MAX;
+                } else {
+                        log_info("Removed image '%s'. Freed exclusive disk space: %s",
+                                 name, format_bytes(fb, sizeof(fb), usage));
+                        if (total != UINT64_MAX)
+                                total += usage;
+                }
                 c++;
         }
 
@@ -2677,8 +2441,11 @@ static int clean_images(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        log_info("Removed %u images in total. Total freed exclusive disk space %s.",
-                 c, format_bytes(fb, sizeof(fb), total));
+        if (total == UINT64_MAX)
+                log_info("Removed %u images in total.", c);
+        else
+                log_info("Removed %u images in total. Total freed exclusive disk space: %s.",
+                         c, format_bytes(fb, sizeof(fb), total));
 
         return 0;
 }
@@ -2693,38 +2460,10 @@ static int help(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...] {COMMAND} ...\n\n"
-               "Send control commands to or query the virtual machine and container\n"
-               "registration manager.\n\n"
-               "  -h --help                   Show this help\n"
-               "     --version                Show package version\n"
-               "     --no-pager               Do not pipe output into a pager\n"
-               "     --no-legend              Do not show the headers and footers\n"
-               "     --no-ask-password        Do not ask for system passwords\n"
-               "  -H --host=[USER@]HOST       Operate on remote host\n"
-               "  -M --machine=CONTAINER      Operate on local container\n"
-               "  -p --property=NAME          Show only properties by this name\n"
-               "  -q --quiet                  Suppress output\n"
-               "  -a --all                    Show all properties, including empty ones\n"
-               "     --value                  When showing properties, only print the value\n"
-               "  -l --full                   Do not ellipsize output\n"
-               "     --kill-who=WHO           Who to send signal to\n"
-               "  -s --signal=SIGNAL          Which signal to send\n"
-               "     --uid=USER               Specify user ID to invoke shell as\n"
-               "  -E --setenv=VAR=VALUE       Add an environment variable for shell\n"
-               "     --read-only              Create read-only bind mount\n"
-               "     --mkdir                  Create directory before bind mounting, if missing\n"
-               "  -n --lines=INTEGER          Number of journal entries to show\n"
-               "     --max-addresses=INTEGER  Number of internet addresses to show at most\n"
-               "  -o --output=STRING          Change journal output mode (short, short-precise,\n"
-               "                               short-iso, short-iso-precise, short-full,\n"
-               "                               short-monotonic, short-unix, verbose, export,\n"
-               "                               json, json-pretty, json-sse, json-seq, cat,\n"
-               "                               with-unit)\n"
-               "     --verify=MODE            Verification mode for downloaded images (no,\n"
-               "                              checksum, signature)\n"
-               "     --force                  Download image even if already exists\n\n"
-               "Machine Commands:\n"
+        printf("%s [OPTIONS...] COMMAND ...\n\n"
+               "%sSend control commands to or query the virtual machine and container%s\n"
+               "%sregistration manager.%s\n"
+               "\nMachine Commands:\n"
                "  list                        List running VMs and containers\n"
                "  status NAME...              Show VM/container details\n"
                "  show [NAME...]              Show properties of one or more VMs/containers\n"
@@ -2763,8 +2502,41 @@ static int help(int argc, char *argv[], void *userdata) {
                "  export-raw NAME [FILE]      Export a RAW container or VM image locally\n"
                "  list-transfers              Show list of downloads in progress\n"
                "  cancel-transfer             Cancel a download\n"
+               "\nOptions:\n"
+               "  -h --help                   Show this help\n"
+               "     --version                Show package version\n"
+               "     --no-pager               Do not pipe output into a pager\n"
+               "     --no-legend              Do not show the headers and footers\n"
+               "     --no-ask-password        Do not ask for system passwords\n"
+               "  -H --host=[USER@]HOST       Operate on remote host\n"
+               "  -M --machine=CONTAINER      Operate on local container\n"
+               "  -p --property=NAME          Show only properties by this name\n"
+               "  -q --quiet                  Suppress output\n"
+               "  -a --all                    Show all properties, including empty ones\n"
+               "     --value                  When showing properties, only print the value\n"
+               "  -l --full                   Do not ellipsize output\n"
+               "     --kill-who=WHO           Who to send signal to\n"
+               "  -s --signal=SIGNAL          Which signal to send\n"
+               "     --uid=USER               Specify user ID to invoke shell as\n"
+               "  -E --setenv=VAR=VALUE       Add an environment variable for shell\n"
+               "     --read-only              Create read-only bind mount\n"
+               "     --mkdir                  Create directory before bind mounting, if missing\n"
+               "  -n --lines=INTEGER          Number of journal entries to show\n"
+               "     --max-addresses=INTEGER  Number of internet addresses to show at most\n"
+               "  -o --output=STRING          Change journal output mode (short, short-precise,\n"
+               "                               short-iso, short-iso-precise, short-full,\n"
+               "                               short-monotonic, short-unix, verbose, export,\n"
+               "                               json, json-pretty, json-sse, json-seq, cat,\n"
+               "                               with-unit)\n"
+               "     --verify=MODE            Verification mode for downloaded images (no,\n"
+               "                              checksum, signature)\n"
+               "     --force                  Download image even if already exists\n"
                "\nSee the %s for details.\n"
                , program_invocation_short_name
+               , ansi_highlight()
+               , ansi_normal()
+               , ansi_highlight()
+               , ansi_normal()
                , link
         );
 
@@ -2786,7 +2558,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_FORCE,
                 ARG_FORMAT,
                 ARG_UID,
-                ARG_NUMBER_IPS,
+                ARG_MAX_ADDRESSES,
         };
 
         static const struct option options[] = {
@@ -2813,7 +2585,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "format",          required_argument, NULL, ARG_FORMAT          },
                 { "uid",             required_argument, NULL, ARG_UID             },
                 { "setenv",          required_argument, NULL, 'E'                 },
-                { "max-addresses",   required_argument, NULL, ARG_NUMBER_IPS      },
+                { "max-addresses",   required_argument, NULL, ARG_MAX_ADDRESSES   },
                 {}
         };
 
@@ -2890,7 +2662,7 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_oom();
 
                         /* If the user asked for a particular
-                         * property, show it to him, even if it is
+                         * property, show it to them, even if it is
                          * empty. */
                         arg_all = true;
                         break;
@@ -3016,15 +2788,15 @@ static int parse_argv(int argc, char *argv[]) {
                                 return log_oom();
                         break;
 
-                case ARG_NUMBER_IPS:
+                case ARG_MAX_ADDRESSES:
                         if (streq(optarg, "all"))
-                                arg_addrs = ALL_IP_ADDRESSES;
-                        else if (safe_atoi(optarg, &arg_addrs) < 0)
+                                arg_max_addresses = ALL_ADDRESSES;
+                        else if (safe_atoi(optarg, &arg_max_addresses) < 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Invalid number of IPs");
-                        else if (arg_addrs < 0)
+                                                       "Invalid number of addresses: %s", optarg);
+                        else if (arg_max_addresses <= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Number of IPs cannot be negative");
+                                                       "Number of IPs cannot be negative or zero: %s", optarg);
                         break;
 
                 case '?':
@@ -3038,7 +2810,6 @@ static int parse_argv(int argc, char *argv[]) {
 done:
         if (shell >= 0) {
                 char *t;
-                int i;
 
                 /* We found the "shell" verb while processing the argument list. Since we turned off reordering of the
                  * argument list initially let's readjust it now, and move the "shell" verb to the back. */
@@ -3046,7 +2817,7 @@ done:
                 optind -= 1; /* place the option index where the "shell" verb will be placed */
 
                 t = argv[shell];
-                for (i = shell; i < optind; i++)
+                for (int i = shell; i < optind; i++)
                         argv[i] = argv[i+1];
                 argv[optind] = t;
         }
@@ -3103,8 +2874,7 @@ static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
-        log_parse_environment();
-        log_open();
+        log_setup_cli();
 
         /* The journal merging logic potentially needs a lot of fds. */
         (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
@@ -3117,7 +2887,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, false, &bus);
         if (r < 0)
-                return log_error_errno(r, "Failed to create bus connection: %m");
+                return bus_log_connect_error(r);
 
         (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
 

@@ -1,7 +1,7 @@
 <?xml version='1.0'?>
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-<!-- SPDX-License-Identifier: LGPL-2.1+ -->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="sd_bus_message_new" xmlns:xi="http://www.w3.org/2001/XInclude">
   <refentryinfo>
@@ -118,7 +118,7 @@
     for an example how to use the cleanup attribute.</para>
 
     <para><function>sd_bus_message_ref()</function> and <function>sd_bus_message_unref()</function>
-    execute no operation if the passed in bus object address is
+    execute no operation if the passed in bus message object address is
     <constant>NULL</constant>. <function>sd_bus_message_unrefp()</function> will first dereference
     its argument, which must not be <constant>NULL</constant>, and will execute no operation if
     <emphasis>that</emphasis> is <constant>NULL</constant>.
@@ -141,33 +141,33 @@
     <constant>NULL</constant>.</para>
 
     <para><function>sd_bus_message_get_bus()</function> always returns the bus object.</para>
-  </refsect1>
 
-  <refsect1>
-    <title>Errors</title>
+    <refsect2>
+      <title>Errors</title>
 
-    <para>Returned errors may indicate the following problems:</para>
+      <para>Returned errors may indicate the following problems:</para>
 
-    <variablelist>
-      <varlistentry>
-        <term><constant>-EINVAL</constant></term>
+      <variablelist>
+        <varlistentry>
+          <term><constant>-EINVAL</constant></term>
 
-        <listitem><para>Specified <parameter>type</parameter> is invalid.</para></listitem>
-      </varlistentry>
+          <listitem><para>Specified <parameter>type</parameter> is invalid.</para></listitem>
+        </varlistentry>
 
-      <varlistentry>
-        <term><constant>-ENOTCONN</constant></term>
+        <varlistentry>
+          <term><constant>-ENOTCONN</constant></term>
 
-        <listitem><para>The bus parameter <parameter>bus</parameter> is <constant>NULL</constant> or
-        the bus is not connected.</para></listitem>
-      </varlistentry>
+          <listitem><para>The bus parameter <parameter>bus</parameter> is <constant>NULL</constant> or
+          the bus is not connected.</para></listitem>
+        </varlistentry>
 
-      <varlistentry>
-        <term><constant>-ENOMEM</constant></term>
+        <varlistentry>
+          <term><constant>-ENOMEM</constant></term>
 
-        <listitem><para>Memory allocation failed.</para></listitem>
-      </varlistentry>
-    </variablelist>
+          <listitem><para>Memory allocation failed.</para></listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
   </refsect1>
 
   <xi:include href="libsystemd-pkgconfig.xml" />

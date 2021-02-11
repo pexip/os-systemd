@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <sys/epoll.h>
@@ -24,11 +24,11 @@
 #include "string-util.h"
 
 void server_forward_kmsg(
-        Server *s,
-        int priority,
-        const char *identifier,
-        const char *message,
-        const struct ucred *ucred) {
+                Server *s,
+                int priority,
+                const char *identifier,
+                const char *message,
+                const struct ucred *ucred) {
 
         _cleanup_free_ char *ident_buf = NULL;
         struct iovec iovec[5];
@@ -58,7 +58,7 @@ void server_forward_kmsg(
         /* Second: identifier and PID */
         if (ucred) {
                 if (!identifier) {
-                        get_process_comm(ucred->pid, &ident_buf);
+                        (void) get_process_comm(ucred->pid, &ident_buf);
                         identifier = ident_buf;
                 }
 
@@ -217,7 +217,7 @@ void dev_kmsg_record(Server *s, char *p, size_t l) {
                         char *b;
 
                         if (sd_device_get_devname(d, &g) >= 0) {
-                                b = strappend("_UDEV_DEVNODE=", g);
+                                b = strjoin("_UDEV_DEVNODE=", g);
                                 if (b) {
                                         iovec[n++] = IOVEC_MAKE_STRING(b);
                                         z++;
@@ -225,7 +225,7 @@ void dev_kmsg_record(Server *s, char *p, size_t l) {
                         }
 
                         if (sd_device_get_sysname(d, &g) >= 0) {
-                                b = strappend("_UDEV_SYSNAME=", g);
+                                b = strjoin("_UDEV_SYSNAME=", g);
                                 if (b) {
                                         iovec[n++] = IOVEC_MAKE_STRING(b);
                                         z++;
@@ -238,7 +238,7 @@ void dev_kmsg_record(Server *s, char *p, size_t l) {
                                 if (j >= N_IOVEC_UDEV_FIELDS)
                                         break;
 
-                                b = strappend("_UDEV_DEVLINK=", g);
+                                b = strjoin("_UDEV_DEVLINK=", g);
                                 if (b) {
                                         iovec[n++] = IOVEC_MAKE_STRING(b);
                                         z++;
@@ -271,13 +271,13 @@ void dev_kmsg_record(Server *s, char *p, size_t l) {
                         goto finish;
 
                 if (identifier) {
-                        syslog_identifier = strappend("SYSLOG_IDENTIFIER=", identifier);
+                        syslog_identifier = strjoin("SYSLOG_IDENTIFIER=", identifier);
                         if (syslog_identifier)
                                 iovec[n++] = IOVEC_MAKE_STRING(syslog_identifier);
                 }
 
                 if (pid) {
-                        syslog_pid = strappend("SYSLOG_PID=", pid);
+                        syslog_pid = strjoin("SYSLOG_PID=", pid);
                         if (syslog_pid)
                                 iovec[n++] = IOVEC_MAKE_STRING(syslog_pid);
                 }
@@ -315,7 +315,7 @@ static int server_read_dev_kmsg(Server *s) {
                 if (IN_SET(errno, EAGAIN, EINTR, EPIPE))
                         return 0;
 
-                return log_error_errno(errno, "Failed to read from kernel: %m");
+                return log_error_errno(errno, "Failed to read from /dev/kmsg: %m");
         }
 
         dev_kmsg_record(s, buffer, l);
@@ -416,19 +416,23 @@ fail:
 }
 
 int server_open_kernel_seqnum(Server *s) {
-        _cleanup_close_ int fd;
+        _cleanup_close_ int fd = -1;
+        const char *fn;
         uint64_t *p;
         int r;
 
         assert(s);
 
-        /* We store the seqnum we last read in an mmaped file. That
-         * way we can just use it like a variable, but it is
-         * persistent and automatically flushed at reboot. */
+        /* We store the seqnum we last read in an mmapped file. That way we can just use it like a variable,
+         * but it is persistent and automatically flushed at reboot. */
 
-        fd = open("/run/systemd/journal/kernel-seqnum", O_RDWR|O_CREAT|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW, 0644);
+        if (!s->read_kmsg)
+                return 0;
+
+        fn = strjoina(s->runtime_directory, "/kernel-seqnum");
+        fd = open(fn, O_RDWR|O_CREAT|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW, 0644);
         if (fd < 0) {
-                log_error_errno(errno, "Failed to open /run/systemd/journal/kernel-seqnum, ignoring: %m");
+                log_error_errno(errno, "Failed to open %s, ignoring: %m", fn);
                 return 0;
         }
 

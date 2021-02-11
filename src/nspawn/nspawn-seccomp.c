@@ -1,8 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <linux/netlink.h>
 #include <sys/capability.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 
 #if HAVE_SECCOMP
@@ -20,17 +21,17 @@
 
 #if HAVE_SECCOMP
 
-static int seccomp_add_default_syscall_filter(
+static int add_syscall_filters(
                 scmp_filter_ctx ctx,
                 uint32_t arch,
                 uint64_t cap_list_retain,
-                char **syscall_whitelist,
-                char **syscall_blacklist) {
+                char **syscall_allow_list,
+                char **syscall_deny_list) {
 
         static const struct {
                 uint64_t capability;
                 const char* name;
-        } whitelist[] = {
+        } allow_list[] = {
                 /* Let's use set names where we can */
                 { 0,                  "@aio"                   },
                 { 0,                  "@basic-io"              },
@@ -122,6 +123,7 @@ static int seccomp_add_default_syscall_filter(
                  * @cpu-emulation
                  * @keyring           (NB: keyring is not namespaced!)
                  * @obsolete
+                 * @pkey
                  * @swap
                  *
                  * bpf                (NB: bpffs is not namespaced!)
@@ -133,60 +135,78 @@ static int seccomp_add_default_syscall_filter(
                  * nfsservctl
                  * open_by_handle_at
                  * perf_event_open
-                 * pkey_alloc
-                 * pkey_free
-                 * pkey_mprotect
                  * quotactl
                  */
         };
 
-        int r;
-        size_t i;
+        _cleanup_strv_free_ char **added = NULL;
         char **p;
+        int r;
 
-        for (i = 0; i < ELEMENTSOF(whitelist); i++) {
-                if (whitelist[i].capability != 0 && (cap_list_retain & (1ULL << whitelist[i].capability)) == 0)
+        for (size_t i = 0; i < ELEMENTSOF(allow_list); i++) {
+                if (allow_list[i].capability != 0 && (cap_list_retain & (1ULL << allow_list[i].capability)) == 0)
                         continue;
 
-                r = seccomp_add_syscall_filter_item(ctx, whitelist[i].name, SCMP_ACT_ALLOW, syscall_blacklist, false);
+                r = seccomp_add_syscall_filter_item(ctx,
+                                                    allow_list[i].name,
+                                                    SCMP_ACT_ALLOW,
+                                                    syscall_deny_list,
+                                                    false,
+                                                    &added);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to add syscall filter item %s: %m", whitelist[i].name);
+                        return log_error_errno(r, "Failed to add syscall filter item %s: %m", allow_list[i].name);
         }
 
-        STRV_FOREACH(p, syscall_whitelist) {
-                r = seccomp_add_syscall_filter_item(ctx, *p, SCMP_ACT_ALLOW, syscall_blacklist, false);
+        STRV_FOREACH(p, syscall_allow_list) {
+                r = seccomp_add_syscall_filter_item(ctx, *p, SCMP_ACT_ALLOW, syscall_deny_list, true, &added);
                 if (r < 0)
                         log_warning_errno(r, "Failed to add rule for system call %s on %s, ignoring: %m",
                                           *p, seccomp_arch_to_string(arch));
         }
 
+        /* The default action is ENOSYS. Respond with EPERM to all other "known" but not allow-listed
+         * syscalls. */
+        r = seccomp_add_syscall_filter_item(ctx, "@known", SCMP_ACT_ERRNO(EPERM), added, true, NULL);
+        if (r < 0)
+                log_warning_errno(r, "Failed to add rule for @known set on %s, ignoring: %m",
+                                  seccomp_arch_to_string(arch));
+
+#if (SCMP_VER_MAJOR == 2 && SCMP_VER_MINOR >= 5) || SCMP_VER_MAJOR > 2
+        /* We have a large filter here, so let's turn on the binary tree mode if possible. */
+        r = seccomp_attr_set(ctx, SCMP_FLTATR_CTL_OPTIMIZE, 2);
+        if (r < 0)
+                return r;
+#endif
+
         return 0;
 }
 
-int setup_seccomp(uint64_t cap_list_retain, char **syscall_whitelist, char **syscall_blacklist) {
+int setup_seccomp(uint64_t cap_list_retain, char **syscall_allow_list, char **syscall_deny_list) {
         uint32_t arch;
         int r;
 
         if (!is_seccomp_available()) {
-                log_debug("SECCOMP features not detected in the kernel, disabling SECCOMP filterering");
+                log_debug("SECCOMP features not detected in the kernel or disabled at runtime, disabling SECCOMP filtering");
                 return 0;
         }
 
         SECCOMP_FOREACH_LOCAL_ARCH(arch) {
                 _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
 
-                log_debug("Applying whitelist on architecture: %s", seccomp_arch_to_string(arch));
+                log_debug("Applying allow list on architecture: %s", seccomp_arch_to_string(arch));
 
-                r = seccomp_init_for_arch(&seccomp, arch, SCMP_ACT_ERRNO(EPERM));
+                /* We install ENOSYS as the default action, but it will only apply to syscalls which are not
+                 * in the @known set, see above. */
+                r = seccomp_init_for_arch(&seccomp, arch, SCMP_ACT_ERRNO(ENOSYS));
                 if (r < 0)
                         return log_error_errno(r, "Failed to allocate seccomp object: %m");
 
-                r = seccomp_add_default_syscall_filter(seccomp, arch, cap_list_retain, syscall_whitelist, syscall_blacklist);
+                r = add_syscall_filters(seccomp, arch, cap_list_retain, syscall_allow_list, syscall_deny_list);
                 if (r < 0)
                         return r;
 
                 r = seccomp_load(seccomp);
-                if (IN_SET(r, -EPERM, -EACCES))
+                if (ERRNO_IS_SECCOMP_FATAL(r))
                         return log_error_errno(r, "Failed to install seccomp filter: %m");
                 if (r < 0)
                         log_debug_errno(r, "Failed to install filter set for architecture %s, skipping: %m", seccomp_arch_to_string(arch));
@@ -222,7 +242,7 @@ int setup_seccomp(uint64_t cap_list_retain, char **syscall_whitelist, char **sys
                 }
 
                 r = seccomp_load(seccomp);
-                if (IN_SET(r, -EPERM, -EACCES))
+                if (ERRNO_IS_SECCOMP_FATAL(r))
                         return log_error_errno(r, "Failed to install seccomp audit filter: %m");
                 if (r < 0)
                         log_debug_errno(r, "Failed to install filter set for architecture %s, skipping: %m", seccomp_arch_to_string(arch));
@@ -233,7 +253,7 @@ int setup_seccomp(uint64_t cap_list_retain, char **syscall_whitelist, char **sys
 
 #else
 
-int setup_seccomp(uint64_t cap_list_retain, char **syscall_whitelist, char **syscall_blacklist) {
+int setup_seccomp(uint64_t cap_list_retain, char **syscall_allow_list, char **syscall_deny_list) {
         return 0;
 }
 

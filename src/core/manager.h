@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <stdbool.h>
@@ -9,11 +9,14 @@
 #include "sd-event.h"
 
 #include "cgroup-util.h"
+#include "cgroup.h"
 #include "fdset.h"
 #include "hashmap.h"
 #include "ip-address-access.h"
 #include "list.h"
+#include "prioq.h"
 #include "ratelimit.h"
+#include "varlink.h"
 
 struct libmnt_monitor;
 typedef struct Unit Unit;
@@ -53,8 +56,17 @@ typedef enum ManagerObjective {
 typedef enum StatusType {
         STATUS_TYPE_EPHEMERAL,
         STATUS_TYPE_NORMAL,
+        STATUS_TYPE_NOTICE,
         STATUS_TYPE_EMERGENCY,
 } StatusType;
+
+typedef enum OOMPolicy {
+        OOM_CONTINUE,          /* The kernel kills the process it wants to kill, and that's it */
+        OOM_STOP,              /* The kernel kills the process it wants to kill, and we stop the unit */
+        OOM_KILL,              /* The kernel kills the process it wants to kill, and all others in the unit, and we stop the unit */
+        _OOM_POLICY_MAX,
+        _OOM_POLICY_INVALID = -1
+} OOMPolicy;
 
 /* Notes:
  * 1. TIMESTAMP_FIRMWARE, TIMESTAMP_LOADER, TIMESTAMP_KERNEL, TIMESTAMP_INITRD,
@@ -102,6 +114,13 @@ typedef enum ManagerTimestamp {
         _MANAGER_TIMESTAMP_INVALID = -1,
 } ManagerTimestamp;
 
+typedef enum WatchdogType {
+        WATCHDOG_RUNTIME,
+        WATCHDOG_REBOOT,
+        WATCHDOG_KEXEC,
+        _WATCHDOG_TYPE_MAX,
+} WatchdogType;
+
 #include "execute.h"
 #include "job.h"
 #include "path-lookup.h"
@@ -137,7 +156,7 @@ struct Manager {
         LIST_HEAD(Unit, load_queue); /* this is actually more a stack than a queue, but uh. */
 
         /* Jobs that need to be run */
-        LIST_HEAD(Job, run_queue);   /* more a stack than a queue, too */
+        struct Prioq *run_queue;
 
         /* Units and jobs that have not yet been announced via
          * D-Bus. When something about a job changes it is added here
@@ -158,6 +177,9 @@ struct Manager {
 
         /* Units whose cgroup ran empty */
         LIST_HEAD(Unit, cgroup_empty_queue);
+
+        /* Units whose memory.event fired */
+        LIST_HEAD(Unit, cgroup_oom_queue);
 
         /* Target units whose default target dependencies haven't been set yet */
         LIST_HEAD(Unit, target_deps_queue);
@@ -206,17 +228,20 @@ struct Manager {
         int user_lookup_fds[2];
         sd_event_source *user_lookup_event_source;
 
-        sd_event_source *sync_bus_names_event_source;
-
         UnitFileScope unit_file_scope;
         LookupPaths lookup_paths;
+        Hashmap *unit_id_map;
+        Hashmap *unit_name_map;
         Set *unit_path_cache;
+        uint64_t unit_cache_timestamp_hash;
 
         char **transient_environment;  /* The environment, as determined from config files, kernel cmdline and environment generators */
         char **client_environment;     /* Environment variables created by clients through the bus API */
 
-        usec_t runtime_watchdog;
-        usec_t shutdown_watchdog;
+        usec_t watchdog[_WATCHDOG_TYPE_MAX];
+        usec_t watchdog_overridden[_WATCHDOG_TYPE_MAX];
+
+        bool runtime_watchdog_running; /* Whether the runtime HW watchdog was started, so we know if we still need to get the real timeout from the hardware */
 
         dual_timestamp timestamps[_MANAGER_TIMESTAMP_MAX];
 
@@ -268,10 +293,15 @@ struct Manager {
         /* Notifications from cgroups, when the unified hierarchy is used is done via inotify. */
         int cgroup_inotify_fd;
         sd_event_source *cgroup_inotify_event_source;
-        Hashmap *cgroup_inotify_wd_unit;
+
+        /* Maps for finding the unit for each inotify watch descriptor for the cgroup.events and
+         * memory.events cgroupv2 attributes. */
+        Hashmap *cgroup_control_inotify_wd_unit;
+        Hashmap *cgroup_memory_inotify_wd_unit;
 
         /* A defer event for handling cgroup empty events and processing them after SIGCHLD in all cases. */
         sd_event_source *cgroup_empty_event_source;
+        sd_event_source *cgroup_oom_event_source;
 
         /* Make sure the user cannot accidentally unmount our cgroup
          * file system */
@@ -307,6 +337,8 @@ struct Manager {
         uint8_t return_value;
 
         ShowStatus show_status;
+        ShowStatus show_status_overridden;
+        StatusUnitFormat status_unit_format;
         char *confirm_spawn;
         bool no_console_output;
         bool service_watchdogs;
@@ -314,6 +346,8 @@ struct Manager {
         ExecOutput default_std_output, default_std_error;
 
         usec_t default_restart_usec, default_timeout_start_usec, default_timeout_stop_usec;
+        usec_t default_timeout_abort_usec;
+        bool default_timeout_abort_set;
 
         usec_t default_start_limit_interval;
         unsigned default_start_limit_burst;
@@ -325,8 +359,10 @@ struct Manager {
         bool default_tasks_accounting;
         bool default_ip_accounting;
 
-        uint64_t default_tasks_max;
+        TasksMax default_tasks_max;
         usec_t default_timer_accuracy_usec;
+
+        OOMPolicy default_oom_policy;
 
         int original_log_level;
         LogTarget original_log_target;
@@ -390,12 +426,24 @@ struct Manager {
 
         /* Prefixes of e.g. RuntimeDirectory= */
         char *prefix[_EXEC_DIRECTORY_TYPE_MAX];
+        char *received_credentials;
 
         /* Used in the SIGCHLD and sd_notify() message invocation logic to avoid that we dispatch the same event
          * multiple times on the same unit. */
         unsigned sigchldgen;
         unsigned notifygen;
+
+        bool honor_device_enumeration;
+
+        VarlinkServer *varlink_server;
+        /* Only systemd-oomd should be using this to subscribe to changes in ManagedOOM settings */
+        Varlink *managed_oom_varlink_request;
 };
+
+static inline usec_t manager_default_timeout_abort_usec(Manager *m) {
+        assert(m);
+        return m->default_timeout_abort_set ? m->default_timeout_abort_usec : m->default_timeout_stop_usec;
+}
 
 #define MANAGER_IS_SYSTEM(m) ((m)->unit_file_scope == UNIT_FILE_SYSTEM)
 #define MANAGER_IS_USER(m) ((m)->unit_file_scope != UNIT_FILE_SYSTEM)
@@ -420,14 +468,15 @@ Unit *manager_get_unit(Manager *m, const char *name);
 
 int manager_get_job_from_dbus_path(Manager *m, const char *s, Job **_j);
 
+bool manager_unit_cache_should_retry_load(Unit *u);
 int manager_load_unit_prepare(Manager *m, const char *name, const char *path, sd_bus_error *e, Unit **_ret);
 int manager_load_unit(Manager *m, const char *name, const char *path, sd_bus_error *e, Unit **_ret);
 int manager_load_startable_unit_or_warn(Manager *m, const char *name, const char *path, Unit **ret);
 int manager_load_unit_from_dbus_path(Manager *m, const char *s, sd_bus_error *e, Unit **_u);
 
-int manager_add_job(Manager *m, JobType type, Unit *unit, JobMode mode, sd_bus_error *e, Job **_ret);
-int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, sd_bus_error *e, Job **_ret);
-int manager_add_job_by_name_and_warn(Manager *m, JobType type, const char *name, JobMode mode, Job **ret);
+int manager_add_job(Manager *m, JobType type, Unit *unit, JobMode mode, Set *affected_jobs, sd_bus_error *e, Job **_ret);
+int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, sd_bus_error *e, Job **_ret);
+int manager_add_job_by_name_and_warn(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs,  Job **ret);
 int manager_propagate_reload(Manager *m, Unit *unit, JobMode mode, sd_bus_error *e);
 
 void manager_dump_units(Manager *s, FILE *f, const char *prefix);
@@ -436,6 +485,8 @@ void manager_dump(Manager *s, FILE *f, const char *prefix);
 int manager_get_dump_string(Manager *m, char **ret);
 
 void manager_clear_jobs(Manager *m);
+
+void manager_unwatch_pid(Manager *m, pid_t pid);
 
 unsigned manager_dispatch_load_queue(Manager *m);
 
@@ -464,14 +515,17 @@ bool manager_unit_inactive_or_pending(Manager *m, const char *name);
 
 void manager_check_finished(Manager *m);
 
+void disable_printk_ratelimit(void);
 void manager_recheck_dbus(Manager *m);
 void manager_recheck_journal(Manager *m);
 
-void manager_set_show_status(Manager *m, ShowStatus mode);
+bool manager_get_show_status_on(Manager *m);
+void manager_set_show_status(Manager *m, ShowStatus mode, const char *reason);
+void manager_override_show_status(Manager *m, ShowStatus mode, const char *reason);
+
 void manager_set_first_boot(Manager *m, bool b);
 
 void manager_status_printf(Manager *m, StatusType type, const char *status, const char *format, ...) _printf_(4,5);
-void manager_flip_auto_status(Manager *m, bool enable);
 
 Set *manager_get_units_requiring_mounts_for(Manager *m, const char *path);
 
@@ -484,15 +538,6 @@ int manager_ref_uid(Manager *m, uid_t uid, bool clean_ipc);
 
 void manager_unref_gid(Manager *m, gid_t gid, bool destroy_now);
 int manager_ref_gid(Manager *m, gid_t gid, bool destroy_now);
-
-void manager_vacuum_uid_refs(Manager *m);
-void manager_vacuum_gid_refs(Manager *m);
-
-void manager_serialize_uid_refs(Manager *m, FILE *f);
-void manager_deserialize_uid_refs_one(Manager *m, const char *value);
-
-void manager_serialize_gid_refs(Manager *m, FILE *f);
-void manager_deserialize_gid_refs_one(Manager *m, const char *value);
 
 char *manager_taint_string(Manager *m);
 
@@ -515,3 +560,11 @@ void manager_disable_confirm_spawn(void);
 const char *manager_timestamp_to_string(ManagerTimestamp m) _const_;
 ManagerTimestamp manager_timestamp_from_string(const char *s) _pure_;
 ManagerTimestamp manager_timestamp_initrd_mangle(ManagerTimestamp s);
+
+usec_t manager_get_watchdog(Manager *m, WatchdogType t);
+void manager_set_watchdog(Manager *m, WatchdogType t, usec_t timeout);
+int manager_override_watchdog(Manager *m, WatchdogType t, usec_t timeout);
+void manager_retry_runtime_watchdog(Manager *m);
+
+const char* oom_policy_to_string(OOMPolicy i) _const_;
+OOMPolicy oom_policy_from_string(const char *s) _pure_;

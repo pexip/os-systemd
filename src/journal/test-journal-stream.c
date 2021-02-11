@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -6,6 +6,8 @@
 #include "sd-journal.h"
 
 #include "alloc-util.h"
+#include "chattr-util.h"
+#include "io-util.h"
 #include "journal-file.h"
 #include "journal-internal.h"
 #include "log.h"
@@ -57,9 +59,9 @@ static void verify_contents(sd_journal *j, unsigned skip) {
                 assert_se(i == N_ENTRIES);
 }
 
-int main(int argc, char *argv[]) {
+static void run_test(void) {
         JournalFile *one, *two, *three;
-        char t[] = "/tmp/journal-stream-XXXXXX";
+        char t[] = "/var/tmp/journal-stream-XXXXXX";
         unsigned i;
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
         char *z;
@@ -67,14 +69,9 @@ int main(int argc, char *argv[]) {
         size_t l;
         dual_timestamp previous_ts = DUAL_TIMESTAMP_NULL;
 
-        /* journal_file_open requires a valid machine id */
-        if (access("/etc/machine-id", F_OK) != 0)
-                return log_tests_skipped("/etc/machine-id not found");
-
-        test_setup_logging(LOG_DEBUG);
-
         assert_se(mkdtemp(t));
         assert_se(chdir(t) >= 0);
+        (void) chattr_path(t, FS_NOCOW_FL, FS_NOCOW_FL, NULL);
 
         assert_se(journal_file_open(-1, "one.journal", O_RDWR|O_CREAT, 0666, true, (uint64_t) -1, false, NULL, NULL, NULL, NULL, &one) == 0);
         assert_se(journal_file_open(-1, "two.journal", O_RDWR|O_CREAT, 0666, true, (uint64_t) -1, false, NULL, NULL, NULL, NULL, &two) == 0);
@@ -96,13 +93,11 @@ int main(int argc, char *argv[]) {
                 previous_ts = ts;
 
                 assert_se(asprintf(&p, "NUMBER=%u", i) >= 0);
-                iovec[0].iov_base = p;
-                iovec[0].iov_len = strlen(p);
+                iovec[0] = IOVEC_MAKE(p, strlen(p));
 
                 assert_se(asprintf(&q, "MAGIC=%s", i % 5 == 0 ? "quux" : "waldo") >= 0);
 
-                iovec[1].iov_base = q;
-                iovec[1].iov_len = strlen(q);
+                iovec[1] = IOVEC_MAKE(q, strlen(q));
 
                 if (i % 10 == 0)
                         assert_se(journal_file_append_entry(three, &ts, NULL, iovec, 2, NULL, NULL, NULL) == 0);
@@ -175,6 +170,22 @@ int main(int argc, char *argv[]) {
                 printf("%.*s\n", (int) l, (const char*) data);
 
         assert_se(rm_rf(t, REMOVE_ROOT|REMOVE_PHYSICAL) >= 0);
+}
+
+int main(int argc, char *argv[]) {
+
+        /* journal_file_open requires a valid machine id */
+        if (access("/etc/machine-id", F_OK) != 0)
+                return log_tests_skipped("/etc/machine-id not found");
+
+        test_setup_logging(LOG_DEBUG);
+
+        /* Run this test twice. Once with old hashing and once with new hashing */
+        assert_se(setenv("SYSTEMD_JOURNAL_KEYED_HASH", "1", 1) >= 0);
+        run_test();
+
+        assert_se(setenv("SYSTEMD_JOURNAL_KEYED_HASH", "0", 1) >= 0);
+        run_test();
 
         return 0;
 }

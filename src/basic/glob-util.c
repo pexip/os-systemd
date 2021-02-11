@@ -1,11 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <dirent.h>
 #include <errno.h>
-#include <glob.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "glob-util.h"
 #include "macro.h"
 #include "path-util.h"
@@ -34,13 +35,12 @@ int safe_glob(const char *path, int flags, glob_t *pglob) {
 
         errno = 0;
         k = glob(path, flags | GLOB_ALTDIRFUNC, NULL, pglob);
-
         if (k == GLOB_NOMATCH)
                 return -ENOENT;
         if (k == GLOB_NOSPACE)
                 return -ENOMEM;
         if (k != 0)
-                return errno > 0 ? -errno : -EIO;
+                return errno_or_else(EIO);
         if (strv_isempty(pglob->gl_pathv))
                 return -ENOENT;
 
@@ -61,11 +61,11 @@ int glob_exists(const char *path) {
         return true;
 }
 
-int glob_extend(char ***strv, const char *path) {
+int glob_extend(char ***strv, const char *path, int flags) {
         _cleanup_globfree_ glob_t g = {};
         int k;
 
-        k = safe_glob(path, GLOB_NOSORT|GLOB_BRACE, &g);
+        k = safe_glob(path, GLOB_NOSORT|GLOB_BRACE|flags, &g);
         if (k < 0)
                 return k;
 

@@ -1,9 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "build.h"
 #include "cgroup-util.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "parse-util.h"
@@ -13,7 +14,6 @@
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
-#include "test-helper.h"
 #include "tests.h"
 #include "user-util.h"
 #include "util.h"
@@ -23,7 +23,7 @@ static void check_p_d_u(const char *path, int code, const char *result) {
         int r;
 
         r = cg_path_decode_unit(path, &unit);
-        printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, result, code);
+        printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, strnull(result), code);
         assert_se(r == code);
         assert_se(streq_ptr(unit, result));
 }
@@ -45,7 +45,7 @@ static void check_p_g_u(const char *path, int code, const char *result) {
         int r;
 
         r = cg_path_get_unit(path, &unit);
-        printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, result, code);
+        printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, strnull(result), code);
         assert_se(r == code);
         assert_se(streq_ptr(unit, result));
 }
@@ -69,7 +69,7 @@ static void check_p_g_u_u(const char *path, int code, const char *result) {
         int r;
 
         r = cg_path_get_user_unit(path, &unit);
-        printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, result, code);
+        printf("%s: %s → %s %d expected %s %d\n", __func__, path, unit, r, strnull(result), code);
         assert_se(r == code);
         assert_se(streq_ptr(unit, result));
 }
@@ -333,64 +333,15 @@ static void test_fd_is_cgroup_fs(void) {
         fd = safe_close(fd);
 }
 
-static void test_is_wanted_print(bool header) {
-        _cleanup_free_ char *cmdline = NULL;
-
-        log_info("-- %s --", __func__);
-        assert_se(proc_cmdline(&cmdline) >= 0);
-        log_info("cmdline: %s", cmdline);
-        if (header) {
-
-                log_info(_CGROUP_HIEARCHY_);
-                (void) system("findmnt -n /sys/fs/cgroup");
-        }
-
-        log_info("is_unified_wanted() → %s", yes_no(cg_is_unified_wanted()));
-        log_info("is_hybrid_wanted() → %s", yes_no(cg_is_hybrid_wanted()));
-        log_info("is_legacy_wanted() → %s", yes_no(cg_is_legacy_wanted()));
-        log_info(" ");
-}
-
-static void test_is_wanted(void) {
-        assert_se(setenv("SYSTEMD_PROC_CMDLINE",
-                         "systemd.unified_cgroup_hierarchy", 1) >= 0);
-        test_is_wanted_print(false);
-
-        assert_se(setenv("SYSTEMD_PROC_CMDLINE",
-                         "systemd.unified_cgroup_hierarchy=0", 1) >= 0);
-        test_is_wanted_print(false);
-
-        assert_se(setenv("SYSTEMD_PROC_CMDLINE",
-                         "systemd.unified_cgroup_hierarchy=0 "
-                         "systemd.legacy_systemd_cgroup_controller", 1) >= 0);
-        test_is_wanted_print(false);
-
-        assert_se(setenv("SYSTEMD_PROC_CMDLINE",
-                         "systemd.unified_cgroup_hierarchy=0 "
-                         "systemd.legacy_systemd_cgroup_controller=0", 1) >= 0);
-        test_is_wanted_print(false);
-
-        /* cgroup_no_v1=all implies unified cgroup hierarchy, unless otherwise
-         * explicitly specified. */
-        assert_se(setenv("SYSTEMD_PROC_CMDLINE",
-                         "cgroup_no_v1=all", 1) >= 0);
-        test_is_wanted_print(false);
-
-        assert_se(setenv("SYSTEMD_PROC_CMDLINE",
-                         "cgroup_no_v1=all "
-                         "systemd.unified_cgroup_hierarchy=0", 1) >= 0);
-        test_is_wanted_print(false);
-}
-
 static void test_cg_tests(void) {
         int all, hybrid, systemd, r;
 
-        r = cg_unified_flush();
+        r = cg_unified();
         if (r == -ENOMEDIUM) {
                 log_notice_errno(r, "Skipping cg hierarchy tests: %m");
                 return;
         }
-        assert_se(r == 0);
+        assert_se(r >= 0);
 
         all = cg_all_unified();
         assert_se(IN_SET(all, 0, 1));
@@ -419,7 +370,7 @@ static void test_cg_get_keyed_attribute(void) {
         int i, r;
 
         r = cg_get_keyed_attribute("cpu", "/init.scope", "no_such_file", STRV_MAKE("no_such_attr"), &val);
-        if (r == -ENOMEDIUM) {
+        if (r == -ENOMEDIUM || ERRNO_IS_PRIVILEGE(r)) {
                 log_info_errno(r, "Skipping most of %s, /sys/fs/cgroup not accessible: %m", __func__);
                 return;
         }
@@ -433,22 +384,42 @@ static void test_cg_get_keyed_attribute(void) {
         }
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("no_such_attr"), &val) == -ENXIO);
+        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("no_such_attr"), &val) == 0);
         assert_se(val == NULL);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec"), &val) == 0);
+        val = mfree(val);
+
+        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec"), &val) == 1);
         log_info("cpu /init.scope cpu.stat [usage_usec] → \"%s\"", val);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "no_such_attr"), vals3) == -ENXIO);
+        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "no_such_attr"), vals3) == 1);
+        assert(vals3[0] && !vals3[1]);
+        free(vals3[0]);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "usage_usec"), vals3) == -ENXIO);
+        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat", STRV_MAKE("usage_usec", "usage_usec"), vals3) == 1);
+        assert(vals3[0] && !vals3[1]);
+        free(vals3[0]);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat",
                                          STRV_MAKE("usage_usec", "user_usec", "system_usec"), vals3) == 0);
+        for (i = 0; i < 3; i++)
+                free(vals3[i]);
+
+        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat",
+                                         STRV_MAKE("usage_usec", "user_usec", "system_usec"), vals3) == 3);
         log_info("cpu /init.scope cpu.stat [usage_usec user_usec system_usec] → \"%s\", \"%s\", \"%s\"",
                  vals3[0], vals3[1], vals3[2]);
 
         assert_se(cg_get_keyed_attribute("cpu", "/init.scope", "cpu.stat",
                                          STRV_MAKE("system_usec", "user_usec", "usage_usec"), vals3a) == 0);
+        for (i = 0; i < 3; i++)
+                free(vals3a[i]);
+
+        assert_se(cg_get_keyed_attribute_graceful("cpu", "/init.scope", "cpu.stat",
+                                         STRV_MAKE("system_usec", "user_usec", "usage_usec"), vals3a) == 3);
         log_info("cpu /init.scope cpu.stat [system_usec user_usec usage_usec] → \"%s\", \"%s\", \"%s\"",
                  vals3a[0], vals3a[1], vals3a[2]);
 
@@ -477,9 +448,6 @@ int main(void) {
         TEST_REQ_RUNNING_SYSTEMD(test_mask_supported());
         TEST_REQ_RUNNING_SYSTEMD(test_is_cgroup_fs());
         TEST_REQ_RUNNING_SYSTEMD(test_fd_is_cgroup_fs());
-        test_is_wanted_print(true);
-        test_is_wanted_print(false); /* run twice to test caching */
-        test_is_wanted();
         test_cg_tests();
         test_cg_get_keyed_attribute();
 

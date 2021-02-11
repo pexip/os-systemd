@@ -1,10 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <getopt.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include <string.h>
 
 #include "env-util.h"
 #include "log.h"
@@ -46,11 +45,20 @@ bool running_in_chroot_or_offline(void) {
         return r > 0;
 }
 
+const Verb* verbs_find_verb(const char *name, const Verb verbs[]) {
+        for (size_t i = 0; verbs[i].dispatch; i++)
+                if (streq_ptr(name, verbs[i].verb) ||
+                    (!name && FLAGS_SET(verbs[i].flags, VERB_DEFAULT)))
+                        return &verbs[i];
+
+        /* At the end of the list? */
+        return NULL;
+}
+
 int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
         const Verb *verb;
         const char *name;
-        unsigned i;
-        int left, r;
+        int left;
 
         assert(verbs);
         assert(verbs[0].dispatch);
@@ -63,30 +71,15 @@ int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
         optind = 0;
         name = argv[0];
 
-        for (i = 0;; i++) {
-                bool found;
-
-                /* At the end of the list? */
-                if (!verbs[i].dispatch) {
-                        if (name)
-                                log_error("Unknown operation %s.", name);
-                        else
-                                log_error("Requires operation parameter.");
-                        return -EINVAL;
-                }
-
+        verb = verbs_find_verb(name, verbs);
+        if (!verb) {
                 if (name)
-                        found = streq(name, verbs[i].verb);
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Unknown command verb %s.", name);
                 else
-                        found = verbs[i].flags & VERB_DEFAULT;
-
-                if (found) {
-                        verb = &verbs[i];
-                        break;
-                }
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Command verb required.");
         }
-
-        assert(verb);
 
         if (!name)
                 left = 1;
@@ -102,17 +95,8 @@ int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
                                        "Too many arguments.");
 
         if ((verb->flags & VERB_ONLINE_ONLY) && running_in_chroot_or_offline()) {
-                if (name)
-                        log_info("Running in chroot, ignoring request: %s", name);
-                else
-                        log_info("Running in chroot, ignoring request.");
+                log_info("Running in chroot, ignoring command '%s'", name ?: verb->verb);
                 return 0;
-        }
-
-        if (verb->flags & VERB_MUST_BE_ROOT) {
-                r = must_be_root();
-                if (r < 0)
-                        return r;
         }
 
         if (name)

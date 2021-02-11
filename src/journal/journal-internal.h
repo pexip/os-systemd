@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <inttypes.h>
@@ -32,7 +32,7 @@ struct Match {
         /* For concrete matches */
         char *data;
         size_t size;
-        le64_t le_hash;
+        uint64_t hash; /* old-style jenkins hash. New-style siphash is different per file, hence won't be cached here */
 
         /* For terms */
         LIST_HEAD(Match, matches);
@@ -41,10 +41,10 @@ struct Match {
 struct Location {
         LocationType type;
 
-        bool seqnum_set;
-        bool realtime_set;
-        bool monotonic_set;
-        bool xor_hash_set;
+        bool seqnum_set:1;
+        bool realtime_set:1;
+        bool monotonic_set:1;
+        bool xor_hash_set:1;
 
         uint64_t seqnum;
         sd_id128_t seqnum_id;
@@ -69,6 +69,7 @@ struct sd_journal {
 
         char *path;
         char *prefix;
+        char *namespace;
 
         OrderedHashmap *files;
         IteratedCache *files_cache;
@@ -126,3 +127,12 @@ void journal_print_header(sd_journal *j);
 
 #define JOURNAL_FOREACH_DATA_RETVAL(j, data, l, retval)                     \
         for (sd_journal_restart_data(j); ((retval) = sd_journal_enumerate_data((j), &(data), &(l))) > 0; )
+
+/* All errors that we might encounter while extracting a field that are not real errors,
+ * but only mean that the field is too large or we don't support the compression. */
+static inline bool JOURNAL_ERRNO_IS_UNAVAILABLE_FIELD(int r) {
+        return IN_SET(abs(r),
+                      ENOBUFS,          /* Field or decompressed field too large */
+                      E2BIG,            /* Field too large for pointer width */
+                      EPROTONOSUPPORT); /* Unsupported compression */
+}

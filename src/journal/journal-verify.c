@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <stddef.h>
@@ -46,7 +46,7 @@ static void draw_progress(uint64_t p, usec_t *last_usec) {
         for (i = 0; i < j; i++)
                 fputs("\xe2\x96\x88", stdout);
 
-        fputs(ANSI_NORMAL, stdout);
+        fputs(ansi_normal(), stdout);
 
         for (i = 0; i < k; i++)
                 fputs("\xe2\x96\x91", stdout);
@@ -65,7 +65,7 @@ static uint64_t scale_progress(uint64_t scale, uint64_t p, uint64_t m) {
          * Currently all callers use m >= 1, but we keep the check to be defensive.
          */
 
-        if (p >= m || m == 0) /* lgtm [cpp/constant-comparison] */
+        if (p >= m || m == 0) // lgtm[cpp/constant-comparison]
                 return scale;
 
         return scale * p / m;
@@ -163,9 +163,9 @@ static int journal_file_object_verify(JournalFile *f, uint64_t offset, Object *o
                                 return r;
                         }
 
-                        h2 = hash64(b, b_size);
+                        h2 = journal_file_hash_data(f, b, b_size);
                 } else
-                        h2 = hash64(o->data.payload, le64toh(o->object.size) - offsetof(Object, data.payload));
+                        h2 = journal_file_hash_data(f, o->data.payload, le64toh(o->object.size) - offsetof(Object, data.payload));
 
                 if (h1 != h2) {
                         error(offset, "Invalid hash (%08"PRIx64" vs. %08"PRIx64, h1, h2);
@@ -925,9 +925,10 @@ int journal_file_verify(
                         goto fail;
                 }
 
-                if ((o->object.flags & OBJECT_COMPRESSED_XZ) &&
-                    (o->object.flags & OBJECT_COMPRESSED_LZ4)) {
-                        error(p, "Objected with double compression");
+                if (!!(o->object.flags & OBJECT_COMPRESSED_XZ) +
+                    !!(o->object.flags & OBJECT_COMPRESSED_LZ4) +
+                    !!(o->object.flags & OBJECT_COMPRESSED_ZSTD) > 1) {
+                        error(p, "Object has multiple compression flags set");
                         r = -EINVAL;
                         goto fail;
                 }
@@ -940,6 +941,12 @@ int journal_file_verify(
 
                 if ((o->object.flags & OBJECT_COMPRESSED_LZ4) && !JOURNAL_HEADER_COMPRESSED_LZ4(f->header)) {
                         error(p, "LZ4 compressed object in file without LZ4 compression");
+                        r = -EBADMSG;
+                        goto fail;
+                }
+
+                if ((o->object.flags & OBJECT_COMPRESSED_ZSTD) && !JOURNAL_HEADER_COMPRESSED_ZSTD(f->header)) {
+                        error(p, "ZSTD compressed object in file without ZSTD compression");
                         r = -EBADMSG;
                         goto fail;
                 }

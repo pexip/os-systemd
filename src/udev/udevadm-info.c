@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <ctype.h>
 #include <errno.h>
@@ -6,7 +6,6 @@
 #include <getopt.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -18,9 +17,12 @@
 #include "device-util.h"
 #include "dirent-util.h"
 #include "fd-util.h"
+#include "sort-util.h"
+#include "string-table.h"
 #include "string-util.h"
-#include "udevadm.h"
+#include "udev-util.h"
 #include "udevadm-util.h"
+#include "udevadm.h"
 
 typedef enum ActionType {
         ACTION_QUERY,
@@ -39,27 +41,49 @@ typedef enum QueryType {
 static bool arg_root = false;
 static bool arg_export = false;
 static const char *arg_export_prefix = NULL;
+static usec_t arg_wait_for_initialization_timeout = 0;
 
 static bool skip_attribute(const char *name) {
-        static const char* const skip[] = {
-                "uevent",
-                "dev",
-                "modalias",
-                "resource",
-                "driver",
-                "subsystem",
-                "module",
-        };
-        unsigned i;
-
-        for (i = 0; i < ELEMENTSOF(skip); i++)
-                if (streq(name, skip[i]))
-                        return true;
-        return false;
+        /* Those are either displayed separately or should not be shown at all. */
+        return STR_IN_SET(name,
+                          "uevent",
+                          "dev",
+                          "modalias",
+                          "resource",
+                          "driver",
+                          "subsystem",
+                          "module");
 }
 
-static void print_all_attributes(sd_device *device, const char *key) {
+typedef struct SysAttr {
+        const char *name;
+        const char *value;
+} SysAttr;
+
+static int sysattr_compare(const SysAttr *a, const SysAttr *b) {
+        return strcmp(a->name, b->name);
+}
+
+static int print_all_attributes(sd_device *device, bool is_parent) {
+        _cleanup_free_ SysAttr *sysattrs = NULL;
+        size_t n_items = 0, n_allocated = 0;
         const char *name, *value;
+
+        value = NULL;
+        (void) sd_device_get_devpath(device, &value);
+        printf("  looking at %sdevice '%s':\n", is_parent ? "parent " : "", strempty(value));
+
+        value = NULL;
+        (void) sd_device_get_sysname(device, &value);
+        printf("    %s==\"%s\"\n", is_parent ? "KERNELS" : "KERNEL", strempty(value));
+
+        value = NULL;
+        (void) sd_device_get_subsystem(device, &value);
+        printf("    %s==\"%s\"\n", is_parent ? "SUBSYSTEMS" : "SUBSYSTEM", strempty(value));
+
+        value = NULL;
+        (void) sd_device_get_driver(device, &value);
+        printf("    %s==\"%s\"\n", is_parent ? "DRIVERS" : "DRIVER", strempty(value));
 
         FOREACH_DEVICE_SYSATTR(device, name) {
                 size_t len;
@@ -76,19 +100,34 @@ static void print_all_attributes(sd_device *device, const char *key) {
 
                 /* skip nonprintable attributes */
                 len = strlen(value);
-                while (len > 0 && isprint(value[len-1]))
+                while (len > 0 && isprint((unsigned char) value[len-1]))
                         len--;
                 if (len > 0)
                         continue;
 
-                printf("    %s{%s}==\"%s\"\n", key, name, value);
+                if (!GREEDY_REALLOC(sysattrs, n_allocated, n_items + 1))
+                        return log_oom();
+
+                sysattrs[n_items] = (SysAttr) {
+                        .name = name,
+                        .value = value,
+                };
+                n_items++;
         }
+
+        typesafe_qsort(sysattrs, n_items, sysattr_compare);
+
+        for (size_t i = 0; i < n_items; i++)
+                printf("    %s{%s}==\"%s\"\n", is_parent ? "ATTRS" : "ATTR", sysattrs[i].name, sysattrs[i].value);
+
         puts("");
+
+        return 0;
 }
 
 static int print_device_chain(sd_device *device) {
         sd_device *child, *parent;
-        const char *str;
+        int r;
 
         printf("\n"
                "Udevadm info starts with the device specified by the devpath and then\n"
@@ -98,30 +137,14 @@ static int print_device_chain(sd_device *device) {
                "and the attributes from one single parent device.\n"
                "\n");
 
-        (void) sd_device_get_devpath(device, &str);
-        printf("  looking at device '%s':\n", str);
-        (void) sd_device_get_sysname(device, &str);
-        printf("    KERNEL==\"%s\"\n", str);
-        if (sd_device_get_subsystem(device, &str) < 0)
-                str = "";
-        printf("    SUBSYSTEM==\"%s\"\n", str);
-        if (sd_device_get_driver(device, &str) < 0)
-                str = "";
-        printf("    DRIVER==\"%s\"\n", str);
-        print_all_attributes(device, "ATTR");
+        r = print_all_attributes(device, false);
+        if (r < 0)
+                return r;
 
         for (child = device; sd_device_get_parent(child, &parent) >= 0; child = parent) {
-                (void) sd_device_get_devpath(parent, &str);
-                printf("  looking at parent device '%s':\n", str);
-                (void) sd_device_get_sysname(parent, &str);
-                printf("    KERNELS==\"%s\"\n", str);
-                if (sd_device_get_subsystem(parent, &str) < 0)
-                        str = "";
-                printf("    SUBSYSTEMS==\"%s\"\n", str);
-                if (sd_device_get_driver(parent, &str) < 0)
-                        str = "";
-                printf("    DRIVERS==\"%s\"\n", str);
-                print_all_attributes(parent, "ATTRS");
+                r = print_all_attributes(parent, true);
+                if (r < 0)
+                        return r;
         }
 
         return 0;
@@ -179,18 +202,18 @@ static int export_devices(void) {
 
         r = sd_device_enumerator_new(&e);
         if (r < 0)
-                return r;
+                return log_oom();
 
         r = sd_device_enumerator_allow_uninitialized(e);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to set allowing uninitialized flag: %m");
 
         r = device_enumerator_scan_devices(e);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to scan devices: %m");
 
         FOREACH_DEVICE_AND_SUBSYSTEM(e, d)
-                print_record(d);
+                (void) print_record(d);
 
         return 0;
 }
@@ -332,6 +355,8 @@ static int help(void) {
                "  -P --export-prefix          Export the key name with a prefix\n"
                "  -e --export-db              Export the content of the udev database\n"
                "  -c --cleanup-db             Clean up the udev database\n"
+               "  -w --wait-for-initialization[=SECONDS]\n"
+               "                              Wait for device to be initialized\n"
                , program_invocation_short_name);
 
         return 0;
@@ -343,25 +368,26 @@ int info_main(int argc, char *argv[], void *userdata) {
         int c, r;
 
         static const struct option options[] = {
-                { "name",              required_argument, NULL, 'n' },
-                { "path",              required_argument, NULL, 'p' },
-                { "query",             required_argument, NULL, 'q' },
-                { "attribute-walk",    no_argument,       NULL, 'a' },
-                { "cleanup-db",        no_argument,       NULL, 'c' },
-                { "export-db",         no_argument,       NULL, 'e' },
-                { "root",              no_argument,       NULL, 'r' },
-                { "device-id-of-file", required_argument, NULL, 'd' },
-                { "export",            no_argument,       NULL, 'x' },
-                { "export-prefix",     required_argument, NULL, 'P' },
-                { "version",           no_argument,       NULL, 'V' },
-                { "help",              no_argument,       NULL, 'h' },
+                { "name",                    required_argument, NULL, 'n' },
+                { "path",                    required_argument, NULL, 'p' },
+                { "query",                   required_argument, NULL, 'q' },
+                { "attribute-walk",          no_argument,       NULL, 'a' },
+                { "cleanup-db",              no_argument,       NULL, 'c' },
+                { "export-db",               no_argument,       NULL, 'e' },
+                { "root",                    no_argument,       NULL, 'r' },
+                { "device-id-of-file",       required_argument, NULL, 'd' },
+                { "export",                  no_argument,       NULL, 'x' },
+                { "export-prefix",           required_argument, NULL, 'P' },
+                { "wait-for-initialization", optional_argument, NULL, 'w' },
+                { "version",                 no_argument,       NULL, 'V' },
+                { "help",                    no_argument,       NULL, 'h' },
                 {}
         };
 
         ActionType action = ACTION_QUERY;
         QueryType query = QUERY_ALL;
 
-        while ((c = getopt_long(argc, argv, "aced:n:p:q:rxP:RVh", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "aced:n:p:q:rxP:w::Vh", options, NULL)) >= 0)
                 switch (c) {
                 case 'n':
                 case 'p': {
@@ -417,6 +443,14 @@ int info_main(int argc, char *argv[], void *userdata) {
                         arg_export = true;
                         arg_export_prefix = optarg;
                         break;
+                case 'w':
+                        if (optarg) {
+                                r = parse_sec(optarg, &arg_wait_for_initialization_timeout);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to parse timeout value: %m");
+                        } else
+                                arg_wait_for_initialization_timeout = USEC_INFINITY;
+                        break;
                 case 'V':
                         return print_version();
                 case 'h':
@@ -455,6 +489,21 @@ int info_main(int argc, char *argv[], void *userdata) {
                         return log_error_errno(r, "Bad argument \"%s\", expected an absolute path in /dev/ or /sys or a unit name: %m", *p);
                 if (r < 0)
                         return log_error_errno(r, "Unknown device \"%s\": %m",  *p);
+
+                if (arg_wait_for_initialization_timeout > 0) {
+                        sd_device *d;
+
+                        r = device_wait_for_initialization(
+                                        device,
+                                        NULL,
+                                        usec_add(now(CLOCK_MONOTONIC), arg_wait_for_initialization_timeout),
+                                        &d);
+                        if (r < 0)
+                                return r;
+
+                        sd_device_unref(device);
+                        device = d;
+                }
 
                 if (action == ACTION_QUERY)
                         r = query_device(query, device);

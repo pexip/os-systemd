@@ -1,7 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/stat.h>
-#include <sys/statfs.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
@@ -9,7 +9,7 @@
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "missing.h"
+#include "missing_magic.h"
 #include "parse-util.h"
 #include "stat-util.h"
 
@@ -21,17 +21,22 @@ int block_get_whole_disk(dev_t d, dev_t *ret) {
 
         assert(ret);
 
+        if (major(d) == 0)
+                return -ENODEV;
+
         /* If it has a queue this is good enough for us */
         xsprintf_sys_block_path(p, "/queue", d);
         if (access(p, F_OK) >= 0) {
                 *ret = d;
                 return 0;
         }
+        if (errno != ENOENT)
+                return -errno;
 
         /* If it is a partition find the originating device */
         xsprintf_sys_block_path(p, "/partition", d);
         if (access(p, F_OK) < 0)
-                return -ENOENT;
+                return -errno;
 
         /* Get parent dev_t */
         xsprintf_sys_block_path(p, "/../dev", d);
@@ -46,38 +51,42 @@ int block_get_whole_disk(dev_t d, dev_t *ret) {
         /* Only return this if it is really good enough for us. */
         xsprintf_sys_block_path(p, "/queue", devt);
         if (access(p, F_OK) < 0)
-                return -ENOENT;
+                return -errno;
 
         *ret = devt;
-        return 0;
+        return 1;
 }
 
-int get_block_device(const char *path, dev_t *dev) {
+int get_block_device(const char *path, dev_t *ret) {
+        _cleanup_close_ int fd = -1;
         struct stat st;
-        struct statfs sfs;
+        int r;
 
         assert(path);
-        assert(dev);
+        assert(ret);
 
-        /* Get's the block device directly backing a file system. If
-         * the block device is encrypted, returns the device mapper
-         * block device. */
+        /* Gets the block device directly backing a file system. If the block device is encrypted, returns
+         * the device mapper block device. */
 
-        if (lstat(path, &st))
+        fd = open(path, O_NOFOLLOW|O_CLOEXEC);
+        if (fd < 0)
+                return -errno;
+
+        if (fstat(fd, &st))
                 return -errno;
 
         if (major(st.st_dev) != 0) {
-                *dev = st.st_dev;
+                *ret = st.st_dev;
                 return 1;
         }
 
-        if (statfs(path, &sfs) < 0)
-                return -errno;
+        r = btrfs_get_block_device_fd(fd, ret);
+        if (r > 0)
+                return 1;
+        if (r != -ENOTTY) /* not btrfs */
+                return r;
 
-        if (F_TYPE_EQUAL(sfs.f_type, BTRFS_SUPER_MAGIC))
-                return btrfs_get_block_device(path, dev);
-
-        *dev = 0;
+        *ret = 0;
         return 0;
 }
 
@@ -115,11 +124,11 @@ int block_get_originating(dev_t dt, dev_t *ret) {
                          * setups, however, only if both partitions are on the same physical device. Hence, let's
                          * verify this. */
 
-                        u = strjoin(p, "/", de->d_name, "/../dev");
+                        u = path_join(p, de->d_name, "../dev");
                         if (!u)
                                 return -ENOMEM;
 
-                        v = strjoin(p, "/", found->d_name, "/../dev");
+                        v = path_join(p, found->d_name, "../dev");
                         if (!v)
                                 return -ENOMEM;
 
@@ -178,4 +187,67 @@ int get_block_device_harder(const char *path, dev_t *ret) {
                 log_debug_errno(r, "Failed to chase block device '%s', ignoring: %m", path);
 
         return 1;
+}
+
+int lock_whole_block_device(dev_t devt, int operation) {
+        _cleanup_free_ char *whole_node = NULL;
+        _cleanup_close_ int lock_fd = -1;
+        dev_t whole_devt;
+        int r;
+
+        /* Let's get a BSD file lock on the whole block device, as per: https://systemd.io/BLOCK_DEVICE_LOCKING */
+
+        r = block_get_whole_disk(devt, &whole_devt);
+        if (r < 0)
+                return r;
+
+        r = device_path_make_major_minor(S_IFBLK, whole_devt, &whole_node);
+        if (r < 0)
+                return r;
+
+        lock_fd = open(whole_node, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
+        if (lock_fd < 0)
+                return -errno;
+
+        if (flock(lock_fd, operation) < 0)
+                return -errno;
+
+        return TAKE_FD(lock_fd);
+}
+
+int blockdev_partscan_enabled(int fd) {
+        _cleanup_free_ char *p = NULL, *buf = NULL;
+        unsigned long long ull;
+        struct stat st;
+        int r;
+
+        /* Checks if partition scanning is correctly enabled on the block device */
+
+        if (fstat(fd, &st) < 0)
+                return -errno;
+
+        if (!S_ISBLK(st.st_mode))
+                return -ENOTBLK;
+
+        if (asprintf(&p, "/sys/dev/block/%u:%u/capability", major(st.st_rdev), minor(st.st_rdev)) < 0)
+                return -ENOMEM;
+
+        r = read_one_line_file(p, &buf);
+        if (r == -ENOENT) /* If the capability file doesn't exist then we are most likely looking at a
+                           * partition block device, not the whole block device. And that means we have no
+                           * partition scanning on for it (we do for its parent, but not for the partition
+                           * itself). */
+                return false;
+        if (r < 0)
+                return r;
+
+        r = safe_atollu_full(buf, 16, &ull);
+        if (r < 0)
+                return r;
+
+#ifndef GENHD_FL_NO_PART_SCAN
+#define GENHD_FL_NO_PART_SCAN (0x0200)
+#endif
+
+        return !FLAGS_SET(ull, GENHD_FL_NO_PART_SCAN);
 }

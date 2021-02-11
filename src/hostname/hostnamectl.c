@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 #include <locale.h>
@@ -12,11 +12,12 @@
 #include "alloc-util.h"
 #include "architecture.h"
 #include "bus-error.h"
-#include "bus-util.h"
+#include "bus-map-properties.h"
 #include "hostname-util.h"
 #include "main-func.h"
 #include "pretty-print.h"
 #include "spawn-polkit-agent.h"
+#include "terminal-util.h"
 #include "util.h"
 #include "verbs.h"
 
@@ -193,10 +194,9 @@ static int show_status(int argc, char **argv, void *userdata) {
         if (arg_pretty || arg_static || arg_transient) {
                 const char *attr;
 
-                if (!!arg_static + !!arg_pretty + !!arg_transient > 1) {
-                        log_error("Cannot query more than one name type at a time");
-                        return -EINVAL;
-                }
+                if (!!arg_static + !!arg_pretty + !!arg_transient > 1)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Cannot query more than one name type at a time");
 
                 attr = arg_pretty ? "PrettyHostname" :
                         arg_static ? "StaticHostname" : "Hostname";
@@ -228,7 +228,7 @@ static int set_simple_string(sd_bus *bus, const char *method, const char *value)
                         &error, NULL,
                         "sb", value, arg_ask_password);
         if (r < 0)
-                return log_error_errno(r, "Could not set property: %s", bus_error_message(&error, -r));
+                return log_error_errno(r, "Could not set property: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -310,7 +310,15 @@ static int help(void) {
                 return log_oom();
 
         printf("%s [OPTIONS...] COMMAND ...\n\n"
-               "Query or change system hostname.\n\n"
+               "%sQuery or change system hostname.%s\n"
+               "\nCommands:\n"
+               "  status                 Show current hostname settings\n"
+               "  set-hostname NAME      Set system hostname\n"
+               "  set-icon-name NAME     Set icon name for host\n"
+               "  set-chassis NAME       Set chassis type for host\n"
+               "  set-deployment NAME    Set deployment environment for host\n"
+               "  set-location NAME      Set location for host\n"
+               "\nOptions:\n"
                "  -h --help              Show this help\n"
                "     --version           Show package version\n"
                "     --no-ask-password   Do not prompt for password\n"
@@ -318,16 +326,11 @@ static int help(void) {
                "  -M --machine=CONTAINER Operate on local container\n"
                "     --transient         Only set transient hostname\n"
                "     --static            Only set static hostname\n"
-               "     --pretty            Only set pretty hostname\n\n"
-               "Commands:\n"
-               "  status                 Show current hostname settings\n"
-               "  set-hostname NAME      Set system hostname\n"
-               "  set-icon-name NAME     Set icon name for host\n"
-               "  set-chassis NAME       Set chassis type for host\n"
-               "  set-deployment NAME    Set deployment environment for host\n"
-               "  set-location NAME      Set location for host\n"
+               "     --pretty            Only set pretty hostname\n"
                "\nSee the %s for details.\n"
                , program_invocation_short_name
+               , ansi_highlight()
+               , ansi_normal()
                , link
         );
 
@@ -432,8 +435,7 @@ static int run(int argc, char *argv[]) {
         int r;
 
         setlocale(LC_ALL, "");
-        log_parse_environment();
-        log_open();
+        log_setup_cli();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -441,7 +443,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, false, &bus);
         if (r < 0)
-                return log_error_errno(r, "Failed to create bus connection: %m");
+                return bus_log_connect_error(r);
 
         return hostnamectl_main(bus, argc, argv);
 }

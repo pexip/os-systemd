@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -9,14 +9,14 @@
 #include "alloc-util.h"
 #include "dirent-util.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "journal-def.h"
 #include "journal-file.h"
 #include "journal-vacuum.h"
-#include "parse-util.h"
+#include "sort-util.h"
 #include "string-util.h"
 #include "time-util.h"
-#include "util.h"
 #include "xattr-util.h"
 
 struct vacuum_info {

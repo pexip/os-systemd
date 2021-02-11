@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 /*
  * IPC barrier tests
@@ -18,6 +18,7 @@
 #include "util.h"
 #include "tests.h"
 #include "virt.h"
+#include "time-util.h"
 
 /* 20ms to test deadlocks; All timings use multiples of this constant as
  * alarm/sleep timers. If this timeout is too small for slow machines to perform

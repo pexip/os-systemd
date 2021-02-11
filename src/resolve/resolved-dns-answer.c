@@ -1,4 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <stdio.h>
 
 #include "alloc-util.h"
 #include "dns-domain.h"
@@ -8,6 +10,9 @@
 
 DnsAnswer *dns_answer_new(size_t n) {
         DnsAnswer *a;
+
+        if (n > UINT16_MAX) /* We can only place 64K RRs in an answer at max */
+                n = UINT16_MAX;
 
         a = malloc0(offsetof(DnsAnswer, items) + sizeof(DnsAnswerItem) * n);
         if (!a)
@@ -87,40 +92,33 @@ int dns_answer_add(DnsAnswer *a, DnsResourceRecord *rr, int ifindex, DnsAnswerFl
                 if (a->items[i].ifindex != ifindex)
                         continue;
 
-                r = dns_resource_record_equal(a->items[i].rr, rr);
-                if (r < 0)
-                        return r;
-                if (r > 0) {
-                        /* Don't mix contradicting TTLs (see below) */
-                        if ((rr->ttl == 0) != (a->items[i].rr->ttl == 0))
-                                return -EINVAL;
-
-                        /* Entry already exists, keep the entry with
-                         * the higher RR. */
-                        if (rr->ttl > a->items[i].rr->ttl) {
-                                dns_resource_record_ref(rr);
-                                dns_resource_record_unref(a->items[i].rr);
-                                a->items[i].rr = rr;
-                        }
-
-                        a->items[i].flags |= flags;
-                        return 0;
-                }
-
                 r = dns_resource_key_equal(a->items[i].rr->key, rr->key);
                 if (r < 0)
                         return r;
-                if (r > 0) {
-                        /* There's already an RR of the same RRset in
-                         * place! Let's see if the TTLs more or less
-                         * match. We don't really care if they match
-                         * precisely, but we do care whether one is 0
-                         * and the other is not. See RFC 2181, Section
-                         * 5.2. */
+                if (r == 0)
+                        continue;
 
-                        if ((rr->ttl == 0) != (a->items[i].rr->ttl == 0))
-                                return -EINVAL;
+                /* There's already an RR of the same RRset in place! Let's see if the TTLs more or less
+                 * match. We don't really care if they match precisely, but we do care whether one is 0 and
+                 * the other is not. See RFC 2181, Section 5.2. */
+                if ((rr->ttl == 0) != (a->items[i].rr->ttl == 0))
+                        return -EINVAL;
+
+                r = dns_resource_record_payload_equal(a->items[i].rr, rr);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        continue;
+
+                /* Entry already exists, keep the entry with the higher RR. */
+                if (rr->ttl > a->items[i].rr->ttl) {
+                        dns_resource_record_ref(rr);
+                        dns_resource_record_unref(a->items[i].rr);
+                        a->items[i].rr = rr;
                 }
+
+                a->items[i].flags |= flags;
+                return 0;
         }
 
         return dns_answer_add_raw(a, rr, ifindex, flags);
@@ -166,7 +164,7 @@ int dns_answer_add_soa(DnsAnswer *a, const char *name, uint32_t ttl, int ifindex
         if (!soa->soa.mname)
                 return -ENOMEM;
 
-        soa->soa.rname = strappend("root.", name);
+        soa->soa.rname = strjoin("root.", name);
         if (!soa->soa.rname)
                 return -ENOMEM;
 
@@ -322,6 +320,11 @@ int dns_answer_merge(DnsAnswer *a, DnsAnswer *b, DnsAnswer **ret) {
         int r;
 
         assert(ret);
+
+        if (a == b) {
+                *ret = dns_answer_ref(a);
+                return 0;
+        }
 
         if (dns_answer_size(a) <= 0) {
                 *ret = dns_answer_ref(b);
@@ -629,12 +632,16 @@ int dns_answer_reserve(DnsAnswer **a, size_t n_free) {
                         return -EBUSY;
 
                 ns = (*a)->n_rrs + n_free;
+                if (ns > UINT16_MAX) /* Maximum number of RRs we can stick into a DNS packet section */
+                        ns = UINT16_MAX;
 
                 if ((*a)->n_allocated >= ns)
                         return 0;
 
                 /* Allocate more than we need */
                 ns *= 2;
+                if (ns > UINT16_MAX)
+                        ns = UINT16_MAX;
 
                 n = realloc(*a, offsetof(DnsAnswer, items) + sizeof(DnsAnswerItem) * ns);
                 if (!n)
@@ -683,6 +690,9 @@ int dns_answer_reserve_or_clone(DnsAnswer **a, size_t n_free) {
         return 0;
 }
 
+/*
+ * This function is not used in the code base, but is useful when debugging. Do not delete.
+ */
 void dns_answer_dump(DnsAnswer *answer, FILE *f) {
         DnsResourceRecord *rr;
         DnsAnswerFlags flags;
@@ -704,17 +714,21 @@ void dns_answer_dump(DnsAnswer *answer, FILE *f) {
 
                 fputs(t, f);
 
-                if (ifindex != 0 || flags & (DNS_ANSWER_AUTHENTICATED|DNS_ANSWER_CACHEABLE|DNS_ANSWER_SHARED_OWNER))
+                if (ifindex != 0 || flags != 0)
                         fputs("\t;", f);
 
                 if (ifindex != 0)
-                        printf(" ifindex=%i", ifindex);
+                        fprintf(f, " ifindex=%i", ifindex);
                 if (flags & DNS_ANSWER_AUTHENTICATED)
                         fputs(" authenticated", f);
                 if (flags & DNS_ANSWER_CACHEABLE)
-                        fputs(" cachable", f);
+                        fputs(" cacheable", f);
                 if (flags & DNS_ANSWER_SHARED_OWNER)
                         fputs(" shared-owner", f);
+                if (flags & DNS_ANSWER_CACHE_FLUSH)
+                        fputs(" cache-flush", f);
+                if (flags & DNS_ANSWER_GOODBYE)
+                        fputs(" goodbye", f);
 
                 fputc('\n', f);
         }

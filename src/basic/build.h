@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "version.h"
@@ -87,6 +87,12 @@
 #define _LZ4_FEATURE_ "-LZ4"
 #endif
 
+#if HAVE_ZSTD
+#define _ZSTD_FEATURE_ "+ZSTD"
+#else
+#define _ZSTD_FEATURE_ "-ZSTD"
+#endif
+
 #if HAVE_SECCOMP
 #define _SECCOMP_FEATURE_ "+SECCOMP"
 #else
@@ -129,7 +135,7 @@
 #define _PCRE2_FEATURE_ "-PCRE2"
 #endif
 
-#define _CGROUP_HIEARCHY_ "default-hierarchy=" DEFAULT_HIERARCHY_NAME
+#define _CGROUP_HIERARCHY_ "default-hierarchy=" DEFAULT_HIERARCHY_NAME
 
 #define SYSTEMD_FEATURES                                                \
         _PAM_FEATURE_ " "                                               \
@@ -146,6 +152,7 @@
         _ACL_FEATURE_ " "                                               \
         _XZ_FEATURE_ " "                                                \
         _LZ4_FEATURE_ " "                                               \
+        _ZSTD_FEATURE_ " "                                              \
         _SECCOMP_FEATURE_ " "                                           \
         _BLKID_FEATURE_ " "                                             \
         _ELFUTILS_FEATURE_ " "                                          \
@@ -153,4 +160,9 @@
         _IDN2_FEATURE_ " "                                              \
         _IDN_FEATURE_ " "                                               \
         _PCRE2_FEATURE_ " "                                             \
-        _CGROUP_HIEARCHY_
+        _CGROUP_HIERARCHY_
+
+enum {
+        BUILD_MODE_DEVELOPER,
+        BUILD_MODE_RELEASE,
+};

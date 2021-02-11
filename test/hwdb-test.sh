@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # Call built systemd-hwdb update on our hwdb files to ensure that they parse
 # without error
@@ -18,10 +18,10 @@ if [ ! -x "$SYSTEMD_HWDB" ]; then
     exit 1
 fi
 
-D=$(mktemp --directory)
+D=$(mktemp --tmpdir --directory "hwdb-test.XXXXXXXXXX")
 trap "rm -rf '$D'" EXIT INT QUIT PIPE
 mkdir -p "$D/etc/udev"
-ln -s "$ROOTDIR/hwdb" "$D/etc/udev/hwdb.d"
+ln -s "$ROOTDIR/hwdb.d" "$D/etc/udev/hwdb.d"
 
 # Test "good" properties" — no warnings or errors allowed
 err=$("$SYSTEMD_HWDB" update --root "$D" 2>&1 >/dev/null) && rc= || rc=$?
@@ -42,7 +42,7 @@ fi
 # Test "bad" properties" — warnings required, errors not allowed
 rm -f "$D/etc/udev/hwdb.bin" "$D/etc/udev/hwdb.d"
 
-ln -s "$ROOTDIR/test/hwdb" "$D/etc/udev/hwdb.d"
+ln -s "$ROOTDIR/test/hwdb.d" "$D/etc/udev/hwdb.d"
 err=$("$SYSTEMD_HWDB" update --root "$D" 2>&1 >/dev/null) && rc= || rc=$?
 if [ -n "$rc" ]; then
     echo "$SYSTEMD_HWDB returned $rc"

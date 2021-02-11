@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 shared_sources = files('''
         acl-util.h
@@ -12,23 +12,55 @@ shared_sources = files('''
         barrier.h
         base-filesystem.c
         base-filesystem.h
+        binfmt-util.c
+        binfmt-util.h
         bitmap.c
         bitmap.h
         blkid-util.h
+        bond-util.c
+        bond-util.h
         boot-timestamps.c
         boot-timestamps.h
         bootspec.c
         bootspec.h
         bpf-program.c
         bpf-program.h
+        bridge-util.c
+        bridge-util.h
+        bus-get-properties.c
+        bus-get-properties.h
+        bus-locator.c
+        bus-locator.h
+        bus-log-control-api.c
+        bus-log-control-api.h
+        bus-map-properties.c
+        bus-map-properties.h
+        bus-message-util.c
+        bus-message-util.h
+        bus-object.c
+        bus-object.h
+        bus-polkit.c
+        bus-polkit.h
+        bus-print-properties.c
+        bus-print-properties.h
+        bus-unit-procs.c
+        bus-unit-procs.h
         bus-unit-util.c
         bus-unit-util.h
         bus-util.c
         bus-util.h
+        bus-wait-for-jobs.c
+        bus-wait-for-jobs.h
+        bus-wait-for-units.c
+        bus-wait-for-units.h
         calendarspec.c
         calendarspec.h
+        cgroup-setup.c
+        cgroup-setup.h
         cgroup-show.c
         cgroup-show.h
+        chown-recursive.c
+        chown-recursive.h
         clean-ipc.c
         clean-ipc.h
         clock-util.c
@@ -37,24 +69,30 @@ shared_sources = files('''
         condition.h
         conf-parser.c
         conf-parser.h
+        coredump-util.c
+        coredump-util.h
         cpu-set-util.c
         cpu-set-util.h
-        crypt-util.c
-        crypt-util.h
+        cryptsetup-util.c
+        cryptsetup-util.h
         daemon-util.h
         dev-setup.c
         dev-setup.h
         dissect-image.c
         dissect-image.h
+        dm-util.c
+        dm-util.h
         dns-domain.c
         dns-domain.h
         dropin.c
         dropin.h
-        efivars.c
-        efivars.h
+        efi-loader.c
+        efi-loader.h
         enable-mempool.c
         env-file-label.c
         env-file-label.h
+        ethtool-util.c
+        ethtool-util.h
         exec-util.c
         exec-util.h
         exit-status.c
@@ -66,13 +104,21 @@ shared_sources = files('''
         firewall-util.h
         format-table.c
         format-table.h
+        fsck-util.h
         fstab-util.c
         fstab-util.h
         generator.c
         generator.h
+        geneve-util.c
+        geneve-util.h
+        gpt.c
         gpt.h
+        group-record.c
+        group-record.h
         id128-print.c
         id128-print.h
+        idn-util.c
+        idn-util.h
         ima-util.c
         ima-util.h
         import-util.c
@@ -82,6 +128,8 @@ shared_sources = files('''
         install-printf.h
         install.c
         install.h
+        ipvlan-util.c
+        ipvlan-util.h
         ip-protocol-list.c
         ip-protocol-list.h
         journal-importer.c
@@ -91,8 +139,20 @@ shared_sources = files('''
         json-internal.h
         json.c
         json.h
+        libcrypt-util.c
+        libcrypt-util.h
+        libmount-util.h
+        linux/auto_dev-ioctl.h
+        linux/bpf.h
+        linux/bpf_common.h
+        linux/bpf_insn.h
+        linux/dm-ioctl.h
+        linux/ethtool.h
+        local-addresses.c
+        local-addresses.h
         lockfile-util.c
         lockfile-util.h
+        log-link.h
         logs-show.c
         logs-show.h
         loop-util.c
@@ -101,28 +161,46 @@ shared_sources = files('''
         machine-image.h
         machine-pool.c
         machine-pool.h
+        macvlan-util.c
+        macvlan-util.h
         main-func.h
+        mkfs-util.c
+        mkfs-util.h
         module-util.h
         mount-util.c
         mount-util.h
+        netif-naming-scheme.c
+        netif-naming-scheme.h
         nscd-flush.c
         nscd-flush.h
         nsflags.c
         nsflags.h
+        numa-util.c
+        numa-util.h
+        openssl-util.h
         os-util.c
         os-util.h
         output-mode.c
         output-mode.h
         pager.c
         pager.h
-        path-lookup.c
-        path-lookup.h
+        pe-header.h
+        pkcs11-util.c
+        pkcs11-util.h
         pretty-print.c
         pretty-print.h
+        psi-util.c
+        psi-util.h
         ptyfwd.c
         ptyfwd.h
+        pwquality-util.c
+        pwquality-util.h
+        qrcode-util.c
+        qrcode-util.h
         reboot-util.c
         reboot-util.h
+        resize-fs.c
+        resize-fs.h
         resolve-util.c
         resolve-util.h
         seccomp-util.h
@@ -130,8 +208,12 @@ shared_sources = files('''
         securebits-util.h
         serialize.c
         serialize.h
+        service-util.c
+        service-util.h
         sleep-config.c
         sleep-config.h
+        socket-netlink.c
+        socket-netlink.h
         spawn-ask-password-agent.c
         spawn-ask-password-agent.h
         spawn-polkit-agent.c
@@ -150,7 +232,19 @@ shared_sources = files('''
         udev-util.h
         uid-range.c
         uid-range.h
+        unit-file.c
+        unit-file.h
+        user-record-nss.c
+        user-record-nss.h
+        user-record-show.c
+        user-record-show.h
+        user-record.c
+        user-record.h
+        userdb.c
+        userdb.h
         utmp-wtmp.h
+        varlink.c
+        varlink.h
         verbs.c
         verbs.h
         vlan-util.c
@@ -161,7 +255,8 @@ shared_sources = files('''
         watchdog.h
         web-util.c
         web-util.h
-        wireguard-netlink.h
+        wifi-util.c
+        wifi-util.h
         xml.c
         xml.h
 '''.split())
@@ -173,6 +268,16 @@ endif
 test_tables_h = files('test-tables.h')
 shared_sources += test_tables_h
 
+generate_syscall_list = find_program('generate-syscall-list.py')
+fname = 'syscall-list.h'
+syscall_list_h = custom_target(
+        fname,
+        input : 'syscall-names.text',
+        output : fname,
+        command : [generate_syscall_list,
+                   '@INPUT@'],
+        capture : true)
+
 if conf.get('HAVE_ACL') == 1
         shared_sources += files('acl-util.c')
 endif
@@ -183,6 +288,7 @@ endif
 
 if conf.get('HAVE_SECCOMP') == 1
         shared_sources += files('seccomp-util.c')
+        shared_sources += syscall_list_h
 endif
 
 if conf.get('HAVE_LIBIPTC') == 1
@@ -191,6 +297,13 @@ endif
 
 if conf.get('HAVE_KMOD') == 1
         shared_sources += files('module-util.c')
+endif
+
+if conf.get('HAVE_PAM') == 1
+        shared_sources += files('''
+        pam-util.c
+        pam-util.h
+'''.split())
 endif
 
 generate_ip_protocol_list = find_program('generate-ip-protocol-list.sh')
@@ -236,20 +349,23 @@ shared_sources += shared_generated_gperf_headers
 libshared_name = 'systemd-shared-@0@'.format(meson.project_version())
 
 libshared_deps = [threads,
-                  librt,
-                  libcap,
                   libacl,
-                  libcryptsetup,
+                  libblkid,
+                  libcap,
+                  libcrypt,
                   libgcrypt,
                   libiptc,
                   libkmod,
+                  liblz4,
                   libmount,
+                  libopenssl,
+                  libp11kit,
+                  libpam,
+                  librt,
                   libseccomp,
                   libselinux,
-                  libidn,
-                  libxz,
-                  liblz4,
-                  libblkid]
+                  libzstd,
+                  libxz]
 
 libshared_sym_path = '@0@/libshared.sym'.format(meson.current_source_dir())
 
@@ -275,3 +391,9 @@ libshared = shared_library(
         dependencies : libshared_deps,
         install : true,
         install_dir : rootlibexecdir)
+
+############################################################
+
+run_target(
+        'syscall-names-update',
+        command : [syscall_names_update_sh, meson.current_source_dir()])

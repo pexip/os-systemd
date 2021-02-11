@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/prctl.h>
 
@@ -61,8 +61,8 @@ int pull_find_old_etags(
         }
 
         FOREACH_DIRENT_ALL(de, d, return -errno) {
+                _cleanup_free_ char *u = NULL;
                 const char *a, *b;
-                char *u;
 
                 if (de->d_type != DT_UNKNOWN &&
                     de->d_type != dt)
@@ -97,12 +97,10 @@ int pull_find_old_etags(
                 if (r < 0)
                         return r;
 
-                if (!http_etag_is_valid(u)) {
-                        free(u);
+                if (!http_etag_is_valid(u))
                         continue;
-                }
 
-                r = strv_consume(&l, u);
+                r = strv_consume(&l, TAKE_PTR(u));
                 if (r < 0)
                         return r;
         }
@@ -122,7 +120,7 @@ int pull_make_local_copy(const char *final, const char *image_root, const char *
         if (!image_root)
                 image_root = "/var/lib/machines";
 
-        p = strjoina(image_root, "/", local);
+        p = prefix_roota(image_root, local);
 
         if (force_local)
                 (void) rm_rf(p, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME);
@@ -391,10 +389,9 @@ int pull_verify(PullJob *main_job,
 
         assert(checksum_job->state == PULL_JOB_DONE);
 
-        if (!checksum_job->payload || checksum_job->payload_size <= 0) {
-                log_error("Checksum is empty, cannot verify.");
-                return -EBADMSG;
-        }
+        if (!checksum_job->payload || checksum_job->payload_size <= 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Checksum is empty, cannot verify.");
 
         r = verify_one(checksum_job, main_job);
         if (r < 0)
@@ -416,10 +413,9 @@ int pull_verify(PullJob *main_job,
 
         assert(signature_job->state == PULL_JOB_DONE);
 
-        if (!signature_job->payload || signature_job->payload_size <= 0) {
-                log_error("Signature is empty, cannot verify.");
-                return -EBADMSG;
-        }
+        if (!signature_job->payload || signature_job->payload_size <= 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "Signature is empty, cannot verify.");
 
         r = pipe2(gpg_pipe, O_CLOEXEC);
         if (r < 0)
@@ -436,7 +432,7 @@ int pull_verify(PullJob *main_job,
         }
 
         if (!mkdtemp(gpg_home)) {
-                r = log_error_errno(errno, "Failed to create tempory home for gpg: %m");
+                r = log_error_errno(errno, "Failed to create temporary home for gpg: %m");
                 goto finish;
         }
 
