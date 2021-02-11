@@ -57,7 +57,7 @@ Build-Depends: debhelper (>= 10.4~),
                tzdata <!nocheck>,
                libcap2-bin <!nocheck>,
                iproute2 <!nocheck>,
-XS-Pexip-Upstream: http://ftp.debian.org/debian/ buster
+XS-Pexip-Upstream: http://ftp.debian.org/debian/ bullseye
 
 Package: systemd
 Architecture: linux-any
