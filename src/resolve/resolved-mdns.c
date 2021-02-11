@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <resolv.h>
 #include <netinet/in.h>
@@ -8,6 +8,7 @@
 #include "fd-util.h"
 #include "resolved-manager.h"
 #include "resolved-mdns.h"
+#include "sort-util.h"
 
 #define CLEAR_CACHE_FLUSH(x) (~MDNS_RR_CACHE_FLUSH & (x))
 
@@ -194,7 +195,7 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
 
                 r = dns_zone_lookup(&s->zone, key, 0, &answer, &soa, &tentative);
                 if (r < 0)
-                        return log_debug_errno(r, "Failed to lookup key: %m");
+                        return log_debug_errno(r, "Failed to look up key: %m");
 
                 if (tentative && DNS_PACKET_NSCOUNT(p) > 0) {
                         /*
@@ -318,7 +319,7 @@ static int on_mdns_packet(sd_event_source *s, int fd, uint32_t revents, void *us
                                 dns_transaction_process_reply(t, p);
                 }
 
-                dns_cache_put(&scope->cache, NULL, DNS_PACKET_RCODE(p), p->answer, false, (uint32_t) -1, 0, p->family, &p->sender);
+                dns_cache_put(&scope->cache, scope->manager->enable_cache, NULL, DNS_PACKET_RCODE(p), p->answer, false, (uint32_t) -1, 0, p->family, &p->sender);
 
         } else if (dns_packet_validate_query(p) > 0)  {
                 log_debug("Got mDNS query packet for id %u", DNS_PACKET_ID(p));

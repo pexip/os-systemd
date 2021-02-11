@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "locale-util.h"
@@ -7,10 +7,12 @@
 #include "strv.h"
 #include "tests.h"
 #include "utf8.h"
+#include "util.h"
 
 static void test_string_erase(void) {
-        char *x;
+        log_info("/* %s */", __func__);
 
+        char *x;
         x = strdupa("");
         assert_se(streq(string_erase(x), ""));
 
@@ -32,17 +34,17 @@ static void test_string_erase(void) {
 }
 
 static void test_free_and_strndup_one(char **t, const char *src, size_t l, const char *expected, bool change) {
-        int r;
-
         log_debug("%s: \"%s\", \"%s\", %zd (expect \"%s\", %s)",
                   __func__, strnull(*t), strnull(src), l, strnull(expected), yes_no(change));
 
-        r = free_and_strndup(t, src, l);
+        int r = free_and_strndup(t, src, l);
         assert_se(streq_ptr(*t, expected));
         assert_se(r == change); /* check that change occurs only when necessary */
 }
 
 static void test_free_and_strndup(void) {
+        log_info("/* %s */", __func__);
+
         static const struct test_case {
                 const char *src;
                 size_t len;
@@ -90,6 +92,7 @@ static void test_free_and_strndup(void) {
 }
 
 static void test_ascii_strcasecmp_n(void) {
+        log_info("/* %s */", __func__);
 
         assert_se(ascii_strcasecmp_n("", "", 0) == 0);
         assert_se(ascii_strcasecmp_n("", "", 1) == 0);
@@ -117,6 +120,8 @@ static void test_ascii_strcasecmp_n(void) {
 }
 
 static void test_ascii_strcasecmp_nn(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(ascii_strcasecmp_nn("", 0, "", 0) == 0);
         assert_se(ascii_strcasecmp_nn("", 0, "", 1) < 0);
         assert_se(ascii_strcasecmp_nn("", 1, "", 0) > 0);
@@ -135,6 +140,8 @@ static void test_ascii_strcasecmp_nn(void) {
 
 static void test_cellescape(void) {
         char buf[40];
+
+        log_info("/* %s */", __func__);
 
         assert_se(streq(cellescape(buf, 1, ""), ""));
         assert_se(streq(cellescape(buf, 1, "1"), ""));
@@ -215,19 +222,24 @@ static void test_cellescape(void) {
 }
 
 static void test_streq_ptr(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(streq_ptr(NULL, NULL));
         assert_se(!streq_ptr("abc", "cdef"));
 }
 
 static void test_strstrip(void) {
-        char *r;
-        char input[] = "   hello, waldo.   ";
+        log_info("/* %s */", __func__);
 
-        r = strstrip(input);
-        assert_se(streq(r, "hello, waldo."));
+        char *ret, input[] = "   hello, waldo.   ";
+
+        ret = strstrip(input);
+        assert_se(streq(ret, "hello, waldo."));
 }
 
 static void test_strextend(void) {
+        log_info("/* %s */", __func__);
+
         _cleanup_free_ char *str = NULL;
 
         assert_se(strextend(&str, NULL));
@@ -239,6 +251,8 @@ static void test_strextend(void) {
 }
 
 static void test_strextend_with_separator(void) {
+        log_info("/* %s */", __func__);
+
         _cleanup_free_ char *str = NULL;
 
         assert_se(strextend_with_separator(&str, NULL, NULL));
@@ -262,6 +276,8 @@ static void test_strextend_with_separator(void) {
 }
 
 static void test_strrep(void) {
+        log_info("/* %s */", __func__);
+
         _cleanup_free_ char *one, *three, *zero;
         one = strrep("waldo", 1);
         three = strrep("waldo", 3);
@@ -270,22 +286,6 @@ static void test_strrep(void) {
         assert_se(streq(one, "waldo"));
         assert_se(streq(three, "waldowaldowaldo"));
         assert_se(streq(zero, ""));
-}
-
-static void test_strappend(void) {
-        _cleanup_free_ char *t1, *t2, *t3, *t4;
-
-        t1 = strappend(NULL, NULL);
-        assert_se(streq(t1, ""));
-
-        t2 = strappend(NULL, "suf");
-        assert_se(streq(t2, "suf"));
-
-        t3 = strappend("pre", NULL);
-        assert_se(streq(t3, "pre"));
-
-        t4 = strappend("pre", "suf");
-        assert_se(streq(t4, "presuf"));
 }
 
 static void test_string_has_cc(void) {
@@ -303,11 +303,15 @@ static void test_string_has_cc(void) {
 }
 
 static void test_ascii_strlower(void) {
+        log_info("/* %s */", __func__);
+
         char a[] = "AabBcC Jk Ii Od LKJJJ kkd LK";
         assert_se(streq(ascii_strlower(a), "aabbcc jk ii od lkjjj kkd lk"));
 }
 
 static void test_strshorten(void) {
+        log_info("/* %s */", __func__);
+
         char s[] = "foobar";
 
         assert_se(strlen(strshorten(s, 6)) == 6);
@@ -317,6 +321,8 @@ static void test_strshorten(void) {
 }
 
 static void test_strjoina(void) {
+        log_info("/* %s */", __func__);
+
         char *actual;
 
         actual = strjoina("", "foo", "bar");
@@ -341,7 +347,41 @@ static void test_strjoina(void) {
         assert_se(streq(actual, "foo"));
 }
 
+static void test_strjoin(void) {
+        char *actual;
+
+        actual = strjoin("", "foo", "bar");
+        assert_se(streq(actual, "foobar"));
+        mfree(actual);
+
+        actual = strjoin("foo", "bar", "baz");
+        assert_se(streq(actual, "foobarbaz"));
+        mfree(actual);
+
+        actual = strjoin("foo", "", "bar", "baz");
+        assert_se(streq(actual, "foobarbaz"));
+        mfree(actual);
+
+        actual = strjoin("foo", NULL);
+        assert_se(streq(actual, "foo"));
+        mfree(actual);
+
+        actual = strjoin(NULL, NULL);
+        assert_se(streq(actual, ""));
+        mfree(actual);
+
+        actual = strjoin(NULL, "foo");
+        assert_se(streq(actual, ""));
+        mfree(actual);
+
+        actual = strjoin("foo", NULL, "bar");
+        assert_se(streq(actual, "foo"));
+        mfree(actual);
+}
+
 static void test_strcmp_ptr(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(strcmp_ptr(NULL, NULL) == 0);
         assert_se(strcmp_ptr("", NULL) > 0);
         assert_se(strcmp_ptr("foo", NULL) > 0);
@@ -354,32 +394,42 @@ static void test_strcmp_ptr(void) {
 }
 
 static void test_foreach_word(void) {
-        const char *word, *state;
-        size_t l;
-        int i = 0;
-        const char test[] = "test abc d\te   f   ";
+        log_info("/* %s */", __func__);
+
+        const char *test = "test abc d\te   f   ";
         const char * const expected[] = {
                 "test",
                 "abc",
                 "d",
                 "e",
                 "f",
-                "",
-                NULL
         };
 
-        FOREACH_WORD(word, l, test, state)
-                assert_se(strneq(expected[i++], word, l));
+        size_t i = 0;
+        int r;
+        for (const char *p = test;;) {
+                _cleanup_free_ char *word = NULL;
+
+                r = extract_first_word(&p, &word, NULL, 0);
+                if (r == 0) {
+                        assert_se(i == ELEMENTSOF(expected));
+                        break;
+                }
+                assert_se(r > 0);
+
+                assert_se(streq(expected[i++], word));
+        }
 }
 
 static void check(const char *test, char** expected, bool trailing) {
-        int i = 0, r;
+        size_t i = 0;
+        int r;
 
         printf("<<<%s>>>\n", test);
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&test, &word, NULL, EXTRACT_QUOTES);
+                r = extract_first_word(&test, &word, NULL, EXTRACT_UNQUOTE);
                 if (r == 0) {
                         assert_se(!trailing);
                         break;
@@ -395,6 +445,8 @@ static void check(const char *test, char** expected, bool trailing) {
 }
 
 static void test_foreach_word_quoted(void) {
+        log_info("/* %s */", __func__);
+
         check("test a b c 'd' e '' '' hhh '' '' \"a b c\"",
               STRV_MAKE("test",
                         "a",
@@ -420,6 +472,8 @@ static void test_foreach_word_quoted(void) {
 }
 
 static void test_endswith(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(endswith("foobar", "bar"));
         assert_se(endswith("foobar", ""));
         assert_se(endswith("foobar", "foobar"));
@@ -430,6 +484,8 @@ static void test_endswith(void) {
 }
 
 static void test_endswith_no_case(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(endswith_no_case("fooBAR", "bar"));
         assert_se(endswith_no_case("foobar", ""));
         assert_se(endswith_no_case("foobar", "FOOBAR"));
@@ -440,6 +496,8 @@ static void test_endswith_no_case(void) {
 }
 
 static void test_delete_chars(void) {
+        log_info("/* %s */", __func__);
+
         char *s, input[] = "   hello, waldo.   abc";
 
         s = delete_chars(input, WHITESPACE);
@@ -448,6 +506,7 @@ static void test_delete_chars(void) {
 }
 
 static void test_delete_trailing_chars(void) {
+        log_info("/* %s */", __func__);
 
         char *s,
                 input1[] = " \n \r k \n \r ",
@@ -472,6 +531,8 @@ static void test_delete_trailing_chars(void) {
 }
 
 static void test_delete_trailing_slashes(void) {
+        log_info("/* %s */", __func__);
+
         char s1[] = "foobar//",
              s2[] = "foobar/",
              s3[] = "foobar",
@@ -485,6 +546,8 @@ static void test_delete_trailing_slashes(void) {
 }
 
 static void test_skip_leading_chars(void) {
+        log_info("/* %s */", __func__);
+
         char input1[] = " \n \r k \n \r ",
                 input2[] = "kkkkthiskkkiskkkaktestkkk",
                 input3[] = "abcdef";
@@ -497,11 +560,15 @@ static void test_skip_leading_chars(void) {
 }
 
 static void test_in_charset(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(in_charset("dddaaabbbcccc", "abcd"));
         assert_se(!in_charset("dddaaabbbcccc", "abc f"));
 }
 
 static void test_split_pair(void) {
+        log_info("/* %s */", __func__);
+
         _cleanup_free_ char *a = NULL, *b = NULL;
 
         assert_se(split_pair("", "", &a, &b) == -EINVAL);
@@ -524,6 +591,8 @@ static void test_split_pair(void) {
 }
 
 static void test_first_word(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(first_word("Hello", ""));
         assert_se(first_word("Hello", "Hello"));
         assert_se(first_word("Hello world", "Hello"));
@@ -538,12 +607,16 @@ static void test_first_word(void) {
 }
 
 static void test_strlen_ptr(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(strlen_ptr("foo") == 3);
         assert_se(strlen_ptr("") == 0);
         assert_se(strlen_ptr(NULL) == 0);
 }
 
 static void test_memory_startswith(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(streq(memory_startswith("", 0, ""), ""));
         assert_se(streq(memory_startswith("", 1, ""), ""));
         assert_se(streq(memory_startswith("x", 2, ""), "x"));
@@ -556,6 +629,8 @@ static void test_memory_startswith(void) {
 }
 
 static void test_memory_startswith_no_case(void) {
+        log_info("/* %s */", __func__);
+
         assert_se(streq(memory_startswith_no_case("", 0, ""), ""));
         assert_se(streq(memory_startswith_no_case("", 1, ""), ""));
         assert_se(streq(memory_startswith_no_case("x", 2, ""), "x"));
@@ -578,6 +653,239 @@ static void test_memory_startswith_no_case(void) {
         assert_se(memory_startswith_no_case((char[2]){'X', 'X'}, 2, "XX"));
 }
 
+static void test_string_truncate_lines_one(const char *input, size_t n_lines, const char *output, bool truncation) {
+        _cleanup_free_ char *b = NULL;
+        int k;
+
+        assert_se((k = string_truncate_lines(input, n_lines, &b)) >= 0);
+        assert_se(streq(b, output));
+        assert_se(!!k == truncation);
+}
+
+static void test_string_truncate_lines(void) {
+        log_info("/* %s */", __func__);
+
+        test_string_truncate_lines_one("", 0, "", false);
+        test_string_truncate_lines_one("", 1, "", false);
+        test_string_truncate_lines_one("", 2, "", false);
+        test_string_truncate_lines_one("", 3, "", false);
+
+        test_string_truncate_lines_one("x", 0, "", true);
+        test_string_truncate_lines_one("x", 1, "x", false);
+        test_string_truncate_lines_one("x", 2, "x", false);
+        test_string_truncate_lines_one("x", 3, "x", false);
+
+        test_string_truncate_lines_one("x\n", 0, "", true);
+        test_string_truncate_lines_one("x\n", 1, "x", false);
+        test_string_truncate_lines_one("x\n", 2, "x", false);
+        test_string_truncate_lines_one("x\n", 3, "x", false);
+
+        test_string_truncate_lines_one("x\ny", 0, "", true);
+        test_string_truncate_lines_one("x\ny", 1, "x", true);
+        test_string_truncate_lines_one("x\ny", 2, "x\ny", false);
+        test_string_truncate_lines_one("x\ny", 3, "x\ny", false);
+
+        test_string_truncate_lines_one("x\ny\n", 0, "", true);
+        test_string_truncate_lines_one("x\ny\n", 1, "x", true);
+        test_string_truncate_lines_one("x\ny\n", 2, "x\ny", false);
+        test_string_truncate_lines_one("x\ny\n", 3, "x\ny", false);
+
+        test_string_truncate_lines_one("x\ny\nz", 0, "", true);
+        test_string_truncate_lines_one("x\ny\nz", 1, "x", true);
+        test_string_truncate_lines_one("x\ny\nz", 2, "x\ny", true);
+        test_string_truncate_lines_one("x\ny\nz", 3, "x\ny\nz", false);
+
+        test_string_truncate_lines_one("x\ny\nz\n", 0, "", true);
+        test_string_truncate_lines_one("x\ny\nz\n", 1, "x", true);
+        test_string_truncate_lines_one("x\ny\nz\n", 2, "x\ny", true);
+        test_string_truncate_lines_one("x\ny\nz\n", 3, "x\ny\nz", false);
+
+        test_string_truncate_lines_one("\n", 0, "", false);
+        test_string_truncate_lines_one("\n", 1, "", false);
+        test_string_truncate_lines_one("\n", 2, "", false);
+        test_string_truncate_lines_one("\n", 3, "", false);
+
+        test_string_truncate_lines_one("\n\n", 0, "", false);
+        test_string_truncate_lines_one("\n\n", 1, "", false);
+        test_string_truncate_lines_one("\n\n", 2, "", false);
+        test_string_truncate_lines_one("\n\n", 3, "", false);
+
+        test_string_truncate_lines_one("\n\n\n", 0, "", false);
+        test_string_truncate_lines_one("\n\n\n", 1, "", false);
+        test_string_truncate_lines_one("\n\n\n", 2, "", false);
+        test_string_truncate_lines_one("\n\n\n", 3, "", false);
+
+        test_string_truncate_lines_one("\nx\n\n", 0, "", true);
+        test_string_truncate_lines_one("\nx\n\n", 1, "", true);
+        test_string_truncate_lines_one("\nx\n\n", 2, "\nx", false);
+        test_string_truncate_lines_one("\nx\n\n", 3, "\nx", false);
+
+        test_string_truncate_lines_one("\n\nx\n", 0, "", true);
+        test_string_truncate_lines_one("\n\nx\n", 1, "", true);
+        test_string_truncate_lines_one("\n\nx\n", 2, "", true);
+        test_string_truncate_lines_one("\n\nx\n", 3, "\n\nx", false);
+}
+
+static void test_string_extract_lines_one(const char *input, size_t i, const char *output, bool more) {
+        _cleanup_free_ char *b = NULL;
+        int k;
+
+        assert_se((k = string_extract_line(input, i, &b)) >= 0);
+        assert_se(streq(b ?: input, output));
+        assert_se(!!k == more);
+}
+
+static void test_string_extract_line(void) {
+        log_info("/* %s */", __func__);
+
+        test_string_extract_lines_one("", 0, "", false);
+        test_string_extract_lines_one("", 1, "", false);
+        test_string_extract_lines_one("", 2, "", false);
+        test_string_extract_lines_one("", 3, "", false);
+
+        test_string_extract_lines_one("x", 0, "x", false);
+        test_string_extract_lines_one("x", 1, "", false);
+        test_string_extract_lines_one("x", 2, "", false);
+        test_string_extract_lines_one("x", 3, "", false);
+
+        test_string_extract_lines_one("x\n", 0, "x", false);
+        test_string_extract_lines_one("x\n", 1, "", false);
+        test_string_extract_lines_one("x\n", 2, "", false);
+        test_string_extract_lines_one("x\n", 3, "", false);
+
+        test_string_extract_lines_one("x\ny", 0, "x", true);
+        test_string_extract_lines_one("x\ny", 1, "y", false);
+        test_string_extract_lines_one("x\ny", 2, "", false);
+        test_string_extract_lines_one("x\ny", 3, "", false);
+
+        test_string_extract_lines_one("x\ny\n", 0, "x", true);
+        test_string_extract_lines_one("x\ny\n", 1, "y", false);
+        test_string_extract_lines_one("x\ny\n", 2, "", false);
+        test_string_extract_lines_one("x\ny\n", 3, "", false);
+
+        test_string_extract_lines_one("x\ny\nz", 0, "x", true);
+        test_string_extract_lines_one("x\ny\nz", 1, "y", true);
+        test_string_extract_lines_one("x\ny\nz", 2, "z", false);
+        test_string_extract_lines_one("x\ny\nz", 3, "", false);
+
+        test_string_extract_lines_one("\n", 0, "", false);
+        test_string_extract_lines_one("\n", 1, "", false);
+        test_string_extract_lines_one("\n", 2, "", false);
+        test_string_extract_lines_one("\n", 3, "", false);
+
+        test_string_extract_lines_one("\n\n", 0, "", true);
+        test_string_extract_lines_one("\n\n", 1, "", false);
+        test_string_extract_lines_one("\n\n", 2, "", false);
+        test_string_extract_lines_one("\n\n", 3, "", false);
+
+        test_string_extract_lines_one("\n\n\n", 0, "", true);
+        test_string_extract_lines_one("\n\n\n", 1, "", true);
+        test_string_extract_lines_one("\n\n\n", 2, "", false);
+        test_string_extract_lines_one("\n\n\n", 3, "", false);
+
+        test_string_extract_lines_one("\n\n\n\n", 0, "", true);
+        test_string_extract_lines_one("\n\n\n\n", 1, "", true);
+        test_string_extract_lines_one("\n\n\n\n", 2, "", true);
+        test_string_extract_lines_one("\n\n\n\n", 3, "", false);
+
+        test_string_extract_lines_one("\nx\n\n\n", 0, "", true);
+        test_string_extract_lines_one("\nx\n\n\n", 1, "x", true);
+        test_string_extract_lines_one("\nx\n\n\n", 2, "", true);
+        test_string_extract_lines_one("\nx\n\n\n", 3, "", false);
+
+        test_string_extract_lines_one("\n\nx\n\n", 0, "", true);
+        test_string_extract_lines_one("\n\nx\n\n", 1, "", true);
+        test_string_extract_lines_one("\n\nx\n\n", 2, "x", true);
+        test_string_extract_lines_one("\n\nx\n\n", 3, "", false);
+
+        test_string_extract_lines_one("\n\n\nx\n", 0, "", true);
+        test_string_extract_lines_one("\n\n\nx\n", 1, "", true);
+        test_string_extract_lines_one("\n\n\nx\n", 2, "", true);
+        test_string_extract_lines_one("\n\n\nx\n", 3, "x", false);
+}
+
+static void test_string_contains_word_strv(void) {
+        log_info("/* %s */", __func__);
+
+        const char *w;
+
+        assert_se(string_contains_word_strv("a b cc", NULL, STRV_MAKE("a", "b"), NULL));
+
+        assert_se(string_contains_word_strv("a b cc", NULL, STRV_MAKE("a", "b"), &w));
+        assert_se(streq(w, "a"));
+
+        assert_se(!string_contains_word_strv("a b cc", NULL, STRV_MAKE("d"), &w));
+        assert_se(w == NULL);
+
+        assert_se(string_contains_word_strv("a b cc", NULL, STRV_MAKE("b", "a"), &w));
+        assert_se(streq(w, "a"));
+
+        assert_se(string_contains_word_strv("b a b cc", NULL, STRV_MAKE("b", "a", "b"), &w));
+        assert_se(streq(w, "b"));
+
+        assert_se(string_contains_word_strv("a b cc", NULL, STRV_MAKE("b", ""), &w));
+        assert_se(streq(w, "b"));
+
+        assert_se(!string_contains_word_strv("a b cc", NULL, STRV_MAKE(""), &w));
+        assert_se(w == NULL);
+
+        assert_se(string_contains_word_strv("a b  cc", " ", STRV_MAKE(""), &w));
+        assert_se(streq(w, ""));
+}
+
+static void test_string_contains_word(void) {
+        log_info("/* %s */", __func__);
+
+        assert_se( string_contains_word("a b cc", NULL, "a"));
+        assert_se( string_contains_word("a b cc", NULL, "b"));
+        assert_se(!string_contains_word("a b cc", NULL, "c"));
+        assert_se( string_contains_word("a b cc", NULL, "cc"));
+        assert_se(!string_contains_word("a b cc", NULL, "d"));
+        assert_se(!string_contains_word("a b cc", NULL, "a b"));
+        assert_se(!string_contains_word("a b cc", NULL, "a b c"));
+        assert_se(!string_contains_word("a b cc", NULL, "b c"));
+        assert_se(!string_contains_word("a b cc", NULL, "b cc"));
+        assert_se(!string_contains_word("a b cc", NULL, "a "));
+        assert_se(!string_contains_word("a b cc", NULL, " b "));
+        assert_se(!string_contains_word("a b cc", NULL, " cc"));
+
+        assert_se( string_contains_word("  a  b\t\tcc", NULL, "a"));
+        assert_se( string_contains_word("  a  b\t\tcc", NULL, "b"));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "c"));
+        assert_se( string_contains_word("  a  b\t\tcc", NULL, "cc"));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "d"));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "a b"));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "a b\t\tc"));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "b\t\tc"));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "b\t\tcc"));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "a "));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, " b "));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, " cc"));
+
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, ""));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, " "));
+        assert_se(!string_contains_word("  a  b\t\tcc", NULL, "  "));
+        assert_se( string_contains_word("  a  b\t\tcc", " ", ""));
+        assert_se( string_contains_word("  a  b\t\tcc", "\t", ""));
+        assert_se( string_contains_word("  a  b\t\tcc", WHITESPACE, ""));
+
+        assert_se( string_contains_word("a:b:cc", ":#", "a"));
+        assert_se( string_contains_word("a:b:cc", ":#", "b"));
+        assert_se(!string_contains_word("a:b:cc", ":#", "c"));
+        assert_se( string_contains_word("a:b:cc", ":#", "cc"));
+        assert_se(!string_contains_word("a:b:cc", ":#", "d"));
+        assert_se(!string_contains_word("a:b:cc", ":#", "a:b"));
+        assert_se(!string_contains_word("a:b:cc", ":#", "a:b:c"));
+        assert_se(!string_contains_word("a:b:cc", ":#", "b:c"));
+        assert_se(!string_contains_word("a#b#cc", ":#", "b:cc"));
+        assert_se( string_contains_word("a#b#cc", ":#", "b"));
+        assert_se( string_contains_word("a#b#cc", ":#", "cc"));
+        assert_se(!string_contains_word("a:b:cc", ":#", "a:"));
+        assert_se(!string_contains_word("a:b cc", ":#", "b"));
+        assert_se( string_contains_word("a:b cc", ":#", "b cc"));
+        assert_se(!string_contains_word("a:b:cc", ":#", ":cc"));
+}
+
 int main(int argc, char *argv[]) {
         test_setup_logging(LOG_DEBUG);
 
@@ -591,11 +899,11 @@ int main(int argc, char *argv[]) {
         test_strextend();
         test_strextend_with_separator();
         test_strrep();
-        test_strappend();
         test_string_has_cc();
         test_ascii_strlower();
         test_strshorten();
         test_strjoina();
+        test_strjoin();
         test_strcmp_ptr();
         test_foreach_word();
         test_foreach_word_quoted();
@@ -611,6 +919,10 @@ int main(int argc, char *argv[]) {
         test_strlen_ptr();
         test_memory_startswith();
         test_memory_startswith_no_case();
+        test_string_truncate_lines();
+        test_string_extract_line();
+        test_string_contains_word_strv();
+        test_string_contains_word();
 
         return 0;
 }

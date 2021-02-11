@@ -1,7 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <ctype.h>
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include "alloc-util.h"
 #include "conf-files.h"
@@ -13,6 +14,7 @@
 #include "label.h"
 #include "mkdir.h"
 #include "path-util.h"
+#include "sort-util.h"
 #include "strbuf.h"
 #include "string-util.h"
 #include "strv.h"
@@ -103,12 +105,10 @@ static struct trie_node *node_lookup(const struct trie_node *node, uint8_t c) {
 }
 
 static void trie_node_cleanup(struct trie_node *node) {
-        size_t i;
-
         if (!node)
                 return;
 
-        for (i = 0; i < node->children_count; i++)
+        for (size_t i = 0; i < node->children_count; i++)
                 trie_node_cleanup(node->children[i].child);
         free(node->children);
         free(node->values);
@@ -189,10 +189,9 @@ static int trie_node_add_value(struct trie *trie, struct trie_node *node,
 static int trie_insert(struct trie *trie, struct trie_node *node, const char *search,
                        const char *key, const char *value,
                        const char *filename, uint16_t file_priority, uint32_t line_number, bool compat) {
-        size_t i = 0;
         int r = 0;
 
-        for (;;) {
+        for (size_t i = 0;; i++) {
                 size_t p;
                 uint8_t c;
                 struct trie_node *child;
@@ -271,7 +270,6 @@ static int trie_insert(struct trie *trie, struct trie_node *node, const char *se
                 }
 
                 node = child;
-                i++;
         }
 }
 
@@ -287,20 +285,17 @@ struct trie_f {
 
 /* calculate the storage space for the nodes, children arrays, value arrays */
 static void trie_store_nodes_size(struct trie_f *trie, struct trie_node *node, bool compat) {
-        uint64_t i;
-
-        for (i = 0; i < node->children_count; i++)
+        for (uint64_t i = 0; i < node->children_count; i++)
                 trie_store_nodes_size(trie, node->children[i].child, compat);
 
         trie->strings_off += sizeof(struct trie_node_f);
-        for (i = 0; i < node->children_count; i++)
+        for (uint64_t i = 0; i < node->children_count; i++)
                 trie->strings_off += sizeof(struct trie_child_entry_f);
-        for (i = 0; i < node->values_count; i++)
+        for (uint64_t i = 0; i < node->values_count; i++)
                 trie->strings_off += compat ? sizeof(struct trie_value_entry_f) : sizeof(struct trie_value_entry2_f);
 }
 
 static int64_t trie_store_nodes(struct trie_f *trie, struct trie_node *node, bool compat) {
-        uint64_t i;
         struct trie_node_f n = {
                 .prefix_off = htole64(trie->strings_off + node->prefix_off),
                 .children_count = node->children_count,
@@ -316,7 +311,7 @@ static int64_t trie_store_nodes(struct trie_f *trie, struct trie_node *node, boo
         }
 
         /* post-order recursion */
-        for (i = 0; i < node->children_count; i++) {
+        for (uint64_t i = 0; i < node->children_count; i++) {
                 int64_t child_off;
 
                 child_off = trie_store_nodes(trie, node->children[i].child, compat);
@@ -341,7 +336,7 @@ static int64_t trie_store_nodes(struct trie_f *trie, struct trie_node *node, boo
         }
 
         /* append values array */
-        for (i = 0; i < node->values_count; i++) {
+        for (uint64_t i = 0; i < node->values_count; i++) {
                 struct trie_value_entry2_f v = {
                         .key_off = htole64(trie->strings_off + node->values[i].key_off),
                         .value_off = htole64(trie->strings_off + node->values[i].value_off),
@@ -432,7 +427,7 @@ static int trie_store(struct trie *trie, const char *filename, bool compat) {
  error_fclose:
         r = -errno;
         fclose(t.f);
-        unlink(filename_tmp);
+        (void) unlink(filename_tmp);
         return r;
 }
 
@@ -444,8 +439,8 @@ static int insert_data(struct trie *trie, char **match_list, char *line, const c
 
         value = strchr(line, '=');
         if (!value)
-                return log_syntax(NULL, LOG_WARNING, filename, line_number, EINVAL,
-                                  "Key-value pair expected but got \"%s\", ignoring", line);
+                return log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
+                                  "Key-value pair expected but got \"%s\", ignoring.", line);
 
         value[0] = '\0';
         value++;
@@ -454,10 +449,9 @@ static int insert_data(struct trie *trie, char **match_list, char *line, const c
         while (isblank(line[0]) && isblank(line[1]))
                 line++;
 
-        if (isempty(line + 1) || isempty(value))
-                return log_syntax(NULL, LOG_WARNING, filename, line_number, EINVAL,
-                                  "Empty %s in \"%s=%s\", ignoring",
-                                  isempty(line + 1) ? "key" : "value",
+        if (isempty(line + 1))
+                return log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
+                                  "Empty key in \"%s=%s\", ignoring.",
                                   line, value);
 
         STRV_FOREACH(entry, match_list)
@@ -475,8 +469,7 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_strv_free_ char **match_list = NULL;
         uint32_t line_number = 0;
-        char *match = NULL;
-        int r = 0, err;
+        int r, err;
 
         f = fopen(filename, "re");
         if (!f)
@@ -487,13 +480,13 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
                 size_t len;
                 char *pos;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_line_full(f, LONG_LINE_MAX, READ_LINE_NOT_A_TTY, &line);
                 if (r < 0)
                         return r;
                 if (r == 0)
                         break;
 
-                ++line_number;
+                line_number ++;
 
                 /* comment line */
                 if (line[0] == '#')
@@ -516,20 +509,15 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
                                 break;
 
                         if (line[0] == ' ') {
-                                log_syntax(NULL, LOG_WARNING, filename, line_number, EINVAL,
-                                           "Match expected but got indented property \"%s\", ignoring line", line);
-                                r = -EINVAL;
+                                r = log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
+                                               "Match expected but got indented property \"%s\", ignoring line.", line);
                                 break;
                         }
 
                         /* start of record, first match */
                         state = HW_MATCH;
 
-                        match = strdup(line);
-                        if (!match)
-                                return -ENOMEM;
-
-                        err = strv_consume(&match_list, match);
+                        err = strv_extend(&match_list, line);
                         if (err < 0)
                                 return err;
 
@@ -537,21 +525,16 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
 
                 case HW_MATCH:
                         if (len == 0) {
-                                log_syntax(NULL, LOG_WARNING, filename, line_number, EINVAL,
-                                           "Property expected, ignoring record with no properties");
-                                r = -EINVAL;
+                                r = log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
+                                               "Property expected, ignoring record with no properties.");
                                 state = HW_NONE;
-                                strv_clear(match_list);
+                                match_list = strv_free(match_list);
                                 break;
                         }
 
                         if (line[0] != ' ') {
                                 /* another match */
-                                match = strdup(line);
-                                if (!match)
-                                        return -ENOMEM;
-
-                                err = strv_consume(&match_list, match);
+                                err = strv_extend(&match_list, line);
                                 if (err < 0)
                                         return err;
 
@@ -569,16 +552,15 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
                         if (len == 0) {
                                 /* end of record */
                                 state = HW_NONE;
-                                strv_clear(match_list);
+                                match_list = strv_free(match_list);
                                 break;
                         }
 
                         if (line[0] != ' ') {
-                                log_syntax(NULL, LOG_WARNING, filename, line_number, EINVAL,
-                                           "Property or empty line expected, got \"%s\", ignoring record", line);
-                                r = -EINVAL;
+                                r = log_syntax(NULL, LOG_WARNING, filename, line_number, SYNTHETIC_ERRNO(EINVAL),
+                                               "Property or empty line expected, got \"%s\", ignoring record.", line);
                                 state = HW_NONE;
-                                strv_clear(match_list);
+                                match_list = strv_free(match_list);
                                 break;
                         }
 
@@ -590,8 +572,8 @@ static int import_file(struct trie *trie, const char *filename, uint16_t file_pr
         }
 
         if (state == HW_MATCH)
-                log_syntax(NULL, LOG_WARNING, filename, line_number, EINVAL,
-                           "Property expected, ignoring record with no properties");
+                log_syntax(NULL, LOG_WARNING, filename, line_number, 0,
+                           "Property expected, ignoring record with no properties.");
 
         return r;
 }

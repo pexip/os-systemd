@@ -1,5 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <sys/ioctl.h>
 #include <sys/reboot.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
@@ -9,7 +10,6 @@
 #include "exit-status.h"
 #include "fd-util.h"
 #include "log.h"
-#include "missing.h"
 #include "nspawn-stub-pid1.h"
 #include "process-util.h"
 #include "signal-util.h"
@@ -60,15 +60,24 @@ int stub_pid1(sd_id128_t uuid) {
         if (pid == 0) {
                 /* Return in the child */
                 assert_se(sigprocmask(SIG_SETMASK, &oldmask, NULL) >= 0);
-                setsid();
+
+                if (setsid() < 0)
+                        return log_error_errno(errno, "Failed to become session leader in payload process: %m");
+
                 return 0;
         }
 
         reset_all_signal_handlers();
 
         log_close();
-        close_all_fds(NULL, 0);
+        (void) close_all_fds(NULL, 0);
         log_open();
+
+        if (ioctl(STDIN_FILENO, TIOCNOTTY) < 0) {
+                if (errno != ENOTTY)
+                        log_warning_errno(errno, "Unexpected error from TIOCNOTTY ioctl in init stub process, ignoring: %m");
+        } else
+                log_warning("Expected TIOCNOTTY to fail, but it succeeded in init stub process, ignoring.");
 
         /* Flush out /proc/self/environ, so that we don't leak the environment from the host into the container. Also,
          * set $container= and $container_uuid= so that clients in the container that query it from /proc/1/environ

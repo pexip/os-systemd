@@ -1,9 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "random-util.h"
 #include "serialize.h"
 #include "string-util.h"
 #include "strv.h"
+#include "tests.h"
 #include "time-util.h"
 
 static void test_parse_sec(void) {
@@ -83,6 +84,26 @@ static void test_parse_sec_fix_0(void) {
         assert_se(u == USEC_INFINITY);
         assert_se(parse_sec_fix_0(" 0", &u) >= 0);
         assert_se(u == USEC_INFINITY);
+}
+
+static void test_parse_sec_def_infinity(void) {
+        usec_t u;
+
+        log_info("/* %s */", __func__);
+
+        assert_se(parse_sec_def_infinity("5s", &u) >= 0);
+        assert_se(u == 5 * USEC_PER_SEC);
+        assert_se(parse_sec_def_infinity("", &u) >= 0);
+        assert_se(u == USEC_INFINITY);
+        assert_se(parse_sec_def_infinity("     ", &u) >= 0);
+        assert_se(u == USEC_INFINITY);
+        assert_se(parse_sec_def_infinity("0s", &u) >= 0);
+        assert_se(u == 0);
+        assert_se(parse_sec_def_infinity("0", &u) >= 0);
+        assert_se(u == 0);
+        assert_se(parse_sec_def_infinity(" 0", &u) >= 0);
+        assert_se(u == 0);
+        assert_se(parse_sec_def_infinity("-5s", &u) < 0);
 }
 
 static void test_parse_time(void) {
@@ -240,8 +261,10 @@ static void test_get_timezones(void) {
         r = get_timezones(&zones);
         assert_se(r == 0);
 
-        STRV_FOREACH(zone, zones)
+        STRV_FOREACH(zone, zones) {
+                log_info("zone: %s", *zone);
                 assert_se(timezone_is_valid(*zone, LOG_ERR));
+        }
 }
 
 static void test_usec_add(void) {
@@ -310,17 +333,17 @@ static void test_format_timestamp(void) {
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x / USEC_PER_SEC == y / USEC_PER_SEC);
 
-                assert_se(format_timestamp_utc(buf, sizeof(buf), x));
+                assert_se(format_timestamp_style(buf, sizeof(buf), x, TIMESTAMP_UTC));
                 log_info("%s", buf);
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x / USEC_PER_SEC == y / USEC_PER_SEC);
 
-                assert_se(format_timestamp_us(buf, sizeof(buf), x));
+                assert_se(format_timestamp_style(buf, sizeof(buf), x, TIMESTAMP_US));
                 log_info("%s", buf);
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x == y);
 
-                assert_se(format_timestamp_us_utc(buf, sizeof(buf), x));
+                assert_se(format_timestamp_style(buf, sizeof(buf), x, TIMESTAMP_US_UTC));
                 log_info("%s", buf);
                 assert_se(parse_timestamp(buf, &y) >= 0);
                 assert_se(x == y);
@@ -341,7 +364,7 @@ static void test_format_timestamp_utc_one(usec_t val, const char *result) {
         char buf[FORMAT_TIMESTAMP_MAX];
         const char *t;
 
-        t = format_timestamp_utc(buf, sizeof(buf), val);
+        t = format_timestamp_style(buf, sizeof(buf), val, TIMESTAMP_UTC);
         assert_se(streq_ptr(t, result));
 }
 
@@ -410,7 +433,7 @@ static void assert_similar(usec_t a, usec_t b) {
         else
                 d = b - a;
 
-        assert(d < 10*USEC_PER_SEC);
+        assert_se(d < 10*USEC_PER_SEC);
 }
 
 static void test_usec_shift_clock(void) {
@@ -452,16 +475,48 @@ static void test_in_utc_timezone(void) {
         assert_se(timezone == 0);
         assert_se(daylight == 0);
 
-        assert_se(setenv("TZ", "Europe/Berlin", 1) >= 0);
+        assert_se(setenv("TZ", ":Europe/Berlin", 1) >= 0);
         assert_se(!in_utc_timezone());
         assert_se(streq(tzname[0], "CET"));
         assert_se(streq(tzname[1], "CEST"));
 
-        assert_se(unsetenv("TZ") >= 0);
+        assert_se(unsetenv("TZ") == 0);
+}
+
+static void test_map_clock_usec(void) {
+        usec_t nowr, x, y, z;
+
+        log_info("/* %s */", __func__);
+        nowr = now(CLOCK_REALTIME);
+
+        x = nowr; /* right now */
+        y = map_clock_usec(x, CLOCK_REALTIME, CLOCK_MONOTONIC);
+        z = map_clock_usec(y, CLOCK_MONOTONIC, CLOCK_REALTIME);
+        /* Converting forth and back will introduce inaccuracies, since we cannot query both clocks atomically, but it should be small. Even on the slowest CI smaller than 1h */
+
+        assert_se((z > x ? z - x : x - z) < USEC_PER_HOUR);
+
+        assert_se(nowr < USEC_INFINITY - USEC_PER_DAY*7); /* overflow check */
+        x = nowr + USEC_PER_DAY*7; /* 1 week from now */
+        y = map_clock_usec(x, CLOCK_REALTIME, CLOCK_MONOTONIC);
+        assert_se(y > 0 && y < USEC_INFINITY);
+        z = map_clock_usec(y, CLOCK_MONOTONIC, CLOCK_REALTIME);
+        assert_se(z > 0 && z < USEC_INFINITY);
+        assert_se((z > x ? z - x : x - z) < USEC_PER_HOUR);
+
+        assert_se(nowr > USEC_PER_DAY * 7); /* underflow check */
+        x = nowr - USEC_PER_DAY*7; /* 1 week ago */
+        y = map_clock_usec(x, CLOCK_REALTIME, CLOCK_MONOTONIC);
+        if (y != 0) { /* might underflow if machine is not up long enough for the monotonic clock to be beyond 1w */
+                assert_se(y < USEC_INFINITY);
+                z = map_clock_usec(y, CLOCK_MONOTONIC, CLOCK_REALTIME);
+                assert_se(z > 0 && z < USEC_INFINITY);
+                assert_se((z > x ? z - x : x - z) < USEC_PER_HOUR);
+        }
 }
 
 int main(int argc, char *argv[]) {
-        uintmax_t x;
+        test_setup_logging(LOG_INFO);
 
         log_info("realtime=" USEC_FMT "\n"
                  "monotonic=" USEC_FMT "\n"
@@ -472,6 +527,7 @@ int main(int argc, char *argv[]) {
 
         test_parse_sec();
         test_parse_sec_fix_0();
+        test_parse_sec_def_infinity();
         test_parse_time();
         test_parse_nsec();
         test_format_timespan(1);
@@ -487,12 +543,13 @@ int main(int argc, char *argv[]) {
         test_deserialize_dual_timestamp();
         test_usec_shift_clock();
         test_in_utc_timezone();
+        test_map_clock_usec();
 
         /* Ensure time_t is signed */
         assert_cc((time_t) -1 < (time_t) 1);
 
         /* Ensure TIME_T_MAX works correctly */
-        x = (uintmax_t) TIME_T_MAX;
+        uintmax_t x = TIME_T_MAX;
         x++;
         assert((time_t) x < 0);
 

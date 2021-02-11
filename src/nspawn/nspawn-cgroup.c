@@ -1,10 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/mount.h>
 
 #include "alloc-util.h"
+#include "cgroup-setup.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "mkdir.h"
 #include "mount-util.h"
@@ -103,11 +105,11 @@ int sync_cgroup(pid_t pid, CGroupUnified unified_requested, uid_t uid_shift) {
                 return log_error_errno(errno, "Failed to generate temporary mount point for unified hierarchy: %m");
 
         if (unified_controller > 0)
-                r = mount_verbose(LOG_ERR, "cgroup", tree, "cgroup",
-                                  MS_NOSUID|MS_NOEXEC|MS_NODEV, "none,name=systemd,xattr");
+                r = mount_nofollow_verbose(LOG_ERR, "cgroup", tree, "cgroup",
+                                           MS_NOSUID|MS_NOEXEC|MS_NODEV, "none,name=systemd,xattr");
         else
-                r = mount_verbose(LOG_ERR, "cgroup", tree, "cgroup2",
-                                  MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, "cgroup", tree, "cgroup2",
+                                           MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
         if (r < 0)
                 goto finish;
 
@@ -120,10 +122,9 @@ int sync_cgroup(pid_t pid, CGroupUnified unified_requested, uid_t uid_shift) {
         (void) rm_rf(fn, REMOVE_ROOT|REMOVE_ONLY_DIRECTORIES);
 
         fn = strjoina(tree, cgroup, "/cgroup.procs");
-        (void) mkdir_parents(fn, 0755);
 
         sprintf(pid_string, PID_FMT, pid);
-        r = write_string_file(fn, pid_string, WRITE_STRING_FILE_DISABLE_BUFFER);
+        r = write_string_file(fn, pid_string, WRITE_STRING_FILE_DISABLE_BUFFER|WRITE_STRING_FILE_MKDIR_0755);
         if (r < 0) {
                 log_error_errno(r, "Failed to move process: %m");
                 goto finish;
@@ -135,7 +136,7 @@ int sync_cgroup(pid_t pid, CGroupUnified unified_requested, uid_t uid_shift) {
                 log_error_errno(r, "Failed to chown() cgroup %s: %m", fn);
 finish:
         if (undo_mount)
-                (void) umount_verbose(tree);
+                (void) umount_verbose(LOG_ERR, tree, UMOUNT_NOFOLLOW);
 
         (void) rmdir(tree);
         return r;
@@ -160,7 +161,7 @@ int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested)
          * attributes. Hence, let's insert an intermediary cgroup to cover that case too.
          *
          * Note that we only bother with the main hierarchy here, not with any secondary ones. On the unified setup
-         * that's fine because there's only one hiearchy anyway and controllers are enabled directly on it. On the
+         * that's fine because there's only one hierarchy anyway and controllers are enabled directly on it. On the
          * legacy setup, this is fine too, since delegation of controllers is generally not safe there, hence we won't
          * do it. */
 
@@ -198,15 +199,11 @@ int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested)
  * namespace.
  */
 static int get_process_controllers(Set **ret) {
-        _cleanup_set_free_free_ Set *controllers = NULL;
+        _cleanup_set_free_ Set *controllers = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
         assert(ret);
-
-        controllers = set_new(&string_hash_ops);
-        if (!controllers)
-                return -ENOMEM;
 
         f = fopen("/proc/self/cgroup", "re");
         if (!f)
@@ -236,7 +233,7 @@ static int get_process_controllers(Set **ret) {
                 if (STR_IN_SET(l, "", "name=systemd", "name=unified"))
                         continue;
 
-                r = set_put_strdup(controllers, l);
+                r = set_put_strdup(&controllers, l);
                 if (r < 0)
                         return r;
         }
@@ -263,7 +260,7 @@ static int mount_legacy_cgroup_hierarchy(
         if (r > 0)
                 return 0;
 
-        mkdir_p(to, 0755);
+        (void) mkdir_p(to, 0755);
 
         /* The superblock mount options of the mount point need to be
          * identical to the hosts', and hence writable... */
@@ -278,14 +275,14 @@ static int mount_legacy_cgroup_hierarchy(
                 opts = controller;
         }
 
-        r = mount_verbose(LOG_ERR, "cgroup", to, fstype, MS_NOSUID|MS_NOEXEC|MS_NODEV, opts);
+        r = mount_nofollow_verbose(LOG_ERR, "cgroup", to, fstype, MS_NOSUID|MS_NOEXEC|MS_NODEV, opts);
         if (r < 0)
                 return r;
 
         /* ... hence let's only make the bind mount read-only, not the superblock. */
         if (read_only) {
-                r = mount_verbose(LOG_ERR, NULL, to, NULL,
-                                  MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_RDONLY, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, NULL, to, NULL,
+                                           MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_RDONLY, NULL);
                 if (r < 0)
                         return r;
         }
@@ -302,7 +299,7 @@ static int mount_legacy_cgns_supported(
                 uid_t uid_range,
                 const char *selinux_apifs_context) {
 
-        _cleanup_set_free_free_ Set *controllers = NULL;
+        _cleanup_set_free_ Set *controllers = NULL;
         const char *cgroup_root = "/sys/fs/cgroup", *c;
         int r;
 
@@ -322,12 +319,12 @@ static int mount_legacy_cgns_supported(
                  * uid/gid as seen from e.g. /proc/1/mountinfo. So we simply
                  * pass uid 0 and not uid_shift to tmpfs_patch_options().
                  */
-                r = tmpfs_patch_options("mode=755", 0, selinux_apifs_context, &options);
+                r = tmpfs_patch_options("mode=755" TMPFS_LIMITS_SYS_FS_CGROUP, 0, selinux_apifs_context, &options);
                 if (r < 0)
                         return log_oom();
 
-                r = mount_verbose(LOG_ERR, "tmpfs", cgroup_root, "tmpfs",
-                                  MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME, options);
+                r = mount_nofollow_verbose(LOG_ERR, "tmpfs", cgroup_root, "tmpfs",
+                                           MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME, options);
                 if (r < 0)
                         return r;
         }
@@ -370,7 +367,7 @@ static int mount_legacy_cgns_supported(
                         if (streq(controller, tok))
                                 break;
 
-                        target = prefix_root("/sys/fs/cgroup/", tok);
+                        target = path_join("/sys/fs/cgroup/", tok);
                         if (!target)
                                 return log_oom();
 
@@ -394,8 +391,8 @@ skip_controllers:
                 return r;
 
         if (!userns)
-                return mount_verbose(LOG_ERR, NULL, cgroup_root, NULL,
-                                     MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
+                return mount_nofollow_verbose(LOG_ERR, NULL, cgroup_root, NULL,
+                                              MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
 
         return 0;
 }
@@ -424,12 +421,12 @@ static int mount_legacy_cgns_unsupported(
         if (r == 0) {
                 _cleanup_free_ char *options = NULL;
 
-                r = tmpfs_patch_options("mode=755", uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &options);
+                r = tmpfs_patch_options("mode=755" TMPFS_LIMITS_SYS_FS_CGROUP, uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &options);
                 if (r < 0)
                         return log_oom();
 
-                r = mount_verbose(LOG_ERR, "tmpfs", cgroup_root, "tmpfs",
-                                  MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME, options);
+                r = mount_nofollow_verbose(LOG_ERR, "tmpfs", cgroup_root, "tmpfs",
+                                           MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME, options);
                 if (r < 0)
                         return r;
         }
@@ -451,7 +448,7 @@ static int mount_legacy_cgns_unsupported(
                 if (!controller)
                         break;
 
-                origin = prefix_root("/sys/fs/cgroup/", controller);
+                origin = path_join("/sys/fs/cgroup/", controller);
                 if (!origin)
                         return log_oom();
 
@@ -468,7 +465,7 @@ static int mount_legacy_cgns_unsupported(
                 else {
                         _cleanup_free_ char *target = NULL;
 
-                        target = prefix_root(dest, origin);
+                        target = path_join(dest, origin);
                         if (!target)
                                 return log_oom();
 
@@ -502,8 +499,8 @@ skip_controllers:
         if (r < 0)
                 return r;
 
-        return mount_verbose(LOG_ERR, NULL, cgroup_root, NULL,
-                             MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
+        return mount_nofollow_verbose(LOG_ERR, NULL, cgroup_root, NULL,
+                                      MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
 }
 
 static int mount_unified_cgroups(const char *dest) {
@@ -530,7 +527,7 @@ static int mount_unified_cgroups(const char *dest) {
                                        "%s is already mounted but not a unified cgroup hierarchy. Refusing.", p);
         }
 
-        return mount_verbose(LOG_ERR, "cgroup", p, "cgroup2", MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
+        return mount_nofollow_verbose(LOG_ERR, "cgroup", p, "cgroup2", MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
 }
 
 int mount_cgroups(
@@ -557,13 +554,13 @@ static int mount_systemd_cgroup_writable_one(const char *root, const char *own) 
         assert(own);
 
         /* Make our own cgroup a (writable) bind mount */
-        r = mount_verbose(LOG_ERR, own, own, NULL, MS_BIND, NULL);
+        r = mount_nofollow_verbose(LOG_ERR, own, own, NULL, MS_BIND, NULL);
         if (r < 0)
                 return r;
 
         /* And then remount the systemd cgroup root read-only */
-        return mount_verbose(LOG_ERR, NULL, root, NULL,
-                             MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_RDONLY, NULL);
+        return mount_nofollow_verbose(LOG_ERR, NULL, root, NULL,
+                                      MS_BIND|MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_RDONLY, NULL);
 }
 
 int mount_systemd_cgroup_writable(

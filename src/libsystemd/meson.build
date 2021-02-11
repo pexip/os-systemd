@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 id128_sources = files('''
         sd-id128/id128-util.c
@@ -71,8 +71,7 @@ libsystemd_sources = files('''
         sd-hwdb/hwdb-util.h
         sd-hwdb/sd-hwdb.c
         sd-netlink/generic-netlink.c
-        sd-netlink/local-addresses.c
-        sd-netlink/local-addresses.h
+        sd-netlink/generic-netlink.h
         sd-netlink/netlink-internal.h
         sd-netlink/netlink-message.c
         sd-netlink/netlink-slot.c

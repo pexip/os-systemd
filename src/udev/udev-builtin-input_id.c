@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * expose input properties via udev
  *
@@ -7,17 +7,16 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <linux/limits.h>
-#include <linux/input.h>
 
 #include "device-util.h"
 #include "fd-util.h"
-#include "missing.h"
+#include "missing_input.h"
+#include "parse-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "udev-builtin.h"
@@ -125,8 +124,25 @@ static void get_cap_mask(sd_device *pdev, const char* attr,
         }
 }
 
+static struct input_id get_input_id(sd_device *dev) {
+        const char *v;
+        struct input_id id = {};
+
+        if (sd_device_get_sysattr_value(dev, "id/bustype", &v) >= 0)
+                (void) safe_atoux16(v, &id.bustype);
+        if (sd_device_get_sysattr_value(dev, "id/vendor", &v) >= 0)
+                (void) safe_atoux16(v, &id.vendor);
+        if (sd_device_get_sysattr_value(dev, "id/product", &v) >= 0)
+                (void) safe_atoux16(v, &id.product);
+        if (sd_device_get_sysattr_value(dev, "id/version", &v) >= 0)
+                (void) safe_atoux16(v, &id.version);
+
+        return id;
+}
+
 /* pointer devices */
 static bool test_pointers(sd_device *dev,
+                          const struct input_id *id,
                           const unsigned long* bitmask_ev,
                           const unsigned long* bitmask_abs,
                           const unsigned long* bitmask_key,
@@ -138,20 +154,23 @@ static bool test_pointers(sd_device *dev,
         bool has_rel_coordinates = false;
         bool has_mt_coordinates = false;
         bool has_joystick_axes_or_buttons = false;
+        bool has_pad_buttons = false;
         bool is_direct = false;
         bool has_touch = false;
         bool has_3d_coordinates = false;
         bool has_keys = false;
-        bool stylus_or_pen = false;
+        bool has_stylus = false;
+        bool has_pen = false;
         bool finger_but_no_pen = false;
         bool has_mouse_button = false;
         bool is_mouse = false;
         bool is_touchpad = false;
         bool is_touchscreen = false;
         bool is_tablet = false;
+        bool is_tablet_pad = false;
         bool is_joystick = false;
         bool is_accelerometer = false;
-        bool is_pointing_stick= false;
+        bool is_pointing_stick = false;
 
         has_keys = test_bit(EV_KEY, bitmask_ev);
         has_abs_coordinates = test_bit(ABS_X, bitmask_abs) && test_bit(ABS_Y, bitmask_abs);
@@ -167,7 +186,8 @@ static bool test_pointers(sd_device *dev,
         }
 
         is_pointing_stick = test_bit(INPUT_PROP_POINTING_STICK, bitmask_props);
-        stylus_or_pen = test_bit(BTN_STYLUS, bitmask_key) || test_bit(BTN_TOOL_PEN, bitmask_key);
+        has_stylus = test_bit(BTN_STYLUS, bitmask_key);
+        has_pen = test_bit(BTN_TOOL_PEN, bitmask_key);
         finger_but_no_pen = test_bit(BTN_TOOL_FINGER, bitmask_key) && !test_bit(BTN_TOOL_PEN, bitmask_key);
         for (button = BTN_MOUSE; button < BTN_JOYSTICK && !has_mouse_button; button++)
                 has_mouse_button = test_bit(button, bitmask_key);
@@ -179,6 +199,7 @@ static bool test_pointers(sd_device *dev,
                 has_mt_coordinates = false;
         is_direct = test_bit(INPUT_PROP_DIRECT, bitmask_props);
         has_touch = test_bit(BTN_TOUCH, bitmask_key);
+        has_pad_buttons = test_bit(BTN_0, bitmask_key) && has_stylus && !has_pen;
 
         /* joysticks don't necessarily have buttons; e. g.
          * rudders/pedals are joystick-like, but buttonless; they have
@@ -200,7 +221,7 @@ static bool test_pointers(sd_device *dev,
                 has_joystick_axes_or_buttons = test_bit(axis, bitmask_abs);
 
         if (has_abs_coordinates) {
-                if (stylus_or_pen)
+                if (has_stylus || has_pen)
                         is_tablet = true;
                 else if (finger_but_no_pen && !is_direct)
                         is_touchpad = true;
@@ -212,12 +233,11 @@ static bool test_pointers(sd_device *dev,
                         is_touchscreen = true;
                 else if (has_joystick_axes_or_buttons)
                         is_joystick = true;
-        } else if (has_joystick_axes_or_buttons) {
+        } else if (has_joystick_axes_or_buttons)
                 is_joystick = true;
-        }
 
         if (has_mt_coordinates) {
-                if (stylus_or_pen)
+                if (has_stylus || has_pen)
                         is_tablet = true;
                 else if (finger_but_no_pen && !is_direct)
                         is_touchpad = true;
@@ -225,11 +245,18 @@ static bool test_pointers(sd_device *dev,
                         is_touchscreen = true;
         }
 
+        if (is_tablet && has_pad_buttons)
+                is_tablet_pad = true;
+
         if (!is_tablet && !is_touchpad && !is_joystick &&
             has_mouse_button &&
             (has_rel_coordinates ||
             !has_abs_coordinates)) /* mouse buttons and no axis */
                 is_mouse = true;
+
+        /* There is no such thing as an i2c mouse */
+        if (is_mouse && id->bustype == BUS_I2C)
+                is_pointing_stick = true;
 
         if (is_pointing_stick)
                 udev_builtin_add_property(dev, test, "ID_INPUT_POINTINGSTICK", "1");
@@ -243,6 +270,8 @@ static bool test_pointers(sd_device *dev,
                 udev_builtin_add_property(dev, test, "ID_INPUT_JOYSTICK", "1");
         if (is_tablet)
                 udev_builtin_add_property(dev, test, "ID_INPUT_TABLET", "1");
+        if (is_tablet_pad)
+                udev_builtin_add_property(dev, test, "ID_INPUT_TABLET_PAD", "1");
 
         return is_tablet || is_mouse || is_touchpad || is_touchscreen || is_joystick || is_pointing_stick;
 }
@@ -328,6 +357,8 @@ static int builtin_input_id(sd_device *dev, int argc, char *argv[], bool test) {
         }
 
         if (pdev) {
+                struct input_id id = get_input_id(pdev);
+
                 /* Use this as a flag that input devices were detected, so that this
                  * program doesn't need to be called more than once per device */
                 udev_builtin_add_property(dev, test, "ID_INPUT", "1");
@@ -336,7 +367,7 @@ static int builtin_input_id(sd_device *dev, int argc, char *argv[], bool test) {
                 get_cap_mask(pdev, "capabilities/rel", bitmask_rel, sizeof(bitmask_rel), test);
                 get_cap_mask(pdev, "capabilities/key", bitmask_key, sizeof(bitmask_key), test);
                 get_cap_mask(pdev, "properties", bitmask_props, sizeof(bitmask_props), test);
-                is_pointer = test_pointers(dev, bitmask_ev, bitmask_abs,
+                is_pointer = test_pointers(dev, &id, bitmask_ev, bitmask_abs,
                                            bitmask_key, bitmask_rel,
                                            bitmask_props, test);
                 is_key = test_key(dev, bitmask_ev, bitmask_key, test);
@@ -357,7 +388,7 @@ static int builtin_input_id(sd_device *dev, int argc, char *argv[], bool test) {
         return 0;
 }
 
-const struct udev_builtin udev_builtin_input_id = {
+const UdevBuiltin udev_builtin_input_id = {
         .name = "input_id",
         .cmd = builtin_input_id,
         .help = "Input device properties",

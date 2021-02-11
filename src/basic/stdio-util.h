@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <printf.h>
@@ -7,7 +7,7 @@
 #include <sys/types.h>
 
 #include "macro.h"
-#include "util.h"
+#include "memory-util.h"
 
 #define snprintf_ok(buf, len, fmt, ...) \
         ((size_t) snprintf(buf, len, fmt, __VA_ARGS__) < (len))

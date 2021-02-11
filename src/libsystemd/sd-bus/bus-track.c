@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-bus.h"
 
@@ -6,6 +6,7 @@
 #include "bus-internal.h"
 #include "bus-track.h"
 #include "bus-util.h"
+#include "string-util.h"
 
 struct track_item {
         unsigned n_ref;
@@ -305,7 +306,7 @@ _public_ const char* sd_bus_track_first(sd_bus_track *track) {
         track->modified = false;
         track->iterator = ITERATOR_FIRST;
 
-        hashmap_iterate(track->names, &track->iterator, NULL, (const void**) &n);
+        (void) hashmap_iterate(track->names, &track->iterator, NULL, (const void**) &n);
         return n;
 }
 
@@ -318,7 +319,7 @@ _public_ const char* sd_bus_track_next(sd_bus_track *track) {
         if (track->modified)
                 return NULL;
 
-        hashmap_iterate(track->names, &track->iterator, NULL, (const void**) &n);
+        (void) hashmap_iterate(track->names, &track->iterator, NULL, (const void**) &n);
         return n;
 }
 

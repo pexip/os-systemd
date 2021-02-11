@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2013 Intel Corporation
 
@@ -7,7 +7,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <string.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -107,7 +106,7 @@ int mac_smack_apply_fd(int fd, SmackAttr attr, const char *label) {
 
 int mac_smack_apply_pid(pid_t pid, const char *label) {
         const char *p;
-        int r = 0;
+        int r;
 
         assert(label);
 
@@ -207,7 +206,7 @@ int mac_smack_fix_at(int dirfd, const char *path, LabelFixFlags flags) {
         return smack_fix_fd(fd, path, flags);
 }
 
-int mac_smack_fix(const char *path, LabelFixFlags flags) {
+int mac_smack_fix_container(const char *path, const char *inside_path, LabelFixFlags flags) {
         _cleanup_free_ char *abspath = NULL;
         _cleanup_close_ int fd = -1;
         int r;
@@ -229,11 +228,11 @@ int mac_smack_fix(const char *path, LabelFixFlags flags) {
                 return -errno;
         }
 
-        return smack_fix_fd(fd, abspath, flags);
+        return smack_fix_fd(fd, inside_path, flags);
 }
 
 int mac_smack_copy(const char *dest, const char *src) {
-        int r = 0;
+        int r;
         _cleanup_free_ char *label = NULL;
 
         assert(dest);
@@ -275,7 +274,7 @@ int mac_smack_apply_pid(pid_t pid, const char *label) {
         return 0;
 }
 
-int mac_smack_fix(const char *path, LabelFixFlags flags) {
+int mac_smack_fix_container(const char *path, const char *inside_path, LabelFixFlags flags) {
         return 0;
 }
 

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #ifndef foosdcommonhfoo
 #define foosdcommonhfoo
 
@@ -19,7 +19,7 @@
 
 /* This is a private header; never even think of including this directly! */
 
-#if defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ <= 1
+#if defined(__INCLUDE_LEVEL__) && __INCLUDE_LEVEL__ <= 1 && !defined(__COVERITY__)
 #  error "Do not include _sd-common.h directly; it is a private header."
 #endif
 
@@ -43,6 +43,18 @@ typedef void (*_sd_destroy_t)(void *userdata);
 
 #ifndef _sd_pure_
 #  define _sd_pure_ __attribute__((__pure__))
+#endif
+
+/* Note that strictly speaking __deprecated__ has been available before GCC 6. However, starting with GCC 6
+ * it also works on enum values, which we are interested in. Since this is a developer-facing feature anyway
+ * (as opposed to build engineer-facing), let's hence conditionalize this to gcc 6, given that the developers
+ * are probably going to use something newer anyway. */
+#ifndef _sd_deprecated_
+#  if __GNUC__ >= 6
+#    define _sd_deprecated_ __attribute__((__deprecated__))
+#  else
+#    define _sd_deprecated_
+#  endif
 #endif
 
 #ifndef _SD_STRINGIFY

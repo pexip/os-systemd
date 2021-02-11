@@ -1,14 +1,14 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include <errno.h>
 #include <getopt.h>
-#include <signal.h>
 
 #include "sd-device.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
 #include "device-monitor-private.h"
+#include "device-private.h"
 #include "device-util.h"
 #include "fd-util.h"
 #include "format-util.h"
@@ -18,6 +18,7 @@
 #include "string-util.h"
 #include "udevadm.h"
 #include "virt.h"
+#include "time-util.h"
 
 static bool arg_show_property = false;
 static bool arg_print_kernel = false;
@@ -26,14 +27,15 @@ static Set *arg_tag_filter = NULL;
 static Hashmap *arg_subsystem_filter = NULL;
 
 static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device, void *userdata) {
-        const char *action = NULL, *devpath = NULL, *subsystem = NULL;
+        DeviceAction action = _DEVICE_ACTION_INVALID;
+        const char *devpath = NULL, *subsystem = NULL;
         MonitorNetlinkGroup group = PTR_TO_INT(userdata);
         struct timespec ts;
 
         assert(device);
         assert(IN_SET(group, MONITOR_GROUP_UDEV, MONITOR_GROUP_KERNEL));
 
-        (void) sd_device_get_property_value(device, "ACTION", &action);
+        (void) device_get_action(device, &action);
         (void) sd_device_get_devpath(device, &devpath);
         (void) sd_device_get_subsystem(device, &subsystem);
 
@@ -42,7 +44,8 @@ static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device,
         printf("%-6s[%"PRI_TIME".%06"PRI_NSEC"] %-8s %s (%s)\n",
                group == MONITOR_GROUP_UDEV ? "UDEV" : "KERNEL",
                ts.tv_sec, (nsec_t)ts.tv_nsec/1000,
-               action, devpath, subsystem);
+               strna(device_action_to_string(action)),
+               devpath, subsystem);
 
         if (arg_show_property) {
                 const char *key, *value;
@@ -59,7 +62,6 @@ static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device,
 static int setup_monitor(MonitorNetlinkGroup sender, sd_event *event, sd_device_monitor **ret) {
         _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor = NULL;
         const char *subsystem, *devtype, *tag;
-        Iterator i;
         int r;
 
         r = device_monitor_new_full(&monitor, sender, -1);
@@ -72,14 +74,14 @@ static int setup_monitor(MonitorNetlinkGroup sender, sd_event *event, sd_device_
         if (r < 0)
                 return log_error_errno(r, "Failed to attach event: %m");
 
-        HASHMAP_FOREACH_KEY(devtype, subsystem, arg_subsystem_filter, i) {
+        HASHMAP_FOREACH_KEY(devtype, subsystem, arg_subsystem_filter) {
                 r = sd_device_monitor_filter_add_match_subsystem_devtype(monitor, subsystem, devtype);
                 if (r < 0)
                         return log_error_errno(r, "Failed to apply subsystem filter '%s%s%s': %m",
                                                subsystem, devtype ? "/" : "", strempty(devtype));
         }
 
-        SET_FOREACH(tag, arg_tag_filter, i) {
+        SET_FOREACH(tag, arg_tag_filter) {
                 r = sd_device_monitor_filter_add_match_tag(monitor, tag);
                 if (r < 0)
                         return log_error_errno(r, "Failed to apply tag filter '%s': %m", tag);
@@ -166,24 +168,13 @@ static int parse_argv(int argc, char *argv[]) {
                         subsystem = devtype = NULL;
                         break;
                 }
-                case 't': {
-                        _cleanup_free_ char *tag = NULL;
-
-                        r = set_ensure_allocated(&arg_tag_filter, &string_hash_ops);
+                case 't':
+                        /* optarg is stored in argv[], so we don't need to copy it */
+                        r = set_ensure_put(&arg_tag_filter, &string_hash_ops, optarg);
                         if (r < 0)
                                 return r;
-
-                        tag = strdup(optarg);
-                        if (!tag)
-                                return -ENOMEM;
-
-                        r = set_put(arg_tag_filter, tag);
-                        if (r < 0)
-                                return r;
-
-                        tag = NULL;
                         break;
-                }
+
                 case 'V':
                         return print_version();
                 case 'h':
@@ -257,7 +248,7 @@ int monitor_main(int argc, char *argv[], void *userdata) {
 
 finalize:
         hashmap_free_free_free(arg_subsystem_filter);
-        set_free_free(arg_tag_filter);
+        set_free(arg_tag_filter);
 
         return r;
 }

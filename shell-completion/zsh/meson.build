@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 zshcompletiondir = get_option('zshcompletiondir')
 if zshcompletiondir == ''
@@ -17,6 +17,7 @@ if zshcompletiondir != 'no'
                  ['_systemd-delta',            ''],
                  ['_systemd-nspawn',           ''],
                  ['_systemd',                  ''],
+                 ['_systemd-path',             ''],
                  ['_systemd-run',              ''],
                  ['_udevadm',                  ''],
                  ['_kernel-install',           ''],
@@ -33,7 +34,7 @@ if zshcompletiondir != 'no'
                  ['_machinectl',               'ENABLE_MACHINED'],
                  ['_networkctl',               'ENABLE_NETWORKD'],
                  ['_systemd-inhibit',          'ENABLE_LOGIND'],
-                 ['_systemd-resolve',          'ENABLE_RESOLVE'],
+                 ['_resolvectl',               'ENABLE_RESOLVE'],
                  ['_systemd-tmpfiles',         'ENABLE_TMPFILES'],
                  ['_timedatectl',              'ENABLE_TIMEDATED'],
                 ]

@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -20,3 +20,4 @@ Before=sysinit.target
 What=debugfs
 Where=/sys/kernel/debug
 Type=debugfs
+Options=nosuid,nodev,noexec

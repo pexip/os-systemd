@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <stdio.h>
 #include <linux/audit.h>
@@ -22,4 +22,5 @@ static void test_audit_type(void) {
 
 int main(int argc, char **argv) {
         test_audit_type();
+        return 0;
 }

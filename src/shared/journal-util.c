@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "acl-util.h"
 #include "fs-util.h"
@@ -50,7 +50,7 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
         if (!strv_isempty(g)) {
                 _cleanup_free_ char *s = NULL;
 
-                /* Thre are groups in the ACL, let's list them */
+                /* There are groups in the ACL, let's list them */
                 r = strv_extend(&g, "systemd-journal");
                 if (r < 0)
                         return log_oom();
@@ -80,8 +80,11 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
         return 1;
 }
 
+int journal_access_blocked(sd_journal *j) {
+        return hashmap_contains(j->errors, INT_TO_PTR(-EACCES));
+}
+
 int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_users) {
-        Iterator it;
         void *code;
         char *path;
         int r = 0;
@@ -95,7 +98,7 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
                 return 0;
         }
 
-        if (hashmap_contains(j->errors, INT_TO_PTR(-EACCES))) {
+        if (journal_access_blocked(j)) {
                 if (!quiet)
                         (void) access_check_var_log_journal(j, want_other_users);
 
@@ -103,7 +106,7 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
                         r = log_error_errno(EACCES, "No journal files were opened due to insufficient permissions.");
         }
 
-        HASHMAP_FOREACH_KEY(path, code, j->errors, it) {
+        HASHMAP_FOREACH_KEY(path, code, j->errors) {
                 int err;
 
                 err = abs(PTR_TO_INT(code));
@@ -133,42 +136,4 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
         }
 
         return r;
-}
-
-bool journal_field_valid(const char *p, size_t l, bool allow_protected) {
-        const char *a;
-
-        /* We kinda enforce POSIX syntax recommendations for
-           environment variables here, but make a couple of additional
-           requirements.
-
-           http://pubs.opengroup.org/onlinepubs/000095399/basedefs/xbd_chap08.html */
-
-        if (l == (size_t) -1)
-                l = strlen(p);
-
-        /* No empty field names */
-        if (l <= 0)
-                return false;
-
-        /* Don't allow names longer than 64 chars */
-        if (l > 64)
-                return false;
-
-        /* Variables starting with an underscore are protected */
-        if (!allow_protected && p[0] == '_')
-                return false;
-
-        /* Don't allow digits as first character */
-        if (p[0] >= '0' && p[0] <= '9')
-                return false;
-
-        /* Only allow A-Z0-9 and '_' */
-        for (a = p; a < p + l; a++)
-                if ((*a < 'A' || *a > 'Z') &&
-                    (*a < '0' || *a > '9') &&
-                    *a != '_')
-                        return false;
-
-        return true;
 }

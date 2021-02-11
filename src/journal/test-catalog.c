@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -26,15 +26,15 @@ static const char *no_catalog_dirs[] = {
         NULL
 };
 
-static Hashmap* test_import(const char* contents, ssize_t size, int code) {
+static OrderedHashmap* test_import(const char* contents, ssize_t size, int code) {
         _cleanup_(unlink_tempfilep) char name[] = "/tmp/test-catalog.XXXXXX";
         _cleanup_close_ int fd;
-        Hashmap *h;
+        OrderedHashmap *h;
 
         if (size < 0)
                 size = strlen(contents);
 
-        assert_se(h = hashmap_new(&catalog_hash_ops));
+        assert_se(h = ordered_hashmap_new(&catalog_hash_ops));
 
         fd = mkostemp_safe(name);
         assert_se(fd >= 0);
@@ -46,14 +46,14 @@ static Hashmap* test_import(const char* contents, ssize_t size, int code) {
 }
 
 static void test_catalog_import_invalid(void) {
-        _cleanup_hashmap_free_free_free_ Hashmap *h = NULL;
+        _cleanup_ordered_hashmap_free_free_free_ OrderedHashmap *h = NULL;
 
         h = test_import("xxx", -1, -EINVAL);
-        assert_se(hashmap_isempty(h));
+        assert_se(ordered_hashmap_isempty(h));
 }
 
 static void test_catalog_import_badid(void) {
-        _cleanup_hashmap_free_free_free_ Hashmap *h = NULL;
+        _cleanup_ordered_hashmap_free_free_free_ OrderedHashmap *h = NULL;
         const char *input =
 "-- 0027229ca0644181a76c4e92458afaff dededededededededededededededede\n" \
 "Subject: message\n" \
@@ -63,9 +63,8 @@ static void test_catalog_import_badid(void) {
 }
 
 static void test_catalog_import_one(void) {
-        _cleanup_hashmap_free_free_free_ Hashmap *h = NULL;
+        _cleanup_ordered_hashmap_free_free_free_ OrderedHashmap *h = NULL;
         char *payload;
-        Iterator j;
 
         const char *input =
 "-- 0027229ca0644181a76c4e92458afaff dededededededededededededededed\n" \
@@ -78,9 +77,9 @@ static void test_catalog_import_one(void) {
 "payload\n";
 
         h = test_import(input, -1, 0);
-        assert_se(hashmap_size(h) == 1);
+        assert_se(ordered_hashmap_size(h) == 1);
 
-        HASHMAP_FOREACH(payload, h, j) {
+        ORDERED_HASHMAP_FOREACH(payload, h) {
                 printf("expect: %s\n", expect);
                 printf("actual: %s\n", payload);
                 assert_se(streq(expect, payload));
@@ -88,9 +87,8 @@ static void test_catalog_import_one(void) {
 }
 
 static void test_catalog_import_merge(void) {
-        _cleanup_hashmap_free_free_free_ Hashmap *h = NULL;
+        _cleanup_ordered_hashmap_free_free_free_ OrderedHashmap *h = NULL;
         char *payload;
-        Iterator j;
 
         const char *input =
 "-- 0027229ca0644181a76c4e92458afaff dededededededededededededededed\n" \
@@ -114,17 +112,15 @@ static void test_catalog_import_merge(void) {
 "override payload\n";
 
         h = test_import(input, -1, 0);
-        assert_se(hashmap_size(h) == 1);
+        assert_se(ordered_hashmap_size(h) == 1);
 
-        HASHMAP_FOREACH(payload, h, j) {
+        ORDERED_HASHMAP_FOREACH(payload, h)
                 assert_se(streq(combined, payload));
-        }
 }
 
 static void test_catalog_import_merge_no_body(void) {
-        _cleanup_hashmap_free_free_free_ Hashmap *h = NULL;
+        _cleanup_ordered_hashmap_free_free_free_ OrderedHashmap *h = NULL;
         char *payload;
-        Iterator j;
 
         const char *input =
 "-- 0027229ca0644181a76c4e92458afaff dededededededededededededededed\n" \
@@ -147,11 +143,10 @@ static void test_catalog_import_merge_no_body(void) {
 "payload\n";
 
         h = test_import(input, -1, 0);
-        assert_se(hashmap_size(h) == 1);
+        assert_se(ordered_hashmap_size(h) == 1);
 
-        HASHMAP_FOREACH(payload, h, j) {
+        ORDERED_HASHMAP_FOREACH(payload, h)
                 assert_se(streq(combined, payload));
-        }
 }
 
 static void test_catalog_update(const char *database) {

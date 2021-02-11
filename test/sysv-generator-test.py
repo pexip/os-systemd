@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # systemd-sysv-generator integration test
 #
@@ -48,7 +48,7 @@ class SysvGeneratorTest(unittest.TestCase):
         '''Run sysv-generator.
 
         Fail if stderr contains any "Fail", unless expect_error is True.
-        Return (stderr, filename -> ConfigParser) pair with ouput to stderr and
+        Return (stderr, filename -> ConfigParser) pair with output to stderr and
         parsed generated units.
         '''
         env = os.environ.copy()

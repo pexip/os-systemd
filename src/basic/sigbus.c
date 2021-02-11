@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <signal.h>
@@ -6,8 +6,8 @@
 #include <sys/mman.h>
 
 #include "macro.h"
+#include "memory-util.h"
 #include "sigbus.h"
-#include "util.h"
 
 #define SIGBUS_QUEUE_MAX 64
 

@@ -1,8 +1,6 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
-#include <pwd.h>
-#include <string.h>
 #include <unistd.h>
 
 #include "sd-messages.h"

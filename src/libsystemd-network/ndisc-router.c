@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 /***
   Copyright © 2014 Intel Corporation. All rights reserved.
 ***/
@@ -10,7 +10,8 @@
 #include "alloc-util.h"
 #include "dns-domain.h"
 #include "hostname-util.h"
-#include "missing.h"
+#include "memory-util.h"
+#include "missing_network.h"
 #include "ndisc-internal.h"
 #include "ndisc-router.h"
 #include "strv.h"

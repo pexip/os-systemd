@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/reboot.h>
 
@@ -12,6 +12,18 @@
 #include "terminal-util.h"
 #include "virt.h"
 
+static const char* const emergency_action_table[_EMERGENCY_ACTION_MAX] = {
+        [EMERGENCY_ACTION_NONE] =               "none",
+        [EMERGENCY_ACTION_REBOOT] =             "reboot",
+        [EMERGENCY_ACTION_REBOOT_FORCE] =       "reboot-force",
+        [EMERGENCY_ACTION_REBOOT_IMMEDIATE] =   "reboot-immediate",
+        [EMERGENCY_ACTION_POWEROFF] =           "poweroff",
+        [EMERGENCY_ACTION_POWEROFF_FORCE] =     "poweroff-force",
+        [EMERGENCY_ACTION_POWEROFF_IMMEDIATE] = "poweroff-immediate",
+        [EMERGENCY_ACTION_EXIT] =               "exit",
+        [EMERGENCY_ACTION_EXIT_FORCE] =         "exit-force",
+};
+
 static void log_and_status(Manager *m, bool warn, const char *message, const char *reason) {
         log_full(warn ? LOG_WARNING : LOG_DEBUG, "%s: %s", message, reason);
         if (warn)
@@ -20,7 +32,7 @@ static void log_and_status(Manager *m, bool warn, const char *message, const cha
                                       "%s: %s", message, reason);
 }
 
-int emergency_action(
+void emergency_action(
                 Manager *m,
                 EmergencyAction action,
                 EmergencyActionFlags options,
@@ -28,16 +40,28 @@ int emergency_action(
                 int exit_status,
                 const char *reason) {
 
+        Unit *u;
+
         assert(m);
         assert(action >= 0);
         assert(action < _EMERGENCY_ACTION_MAX);
 
+        /* Is the special shutdown target active or queued? If so, we are in shutdown state */
+        if (IN_SET(action, EMERGENCY_ACTION_REBOOT, EMERGENCY_ACTION_POWEROFF, EMERGENCY_ACTION_EXIT)) {
+                u = manager_get_unit(m, SPECIAL_SHUTDOWN_TARGET);
+                if (u && unit_active_or_pending(u)) {
+                        log_notice("Shutdown is already active. Skipping emergency action request %s.",
+                                   emergency_action_table[action]);
+                        return;
+                }
+        }
+
         if (action == EMERGENCY_ACTION_NONE)
-                return -ECANCELED;
+                return;
 
         if (FLAGS_SET(options, EMERGENCY_ACTION_IS_WATCHDOG) && !m->service_watchdogs) {
                 log_warning("Watchdog disabled! Not acting on: %s", reason);
-                return -ECANCELED;
+                return;
         }
 
         bool warn = FLAGS_SET(options, EMERGENCY_ACTION_WARN);
@@ -47,15 +71,14 @@ int emergency_action(
         case EMERGENCY_ACTION_REBOOT:
                 log_and_status(m, warn, "Rebooting", reason);
 
-                (void) update_reboot_parameter_and_warn(reboot_arg);
-                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL);
-
+                (void) update_reboot_parameter_and_warn(reboot_arg, true);
+                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_REBOOT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                 break;
 
         case EMERGENCY_ACTION_REBOOT_FORCE:
                 log_and_status(m, warn, "Forcibly rebooting", reason);
 
-                (void) update_reboot_parameter_and_warn(reboot_arg);
+                (void) update_reboot_parameter_and_warn(reboot_arg, true);
                 m->objective = MANAGER_REBOOT;
 
                 break;
@@ -82,7 +105,7 @@ int emergency_action(
 
                 if (MANAGER_IS_USER(m) || detect_container() > 0) {
                         log_and_status(m, warn, "Exiting", reason);
-                        (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_EXIT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL);
+                        (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_EXIT_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                         break;
                 }
 
@@ -91,7 +114,7 @@ int emergency_action(
 
         case EMERGENCY_ACTION_POWEROFF:
                 log_and_status(m, warn, "Powering off", reason);
-                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_POWEROFF_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL);
+                (void) manager_add_job_by_name_and_warn(m, JOB_START, SPECIAL_POWEROFF_TARGET, JOB_REPLACE_IRREVERSIBLY, NULL, NULL);
                 break;
 
         case EMERGENCY_ACTION_EXIT_FORCE:
@@ -125,21 +148,8 @@ int emergency_action(
         default:
                 assert_not_reached("Unknown emergency action");
         }
-
-        return -ECANCELED;
 }
 
-static const char* const emergency_action_table[_EMERGENCY_ACTION_MAX] = {
-        [EMERGENCY_ACTION_NONE] = "none",
-        [EMERGENCY_ACTION_REBOOT] = "reboot",
-        [EMERGENCY_ACTION_REBOOT_FORCE] = "reboot-force",
-        [EMERGENCY_ACTION_REBOOT_IMMEDIATE] = "reboot-immediate",
-        [EMERGENCY_ACTION_POWEROFF] = "poweroff",
-        [EMERGENCY_ACTION_POWEROFF_FORCE] = "poweroff-force",
-        [EMERGENCY_ACTION_POWEROFF_IMMEDIATE] = "poweroff-immediate",
-        [EMERGENCY_ACTION_EXIT] = "exit",
-        [EMERGENCY_ACTION_EXIT_FORCE] = "exit-force",
-};
 DEFINE_STRING_TABLE_LOOKUP(emergency_action, EmergencyAction);
 
 int parse_emergency_action(

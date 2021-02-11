@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # networkd integration test
 # This uses temporary configuration in /run and temporary veth devices, and
@@ -29,6 +29,7 @@ import time
 import unittest
 
 HAVE_DNSMASQ = shutil.which('dnsmasq') is not None
+IS_CONTAINER = subprocess.call(['systemd-detect-virt', '--quiet', '--container']) == 0
 
 NETWORK_UNITDIR = '/run/systemd/network'
 
@@ -65,7 +66,8 @@ def setUpModule():
     # create static systemd-network user for networkd-test-router.service (it
     # needs to do some stuff as root and can't start as user; but networkd
     # still insists on the user)
-    subprocess.call(['adduser', '--system', '--no-create-home', 'systemd-network'])
+    if subprocess.call(['getent', 'passwd', 'systemd-network']) != 0:
+        subprocess.call(['useradd', '--system', '--no-create-home', 'systemd-network'])
 
     for d in ['/etc/systemd/network', '/run/systemd/network',
               '/run/systemd/netif', '/run/systemd/resolve']:
@@ -221,7 +223,8 @@ Gateway=192.168.250.1''')
         subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
 
     def tearDown(self):
-        subprocess.check_call(['systemctl', 'stop', 'systemd-networkd'])
+        subprocess.check_call(['systemctl', 'stop', 'systemd-networkd.socket'])
+        subprocess.check_call(['systemctl', 'stop', 'systemd-networkd.service'])
         subprocess.check_call(['ip', 'link', 'del', 'mybridge'])
         subprocess.check_call(['ip', 'link', 'del', 'port1'])
         subprocess.check_call(['ip', 'link', 'del', 'port2'])
@@ -282,11 +285,11 @@ class ClientTestBase(NetworkdTestingUtilities):
         klass.orig_log_level = subprocess.check_output(
             ['systemctl', 'show', '--value', '--property', 'LogLevel'],
             universal_newlines=True).strip()
-        subprocess.check_call(['systemd-analyze', 'set-log-level', 'debug'])
+        subprocess.check_call(['systemd-analyze', 'log-level', 'debug'])
 
     @classmethod
     def tearDownClass(klass):
-        subprocess.check_call(['systemd-analyze', 'set-log-level', klass.orig_log_level])
+        subprocess.check_call(['systemd-analyze', 'log-level', klass.orig_log_level])
 
     def setUp(self):
         self.iface = 'test_eth42'
@@ -307,7 +310,8 @@ class ClientTestBase(NetworkdTestingUtilities):
 
     def tearDown(self):
         self.shutdown_iface()
-        subprocess.call(['systemctl', 'stop', 'systemd-networkd'])
+        subprocess.call(['systemctl', 'stop', 'systemd-networkd.socket'])
+        subprocess.call(['systemctl', 'stop', 'systemd-networkd.service'])
         subprocess.call(['ip', 'link', 'del', 'dummy0'],
                         stderr=subprocess.DEVNULL)
 
@@ -335,13 +339,16 @@ class ClientTestBase(NetworkdTestingUtilities):
 
         raise NotImplementedError('must be implemented by a subclass')
 
+    def start_unit(self, unit):
+        try:
+            subprocess.check_call(['systemctl', 'start', unit])
+        except subprocess.CalledProcessError:
+            self.show_journal(unit)
+            raise
+
     def do_test(self, coldplug=True, ipv6=False, extra_opts='',
                 online_timeout=10, dhcp_mode='yes'):
-        try:
-            subprocess.check_call(['systemctl', 'start', 'systemd-resolved'])
-        except subprocess.CalledProcessError:
-            self.show_journal('systemd-resolved.service')
-            raise
+        self.start_unit('systemd-resolved')
         self.write_network(self.config, '''\
 [Match]
 Name={}
@@ -352,14 +359,14 @@ DHCP={}
         if coldplug:
             # create interface first, then start networkd
             self.create_iface(ipv6=ipv6)
-            subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+            self.start_unit('systemd-networkd')
         elif coldplug is not None:
             # start networkd first, then create interface
-            subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+            self.start_unit('systemd-networkd')
             self.create_iface(ipv6=ipv6)
         else:
             # "None" means test sets up interface by itself
-            subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+            self.start_unit('systemd-networkd')
 
         try:
             subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface',
@@ -371,7 +378,7 @@ DHCP={}
                 # IPv6, but we want to wait for both
                 for _ in range(10):
                     out = subprocess.check_output(['ip', 'a', 'show', 'dev', self.iface])
-                    if b'state UP' in out and b'inet6 2600' in out and b'inet 192.168' in out:
+                    if b'state UP' in out and b'inet6 2600' in out and b'inet 192.168' in out and b'tentative' not in out:
                         break
                     time.sleep(1)
                 else:
@@ -395,7 +402,7 @@ DHCP={}
             self.assertRegex(out, (r'{}\s+ether\s+[a-z-]+\s+unmanaged'.format(self.if_router)).encode())
             self.assertRegex(out, (r'{}\s+ether\s+routable\s+configured'.format(self.iface)).encode())
 
-            out = subprocess.check_output(['networkctl', 'status', self.iface])
+            out = subprocess.check_output(['networkctl', '-n', '0', 'status', self.iface])
             self.assertRegex(out, br'Type:\s+ether')
             self.assertRegex(out, br'State:\s+routable.*configured')
             self.assertRegex(out, br'Address:\s+192.168.5.\d+')
@@ -415,7 +422,9 @@ DHCP={}
             subprocess.call(['ip', 'a', 'show', 'dev', self.iface])
             print('---- networkctl status {} ----'.format(self.iface))
             sys.stdout.flush()
-            subprocess.call(['networkctl', 'status', self.iface])
+            rc = subprocess.call(['networkctl', '-n', '0', 'status', self.iface])
+            if rc != 0:
+                print("'networkctl status' exited with an unexpected code {}".format(rc))
             self.show_journal('systemd-networkd.service')
             self.print_server_log()
             raise
@@ -472,12 +481,19 @@ MACAddress=12:34:56:78:9a:bc''')
 [Match]
 Name=dummy0
 [Network]
-Address=192.168.42.100
+Address=192.168.42.100/24
 DNS=192.168.42.1
 Domains= ~company''')
 
-        self.do_test(coldplug=True, ipv6=False,
-                     extra_opts='IPv6AcceptRouterAdvertisements=False')
+        try:
+            self.do_test(coldplug=True, ipv6=False,
+                         extra_opts='IPv6AcceptRouterAdvertisements=False')
+        except subprocess.CalledProcessError as e:
+            # networkd often fails to start in LXC: https://github.com/systemd/systemd/issues/11848
+            if IS_CONTAINER and e.cmd == ['systemctl', 'start', 'systemd-networkd']:
+                raise unittest.SkipTest('https://github.com/systemd/systemd/issues/11848')
+            else:
+                raise
 
         with open(RESOLV_CONF) as f:
             contents = f.read()
@@ -496,12 +512,19 @@ MACAddress=12:34:56:78:9a:bc''')
         self.write_network('myvpn.network', '''[Match]
 Name=dummy0
 [Network]
-Address=192.168.42.100
+Address=192.168.42.100/24
 DNS=192.168.42.1
 Domains= ~company ~.''')
 
-        self.do_test(coldplug=True, ipv6=False,
-                     extra_opts='IPv6AcceptRouterAdvertisements=False')
+        try:
+            self.do_test(coldplug=True, ipv6=False,
+                         extra_opts='IPv6AcceptRouterAdvertisements=False')
+        except subprocess.CalledProcessError as e:
+            # networkd often fails to start in LXC: https://github.com/systemd/systemd/issues/11848
+            if IS_CONTAINER and e.cmd == ['systemctl', 'start', 'systemd-networkd']:
+                raise unittest.SkipTest('https://github.com/systemd/systemd/issues/11848')
+            else:
+                raise
 
         with open(RESOLV_CONF) as f:
             contents = f.read()
@@ -575,6 +598,13 @@ class DnsmasqClientTest(ClientTestBase, unittest.TestCase):
     def test_resolved_domain_restricted_dns(self):
         '''resolved: domain-restricted DNS servers'''
 
+        # FIXME: resolvectl query fails with enabled DNSSEC against our dnsmasq
+        conf = '/run/systemd/resolved.conf.d/test-disable-dnssec.conf'
+        os.makedirs(os.path.dirname(conf), exist_ok=True)
+        with open(conf, 'w') as f:
+            f.write('[Resolve]\nDNSSEC=no\n')
+        self.addCleanup(os.remove, conf)
+
         # create interface for generic connections; this will map all DNS names
         # to 192.168.42.1
         self.create_iface(dnsmasq_opts=['--address=/#/192.168.42.1'])
@@ -611,7 +641,7 @@ Address=10.241.3.2/24
 DNS=10.241.3.1
 Domains= ~company ~lab''')
 
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        self.start_unit('systemd-networkd')
         subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface', self.iface,
                                '--interface=testvpnclient', '--timeout=20'])
 
@@ -648,52 +678,52 @@ Domains= ~company ~lab''')
         '''resolved queries to /etc/hosts'''
 
         # FIXME: -t MX query fails with enabled DNSSEC (even when using
-        # the known negative trust anchor .internal instead of .example)
+        # the known negative trust anchor .internal instead of .example.com)
         conf = '/run/systemd/resolved.conf.d/test-disable-dnssec.conf'
         os.makedirs(os.path.dirname(conf), exist_ok=True)
         with open(conf, 'w') as f:
             f.write('[Resolve]\nDNSSEC=no\nLLMNR=no\nMulticastDNS=no\n')
         self.addCleanup(os.remove, conf)
 
-        # create /etc/hosts bind mount which resolves my.example for IPv4
+        # create /etc/hosts bind mount which resolves my.example.com for IPv4
         hosts = os.path.join(self.workdir, 'hosts')
         with open(hosts, 'w') as f:
-            f.write('172.16.99.99  my.example\n')
+            f.write('172.16.99.99  my.example.com\n')
         subprocess.check_call(['mount', '--bind', hosts, '/etc/hosts'])
         self.addCleanup(subprocess.call, ['umount', '/etc/hosts'])
         subprocess.check_call(['systemctl', 'stop', 'systemd-resolved.service'])
 
         # note: different IPv4 address here, so that it's easy to tell apart
         # what resolved the query
-        self.create_iface(dnsmasq_opts=['--host-record=my.example,172.16.99.1,2600::99:99',
-                                        '--host-record=other.example,172.16.0.42,2600::42',
-                                        '--mx-host=example,mail.example'],
+        self.create_iface(dnsmasq_opts=['--host-record=my.example.com,172.16.99.1,2600::99:99',
+                                        '--host-record=other.example.com,172.16.0.42,2600::42',
+                                        '--mx-host=example.com,mail.example.com'],
                           ipv6=True)
         self.do_test(coldplug=None, ipv6=True)
 
         try:
             # family specific queries
-            out = subprocess.check_output(['resolvectl', 'query', '-4', 'my.example'])
-            self.assertIn(b'my.example: 172.16.99.99', out)
+            out = subprocess.check_output(['resolvectl', 'query', '-4', 'my.example.com'])
+            self.assertIn(b'my.example.com: 172.16.99.99', out)
             # we don't expect an IPv6 answer; if /etc/hosts has any IP address,
             # it's considered a sufficient source
-            self.assertNotEqual(subprocess.call(['resolvectl', 'query', '-6', 'my.example']), 0)
+            self.assertNotEqual(subprocess.call(['resolvectl', 'query', '-6', 'my.example.com']), 0)
             # "any family" query; IPv4 should come from /etc/hosts
-            out = subprocess.check_output(['resolvectl', 'query', 'my.example'])
-            self.assertIn(b'my.example: 172.16.99.99', out)
+            out = subprocess.check_output(['resolvectl', 'query', 'my.example.com'])
+            self.assertIn(b'my.example.com: 172.16.99.99', out)
             # IP → name lookup; again, takes the /etc/hosts one
             out = subprocess.check_output(['resolvectl', 'query', '172.16.99.99'])
-            self.assertIn(b'172.16.99.99: my.example', out)
+            self.assertIn(b'172.16.99.99: my.example.com', out)
 
             # non-address RRs should fall back to DNS
-            out = subprocess.check_output(['resolvectl', 'query', '--type=MX', 'example'])
-            self.assertIn(b'example IN MX 1 mail.example', out)
+            out = subprocess.check_output(['resolvectl', 'query', '--type=MX', 'example.com'])
+            self.assertIn(b'example.com IN MX 1 mail.example.com', out)
 
             # other domains query DNS
-            out = subprocess.check_output(['resolvectl', 'query', 'other.example'])
+            out = subprocess.check_output(['resolvectl', 'query', 'other.example.com'])
             self.assertIn(b'172.16.0.42', out)
             out = subprocess.check_output(['resolvectl', 'query', '172.16.0.42'])
-            self.assertIn(b'172.16.0.42: other.example', out)
+            self.assertIn(b'172.16.0.42: other.example.com', out)
         except (AssertionError, subprocess.CalledProcessError):
             self.show_journal('systemd-resolved.service')
             self.print_server_log()
@@ -877,11 +907,11 @@ MACAddress=12:34:56:78:9a:bc''')
 [Match]
 Name=dummy0
 [Network]
-Address=192.168.42.100
+Address=192.168.42.100/24
 DNS=192.168.42.1
 Domains= one two three four five six seven eight nine ten''')
 
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        self.start_unit('systemd-networkd')
 
         for timeout in range(50):
             with open(RESOLV_CONF) as f:
@@ -889,40 +919,7 @@ Domains= one two three four five six seven eight nine ten''')
             if ' one' in contents:
                 break
             time.sleep(0.1)
-        self.assertRegex(contents, 'search .*one two three four')
-        self.assertNotIn('seven\n', contents)
-        self.assertIn('# Too many search domains configured, remaining ones ignored.\n', contents)
-
-    def test_search_domains_too_long(self):
-
-        # we don't use this interface for this test
-        self.if_router = None
-
-        name_prefix = 'a' * 60
-
-        self.write_network('test.netdev', '''\
-[NetDev]
-Name=dummy0
-Kind=dummy
-MACAddress=12:34:56:78:9a:bc''')
-        self.write_network('test.network', '''\
-[Match]
-Name=dummy0
-[Network]
-Address=192.168.42.100
-DNS=192.168.42.1
-Domains={p}0 {p}1 {p}2 {p}3 {p}4'''.format(p=name_prefix))
-
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
-
-        for timeout in range(50):
-            with open(RESOLV_CONF) as f:
-                contents = f.read()
-            if ' one' in contents:
-                break
-            time.sleep(0.1)
-        self.assertRegex(contents, 'search .*{p}0 {p}1 {p}2'.format(p=name_prefix))
-        self.assertIn('# Total length of all search domains is too long, remaining ones ignored.', contents)
+        self.assertRegex(contents, 'search .*one two three four five six seven eight nine ten')
 
     def test_dropin(self):
         # we don't use this interface for this test
@@ -937,18 +934,19 @@ MACAddress=12:34:56:78:9a:bc''')
 [Match]
 Name=dummy0
 [Network]
-Address=192.168.42.100
+Address=192.168.42.100/24
 DNS=192.168.42.1''')
         self.write_network_dropin('test.network', 'dns', '''\
 [Network]
 DNS=127.0.0.1''')
 
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        self.start_unit('systemd-resolved')
+        self.start_unit('systemd-networkd')
 
         for timeout in range(50):
             with open(RESOLV_CONF) as f:
                 contents = f.read()
-            if ' 127.0.0.1' in contents:
+            if ' 127.0.0.1' in contents and '192.168.42.1' in contents:
                 break
             time.sleep(0.1)
         self.assertIn('nameserver 192.168.42.1\n', contents)
@@ -991,7 +989,8 @@ class MatchClientTest(unittest.TestCase, NetworkdTestingUtilities):
 
     def tearDown(self):
         """Stop networkd."""
-        subprocess.call(['systemctl', 'stop', 'systemd-networkd'])
+        subprocess.call(['systemctl', 'stop', 'systemd-networkd.socket'])
+        subprocess.call(['systemctl', 'stop', 'systemd-networkd.service'])
 
     def test_basic_matching(self):
         """Verify the Name= line works throughout this class."""
@@ -1041,7 +1040,8 @@ class UnmanagedClientTest(unittest.TestCase, NetworkdTestingUtilities):
 
     def tearDown(self):
         """Stop networkd."""
-        subprocess.call(['systemctl', 'stop', 'systemd-networkd'])
+        subprocess.call(['systemctl', 'stop', 'systemd-networkd.socket'])
+        subprocess.call(['systemctl', 'stop', 'systemd-networkd.service'])
 
     def create_iface(self):
         """Create temporary veth pairs for interface matching."""

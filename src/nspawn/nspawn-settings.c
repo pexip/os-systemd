@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "cap-list.h"
@@ -17,6 +17,50 @@
 #include "user-util.h"
 #include "util.h"
 
+Settings *settings_new(void) {
+        Settings *s;
+
+        s = new(Settings, 1);
+        if (!s)
+                return NULL;
+
+        *s = (Settings) {
+                .start_mode = _START_MODE_INVALID,
+                .personality = PERSONALITY_INVALID,
+
+                .resolv_conf = _RESOLV_CONF_MODE_INVALID,
+                .link_journal = _LINK_JOURNAL_INVALID,
+                .timezone = _TIMEZONE_MODE_INVALID,
+
+                .userns_mode = _USER_NAMESPACE_MODE_INVALID,
+                .userns_chown = -1,
+                .uid_shift = UID_INVALID,
+                .uid_range = UID_INVALID,
+
+                .no_new_privileges = -1,
+
+                .read_only = -1,
+                .volatile_mode = _VOLATILE_MODE_INVALID,
+
+                .private_network = -1,
+                .network_veth = -1,
+
+                .full_capabilities = CAPABILITY_QUINTET_NULL,
+
+                .uid = UID_INVALID,
+                .gid = GID_INVALID,
+
+                .console_mode = _CONSOLE_MODE_INVALID,
+                .console_width = (unsigned) -1,
+                .console_height = (unsigned) -1,
+
+                .clone_ns_flags = (unsigned long) -1,
+                .use_cgns = -1,
+        };
+
+        return s;
+}
+
 int settings_load(FILE *f, const char *path, Settings **ret) {
         _cleanup_(settings_freep) Settings *s = NULL;
         int r;
@@ -24,26 +68,9 @@ int settings_load(FILE *f, const char *path, Settings **ret) {
         assert(path);
         assert(ret);
 
-        s = new0(Settings, 1);
+        s = settings_new();
         if (!s)
                 return -ENOMEM;
-
-        s->start_mode = _START_MODE_INVALID;
-        s->personality = PERSONALITY_INVALID;
-        s->userns_mode = _USER_NAMESPACE_MODE_INVALID;
-        s->resolv_conf = _RESOLV_CONF_MODE_INVALID;
-        s->link_journal = _LINK_JOURNAL_INVALID;
-        s->timezone = _TIMEZONE_MODE_INVALID;
-        s->uid_shift = UID_INVALID;
-        s->uid_range = UID_INVALID;
-        s->no_new_privileges = -1;
-
-        s->read_only = -1;
-        s->volatile_mode = _VOLATILE_MODE_INVALID;
-        s->userns_chown = -1;
-
-        s->private_network = -1;
-        s->network_veth = -1;
 
         r = config_parse(NULL, path, f,
                          "Exec\0"
@@ -51,7 +78,7 @@ int settings_load(FILE *f, const char *path, Settings **ret) {
                          "Files\0",
                          config_item_perf_lookup, nspawn_gperf_lookup,
                          CONFIG_PARSE_WARN,
-                         s);
+                         s, NULL);
         if (r < 0)
                 return r;
 
@@ -66,12 +93,33 @@ int settings_load(FILE *f, const char *path, Settings **ret) {
                 s->userns_mode = USER_NAMESPACE_NO;
 
         *ret = TAKE_PTR(s);
-
         return 0;
 }
 
-Settings* settings_free(Settings *s) {
+static void free_oci_hooks(OciHook *h, size_t n) {
+        size_t i;
 
+        assert(h || n == 0);
+
+        for (i = 0; i < n; i++) {
+                free(h[i].path);
+                strv_free(h[i].args);
+                strv_free(h[i].env);
+        }
+
+        free(h);
+}
+
+void device_node_array_free(DeviceNode *node, size_t n) {
+        size_t i;
+
+        for (i = 0; i < n; i++)
+                free(node[i].path);
+
+        free(node);
+}
+
+Settings* settings_free(Settings *s) {
         if (!s)
                 return NULL;
 
@@ -81,11 +129,11 @@ Settings* settings_free(Settings *s) {
         free(s->pivot_root_new);
         free(s->pivot_root_old);
         free(s->working_directory);
-        strv_free(s->syscall_whitelist);
-        strv_free(s->syscall_blacklist);
+        strv_free(s->syscall_allow_list);
+        strv_free(s->syscall_deny_list);
         rlimit_free_all(s->rlimit);
         free(s->hostname);
-        s->cpuset = cpu_set_mfree(s->cpuset);
+        cpu_set_reset(&s->cpu_set);
 
         strv_free(s->network_interfaces);
         strv_free(s->network_macvlan);
@@ -96,6 +144,27 @@ Settings* settings_free(Settings *s) {
         expose_port_free_all(s->expose_ports);
 
         custom_mount_free_all(s->custom_mounts, s->n_custom_mounts);
+
+        free(s->bundle);
+        free(s->root);
+
+        free_oci_hooks(s->oci_hooks_prestart, s->n_oci_hooks_prestart);
+        free_oci_hooks(s->oci_hooks_poststart, s->n_oci_hooks_poststart);
+        free_oci_hooks(s->oci_hooks_poststop, s->n_oci_hooks_poststop);
+
+        free(s->slice);
+        sd_bus_message_unref(s->properties);
+
+        free(s->supplementary_gids);
+        device_node_array_free(s->extra_nodes, s->n_extra_nodes);
+        free(s->network_namespace_path);
+
+        strv_free(s->sysctl);
+
+#if HAVE_SECCOMP
+        seccomp_release(s->seccomp);
+#endif
+
         return mfree(s);
 }
 
@@ -122,6 +191,26 @@ bool settings_network_veth(Settings *s) {
                 s->network_zone;
 }
 
+int settings_allocate_properties(Settings *s) {
+        _cleanup_(sd_bus_unrefp) sd_bus *bus = NULL;
+        int r;
+
+        assert(s);
+
+        if (s->properties)
+                return 0;
+
+        r = sd_bus_default_system(&bus);
+        if (r < 0)
+                return r;
+
+        r = sd_bus_message_new(bus, &s->properties, SD_BUS_MESSAGE_METHOD_CALL);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
 DEFINE_CONFIG_PARSE_ENUM(config_parse_volatile_mode, volatile_mode, VolatileMode, "Failed to parse volatile mode");
 
 int config_parse_expose_port(
@@ -144,14 +233,10 @@ int config_parse_expose_port(
         assert(rvalue);
 
         r = expose_port_parse(&s->expose_ports, rvalue);
-        if (r == -EEXIST) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Duplicate port specification, ignoring: %s", rvalue);
-                return 0;
-        }
-        if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse host port %s: %m", rvalue);
-                return 0;
-        }
+        if (r == -EEXIST)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Duplicate port specification, ignoring: %s", rvalue);
+        else if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse host port %s: %m", rvalue);
 
         return 0;
 }
@@ -179,55 +264,32 @@ int config_parse_capability(
                 _cleanup_free_ char *word = NULL;
 
                 r = extract_first_word(&rvalue, &word, NULL, 0);
+                if (r == -ENOMEM)
+                        return log_oom();
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r, "Failed to extract capability string, ignoring: %s", rvalue);
+                        log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to extract capability string, ignoring: %s", rvalue);
                         return 0;
                 }
                 if (r == 0)
                         break;
 
-                r = capability_from_name(word);
-                if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse capability, ignoring: %s", word);
-                        continue;
-                }
+                if (streq(word, "all"))
+                        u = (uint64_t) -1;
+                else {
+                        r = capability_from_name(word);
+                        if (r < 0) {
+                                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse capability, ignoring: %s", word);
+                                continue;
+                        }
 
-                u |= UINT64_C(1) << r;
+                        u |= UINT64_C(1) << r;
+                }
         }
 
         if (u == 0)
                 return 0;
 
         *result |= u;
-        return 0;
-}
-
-int config_parse_id128(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        sd_id128_t t, *result = data;
-        int r;
-
-        assert(filename);
-        assert(lvalue);
-        assert(rvalue);
-
-        r = sd_id128_from_string(rvalue, &t);
-        if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse 128bit ID/UUID, ignoring: %s", rvalue);
-                return 0;
-        }
-
-        *result = t;
         return 0;
 }
 
@@ -251,10 +313,8 @@ int config_parse_pivot_root(
         assert(rvalue);
 
         r = pivot_root_parse(&settings->pivot_root_new, &settings->pivot_root_old, rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Invalid pivot root mount specification %s: %m", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid pivot root mount specification %s: %m", rvalue);
 
         return 0;
 }
@@ -279,10 +339,8 @@ int config_parse_bind(
         assert(rvalue);
 
         r = bind_mount_parse(&settings->custom_mounts, &settings->n_custom_mounts, rvalue, ltype);
-        if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Invalid bind mount specification %s: %m", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid bind mount specification %s: %m", rvalue);
 
         return 0;
 }
@@ -307,10 +365,34 @@ int config_parse_tmpfs(
         assert(rvalue);
 
         r = tmpfs_mount_parse(&settings->custom_mounts, &settings->n_custom_mounts, rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Invalid temporary file system specification %s: %m", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid temporary file system specification %s: %m", rvalue);
+
+        return 0;
+}
+
+int config_parse_inaccessible(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Settings *settings = data;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        r = inaccessible_mount_parse(&settings->custom_mounts, &settings->n_custom_mounts, rvalue);
+        if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid inaccessible file system specification %s: %m", rvalue);
 
         return 0;
 }
@@ -336,7 +418,7 @@ int config_parse_overlay(
 
         r = overlay_mount_parse(&settings->custom_mounts, &settings->n_custom_mounts, rvalue, ltype);
         if (r < 0)
-                log_syntax(unit, LOG_ERR, filename, line, r, "Invalid overlay file system specification %s, ignoring: %m", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid overlay file system specification %s, ignoring: %m", rvalue);
 
         return 0;
 }
@@ -361,10 +443,8 @@ int config_parse_veth_extra(
         assert(rvalue);
 
         r = veth_extra_parse(&settings->network_veth_extra, rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Invalid extra virtual Ethernet link specification %s: %m", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid extra virtual Ethernet link specification %s: %m", rvalue);
 
         return 0;
 }
@@ -388,15 +468,13 @@ int config_parse_network_zone(
         assert(lvalue);
         assert(rvalue);
 
-        j = strappend("vz-", rvalue);
+        j = strjoin("vz-", rvalue);
         if (!ifname_valid(j)) {
-                log_syntax(unit, LOG_ERR, filename, line, 0, "Invalid network zone name, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid network zone name, ignoring: %s", rvalue);
                 return 0;
         }
 
-        free_and_replace(settings->network_zone, j);
-
-        return 0;
+        return free_and_replace(settings->network_zone, j);
 }
 
 int config_parse_boot(
@@ -420,11 +498,11 @@ int config_parse_boot(
 
         r = parse_boolean(rvalue);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse Boot= parameter %s, ignoring: %m", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse Boot= parameter %s, ignoring: %m", rvalue);
                 return 0;
         }
 
-        if (r > 0) {
+        if (r) {
                 if (settings->start_mode == START_PID2)
                         goto conflict;
 
@@ -440,7 +518,7 @@ int config_parse_boot(
         return 0;
 
 conflict:
-        log_syntax(unit, LOG_ERR, filename, line, r, "Conflicting Boot= or ProcessTwo= setting found. Ignoring.");
+        log_syntax(unit, LOG_WARNING, filename, line, 0, "Conflicting Boot= or ProcessTwo= setting found. Ignoring.");
         return 0;
 }
 
@@ -465,11 +543,11 @@ int config_parse_pid2(
 
         r = parse_boolean(rvalue);
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse ProcessTwo= parameter %s, ignoring: %m", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse ProcessTwo= parameter %s, ignoring: %m", rvalue);
                 return 0;
         }
 
-        if (r > 0) {
+        if (r) {
                 if (settings->start_mode == START_BOOT)
                         goto conflict;
 
@@ -485,7 +563,7 @@ int config_parse_pid2(
         return 0;
 
 conflict:
-        log_syntax(unit, LOG_ERR, filename, line, r, "Conflicting Boot= or ProcessTwo= setting found. Ignoring.");
+        log_syntax(unit, LOG_WARNING, filename, line, 0, "Conflicting Boot= or ProcessTwo= setting found. Ignoring.");
         return 0;
 }
 
@@ -537,7 +615,7 @@ int config_parse_private_users(
 
                         r = safe_atou32(range, &rn);
                         if (r < 0 || rn <= 0) {
-                                log_syntax(unit, LOG_ERR, filename, line, r, "UID/GID range invalid, ignoring: %s", range);
+                                log_syntax(unit, LOG_WARNING, filename, line, r, "UID/GID range invalid, ignoring: %s", range);
                                 return 0;
                         }
                 } else {
@@ -547,7 +625,7 @@ int config_parse_private_users(
 
                 r = parse_uid(shift, &sh);
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r, "UID/GID shift invalid, ignoring: %s", range);
+                        log_syntax(unit, LOG_WARNING, filename, line, r, "UID/GID shift invalid, ignoring: %s", range);
                         return 0;
                 }
 
@@ -588,23 +666,22 @@ int config_parse_syscall_filter(
 
                 r = extract_first_word(&items, &word, NULL, 0);
                 if (r == 0)
-                        break;
+                        return 0;
                 if (r == -ENOMEM)
                         return log_oom();
                 if (r < 0) {
-                        log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse SystemCallFilter= parameter %s, ignoring: %m", rvalue);
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Failed to parse SystemCallFilter= parameter %s, ignoring: %m", rvalue);
                         return 0;
                 }
 
                 if (negative)
-                        r = strv_extend(&settings->syscall_blacklist, word);
+                        r = strv_extend(&settings->syscall_deny_list, word);
                 else
-                        r = strv_extend(&settings->syscall_whitelist, word);
+                        r = strv_extend(&settings->syscall_allow_list, word);
                 if (r < 0)
                         return log_oom();
         }
-
-        return 0;
 }
 
 int config_parse_hostname(
@@ -625,7 +702,7 @@ int config_parse_hostname(
         assert(s);
 
         if (!hostname_is_valid(rvalue, false)) {
-                log_syntax(unit, LOG_ERR, filename, line, 0, "Invalid hostname, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid hostname, ignoring: %s", rvalue);
                 return 0;
         }
 
@@ -660,11 +737,11 @@ int config_parse_oom_score_adjust(
 
         r = parse_oom_score_adjust(rvalue, &oa);
         if (r == -ERANGE) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "OOM score adjust value out of range, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r, "OOM score adjust value out of range, ignoring: %s", rvalue);
                 return 0;
         }
         if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse the OOM score adjust value, ignoring: %s", rvalue);
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse the OOM score adjust value, ignoring: %s", rvalue);
                 return 0;
         }
 
@@ -686,41 +763,12 @@ int config_parse_cpu_affinity(
                 void *data,
                 void *userdata) {
 
-        _cleanup_cpu_free_ cpu_set_t *cpuset = NULL;
         Settings *settings = data;
-        int ncpus;
 
         assert(rvalue);
         assert(settings);
 
-        ncpus = parse_cpu_set_and_warn(rvalue, &cpuset, unit, filename, line, lvalue);
-        if (ncpus < 0)
-                return ncpus;
-
-        if (ncpus == 0) {
-                /* An empty assignment resets the CPU list */
-                settings->cpuset = cpu_set_mfree(settings->cpuset);
-                settings->cpuset_ncpus = 0;
-                return 0;
-        }
-
-        if (!settings->cpuset) {
-                settings->cpuset = TAKE_PTR(cpuset);
-                settings->cpuset_ncpus = (unsigned) ncpus;
-                return 0;
-        }
-
-        if (settings->cpuset_ncpus < (unsigned) ncpus) {
-                CPU_OR_S(CPU_ALLOC_SIZE(settings->cpuset_ncpus), cpuset, settings->cpuset, cpuset);
-                CPU_FREE(settings->cpuset);
-                settings->cpuset = TAKE_PTR(cpuset);
-                settings->cpuset_ncpus = (unsigned) ncpus;
-                return 0;
-        }
-
-        CPU_OR_S(CPU_ALLOC_SIZE((unsigned) ncpus), settings->cpuset, settings->cpuset, cpuset);
-
-        return 0;
+        return parse_cpu_set_extend(rvalue, &settings->cpu_set, true, unit, filename, line, lvalue);
 }
 
 DEFINE_CONFIG_PARSE_ENUM(config_parse_resolv_conf, resolv_conf_mode, ResolvConfMode, "Failed to parse resolv.conf mode");
@@ -729,8 +777,16 @@ static const char *const resolv_conf_mode_table[_RESOLV_CONF_MODE_MAX] = {
         [RESOLV_CONF_OFF] = "off",
         [RESOLV_CONF_COPY_HOST] = "copy-host",
         [RESOLV_CONF_COPY_STATIC] = "copy-static",
+        [RESOLV_CONF_COPY_UPLINK] = "copy-uplink",
+        [RESOLV_CONF_COPY_STUB] = "copy-stub",
+        [RESOLV_CONF_REPLACE_HOST] = "replace-host",
+        [RESOLV_CONF_REPLACE_STATIC] = "replace-static",
+        [RESOLV_CONF_REPLACE_UPLINK] = "replace-uplink",
+        [RESOLV_CONF_REPLACE_STUB] = "replace-stub",
         [RESOLV_CONF_BIND_HOST] = "bind-host",
         [RESOLV_CONF_BIND_STATIC] = "bind-static",
+        [RESOLV_CONF_BIND_UPLINK] = "bind-uplink",
+        [RESOLV_CONF_BIND_STUB] = "bind-stub",
         [RESOLV_CONF_DELETE] = "delete",
         [RESOLV_CONF_AUTO] = "auto",
 };
@@ -738,15 +794,14 @@ static const char *const resolv_conf_mode_table[_RESOLV_CONF_MODE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(resolv_conf_mode, ResolvConfMode, RESOLV_CONF_AUTO);
 
 int parse_link_journal(const char *s, LinkJournal *ret_mode, bool *ret_try) {
+        int r;
+
         assert(s);
         assert(ret_mode);
         assert(ret_try);
 
         if (streq(s, "auto")) {
                 *ret_mode = LINK_AUTO;
-                *ret_try = false;
-        } else if (streq(s, "no")) {
-                *ret_mode = LINK_NO;
                 *ret_try = false;
         } else if (streq(s, "guest")) {
                 *ret_mode = LINK_GUEST;
@@ -760,8 +815,16 @@ int parse_link_journal(const char *s, LinkJournal *ret_mode, bool *ret_try) {
         } else if (streq(s, "try-host")) {
                 *ret_mode = LINK_HOST;
                 *ret_try = true;
-        } else
-                return -EINVAL;
+        } else {
+                /* Also support boolean values, to make things less confusing. */
+                r = parse_boolean(s);
+                if (r < 0)
+                        return r;
+
+                /* Let's consider "true" to be equivalent to "auto". */
+                *ret_mode = r ? LINK_AUTO : LINK_NO;
+                *ret_try = false;
+        }
 
         return 0;
 }
@@ -785,10 +848,8 @@ int config_parse_link_journal(
         assert(settings);
 
         r = parse_link_journal(rvalue, &settings->link_journal, &settings->link_journal_try);
-        if (r < 0) {
-                log_syntax(unit, LOG_ERR, filename, line, r, "Failed to parse link journal mode, ignoring: %s", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse link journal mode, ignoring: %s", rvalue);
 
         return 0;
 }

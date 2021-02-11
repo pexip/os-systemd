@@ -1,10 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-bus.h"
 
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-unit-util.h"
 #include "bus-util.h"
+#include "bus-wait-for-jobs.h"
 #include "nspawn-register.h"
 #include "special.h"
 #include "stat-util.h"
@@ -111,6 +113,7 @@ int register_machine(
                 unsigned n_mounts,
                 int kill_signal,
                 char **properties,
+                sd_bus_message *properties_message,
                 bool keep_unit,
                 const char *service) {
 
@@ -120,11 +123,9 @@ int register_machine(
         assert(bus);
 
         if (keep_unit) {
-                r = sd_bus_call_method(
+                r = bus_call_method(
                                 bus,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
+                                bus_machine_mgr,
                                 "RegisterMachineWithNetwork",
                                 &error,
                                 NULL,
@@ -139,13 +140,7 @@ int register_machine(
         } else {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
 
-                r = sd_bus_message_new_method_call(
-                                bus,
-                                &m,
-                                "org.freedesktop.machine1",
-                                "/org/freedesktop/machine1",
-                                "org.freedesktop.machine1.Manager",
-                                "CreateMachineWithNetwork");
+                r = bus_message_new_method_call(bus, &m,  bus_machine_mgr, "CreateMachineWithNetwork");
                 if (r < 0)
                         return bus_log_create_error(r);
 
@@ -184,6 +179,12 @@ int register_machine(
                 if (r < 0)
                         return r;
 
+                if (properties_message) {
+                        r = sd_bus_message_copy(m, properties_message, true);
+                        if (r < 0)
+                                return bus_log_create_error(r);
+                }
+
                 r = bus_append_unit_property_assignment_many(m, UNIT_SERVICE, properties);
                 if (r < 0)
                         return r;
@@ -201,7 +202,7 @@ int register_machine(
         return 0;
 }
 
-int terminate_machine(
+int unregister_machine(
                 sd_bus *bus,
                 const char *machine_name) {
 
@@ -210,18 +211,9 @@ int terminate_machine(
 
         assert(bus);
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.machine1",
-                        "/org/freedesktop/machine1",
-                        "org.freedesktop.machine1.Manager",
-                        "TerminateMachine",
-                        &error,
-                        NULL,
-                        "s",
-                        machine_name);
+        r = bus_call_method(bus, bus_machine_mgr, "UnregisterMachine", &error, NULL, "s", machine_name);
         if (r < 0)
-                log_debug("Failed to terminate machine: %s", bus_error_message(&error, r));
+                log_debug("Failed to unregister machine: %s", bus_error_message(&error, r));
 
         return 0;
 }
@@ -234,7 +226,8 @@ int allocate_scope(
                 CustomMount *mounts,
                 unsigned n_mounts,
                 int kill_signal,
-                char **properties) {
+                char **properties,
+                sd_bus_message *properties_message) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL, *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -249,17 +242,11 @@ int allocate_scope(
         if (r < 0)
                 return log_error_errno(r, "Could not watch job: %m");
 
-        r = unit_name_mangle_with_suffix(machine_name, 0, ".scope", &scope);
+        r = unit_name_mangle_with_suffix(machine_name, "as machine name", 0, ".scope", &scope);
         if (r < 0)
                 return log_error_errno(r, "Failed to mangle scope name: %m");
 
-        r = sd_bus_message_new_method_call(
-                        bus,
-                        &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "StartTransientUnit");
+        r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "StartTransientUnit");
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -287,6 +274,12 @@ int allocate_scope(
         r = append_controller_property(bus, m);
         if (r < 0)
                 return r;
+
+        if (properties_message) {
+                r = sd_bus_message_copy(m, properties_message, true);
+                if (r < 0)
+                        return bus_log_create_error(r);
+        }
 
         r = append_machine_properties(
                         m,
@@ -335,30 +328,19 @@ int terminate_scope(
         _cleanup_free_ char *scope = NULL;
         int r;
 
-        r = unit_name_mangle_with_suffix(machine_name, 0, ".scope", &scope);
+        r = unit_name_mangle_with_suffix(machine_name, "to terminate", 0, ".scope", &scope);
         if (r < 0)
                 return log_error_errno(r, "Failed to mangle scope name: %m");
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "AbandonScope",
-                        &error,
-                        NULL,
-                        "s",
-                        scope);
+        r = bus_call_method(bus, bus_systemd_mgr, "AbandonScope", &error, NULL, "s", scope);
         if (r < 0) {
                 log_debug_errno(r, "Failed to abandon scope '%s', ignoring: %s", scope, bus_error_message(&error, r));
                 sd_bus_error_free(&error);
         }
 
-        r = sd_bus_call_method(
+        r = bus_call_method(
                         bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         "KillUnit",
                         &error,
                         NULL,
@@ -371,16 +353,7 @@ int terminate_scope(
                 sd_bus_error_free(&error);
         }
 
-        r = sd_bus_call_method(
-                        bus,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
-                        "UnrefUnit",
-                        &error,
-                        NULL,
-                        "s",
-                        scope);
+        r = bus_call_method(bus, bus_systemd_mgr, "UnrefUnit", &error, NULL, "s", scope);
         if (r < 0)
                 log_debug_errno(r, "Failed to drop reference to scope '%s', ignoring: %s", scope, bus_error_message(&error, r));
 

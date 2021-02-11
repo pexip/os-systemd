@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <dirent.h>
@@ -77,18 +77,6 @@ int acquire_data_fd(const void *data, size_t size, unsigned flags);
 
 int fd_duplicate_data_fd(int fd);
 
-/* Hint: ENETUNREACH happens if we try to connect to "non-existing" special IP addresses, such as ::5 */
-/* The kernel sends e.g., EHOSTUNREACH or ENONET to userspace in some ICMP error cases.
- * See the icmp_err_convert[] in net/ipv4/icmp.c in the kernel sources */
-#define ERRNO_IS_DISCONNECT(r)                                          \
-        IN_SET(r,                                                       \
-               ENOTCONN, ECONNRESET, ECONNREFUSED, ECONNABORTED, EPIPE, \
-               ENETUNREACH, EHOSTUNREACH, ENOPROTOOPT, EHOSTDOWN, ENONET)
-
-/* Resource exhaustion, could be our fault or general system trouble */
-#define ERRNO_IS_RESOURCE(r) \
-        IN_SET(r, ENOMEM, EMFILE, ENFILE)
-
 int fd_move_above_stdio(int fd);
 
 int rearrange_stdio(int original_input_fd, int original_output_fd, int original_error_fd);
@@ -104,6 +92,16 @@ static inline int make_null_stdio(void) {
                 (fd) = -1;                      \
                 _fd_;                           \
         })
+
+/* Like free_and_replace(), but for file descriptors */
+#define CLOSE_AND_REPLACE(a, b)                 \
+        ({                                      \
+                int *_fdp_ = &(a);              \
+                safe_close(*_fdp_);             \
+                *_fdp_ = TAKE_FD(b);            \
+                0;                              \
+        })
+
 
 int fd_reopen(int fd, int flags);
 

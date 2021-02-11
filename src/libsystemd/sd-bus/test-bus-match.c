@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "bus-match.h"
 #include "bus-message.h"
@@ -6,6 +6,7 @@
 #include "bus-util.h"
 #include "log.h"
 #include "macro.h"
+#include "memory-util.h"
 #include "tests.h"
 
 static bool mask[32];

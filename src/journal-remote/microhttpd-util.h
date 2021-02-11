@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <microhttpd.h>
@@ -33,7 +33,7 @@
 
 /* Both the old and new names are defines, check for the new one. */
 
-/* Compatiblity with libmicrohttpd < 0.9.38 */
+/* Compatibility with libmicrohttpd < 0.9.38 */
 #ifndef MHD_HTTP_NOT_ACCEPTABLE
 #  define MHD_HTTP_NOT_ACCEPTABLE MHD_HTTP_METHOD_NOT_ACCEPTABLE
 #endif
@@ -45,6 +45,12 @@
 
 #if MHD_VERSION < 0x00094203
 #  define MHD_create_response_from_fd_at_offset64 MHD_create_response_from_fd_at_offset
+#endif
+
+#if MHD_VERSION >= 0x00097002
+#  define mhd_result enum MHD_Result
+#else
+#  define mhd_result int
 #endif
 
 void microhttpd_logger(void *arg, const char *fmt, va_list ap) _printf_(2, 0);

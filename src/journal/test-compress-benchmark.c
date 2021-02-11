@@ -1,22 +1,23 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "compress.h"
 #include "env-util.h"
 #include "macro.h"
+#include "memory-util.h"
+#include "nulstr-util.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "string-util.h"
 #include "tests.h"
-#include "util.h"
 
 typedef int (compress_t)(const void *src, uint64_t src_size, void *dst,
                          size_t dst_alloc_size, size_t *dst_size);
 typedef int (decompress_t)(const void *src, uint64_t src_size,
                            void **dst, size_t *dst_alloc_size, size_t* dst_size, size_t dst_max);
 
-#if HAVE_XZ || HAVE_LZ4
+#if HAVE_COMPRESSION
 
 static usec_t arg_duration;
 static size_t arg_start;
@@ -142,7 +143,7 @@ static void test_compress_decompress(const char* label, const char* type,
 #endif
 
 int main(int argc, char *argv[]) {
-#if HAVE_XZ || HAVE_LZ4
+#if HAVE_COMPRESSION
         test_setup_logging(LOG_INFO);
 
         if (argc >= 2) {
@@ -166,6 +167,9 @@ int main(int argc, char *argv[]) {
 #endif
 #if HAVE_LZ4
                 test_compress_decompress("LZ4", i, compress_blob_lz4, decompress_blob_lz4);
+#endif
+#if HAVE_ZSTD
+                test_compress_decompress("ZSTD", i, compress_blob_zstd, decompress_blob_zstd);
 #endif
         }
         return 0;

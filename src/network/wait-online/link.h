@@ -1,7 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "sd-netlink.h"
+
+#include "log-link.h"
+#include "network-util.h"
 
 typedef struct Link Link;
 typedef struct Manager Manager;
@@ -14,7 +17,8 @@ struct Link {
         unsigned flags;
 
         bool required_for_online;
-        char *operational_state;
+        LinkOperationalStateRange required_operstate;
+        LinkOperationalState operational_state;
         char *state;
 };
 

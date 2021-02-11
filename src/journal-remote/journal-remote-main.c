@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
 #include <unistd.h>
@@ -17,6 +17,7 @@
 #include "process-util.h"
 #include "rlimit-util.h"
 #include "signal-util.h"
+#include "socket-netlink.h"
 #include "socket-util.h"
 #include "stat-util.h"
 #include "string-table.h"
@@ -123,7 +124,7 @@ static int spawn_getter(const char *getter) {
         _cleanup_strv_free_ char **words = NULL;
 
         assert(getter);
-        r = strv_split_extract(&words, getter, WHITESPACE, EXTRACT_QUOTES);
+        r = strv_split_full(&words, getter, WHITESPACE, EXTRACT_UNQUOTE);
         if (r < 0)
                 return log_error_errno(r, "Failed to split getter option: %m");
 
@@ -252,7 +253,7 @@ static int process_http_upload(
         return mhd_respond(connection, MHD_HTTP_ACCEPTED, "OK.");
 };
 
-static int request_handler(
+static mhd_result request_handler(
                 void *cls,
                 struct MHD_Connection *connection,
                 const char *url,
@@ -265,7 +266,7 @@ static int request_handler(
         const char *header;
         int r, code, fd;
         _cleanup_free_ char *hostname = NULL;
-        size_t len;
+        bool chunked = false;
 
         assert(connection);
         assert(connection_cls);
@@ -290,21 +291,35 @@ static int request_handler(
                 return mhd_respond(connection, MHD_HTTP_UNSUPPORTED_MEDIA_TYPE,
                                    "Content-Type: application/vnd.fdo.journal is required.");
 
-        header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Length");
-        if (!header)
-                return mhd_respond(connection, MHD_HTTP_LENGTH_REQUIRED,
-                                   "Content-Length header is required.");
-        r = safe_atozu(header, &len);
-        if (r < 0)
-                return mhd_respondf(connection, r, MHD_HTTP_LENGTH_REQUIRED,
-                                    "Content-Length: %s cannot be parsed: %m", header);
+        header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Transfer-Encoding");
+        if (header) {
+                if (!strcaseeq(header, "chunked"))
+                        return mhd_respondf(connection, 0, MHD_HTTP_BAD_REQUEST,
+                                            "Unsupported Transfer-Encoding type: %s", header);
 
-        if (len > ENTRY_SIZE_MAX)
-                /* When serialized, an entry of maximum size might be slightly larger,
-                 * so this does not correspond exactly to the limit in journald. Oh well.
-                 */
-                return mhd_respondf(connection, 0, MHD_HTTP_PAYLOAD_TOO_LARGE,
-                                    "Payload larger than maximum size of %u bytes", ENTRY_SIZE_MAX);
+                chunked = true;
+        }
+
+        header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Length");
+        if (header) {
+                size_t len;
+
+                if (chunked)
+                        return mhd_respond(connection, MHD_HTTP_BAD_REQUEST,
+                                           "Content-Length must not specified when Transfer-Encoding type is 'chuncked'");
+
+                r = safe_atozu(header, &len);
+                if (r < 0)
+                        return mhd_respondf(connection, r, MHD_HTTP_LENGTH_REQUIRED,
+                                            "Content-Length: %s cannot be parsed: %m", header);
+
+                if (len > ENTRY_SIZE_MAX)
+                        /* When serialized, an entry of maximum size might be slightly larger,
+                         * so this does not correspond exactly to the limit in journald. Oh well.
+                         */
+                        return mhd_respondf(connection, 0, MHD_HTTP_PAYLOAD_TOO_LARGE,
+                                            "Payload larger than maximum size of %u bytes", ENTRY_SIZE_MAX);
+        }
 
         {
                 const union MHD_ConnectionInfo *ci;
@@ -515,7 +530,7 @@ static int dispatch_http_event(sd_event_source *event,
                                void *userdata) {
         MHDDaemonWrapper *d = userdata;
         int r;
-        MHD_UNSIGNED_LONG_LONG timeout = ULONG_LONG_MAX;
+        MHD_UNSIGNED_LONG_LONG timeout = ULLONG_MAX;
 
         assert(d);
 
@@ -525,7 +540,7 @@ static int dispatch_http_event(sd_event_source *event,
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "MHD_run failed!");
         if (MHD_get_timeout(d->daemon, &timeout) == MHD_NO)
-                timeout = ULONG_LONG_MAX;
+                timeout = ULLONG_MAX;
 
         r = sd_event_source_set_time(d->timer_event, timeout);
         if (r < 0) {
@@ -747,10 +762,14 @@ static int parse_config(void) {
                 {}
         };
 
-        return config_parse_many_nulstr(PKGSYSCONFDIR "/journal-remote.conf",
-                                        CONF_PATHS_NULSTR("systemd/journal-remote.conf.d"),
-                                        "Remote\0", config_item_table_lookup, items,
-                                        CONFIG_PARSE_WARN, NULL);
+        return config_parse_many_nulstr(
+                        PKGSYSCONFDIR "/journal-remote.conf",
+                        CONF_PATHS_NULSTR("systemd/journal-remote.conf.d"),
+                        "Remote\0",
+                        config_item_table_lookup, items,
+                        CONFIG_PARSE_WARN,
+                        NULL,
+                        NULL);
 }
 
 static int help(void) {
@@ -771,7 +790,7 @@ static int help(void) {
                "     --listen-http=ADDR     Listen for HTTP connections at ADDR\n"
                "     --listen-https=ADDR    Listen for HTTPS connections at ADDR\n"
                "  -o --output=FILE|DIR      Write output to FILE or DIR/external-*.journal\n"
-               "     --compress[=BOOL]      XZ-compress the output journal (default: yes)\n"
+               "     --compress[=BOOL]      Use compression in the output journal (default: yes)\n"
                "     --seal[=BOOL]          Use event sealing (default: no)\n"
                "     --key=FILENAME         SSL key in PEM format (default:\n"
                "                            \"" PRIV_KEY_FILE "\")\n"
@@ -1058,12 +1077,12 @@ static int parse_argv(int argc, char *argv[]) {
 static int load_certificates(char **key, char **cert, char **trust) {
         int r;
 
-        r = read_full_file(arg_key ?: PRIV_KEY_FILE, key, NULL);
+        r = read_full_file_full(AT_FDCWD, arg_key ?: PRIV_KEY_FILE, READ_FULL_FILE_CONNECT_SOCKET, NULL, key, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to read key from file '%s': %m",
                                        arg_key ?: PRIV_KEY_FILE);
 
-        r = read_full_file(arg_cert ?: CERT_FILE, cert, NULL);
+        r = read_full_file_full(AT_FDCWD, arg_cert ?: CERT_FILE, READ_FULL_FILE_CONNECT_SOCKET, NULL, cert, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to read certificate from file '%s': %m",
                                        arg_cert ?: CERT_FILE);
@@ -1071,7 +1090,7 @@ static int load_certificates(char **key, char **cert, char **trust) {
         if (arg_trust_all)
                 log_info("Certificate checking disabled.");
         else {
-                r = read_full_file(arg_trust ?: TRUST_FILE, trust, NULL);
+                r = read_full_file_full(AT_FDCWD, arg_trust ?: TRUST_FILE, READ_FULL_FILE_CONNECT_SOCKET, NULL, trust, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read CA certificate file '%s': %m",
                                                arg_trust ?: TRUST_FILE);
@@ -1085,13 +1104,13 @@ static int load_certificates(char **key, char **cert, char **trust) {
 }
 
 static int run(int argc, char **argv) {
-        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_(journal_remote_server_destroy) RemoteServer s = {};
+        _cleanup_(notify_on_cleanup) const char *notify_message = NULL;
         _cleanup_free_ char *key = NULL, *cert = NULL, *trust = NULL;
         int r;
 
         log_show_color(true);
-        log_parse_environment();
+        log_parse_environment_cli();
 
         /* The journal merging logic potentially needs a lot of fds. */
         (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);

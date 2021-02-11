@@ -1,5 +1,7 @@
 ---
 title: Control Group APIs and Delegation
+category: Interfaces
+layout: default
 ---
 
 # Control Group APIs and Delegation
@@ -19,10 +21,10 @@ comprehensive up-to-date information about all this, particular in light of the
 poor implementations of the components interfacing with systemd of current
 container managers.
 
-Before you read on, please make sure you read the low-level [kernel
-documentation about
-cgroup v2](https://www.kernel.org/doc/Documentation/cgroup-v2.txt). This
-documentation then adds in the higher-level view from systemd.
+Before you read on, please make sure you read the low-level kernel
+documentation about the
+[unified cgroup hierarchy](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+This document then adds in the higher-level view from systemd.
 
 This document augments the existing documentation we already have:
 
@@ -129,6 +131,8 @@ If you wonder how to detect which of these three modes is currently used, use
 you are either in legacy or hybrid mode. To distinguish these two cases, run
 `statfs()` again on `/sys/fs/cgroup/unified/`. If that succeeds and reports
 `CGROUP2_SUPER_MAGIC` you are in hybrid mode, otherwise not.
+From a shell, you can use check the `Type` in `stat -f /sys/fs/cgroup` and
+`stat -f /sys/fs/cgroup/unified`.
 
 ## systemd's Unit Types
 
@@ -230,7 +234,7 @@ guarantees:
 In unit files the `Delegate=` property is superficially exposed as
 boolean. However, since v236 it optionally takes a list of controller names
 instead. If so, delegation is requested for listed controllers
-specifically. Note hat this only encodes a request. Depending on various
+specifically. Note that this only encodes a request. Depending on various
 parameters it might happen that your service actually will get fewer
 controllers delegated (for example, because the controller is not available on
 the current kernel or was turned off) or more.  If no list is specified

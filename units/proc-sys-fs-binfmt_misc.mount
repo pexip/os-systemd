@@ -1,4 +1,4 @@
-#  SPDX-License-Identifier: LGPL-2.1+
+#  SPDX-License-Identifier: LGPL-2.1-or-later
 #
 #  This file is part of systemd.
 #
@@ -17,3 +17,7 @@ DefaultDependencies=no
 What=binfmt_misc
 Where=/proc/sys/fs/binfmt_misc
 Type=binfmt_misc
+Options=nosuid,nodev,noexec
+
+[Install]
+WantedBy=sysinit.target

@@ -1,15 +1,14 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <poll.h>
-#include <sys/socket.h>
 
 #include "sd-netlink.h"
 
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "hashmap.h"
+#include "io-util.h"
 #include "macro.h"
-#include "missing.h"
 #include "netlink-internal.h"
 #include "netlink-slot.h"
 #include "netlink-util.h"
@@ -28,7 +27,7 @@ static int sd_netlink_new(sd_netlink **ret) {
                 return -ENOMEM;
 
         *rtnl = (sd_netlink) {
-                .n_ref = REFCNT_INIT,
+                .n_ref = 1,
                 .fd = -1,
                 .sockaddr.nl.nl_family = AF_NETLINK,
                 .original_pid = getpid_cached(),
@@ -79,7 +78,7 @@ int sd_netlink_new_from_netlink(sd_netlink **ret, int fd) {
         return 0;
 }
 
-static bool rtnl_pid_changed(sd_netlink *rtnl) {
+static bool rtnl_pid_changed(const sd_netlink *rtnl) {
         assert(rtnl);
 
         /* We don't support people creating an rtnl connection and
@@ -109,6 +108,10 @@ int sd_netlink_open_fd(sd_netlink **ret, int fd) {
         rtnl->fd = fd;
         rtnl->protocol = protocol;
 
+        r = setsockopt_int(fd, SOL_NETLINK, NETLINK_EXT_ACK, 1);
+        if (r < 0)
+                log_debug_errno(r, "sd-netlink: Failed to enable NETLINK_EXT_ACK option, ignoring: %m");
+
         r = socket_bind(rtnl);
         if (r < 0) {
                 rtnl->fd = -1; /* on failure, the caller remains owner of the fd, hence don't close it here */
@@ -132,8 +135,7 @@ int netlink_open_family(sd_netlink **ret, int family) {
         r = sd_netlink_open_fd(ret, fd);
         if (r < 0)
                 return r;
-
-        fd = -1;
+        TAKE_FD(fd);
 
         return 0;
 }
@@ -178,11 +180,14 @@ static sd_netlink *netlink_free(sd_netlink *rtnl) {
 
         hashmap_free(rtnl->broadcast_group_refs);
 
+        hashmap_free(rtnl->genl_family_to_nlmsg_type);
+        hashmap_free(rtnl->nlmsg_type_to_genl_family);
+
         safe_close(rtnl->fd);
         return mfree(rtnl);
 }
 
-DEFINE_ATOMIC_REF_UNREF_FUNC(sd_netlink, sd_netlink, netlink_free);
+DEFINE_TRIVIAL_REF_UNREF_FUNC(sd_netlink, sd_netlink, netlink_free);
 
 static void rtnl_seal_message(sd_netlink *rtnl, sd_netlink_message *m) {
         assert(rtnl);
@@ -457,8 +462,6 @@ static usec_t calc_elapse(uint64_t usec) {
 }
 
 static int rtnl_poll(sd_netlink *rtnl, bool need_more, uint64_t timeout_usec) {
-        struct pollfd p[1] = {};
-        struct timespec ts;
         usec_t m = USEC_INFINITY;
         int r, e;
 
@@ -487,17 +490,14 @@ static int rtnl_poll(sd_netlink *rtnl, bool need_more, uint64_t timeout_usec) {
                 }
         }
 
-        if (timeout_usec != (uint64_t) -1 && (m == (uint64_t) -1 || timeout_usec < m))
+        if (timeout_usec != (uint64_t) -1 && (m == USEC_INFINITY || timeout_usec < m))
                 m = timeout_usec;
 
-        p[0].fd = rtnl->fd;
-        p[0].events = e;
+        r = fd_wait_for_event(rtnl->fd, e, m);
+        if (r <= 0)
+                return r;
 
-        r = ppoll(p, 1, m == (uint64_t) -1 ? NULL : timespec_store(&ts, m), NULL);
-        if (r < 0)
-                return -errno;
-
-        return r > 0 ? 1 : 0;
+        return 1;
 }
 
 int sd_netlink_wait(sd_netlink *nl, uint64_t timeout_usec) {
@@ -670,7 +670,7 @@ int sd_netlink_call(sd_netlink *rtnl,
         }
 }
 
-int sd_netlink_get_events(sd_netlink *rtnl) {
+int sd_netlink_get_events(const sd_netlink *rtnl) {
         assert_return(rtnl, -EINVAL);
         assert_return(!rtnl_pid_changed(rtnl), -ECHILD);
 
@@ -680,7 +680,7 @@ int sd_netlink_get_events(sd_netlink *rtnl) {
                 return 0;
 }
 
-int sd_netlink_get_timeout(sd_netlink *rtnl, uint64_t *timeout_usec) {
+int sd_netlink_get_timeout(const sd_netlink *rtnl, uint64_t *timeout_usec) {
         struct reply_callback *c;
 
         assert_return(rtnl, -EINVAL);
@@ -869,6 +869,13 @@ int sd_netlink_add_match(
                                 return r;
 
                         break;
+                case RTM_NEWNEIGH:
+                case RTM_DELNEIGH:
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_NEIGH);
+                        if (r < 0)
+                                return r;
+
+                        break;
                 case RTM_NEWROUTE:
                 case RTM_DELROUTE:
                         r = socket_broadcast_group_ref(rtnl, RTNLGRP_IPV4_ROUTE);
@@ -889,6 +896,13 @@ int sd_netlink_add_match(
                         if (r < 0)
                                 return r;
                         break;
+                case RTM_NEWNEXTHOP:
+                case RTM_DELNEXTHOP:
+                        r = socket_broadcast_group_ref(rtnl, RTNLGRP_NEXTHOP);
+                        if (r < 0)
+                                return r;
+                break;
+
                 default:
                         return -EOPNOTSUPP;
         }

@@ -1,8 +1,10 @@
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 libnspawn_core_sources = files('''
         nspawn-cgroup.c
         nspawn-cgroup.h
+        nspawn-creds.c
+        nspawn-creds.h
         nspawn-def.h
         nspawn-expose-ports.c
         nspawn-expose-ports.h
@@ -10,6 +12,8 @@ libnspawn_core_sources = files('''
         nspawn-mount.h
         nspawn-network.c
         nspawn-network.h
+        nspawn-oci.c
+        nspawn-oci.h
         nspawn-patch-uid.c
         nspawn-patch-uid.h
         nspawn-register.c
@@ -46,7 +50,7 @@ tests += [
         [['src/nspawn/test-nspawn-tables.c'],
          [libnspawn_core,
           libshared],
-         []],
+         [libseccomp]],
 
         [['src/nspawn/test-patch-uid.c'],
          [libnspawn_core,

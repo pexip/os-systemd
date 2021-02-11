@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <assert.h>
@@ -84,7 +84,19 @@
 #define _variable_no_sanitize_address_
 #endif
 
+/* Apparently there's no has_feature() call defined to check for ubsan, hence let's define this
+ * unconditionally on llvm */
+#if defined(__clang__)
+#define _function_no_sanitize_float_cast_overflow_ __attribute__((no_sanitize("float-cast-overflow")))
+#else
+#define _function_no_sanitize_float_cast_overflow_
+#endif
+
 /* Temporarily disable some warnings */
+#define DISABLE_WARNING_DEPRECATED_DECLARATIONS                         \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
+
 #define DISABLE_WARNING_FORMAT_NONLITERAL                               \
         _Pragma("GCC diagnostic push");                                 \
         _Pragma("GCC diagnostic ignored \"-Wformat-nonliteral\"")
@@ -104,6 +116,23 @@
 #define DISABLE_WARNING_INCOMPATIBLE_POINTER_TYPES                      \
         _Pragma("GCC diagnostic push");                                 \
         _Pragma("GCC diagnostic ignored \"-Wincompatible-pointer-types\"")
+
+#if HAVE_WSTRINGOP_TRUNCATION
+#  define DISABLE_WARNING_STRINGOP_TRUNCATION                           \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wstringop-truncation\"")
+#else
+#  define DISABLE_WARNING_STRINGOP_TRUNCATION                           \
+        _Pragma("GCC diagnostic push")
+#endif
+
+#define DISABLE_WARNING_FLOAT_EQUAL \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wfloat-equal\"")
+
+#define DISABLE_WARNING_TYPE_LIMITS \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wtype-limits\"")
 
 #define REENABLE_WARNING                                                \
         _Pragma("GCC diagnostic pop")
@@ -154,6 +183,11 @@ static inline size_t ALIGN_TO(size_t l, size_t ali) {
 
 /* align to next higher power-of-2 (except for: 0 => 0, overflow => 0) */
 static inline unsigned long ALIGN_POWER2(unsigned long u) {
+
+        /* Avoid subtraction overflow */
+        if (u == 0)
+                return 0;
+
         /* clz(0) is undefined */
         if (u == 1)
                 return 1;
@@ -163,6 +197,29 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
                 return 0;
 
         return 1UL << (sizeof(u) * 8 - __builtin_clzl(u - 1UL));
+}
+
+static inline size_t GREEDY_ALLOC_ROUND_UP(size_t l) {
+        size_t m;
+
+        /* Round up allocation sizes a bit to some reasonable, likely larger value. This is supposed to be
+         * used for cases which are likely called in an allocation loop of some form, i.e. that repetitively
+         * grow stuff, for example strv_extend() and suchlike.
+         *
+         * Note the difference to GREEDY_REALLOC() here, as this helper operates on a single size value only,
+         * and rounds up to next multiple of 2, needing no further counter.
+         *
+         * Note the benefits of direct ALIGN_POWER2() usage: type-safety for size_t, sane handling for very
+         * small (i.e. <= 2) and safe handling for very large (i.e. > SSIZE_MAX) values. */
+
+        if (l <= 2)
+                return 2; /* Never allocate less than 2 of something.  */
+
+        m = ALIGN_POWER2(l);
+        if (m == 0) /* overflow? */
+                return l;
+
+        return m;
 }
 
 #ifndef __COVERITY__
@@ -224,6 +281,12 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
                 MAX(_c, z);                             \
         })
 
+#define MAX4(x, y, z, a)                                \
+        ({                                              \
+                const typeof(x) _d = MAX3(x, y, z);     \
+                MAX(_d, a);                             \
+        })
+
 #undef MIN
 #define MIN(a, b) __MIN(UNIQ, (a), UNIQ, (b))
 #define __MIN(aq, a, bq, b)                             \
@@ -232,6 +295,15 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
                 const typeof(b) UNIQ_T(B, bq) = (b);    \
                 UNIQ_T(A, aq) < UNIQ_T(B, bq) ? UNIQ_T(A, aq) : UNIQ_T(B, bq); \
         })
+
+/* evaluates to (void) if _A or _B are not constant or of different types */
+#define CONST_MIN(_A, _B) \
+        (__builtin_choose_expr(                                         \
+                __builtin_constant_p(_A) &&                             \
+                __builtin_constant_p(_B) &&                             \
+                __builtin_types_compatible_p(typeof(_A), typeof(_B)),   \
+                ((_A) < (_B)) ? (_A) : (_B),                            \
+                VOID_0))
 
 #define MIN3(x, y, z)                                   \
         ({                                              \
@@ -298,29 +370,30 @@ static inline unsigned long ALIGN_POWER2(unsigned long u) {
 
 extern void __coverity_panic__(void);
 
-static inline int __coverity_check__(int condition) {
+static inline void __coverity_check__(int condition) {
+        if (!condition)
+                __coverity_panic__();
+}
+
+static inline int __coverity_check_and_return__(int condition) {
         return condition;
 }
 
-#define assert_message_se(expr, message)                                \
-        do {                                                            \
-                if (__coverity_check__(!(expr)))                        \
-                        __coverity_panic__();                           \
-        } while (false)
+#define assert_message_se(expr, message) __coverity_check__(!!(expr))
 
-#define assert_log(expr, message) __coverity_check__(!!(expr))
+#define assert_log(expr, message) __coverity_check_and_return__(!!(expr))
 
 #else  /* ! __COVERITY__ */
 
 #define assert_message_se(expr, message)                                \
         do {                                                            \
                 if (_unlikely_(!(expr)))                                \
-                        log_assert_failed(message, __FILE__, __LINE__, __PRETTY_FUNCTION__); \
+                        log_assert_failed(message, PROJECT_FILE, __LINE__, __PRETTY_FUNCTION__); \
         } while (false)
 
 #define assert_log(expr, message) ((_likely_(expr))                     \
         ? (true)                                                        \
-        : (log_assert_failed_return(message, __FILE__, __LINE__, __PRETTY_FUNCTION__), false))
+        : (log_assert_failed_return(message, PROJECT_FILE, __LINE__, __PRETTY_FUNCTION__), false))
 
 #endif  /* __COVERITY__ */
 
@@ -335,18 +408,16 @@ static inline int __coverity_check__(int condition) {
 #endif
 
 #define assert_not_reached(t)                                           \
-        do {                                                            \
-                log_assert_failed_unreachable(t, __FILE__, __LINE__, __PRETTY_FUNCTION__); \
-        } while (false)
+        log_assert_failed_unreachable(t, PROJECT_FILE, __LINE__, __PRETTY_FUNCTION__)
 
 #if defined(static_assert)
 #define assert_cc(expr)                                                 \
-        static_assert(expr, #expr);
+        static_assert(expr, #expr)
 #else
 #define assert_cc(expr)                                                 \
         struct CONCATENATE(_assert_struct_, __COUNTER__) {              \
                 char x[(expr) ? 0 : -1];                                \
-        };
+        }
 #endif
 
 #define assert_return(expr, r)                                          \
@@ -379,6 +450,9 @@ static inline int __coverity_check__(int condition) {
 #define PTR_TO_ULONG(p) ((unsigned long) ((uintptr_t) (p)))
 #define ULONG_TO_PTR(u) ((void *) ((uintptr_t) (u)))
 
+#define PTR_TO_UINT8(p) ((uint8_t) ((uintptr_t) (p)))
+#define UINT8_TO_PTR(u) ((void *) ((uintptr_t) (u)))
+
 #define PTR_TO_INT32(p) ((int32_t) ((intptr_t) (p)))
 #define INT32_TO_PTR(u) ((void *) ((intptr_t) (u)))
 #define PTR_TO_UINT32(p) ((uint32_t) ((uintptr_t) (p)))
@@ -395,6 +469,8 @@ static inline int __coverity_check__(int condition) {
 #define CHAR_TO_STR(x) ((char[2]) { x, 0 })
 
 #define char_array_0(x) x[sizeof(x)-1] = 0;
+
+#define sizeof_field(struct_type, member) sizeof(((struct_type *) 0)->member)
 
 /* Returns the number of chars needed to format variables of the
  * specified type as a decimal string. Adds in extra space for a
@@ -415,8 +491,10 @@ static inline int __coverity_check__(int condition) {
                 ans;                                    \
         })
 
+#define UPDATE_FLAG(orig, flag, b)                      \
+        ((b) ? ((orig) | (flag)) : ((orig) & ~(flag)))
 #define SET_FLAG(v, flag, b) \
-        (v) = (b) ? ((v) | (flag)) : ((v) & ~(flag))
+        (v) = UPDATE_FLAG(v, flag, b)
 #define FLAGS_SET(v, flags) \
         ((~(v) & (flags)) == 0)
 
@@ -455,7 +533,8 @@ static inline int __coverity_check__(int condition) {
                  * type for the array, in the hope that checkers such as ubsan don't complain that the initializers for \
                  * the array are not representable by the base type. Ideally we'd use typeof(x) as base type, but that  \
                  * doesn't work, as we want to use this on bitfields and gcc refuses typeof() on bitfields.) */         \
-                assert_cc((sizeof((long double[]){__VA_ARGS__})/sizeof(long double)) <= 20); \
+                static const long double __assert_in_set[] _unused_ = { __VA_ARGS__ }; \
+                assert_cc(ELEMENTSOF(__assert_in_set) <= 20); \
                 switch(x) {                     \
                 FOR_EACH_MAKE_CASE(__VA_ARGS__) \
                         _found = true;          \
@@ -471,6 +550,18 @@ static inline int __coverity_check__(int condition) {
                 (x) = (y);                         \
                 (y) = (_t);                        \
         } while (false)
+
+#define STRV_MAKE(...) ((char**) ((const char*[]) { __VA_ARGS__, NULL }))
+#define STRV_MAKE_EMPTY ((char*[1]) { NULL })
+
+/* Pointers range from NULL to POINTER_MAX */
+#define POINTER_MAX ((void*) UINTPTR_MAX)
+
+/* Iterates through a specified list of pointers. Accepts NULL pointers, but uses POINTER_MAX as internal marker for EOL. */
+#define FOREACH_POINTER(p, x, ...)                                                       \
+        for (typeof(p) *_l = (typeof(p)[]) { ({ p = x; }), ##__VA_ARGS__, POINTER_MAX }; \
+             p != (typeof(p)) POINTER_MAX;                                               \
+             p = *(++_l))
 
 /* Define C11 thread_local attribute even on older gcc compiler
  * version */
@@ -545,5 +636,22 @@ static inline int __coverity_check__(int condition) {
 #define DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(type, name, free_func)    \
         DEFINE_PUBLIC_TRIVIAL_REF_FUNC(type, name);                    \
         DEFINE_PUBLIC_TRIVIAL_UNREF_FUNC(type, name, free_func);
+
+/* A macro to force copying of a variable from memory. This is useful whenever we want to read something from
+ * memory and want to make sure the compiler won't optimize away the destination variable for us. It's not
+ * supposed to be a full CPU memory barrier, i.e. CPU is still allowed to reorder the reads, but it is not
+ * allowed to remove our local copies of the variables. We want this to work for unaligned memory, hence
+ * memcpy() is great for our purposes. */
+#define READ_NOW(x)                                                     \
+        ({                                                              \
+                typeof(x) _copy;                                        \
+                memcpy(&_copy, &(x), sizeof(_copy));                    \
+                asm volatile ("" : : : "memory");                       \
+                _copy;                                                  \
+        })
+
+static inline size_t size_add(size_t x, size_t y) {
+        return y >= SIZE_MAX - x ? SIZE_MAX : x + y;
+}
 
 #include "log.h"

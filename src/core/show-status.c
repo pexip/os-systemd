@@ -1,4 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "alloc-util.h"
 #include "fd-util.h"
@@ -11,10 +15,11 @@
 #include "util.h"
 
 static const char* const show_status_table[_SHOW_STATUS_MAX] = {
-        [SHOW_STATUS_NO] = "no",
-        [SHOW_STATUS_AUTO] = "auto",
+        [SHOW_STATUS_NO]        = "no",
+        [SHOW_STATUS_ERROR]     = "error",
+        [SHOW_STATUS_AUTO]      = "auto",
         [SHOW_STATUS_TEMPORARY] = "temporary",
-        [SHOW_STATUS_YES] = "yes",
+        [SHOW_STATUS_YES]       = "yes",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(show_status, ShowStatus, SHOW_STATUS_YES);
@@ -114,3 +119,10 @@ int status_printf(const char *status, ShowStatusFlags flags, const char *format,
 
         return r;
 }
+
+static const char* const status_unit_format_table[_STATUS_UNIT_FORMAT_MAX] = {
+        [STATUS_UNIT_FORMAT_NAME]        = "name",
+        [STATUS_UNIT_FORMAT_DESCRIPTION] = "description",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(status_unit_format, StatusUnitFormat);

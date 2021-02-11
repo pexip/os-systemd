@@ -1,10 +1,7 @@
 <?xml version='1.0'?>
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-
-<!--
-  SPDX-License-Identifier: LGPL-2.1+
--->
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="systemd-udevd.service"
           xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -80,7 +77,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>-c=</option></term>
+        <term><option>-c</option></term>
         <term><option>--children-max=</option></term>
         <listitem>
           <para>Limit the number of events executed in parallel.</para>
@@ -88,7 +85,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>-e=</option></term>
+        <term><option>-e</option></term>
         <term><option>--exec-delay=</option></term>
         <listitem>
           <para>Delay the execution of <varname>RUN</varname>
@@ -100,7 +97,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>-t=</option></term>
+        <term><option>-t</option></term>
         <term><option>--event-timeout=</option></term>
         <listitem>
           <para>Set the number of seconds to wait for events to finish. After
@@ -109,7 +106,22 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>-N=</option></term>
+        <term><option>-s</option></term>
+        <term><option>--timeout-signal=</option></term>
+        <listitem>
+          <para>Set the signal which <filename>systemd-udevd</filename> will send to
+          forked off processes after reaching event timeout. The setting can be overridden
+          at boot time with the kernel command line option
+          <varname>udev.timeout_signal=</varname>. Setting to <constant>SIGABRT</constant>
+          may be helpful in order to debug worker timeouts. Defaults to
+          <constant>SIGKILL</constant>. Note that setting the option on the command line
+          overrides the setting from the configuration file.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-N</option></term>
         <term><option>--resolve-names=</option></term>
         <listitem>
           <para>Specify when systemd-udevd should resolve names of users and groups.
@@ -128,11 +140,11 @@
 
   <refsect1><title>Kernel command line</title>
     <variablelist class='kernel-commandline-options'>
-      <para>Parameters starting with "rd." will be read when
-      <command>systemd-udevd</command> is used in an initrd.</para>
+      <para>Parameters prefixed with "rd." will be read when <command>systemd-udevd</command> is used in an
+      initrd, those without will be processed both in the initrd and on the host.</para>
       <varlistentry>
-        <term><varname>udev.log_priority=</varname></term>
-        <term><varname>rd.udev.log_priority=</varname></term>
+        <term><varname>udev.log_level=</varname></term>
+        <term><varname>rd.udev.log_level=</varname></term>
         <listitem>
           <para>Set the log level.</para>
         </listitem>
@@ -164,6 +176,31 @@
         </listitem>
       </varlistentry>
       <varlistentry>
+        <term><varname>udev.timeout_signal=</varname></term>
+        <term><varname>rd.udev.timeout_signal=</varname></term>
+        <listitem>
+          <para>Specifies a signal that <filename>systemd-udevd</filename> will send to
+          workers on timeout. Note that kernel command line option overrides both the
+          setting in the configuration file and the one on the program command line.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>udev.blockdev_read_only</varname></term>
+        <term><varname>rd.udev.blockdev_read_only</varname></term>
+        <listitem>
+          <para>If specified, mark all physical block devices read-only as they appear. Synthetic block
+          devices (such as loopback block devices or device mapper devices) are left as they are. This is
+          useful to guarantee that the contents of physical block devices remains unmodified during runtime,
+          for example to implement fully stateless systems, for testing or for recovery situations where
+          corrupted file systems shall not be corrupted further through accidental modification.</para>
+
+          <para>A block device may be marked writable again by issuing the <command>blockdev
+          --setrw</command> command, see <citerefentry
+          project='man-pages'><refentrytitle>blockdev</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          for details.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
         <term><varname>net.ifnames=</varname></term>
         <listitem>
           <para>Network interfaces are renamed to give them predictable names
@@ -174,15 +211,12 @@
         <term><varname>net.naming-scheme=</varname></term>
         <listitem>
           <para>Network interfaces are renamed to give them predictable names when possible (unless
-          <varname>net.ifnames=0</varname> is specified, see above). The names are derived from various
-          device metadata fields. Newer versions of <filename>systemd-udevd.service</filename> take more of
-          these fields into account, improving (and thus possibly changing) the names used for the same
-          devices. With this kernel command line option it is possible to pick a specific version of this
-          algorithm. It expects a naming scheme identifier as argument. Currently the following identifiers
-          are known: <literal>v238</literal>, <literal>v239</literal>, <literal>v240</literal> which each
-          implement the naming scheme that was the default in the indicated systemd version. In addition,
-          <literal>latest</literal> may be used to designate the latest scheme known (to this particular
-          version of <filename>systemd-udevd.service</filename>).</para>
+          <varname>net.ifnames=0</varname> is specified, see above). With this kernel command line option it
+          is possible to pick a specific version of this algorithm and override the default chosen at
+          compilation time. Expects one of the naming scheme identifiers listed in
+          <citerefentry><refentrytitle>systemd.net-naming-scheme</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
+          or <literal>latest</literal> to select the latest scheme known (to this particular version of
+          <filename>systemd-udevd.service</filename>).</para>
 
           <para>Note that selecting a specific scheme is not sufficient to fully stabilize interface naming:
           the naming is generally derived from driver attributes exposed by the kernel. As the kernel is
@@ -191,9 +225,8 @@
         </listitem>
       </varlistentry>
     </variablelist>
-    <!-- when adding entries here, consider also adding them
-         in kernel-command-line.xml -->
- </refsect1>
+    <!-- when adding entries here, consider also adding them in kernel-command-line.xml -->
+  </refsect1>
 
   <refsect1>
     <title>See Also</title>

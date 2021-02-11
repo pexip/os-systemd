@@ -1,4 +1,6 @@
-#!/bin/sh -e
+#!/bin/sh
+
+set -e
 
 chrooted() {
   if [ "$(stat -c %d/%i /)" = "$(stat -Lc %d/%i /proc/1/root 2>/dev/null)" ];
@@ -33,12 +35,6 @@ can_start_udevd() {
 enable_udev() {
   can_start_udevd || return 0
   invoke-rc.d udev start
-}
-
-update_initramfs() {
-  [ -x /usr/sbin/update-initramfs -a -e /etc/initramfs-tools/initramfs.conf ] \
-    || return 0
-  update-initramfs -u
 }
 
 upgrade_fixes() {
@@ -85,8 +81,6 @@ case "$1" in
 	fi
       fi
     fi
-
-    update_initramfs
     ;;
 
     triggered)
@@ -96,4 +90,3 @@ case "$1" in
 esac
 
 #DEBHELPER#
-

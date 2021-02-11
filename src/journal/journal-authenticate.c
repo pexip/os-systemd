@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -10,6 +10,8 @@
 #include "journal-authenticate.h"
 #include "journal-def.h"
 #include "journal-file.h"
+#include "memory-util.h"
+#include "time-util.h"
 
 static uint64_t journal_file_tag_seqnum(JournalFile *f) {
         uint64_t r;

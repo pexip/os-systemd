@@ -1,9 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "hashmap.h"
 #include "list.h"
 #include "prioq.h"
+#include "resolve-util.h"
 #include "time-util.h"
 
 typedef struct DnsCache {
@@ -21,7 +22,7 @@ typedef struct DnsCache {
 void dns_cache_flush(DnsCache *c);
 void dns_cache_prune(DnsCache *c);
 
-int dns_cache_put(DnsCache *c, DnsResourceKey *key, int rcode, DnsAnswer *answer, bool authenticated, uint32_t nsec_ttl, usec_t timestamp, int owner_family, const union in_addr_union *owner_address);
+int dns_cache_put(DnsCache *c, DnsCacheMode cache_mode, DnsResourceKey *key, int rcode, DnsAnswer *answer, bool authenticated, uint32_t nsec_ttl, usec_t timestamp, int owner_family, const union in_addr_union *owner_address);
 int dns_cache_lookup(DnsCache *c, DnsResourceKey *key, bool clamp_ttl, int *rcode, DnsAnswer **answer, bool *authenticated);
 
 int dns_cache_check_conflicts(DnsCache *cache, DnsResourceRecord *rr, int owner_family, const union in_addr_union *owner_address);

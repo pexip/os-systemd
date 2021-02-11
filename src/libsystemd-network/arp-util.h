@@ -1,11 +1,11 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /***
   Copyright © 2014 Axis Communications AB. All rights reserved.
 ***/
 
-#include <netinet/if_ether.h>
+#include <net/ethernet.h>
 
 #include "socket-util.h"
 #include "sparse-endian.h"

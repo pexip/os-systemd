@@ -1,13 +1,12 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kd.h>
 #include <linux/vt.h>
 #include <signal.h>
-#include <stdio_ext.h>
-#include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "sd-messages.h"
@@ -22,7 +21,11 @@
 #include "fileio.h"
 #include "format-util.h"
 #include "io-util.h"
+#include "logind-dbus.h"
+#include "logind-seat-dbus.h"
+#include "logind-session-dbus.h"
 #include "logind-session.h"
+#include "logind-user-dbus.h"
 #include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -63,7 +66,7 @@ int session_new(Session **ret, Manager *m, const char *id) {
                 .tty_validity = _TTY_VALIDITY_INVALID,
         };
 
-        s->state_file = strappend("/run/systemd/sessions/", id);
+        s->state_file = path_join("/run/systemd/sessions", id);
         if (!s->state_file)
                 return -ENOMEM;
 
@@ -91,8 +94,6 @@ Session* session_free(Session *s) {
                 LIST_REMOVE(gc_queue, s->manager->session_gc_queue, s);
 
         s->timer_event_source = sd_event_source_unref(s->timer_event_source);
-
-        session_remove_fifo(s);
 
         session_drop_controller(s);
 
@@ -141,7 +142,13 @@ Session* session_free(Session *s) {
 
         hashmap_remove(s->manager->sessions, s->id);
 
+        sd_event_source_unref(s->fifo_event_source);
+        safe_close(s->fifo_fd);
+
+        /* Note that we remove neither the state file nor the fifo path here, since we want both to survive
+         * daemon restarts */
         free(s->state_file);
+        free(s->fifo_path);
 
         return mfree(s);
 }
@@ -182,11 +189,10 @@ int session_set_leader(Session *s, pid_t pid) {
 
 static void session_save_devices(Session *s, FILE *f) {
         SessionDevice *sd;
-        Iterator i;
 
         if (!hashmap_isempty(s->devices)) {
                 fprintf(f, "DEVICES=");
-                HASHMAP_FOREACH(sd, s->devices, i)
+                HASHMAP_FOREACH(sd, s->devices)
                         fprintf(f, "%u:%u ", major(sd->dev), minor(sd->dev));
                 fprintf(f, "\n");
         }
@@ -195,7 +201,7 @@ static void session_save_devices(Session *s, FILE *f) {
 int session_save(Session *s) {
         _cleanup_free_ char *temp_path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        int r = 0;
+        int r;
 
         assert(s);
 
@@ -213,7 +219,6 @@ int session_save(Session *s) {
         if (r < 0)
                 goto fail;
 
-        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
         (void) fchmod(fileno(f), 0644);
 
         fprintf(f,
@@ -224,8 +229,8 @@ int session_save(Session *s) {
                 "IS_DISPLAY=%i\n"
                 "STATE=%s\n"
                 "REMOTE=%i\n",
-                s->user->uid,
-                s->user->name,
+                s->user->user_record->uid,
+                s->user->user_record->user_name,
                 session_is_active(s),
                 s->user->display == s,
                 session_state_to_string(session_get_state(s)),
@@ -233,6 +238,9 @@ int session_save(Session *s) {
 
         if (s->type >= 0)
                 fprintf(f, "TYPE=%s\n", session_type_to_string(s->type));
+
+        if (s->original_type >= 0)
+                fprintf(f, "ORIGINAL_TYPE=%s\n", session_type_to_string(s->original_type));
 
         if (s->class >= 0)
                 fprintf(f, "CLASS=%s\n", session_class_to_string(s->class));
@@ -396,6 +404,7 @@ int session_load(Session *s) {
                 *position = NULL,
                 *leader = NULL,
                 *type = NULL,
+                *original_type = NULL,
                 *class = NULL,
                 *uid = NULL,
                 *realtime = NULL,
@@ -427,6 +436,7 @@ int session_load(Session *s) {
                            "POSITION",       &position,
                            "LEADER",         &leader,
                            "TYPE",           &type,
+                           "ORIGINAL_TYPE",  &original_type,
                            "CLASS",          &class,
                            "UID",            &uid,
                            "REALTIME",       &realtime,
@@ -522,6 +532,16 @@ int session_load(Session *s) {
                 if (t >= 0)
                         s->type = t;
         }
+
+        if (original_type) {
+                SessionType ot;
+
+                ot = session_type_from_string(original_type);
+                if (ot >= 0)
+                        s->original_type = ot;
+        } else
+                /* Pre-v246 compat: initialize original_type if not set in the state file */
+                s->original_type = s->type;
 
         if (class) {
                 SessionClass c;
@@ -635,7 +655,7 @@ static int session_start_scope(Session *s, sd_bus_message *properties, sd_bus_er
                 if (!scope)
                         return log_oom();
 
-                description = strjoina("Session ", s->id, " of user ", s->user->name);
+                description = strjoina("Session ", s->id, " of user ", s->user->user_record->user_name);
 
                 r = manager_start_scope(
                                 s->manager,
@@ -643,20 +663,26 @@ static int session_start_scope(Session *s, sd_bus_message *properties, sd_bus_er
                                 s->leader,
                                 s->user->slice,
                                 description,
-                                STRV_MAKE(s->user->runtime_dir_service, s->user->service), /* These two have StopWhenUnneeded= set, hence add a dep towards them */
-                                STRV_MAKE("systemd-logind.service", "systemd-user-sessions.service", s->user->runtime_dir_service, s->user->service), /* And order us after some more */
-                                s->user->home,
+                                /* These two have StopWhenUnneeded= set, hence add a dep towards them */
+                                STRV_MAKE(s->user->runtime_dir_service,
+                                          s->user->service),
+                                /* And order us after some more */
+                                STRV_MAKE("systemd-logind.service",
+                                          "systemd-user-sessions.service",
+                                          s->user->runtime_dir_service,
+                                          s->user->service),
+                                user_record_home_directory(s->user->user_record),
                                 properties,
                                 error,
                                 &s->scope_job);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to start session scope %s: %s", scope, bus_error_message(error, r));
+                        return log_error_errno(r, "Failed to start session scope %s: %s",
+                                               scope, bus_error_message(error, r));
 
                 s->scope = TAKE_PTR(scope);
         }
 
-        if (s->scope)
-                (void) hashmap_put(s->manager->session_units, s->scope, s);
+        (void) hashmap_put(s->manager->session_units, s->scope, s);
 
         return 0;
 }
@@ -686,9 +712,9 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         log_struct(s->class == SESSION_BACKGROUND ? LOG_DEBUG : LOG_INFO,
                    "MESSAGE_ID=" SD_MESSAGE_SESSION_START_STR,
                    "SESSION_ID=%s", s->id,
-                   "USER_ID=%s", s->user->name,
+                   "USER_ID=%s", s->user->user_record->user_name,
                    "LEADER="PID_FMT, s->leader,
-                   LOG_MESSAGE("New session %s of user %s.", s->id, s->user->name));
+                   LOG_MESSAGE("New session %s of user %s.", s->id, s->user->user_record->user_name));
 
         if (!dual_timestamp_is_set(&s->timestamp))
                 dual_timestamp_get(&s->timestamp);
@@ -709,10 +735,9 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         /* Send signals */
         session_send_signal(s, true);
         user_send_changed(s->user, "Display", NULL);
-        if (s->seat) {
-                if (s->seat->active == s)
-                        seat_send_changed(s->seat, "ActiveSession", NULL);
-        }
+
+        if (s->seat && s->seat->active == s)
+                seat_send_changed(s->seat, "ActiveSession", NULL);
 
         return 0;
 }
@@ -738,9 +763,12 @@ static int session_stop_scope(Session *s, bool force) {
         s->scope_job = mfree(s->scope_job);
 
         /* Optionally, let's kill everything that's left now. */
-        if (force || manager_shall_kill(s->manager, s->user->name)) {
+        if (force ||
+            (s->user->user_record->kill_processes != 0 &&
+             (s->user->user_record->kill_processes > 0 ||
+              manager_shall_kill(s->manager, s->user->user_record->user_name)))) {
 
-                r = manager_stop_unit(s->manager, s->scope, &error, &s->scope_job);
+                r = manager_stop_unit(s->manager, s->scope, force ? "replace" : "fail", &error, &s->scope_job);
                 if (r < 0) {
                         if (force)
                                 return log_error_errno(r, "Failed to stop session scope: %s", bus_error_message(&error, r));
@@ -754,7 +782,7 @@ static int session_stop_scope(Session *s, bool force) {
                  * Session stop is quite significant on its own, let's log it. */
                 log_struct(s->class == SESSION_BACKGROUND ? LOG_DEBUG : LOG_INFO,
                            "SESSION_ID=%s", s->id,
-                           "USER_ID=%s", s->user->name,
+                           "USER_ID=%s", s->user->user_record->user_name,
                            "LEADER="PID_FMT, s->leader,
                            LOG_MESSAGE("Session %s logged out. Waiting for processes to exit.", s->id));
         }
@@ -812,7 +840,7 @@ int session_finalize(Session *s) {
                 log_struct(s->class == SESSION_BACKGROUND ? LOG_DEBUG : LOG_INFO,
                            "MESSAGE_ID=" SD_MESSAGE_SESSION_STOP_STR,
                            "SESSION_ID=%s", s->id,
-                           "USER_ID=%s", s->user->name,
+                           "USER_ID=%s", s->user->user_record->user_name,
                            "LEADER="PID_FMT, s->leader,
                            LOG_MESSAGE("Removed session %s.", s->id));
 
@@ -853,7 +881,7 @@ static int release_timeout_callback(sd_event_source *es, uint64_t usec, void *us
         assert(es);
         assert(s);
 
-        session_stop(s, false);
+        session_stop(s, /* force = */ false);
         return 0;
 }
 
@@ -866,11 +894,12 @@ int session_release(Session *s) {
         if (s->timer_event_source)
                 return 0;
 
-        return sd_event_add_time(s->manager->event,
-                                 &s->timer_event_source,
-                                 CLOCK_MONOTONIC,
-                                 usec_add(now(CLOCK_MONOTONIC), RELEASE_USEC), 0,
-                                 release_timeout_callback, s);
+        return sd_event_add_time_relative(
+                        s->manager->event,
+                        &s->timer_event_source,
+                        CLOCK_MONOTONIC,
+                        RELEASE_USEC, 0,
+                        release_timeout_callback, s);
 }
 
 bool session_is_active(Session *s) {
@@ -890,7 +919,7 @@ static int get_tty_atime(const char *tty, usec_t *atime) {
         assert(atime);
 
         if (!path_is_absolute(tty)) {
-                p = strappend("/dev/", tty);
+                p = path_join("/dev", tty);
                 if (!p)
                         return -ENOMEM;
 
@@ -920,63 +949,57 @@ static int get_process_ctty_atime(pid_t pid, usec_t *atime) {
 }
 
 int session_get_idle_hint(Session *s, dual_timestamp *t) {
-        usec_t atime = 0, n;
+        usec_t atime = 0;
         int r;
 
         assert(s);
 
-        /* Explicit idle hint is set */
-        if (s->idle_hint) {
+        /* Graphical sessions have an explicit idle hint */
+        if (SESSION_TYPE_IS_GRAPHICAL(s->type)) {
                 if (t)
                         *t = s->idle_hint_timestamp;
 
                 return s->idle_hint;
         }
 
-        /* Graphical sessions should really implement a real
-         * idle hint logic */
-        if (SESSION_TYPE_IS_GRAPHICAL(s->type))
-                goto dont_know;
-
-        /* For sessions with an explicitly configured tty, let's check
-         * its atime */
+        /* For sessions with an explicitly configured tty, let's check its atime */
         if (s->tty) {
                 r = get_tty_atime(s->tty, &atime);
                 if (r >= 0)
                         goto found_atime;
         }
 
-        /* For sessions with a leader but no explicitly configured
-         * tty, let's check the controlling tty of the leader */
+        /* For sessions with a leader but no explicitly configured tty, let's check the controlling tty of
+         * the leader */
         if (pid_is_valid(s->leader)) {
                 r = get_process_ctty_atime(s->leader, &atime);
                 if (r >= 0)
                         goto found_atime;
         }
 
-dont_know:
         if (t)
-                *t = s->idle_hint_timestamp;
+                *t = DUAL_TIMESTAMP_NULL;
 
-        return 0;
+        return false;
 
 found_atime:
         if (t)
                 dual_timestamp_from_realtime(t, atime);
 
-        n = now(CLOCK_REALTIME);
-
         if (s->manager->idle_action_usec <= 0)
-                return 0;
+                return false;
 
-        return atime + s->manager->idle_action_usec <= n;
+        return usec_add(atime, s->manager->idle_action_usec) <= now(CLOCK_REALTIME);
 }
 
-void session_set_idle_hint(Session *s, bool b) {
+int session_set_idle_hint(Session *s, bool b) {
         assert(s);
 
+        if (!SESSION_TYPE_IS_GRAPHICAL(s->type))
+                return -ENOTTY;
+
         if (s->idle_hint == b)
-                return;
+                return 0;
 
         s->idle_hint = b;
         dual_timestamp_get(&s->idle_hint_timestamp);
@@ -988,6 +1011,8 @@ void session_set_idle_hint(Session *s, bool b) {
 
         user_send_changed(s->user, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic", NULL);
         manager_send_changed(s->manager, "IdleHint", "IdleSinceHint", "IdleSinceHintMonotonic", NULL);
+
+        return 1;
 }
 
 int session_get_locked_hint(Session *s) {
@@ -1007,6 +1032,18 @@ void session_set_locked_hint(Session *s, bool b) {
         session_send_changed(s, "LockedHint", NULL);
 }
 
+void session_set_type(Session *s, SessionType t) {
+        assert(s);
+
+        if (s->type == t)
+                return;
+
+        s->type = t;
+        session_save(s);
+
+        session_send_changed(s, "Type", NULL);
+}
+
 static int session_dispatch_fifo(sd_event_source *es, int fd, uint32_t revents, void *userdata) {
         Session *s = userdata;
 
@@ -1016,7 +1053,7 @@ static int session_dispatch_fifo(sd_event_source *es, int fd, uint32_t revents, 
         /* EOF on the FIFO means the session died abnormally. */
 
         session_remove_fifo(s);
-        session_stop(s, false);
+        session_stop(s, /* force = */ false);
 
         return 1;
 }
@@ -1052,8 +1089,8 @@ int session_create_fifo(Session *s) {
                 if (r < 0)
                         return r;
 
-                /* Let's make sure we noticed dead sessions before we process new bus requests (which might create new
-                 * sessions). */
+                /* Let's make sure we noticed dead sessions before we process new bus requests (which might
+                 * create new sessions). */
                 r = sd_event_source_set_priority(s->fifo_event_source, SD_EVENT_PRIORITY_NORMAL-10);
                 if (r < 0)
                         return r;
@@ -1170,9 +1207,9 @@ static int session_open_vt(Session *s) {
         return s->vtfd;
 }
 
-int session_prepare_vt(Session *s) {
+static int session_prepare_vt(Session *s) {
         int vt, r;
-        struct vt_mode mode = { 0 };
+        struct vt_mode mode = {};
 
         if (s->vtnr < 1)
                 return 0;
@@ -1181,7 +1218,7 @@ int session_prepare_vt(Session *s) {
         if (vt < 0)
                 return vt;
 
-        r = fchown(vt, s->user->uid, -1);
+        r = fchown(vt, s->user->user_record->uid, -1);
         if (r < 0) {
                 r = log_error_errno(errno,
                                     "Cannot change owner of /dev/tty%u: %m",
@@ -1227,23 +1264,27 @@ error:
 }
 
 static void session_restore_vt(Session *s) {
-        int r, vt, old_fd;
+        int r;
 
-        /* We need to get a fresh handle to the virtual terminal,
-         * since the old file-descriptor is potentially in a hung-up
-         * state after the controlling process exited; we do a
-         * little dance to avoid having the terminal be available
-         * for reuse before we've cleaned it up.
-         */
-        old_fd = TAKE_FD(s->vtfd);
+        r = vt_restore(s->vtfd);
+        if (r == -EIO) {
+                int vt, old_fd;
 
-        vt = session_open_vt(s);
-        safe_close(old_fd);
+                /* It might happen if the controlling process exited before or while we were
+                 * restoring the VT as it would leave the old file-descriptor in a hung-up
+                 * state. In this case let's retry with a fresh handle to the virtual terminal. */
 
-        if (vt < 0)
-                return;
+                /* We do a little dance to avoid having the terminal be available
+                 * for reuse before we've cleaned it up. */
+                old_fd = TAKE_FD(s->vtfd);
 
-        r = vt_restore(vt);
+                vt = session_open_vt(s);
+                safe_close(old_fd);
+
+                if (vt >= 0)
+                        r = vt_restore(vt);
+        }
+
         if (r < 0)
                 log_warning_errno(r, "Failed to restore VT, ignoring: %m");
 
@@ -1290,9 +1331,8 @@ static void session_release_controller(Session *s, bool notify) {
 
         name = s->controller;
 
-        /* By resetting the controller before releasing the devices, we won't
-         * send notification signals. This avoids sending useless notifications
-         * if the controller is released on disconnects. */
+        /* By resetting the controller before releasing the devices, we won't send notification signals.
+         * This avoids sending useless notifications if the controller is released on disconnects. */
         if (!notify)
                 s->controller = NULL;
 
@@ -1370,6 +1410,7 @@ void session_drop_controller(Session *s) {
                 return;
 
         s->track = sd_bus_track_unref(s->track);
+        session_set_type(s, s->original_type);
         session_release_controller(s, false);
         session_save(s);
         session_restore_vt(s);
@@ -1377,43 +1418,43 @@ void session_drop_controller(Session *s) {
 
 static const char* const session_state_table[_SESSION_STATE_MAX] = {
         [SESSION_OPENING] = "opening",
-        [SESSION_ONLINE] = "online",
-        [SESSION_ACTIVE] = "active",
-        [SESSION_CLOSING] = "closing"
+        [SESSION_ONLINE]  = "online",
+        [SESSION_ACTIVE]  = "active",
+        [SESSION_CLOSING] = "closing",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(session_state, SessionState);
 
 static const char* const session_type_table[_SESSION_TYPE_MAX] = {
         [SESSION_UNSPECIFIED] = "unspecified",
-        [SESSION_TTY] = "tty",
-        [SESSION_X11] = "x11",
-        [SESSION_WAYLAND] = "wayland",
-        [SESSION_MIR] = "mir",
-        [SESSION_WEB] = "web",
+        [SESSION_TTY]         = "tty",
+        [SESSION_X11]         = "x11",
+        [SESSION_WAYLAND]     = "wayland",
+        [SESSION_MIR]         = "mir",
+        [SESSION_WEB]         = "web",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(session_type, SessionType);
 
 static const char* const session_class_table[_SESSION_CLASS_MAX] = {
-        [SESSION_USER] = "user",
-        [SESSION_GREETER] = "greeter",
+        [SESSION_USER]        = "user",
+        [SESSION_GREETER]     = "greeter",
         [SESSION_LOCK_SCREEN] = "lock-screen",
-        [SESSION_BACKGROUND] = "background"
+        [SESSION_BACKGROUND]  = "background",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(session_class, SessionClass);
 
 static const char* const kill_who_table[_KILL_WHO_MAX] = {
         [KILL_LEADER] = "leader",
-        [KILL_ALL] = "all"
+        [KILL_ALL]    = "all",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(kill_who, KillWho);
 
 static const char* const tty_validity_table[_TTY_VALIDITY_MAX] = {
-        [TTY_FROM_PAM] = "from-pam",
-        [TTY_FROM_UTMP] = "from-utmp",
+        [TTY_FROM_PAM]          = "from-pam",
+        [TTY_FROM_UTMP]         = "from-utmp",
         [TTY_UTMP_INCONSISTENT] = "utmp-inconsistent",
 };
 

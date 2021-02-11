@@ -1,37 +1,45 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
+
+#include <stdbool.h>
 
 #include "sd-netlink.h"
 
 #include "conf-parser.h"
 #include "ether-addr-util.h"
 #include "in-addr-util.h"
-#include "list.h"
-#include "macro.h"
+#include "networkd-util.h"
 
-typedef struct Neighbor Neighbor;
+typedef Manager Manager;
+typedef Network Network;
+typedef Link Link;
 
-#include "networkd-link.h"
-#include "networkd-network.h"
+union lladdr_union {
+        struct ether_addr mac;
+        union in_addr_union ip;
+};
 
-struct Neighbor {
+typedef struct Neighbor {
         Network *network;
         Link *link;
         NetworkConfigSection *section;
 
         int family;
         union in_addr_union in_addr;
-        bool mac_configured;
-        struct ether_addr mac;
+        union lladdr_union lladdr;
+        size_t lladdr_size;
+} Neighbor;
 
-        LIST_FIELDS(Neighbor, neighbors);
-};
+Neighbor *neighbor_free(Neighbor *neighbor);
 
-void neighbor_free(Neighbor *neighbor);
+void network_drop_invalid_neighbors(Network *network);
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(Neighbor*, neighbor_free);
+int link_set_neighbors(Link *link);
+int link_drop_neighbors(Link *link);
+int link_drop_foreign_neighbors(Link *link);
 
-int neighbor_configure(Neighbor *neighbor, Link *link, link_netlink_message_handler_t callback);
+int manager_rtnl_process_neighbor(sd_netlink *rtnl, sd_netlink_message *message, Manager *m);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_neighbor_address);
 CONFIG_PARSER_PROTOTYPE(config_parse_neighbor_hwaddr);
+CONFIG_PARSER_PROTOTYPE(config_parse_neighbor_lladdr);

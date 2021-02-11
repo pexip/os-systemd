@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <signal.h>
 #include <stdlib.h>
@@ -45,4 +45,17 @@ void ask_password_agent_close(void) {
         (void) kill_and_sigcont(agent_pid, SIGTERM);
         (void) wait_for_terminate(agent_pid, NULL);
         agent_pid = 0;
+}
+
+int ask_password_agent_open_if_enabled(BusTransport transport, bool ask_password) {
+
+        /* Open the ask password agent as a child process if necessary */
+
+        if (transport != BUS_TRANSPORT_LOCAL)
+                return 0;
+
+        if (!ask_password)
+                return 0;
+
+        return ask_password_agent_open();
 }

@@ -1,8 +1,8 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "acpi-fpdt.h"
 #include "boot-timestamps.h"
-#include "efivars.h"
+#include "efi-loader.h"
 #include "macro.h"
 #include "time-util.h"
 

@@ -1,14 +1,15 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include <inttypes.h>
 #include <linux/netlink.h>
+#include <linux/if_ether.h>
 #include <linux/if_infiniband.h>
 #include <linux/if_packet.h>
-#include <netinet/ether.h>
 #include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -40,6 +41,8 @@ union sockaddr_union {
         uint8_t un_buffer[sizeof(struct sockaddr_un) + 1];
 };
 
+#define SUN_PATH_LEN (sizeof(((struct sockaddr_un){}).sun_path))
+
 typedef struct SocketAddress {
         union sockaddr_union sockaddr;
 
@@ -67,12 +70,6 @@ typedef enum SocketAddressBindIPv6Only {
 const char* socket_address_type_to_string(int t) _const_;
 int socket_address_type_from_string(const char *s) _pure_;
 
-int socket_address_parse(SocketAddress *a, const char *s);
-int socket_address_parse_and_warn(SocketAddress *a, const char *s);
-int socket_address_parse_netlink(SocketAddress *a, const char *s);
-int socket_address_print(const SocketAddress *a, char **p);
-int socket_address_verify(const SocketAddress *a, bool strict) _pure_;
-
 int sockaddr_un_unlink(const struct sockaddr_un *sa);
 
 static inline int socket_address_unlink(const SocketAddress *a) {
@@ -93,11 +90,9 @@ int socket_address_listen(
                 mode_t directory_mode,
                 mode_t socket_mode,
                 const char *label);
-int make_socket_fd(int log_level, const char* address, int type, int flags);
 
-bool socket_address_is(const SocketAddress *a, const char *s, int type);
-bool socket_address_is_netlink(const SocketAddress *a, const char *s);
-
+int socket_address_verify(const SocketAddress *a, bool strict) _pure_;
+int socket_address_print(const SocketAddress *a, char **p);
 bool socket_address_matches_fd(const SocketAddress *a, int fd);
 
 bool socket_address_equal(const SocketAddress *a, const SocketAddress *b) _pure_;
@@ -123,13 +118,27 @@ int netlink_family_from_string(const char *s) _pure_;
 
 bool sockaddr_equal(const union sockaddr_union *a, const union sockaddr_union *b);
 
-int fd_inc_sndbuf(int fd, size_t n);
-int fd_inc_rcvbuf(int fd, size_t n);
+int fd_set_sndbuf(int fd, size_t n, bool increase);
+static inline int fd_inc_sndbuf(int fd, size_t n) {
+        return fd_set_sndbuf(fd, n, true);
+}
+int fd_set_rcvbuf(int fd, size_t n, bool increase);
+static inline int fd_inc_rcvbuf(int fd, size_t n) {
+        return fd_set_rcvbuf(fd, n, true);
+}
 
 int ip_tos_to_string_alloc(int i, char **s);
 int ip_tos_from_string(const char *s);
 
-bool ifname_valid(const char *p);
+typedef enum {
+      IFNAME_VALID_ALTERNATIVE = 1 << 0,
+      IFNAME_VALID_NUMERIC     = 1 << 1,
+      _IFNAME_VALID_ALL        = IFNAME_VALID_ALTERNATIVE | IFNAME_VALID_NUMERIC,
+} IfnameValidFlags;
+bool ifname_valid_full(const char *p, IfnameValidFlags flags);
+static inline bool ifname_valid(const char *p) {
+        return ifname_valid_full(p, 0);
+}
 bool address_label_valid(const char *p);
 
 int getpeercred(int fd, struct ucred *ucred);
@@ -160,6 +169,25 @@ int flush_accept(int fd);
 
 struct cmsghdr* cmsg_find(struct msghdr *mh, int level, int type, socklen_t length);
 
+/* Type-safe, dereferencing version of cmsg_find() */
+#define CMSG_FIND_DATA(mh, level, type, ctype) \
+        ({                                                            \
+                struct cmsghdr *_found;                               \
+                _found = cmsg_find(mh, level, type, CMSG_LEN(sizeof(ctype))); \
+                (ctype*) (_found ? CMSG_DATA(_found) : NULL);         \
+        })
+
+/* Resolves to a type that can carry cmsghdr structures. Make sure things are properly aligned, i.e. the type
+ * itself is placed properly in memory and the size is also aligned to what's appropriate for "cmsghdr"
+ * structures. */
+#define CMSG_BUFFER_TYPE(size)                                          \
+        union {                                                         \
+                struct cmsghdr cmsghdr;                                 \
+                uint8_t buf[size];                                      \
+                uint8_t align_check[(size) >= CMSG_SPACE(0) &&          \
+                                    (size) == CMSG_ALIGN(size) ? 1 : -1]; \
+        }
+
 /*
  * Certain hardware address types (e.g Infiniband) do not fit into sll_addr
  * (8 bytes) and run over the structure. This macro returns the correct size that
@@ -188,6 +216,35 @@ struct cmsghdr* cmsg_find(struct msghdr *mh, int level, int type, socklen_t leng
                          strnlen(_sa->sun_path, sizeof(_sa->sun_path))+1); \
         })
 
+#define SOCKADDR_LEN(sa)                                                \
+        ({                                                              \
+                const union sockaddr_union *__sa = &(sa);               \
+                size_t _len;                                            \
+                switch(__sa->sa.sa_family) {                            \
+                case AF_INET:                                           \
+                        _len = sizeof(struct sockaddr_in);              \
+                        break;                                          \
+                case AF_INET6:                                          \
+                        _len = sizeof(struct sockaddr_in6);             \
+                        break;                                          \
+                case AF_UNIX:                                           \
+                        _len = SOCKADDR_UN_LEN(__sa->un);               \
+                        break;                                          \
+                case AF_PACKET:                                         \
+                        _len = SOCKADDR_LL_LEN(__sa->ll);               \
+                        break;                                          \
+                case AF_NETLINK:                                        \
+                        _len = sizeof(struct sockaddr_nl);              \
+                        break;                                          \
+                case AF_VSOCK:                                          \
+                        _len = sizeof(struct sockaddr_vm);              \
+                        break;                                          \
+                default:                                                \
+                        assert_not_reached("invalid socket family");    \
+                }                                                       \
+                _len;                                                   \
+        })
+
 int socket_ioctl_fd(void);
 
 int sockaddr_un_set_path(struct sockaddr_un *ret, const char *path);
@@ -198,3 +255,17 @@ static inline int setsockopt_int(int fd, int level, int optname, int value) {
 
         return 0;
 }
+
+int socket_bind_to_ifname(int fd, const char *ifname);
+int socket_bind_to_ifindex(int fd, int ifindex);
+
+ssize_t recvmsg_safe(int sockfd, struct msghdr *msg, int flags);
+
+int socket_get_family(int fd, int *ret);
+int socket_set_recvpktinfo(int fd, int af, bool b);
+int socket_set_recverr(int fd, int af, bool b);
+int socket_set_recvttl(int fd, int af, bool b);
+int socket_set_ttl(int fd, int af, int ttl);
+int socket_set_unicast_if(int fd, int af, int ifi);
+int socket_set_freebind(int fd, int af, bool b);
+int socket_set_transparent(int fd, int af, bool b);

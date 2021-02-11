@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -16,17 +16,17 @@
 #include "fd-util.h"
 #include "io-util.h"
 #include "memfd-util.h"
+#include "memory-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
 #include "utf8.h"
-#include "util.h"
 
 static int message_append_basic(sd_bus_message *m, char type, const void *p, const void **stored);
 
 static void *adjust_pointer(const void *p, void *old_base, size_t sz, void *new_base) {
 
-        if (p == NULL)
+        if (!p)
                 return NULL;
 
         if (old_base == new_base)
@@ -45,12 +45,24 @@ static void message_free_part(sd_bus_message *m, struct bus_body_part *part) {
         assert(m);
         assert(part);
 
-        if (part->memfd >= 0)
+        if (part->memfd >= 0) {
+                /* erase if requested, but only if the memfd is not sealed yet, i.e. is writable */
+                if (m->sensitive && !m->sealed)
+                        explicit_bzero_safe(part->data, part->size);
+
                 close_and_munmap(part->memfd, part->mmap_begin, part->mapped);
-        else if (part->munmap_this)
+        } else if (part->munmap_this)
+                /* We don't erase sensitive data here, since the data is memory mapped from someone else, and
+                 * we just don't know if it's OK to write to it */
                 munmap(part->mmap_begin, part->mapped);
-        else if (part->free_this)
-                free(part->data);
+        else {
+                /* Erase this if that is requested. Since this is regular memory we know we can write it. */
+                if (m->sensitive)
+                        explicit_bzero_safe(part->data, part->size);
+
+                if (part->free_this)
+                        free(part->data);
+        }
 
         if (part != &m->body)
                 free(part);
@@ -113,12 +125,13 @@ static void message_reset_containers(sd_bus_message *m) {
 static sd_bus_message* message_free(sd_bus_message *m) {
         assert(m);
 
+        message_reset_parts(m);
+
         if (m->free_header)
                 free(m->header);
 
-        message_reset_parts(m);
-
-        sd_bus_unref(m->bus);
+        /* Note that we don't unref m->bus here. That's already done by sd_bus_message_unref() as each user
+         * reference to the bus message also is considered a reference to the bus connection itself. */
 
         if (m->free_fds) {
                 close_many(m->fds, m->n_fds);
@@ -135,8 +148,6 @@ static sd_bus_message* message_free(sd_bus_message *m) {
         bus_creds_done(&m->creds);
         return mfree(m);
 }
-
-DEFINE_TRIVIAL_CLEANUP_FUNC(sd_bus_message*, message_free);
 
 static void *message_extend_fields(sd_bus_message *m, size_t align, size_t sz, bool add_offset) {
         void *op, *np;
@@ -285,7 +296,7 @@ static int message_append_field_signature(
         /* dbus1 doesn't allow signatures over 8bit, let's enforce
          * this globally, to not risk convertability */
         l = strlen(s);
-        if (l > 255)
+        if (l > SD_BUS_MAXIMUM_SIGNATURE_LENGTH)
                 return -EINVAL;
 
         /* Signature "(yv)" where the variant contains "g" */
@@ -459,7 +470,6 @@ int bus_message_from_header(
         if (!m)
                 return -ENOMEM;
 
-        m->n_ref = 1;
         m->sealed = true;
         m->header = header;
         m->header_accessible = header_accessible;
@@ -513,7 +523,9 @@ int bus_message_from_header(
                 m->creds.mask |= SD_BUS_CREDS_SELINUX_CONTEXT;
         }
 
+        m->n_ref = 1;
         m->bus = sd_bus_ref(bus);
+
         *ret = TAKE_PTR(m);
 
         return 0;
@@ -528,7 +540,7 @@ int bus_message_from_malloc(
                 const char *label,
                 sd_bus_message **ret) {
 
-        _cleanup_(message_freep) sd_bus_message *m = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         size_t sz;
         int r;
 
@@ -573,25 +585,25 @@ _public_ int sd_bus_message_new(
                 sd_bus_message **m,
                 uint8_t type) {
 
-        sd_bus_message *t;
-
         assert_return(bus, -ENOTCONN);
+        assert_return(bus = bus_resolve(bus), -ENOPKG);
         assert_return(bus->state != BUS_UNSET, -ENOTCONN);
         assert_return(m, -EINVAL);
+        /* Creation of messages with _SD_BUS_MESSAGE_TYPE_INVALID is allowed. */
         assert_return(type < _SD_BUS_MESSAGE_TYPE_MAX, -EINVAL);
 
-        t = malloc0(ALIGN(sizeof(sd_bus_message)) + sizeof(struct bus_header));
+        sd_bus_message *t = malloc0(ALIGN(sizeof(sd_bus_message)) + sizeof(struct bus_header));
         if (!t)
                 return -ENOMEM;
 
         t->n_ref = 1;
+        t->bus = sd_bus_ref(bus);
         t->header = (struct bus_header*) ((uint8_t*) t + ALIGN(sizeof(struct sd_bus_message)));
         t->header->endian = BUS_NATIVE_ENDIAN;
         t->header->type = type;
         t->header->version = bus->message_version;
         t->allow_fds = bus->can_fds || !IN_SET(bus->state, BUS_HELLO, BUS_RUNNING);
         t->root_container.need_offsets = BUS_MESSAGE_IS_GVARIANT(t);
-        t->bus = sd_bus_ref(bus);
 
         if (bus->allow_interactive_authorization)
                 t->header->flags |= BUS_MESSAGE_ALLOW_INTERACTIVE_AUTHORIZATION;
@@ -611,6 +623,7 @@ _public_ int sd_bus_message_new_signal(
         int r;
 
         assert_return(bus, -ENOTCONN);
+        assert_return(bus = bus_resolve(bus), -ENOPKG);
         assert_return(bus->state != BUS_UNSET, -ENOTCONN);
         assert_return(object_path_is_valid(path), -EINVAL);
         assert_return(interface_name_is_valid(interface), -EINVAL);
@@ -647,10 +660,11 @@ _public_ int sd_bus_message_new_method_call(
                 const char *interface,
                 const char *member) {
 
-        _cleanup_(message_freep) sd_bus_message *t = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *t = NULL;
         int r;
 
         assert_return(bus, -ENOTCONN);
+        assert_return(bus = bus_resolve(bus), -ENOPKG);
         assert_return(bus->state != BUS_UNSET, -ENOTCONN);
         assert_return(!destination || service_name_is_valid(destination), -EINVAL);
         assert_return(object_path_is_valid(path), -EINVAL);
@@ -692,7 +706,7 @@ static int message_new_reply(
                 uint8_t type,
                 sd_bus_message **m) {
 
-        _cleanup_(message_freep) sd_bus_message *t = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *t = NULL;
         uint64_t cookie;
         int r;
 
@@ -727,6 +741,12 @@ static int message_new_reply(
         t->dont_send = !!(call->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED);
         t->enforced_reply_signature = call->enforced_reply_signature;
 
+        /* let's copy the sensitive flag over. Let's do that as a safety precaution to keep a transaction
+         * wholly sensitive if already the incoming message was sensitive. This is particularly useful when a
+         * vtable record sets the SD_BUS_VTABLE_SENSITIVE flag on a method call, since this means it applies
+         * to both the message call and the reply. */
+        t->sensitive = call->sensitive;
+
         *m = TAKE_PTR(t);
         return 0;
 }
@@ -743,7 +763,7 @@ _public_ int sd_bus_message_new_method_error(
                 sd_bus_message **m,
                 const sd_bus_error *e) {
 
-        _cleanup_(message_freep) sd_bus_message *t = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *t = NULL;
         int r;
 
         assert_return(sd_bus_error_is_set(e), -EINVAL);
@@ -846,7 +866,7 @@ int bus_message_new_synthetic_error(
                 const sd_bus_error *e,
                 sd_bus_message **m) {
 
-        _cleanup_(message_freep) sd_bus_message *t = NULL;
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *t = NULL;
         int r;
 
         assert(bus);
@@ -890,7 +910,79 @@ int bus_message_new_synthetic_error(
         return 0;
 }
 
-DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(sd_bus_message, sd_bus_message, message_free);
+_public_ sd_bus_message* sd_bus_message_ref(sd_bus_message *m) {
+        if (!m)
+                return NULL;
+
+        /* We are fine if this message so far was either explicitly reffed or not reffed but queued into at
+         * least one bus connection object. */
+        assert(m->n_ref > 0 || m->n_queued > 0);
+
+        m->n_ref++;
+
+        /* Each user reference to a bus message shall also be considered a ref on the bus */
+        sd_bus_ref(m->bus);
+        return m;
+}
+
+_public_ sd_bus_message* sd_bus_message_unref(sd_bus_message *m) {
+        if (!m)
+                return NULL;
+
+        assert(m->n_ref > 0);
+
+        sd_bus_unref(m->bus); /* Each regular ref is also a ref on the bus connection. Let's hence drop it
+                               * here. Note we have to do this before decrementing our own n_ref here, since
+                               * otherwise, if this message is currently queued sd_bus_unref() might call
+                               * bus_message_unref_queued() for this which might then destroy the message
+                               * while we are still processing it. */
+        m->n_ref--;
+
+        if (m->n_ref > 0 || m->n_queued > 0)
+                return NULL;
+
+        /* Unset the bus field if neither the user has a reference nor this message is queued. We are careful
+         * to reset the field only after the last reference to the bus is dropped, after all we might keep
+         * multiple references to the bus, once for each reference kept on ourselves. */
+        m->bus = NULL;
+
+        return message_free(m);
+}
+
+sd_bus_message* bus_message_ref_queued(sd_bus_message *m, sd_bus *bus) {
+        if (!m)
+                return NULL;
+
+        /* If this is a different bus than the message is associated with, then implicitly turn this into a
+         * regular reference. This means that you can create a memory leak by enqueuing a message generated
+         * on one bus onto another at the same time as enqueueing a message from the second one on the first,
+         * as we'll not detect the cyclic references there. */
+        if (bus != m->bus)
+                return sd_bus_message_ref(m);
+
+        assert(m->n_ref > 0 || m->n_queued > 0);
+        m->n_queued++;
+
+        return m;
+}
+
+sd_bus_message* bus_message_unref_queued(sd_bus_message *m, sd_bus *bus) {
+        if (!m)
+                return NULL;
+
+        if (bus != m->bus)
+                return sd_bus_message_unref(m);
+
+        assert(m->n_queued > 0);
+        m->n_queued--;
+
+        if (m->n_ref > 0 || m->n_queued > 0)
+                return NULL;
+
+        m->bus = NULL;
+
+        return message_free(m);
+}
 
 _public_ int sd_bus_message_get_type(sd_bus_message *m, uint8_t *type) {
         assert_return(m, -EINVAL);
@@ -1207,19 +1299,18 @@ static int message_add_offset(sd_bus_message *m, size_t offset) {
 }
 
 static void message_extend_containers(sd_bus_message *m, size_t expand) {
-        struct bus_container *c;
-
         assert(m);
 
         if (expand <= 0)
                 return;
 
-        /* Update counters */
-        for (c = m->containers; c < m->containers + m->n_containers; c++) {
+        if (m->n_containers <= 0)
+                return;
 
+        /* Update counters */
+        for (struct bus_container *c = m->containers; c < m->containers + m->n_containers; c++)
                 if (c->array_size)
                         *c->array_size += expand;
-        }
 }
 
 static void *message_extend_body(
@@ -1282,7 +1373,6 @@ static void *message_extend_body(
                         if (r < 0)
                                 return NULL;
                 } else {
-                        struct bus_container *c;
                         void *op;
                         size_t os, start_part, end_part;
 
@@ -1303,8 +1393,9 @@ static void *message_extend_body(
                         }
 
                         /* Readjust pointers */
-                        for (c = m->containers; c < m->containers + m->n_containers; c++)
-                                c->array_size = adjust_pointer(c->array_size, op, os, part->data);
+                        if (m->n_containers > 0)
+                                for (struct bus_container *c = m->containers; c < m->containers + m->n_containers; c++)
+                                        c->array_size = adjust_pointer(c->array_size, op, os, part->data);
 
                         m->error.message = (const char*) adjust_pointer(m->error.message, op, os, part->data);
                 }
@@ -2931,7 +3022,7 @@ int bus_body_part_map(struct bus_body_part *part) {
                 return 0;
         }
 
-        shift = part->memfd_offset - ((part->memfd_offset / page_size()) * page_size());
+        shift = PAGE_OFFSET(part->memfd_offset);
         psz = PAGE_ALIGN(part->size + shift);
 
         if (part->memfd >= 0)
@@ -3068,7 +3159,8 @@ static struct bus_body_part* find_part(sd_bus_message *m, size_t index, size_t s
                                 return NULL;
 
                         if (p)
-                                *p = (uint8_t*) part->data + index - begin;
+                                *p = part->data ? (uint8_t*) part->data + index - begin
+                                        : NULL; /* Avoid dereferencing a NULL pointer. */
 
                         m->cached_rindex_part = part;
                         m->cached_rindex_part_begin = begin;
@@ -3097,6 +3189,8 @@ static int container_next_item(sd_bus_message *m, struct bus_container *c, size_
                 int sz;
 
                 sz = bus_gvariant_get_size(c->signature);
+                if (sz == 0)
+                        return -EBADMSG;
                 if (sz < 0) {
                         int alignment;
 
@@ -4703,8 +4797,13 @@ _public_ int sd_bus_message_read_array(
         assert_return(!BUS_MESSAGE_NEED_BSWAP(m), -EOPNOTSUPP);
 
         r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, CHAR_TO_STR(type));
-        if (r <= 0)
+        if (r < 0)
                 return r;
+        if (r == 0) {
+                *ptr = NULL;
+                *size = 0;
+                return 0;
+        }
 
         c = message_get_last_container(m);
 
@@ -5079,7 +5178,7 @@ int bus_message_parse_fields(sd_bus_message *m) {
                                 return -EBADMSG;
 
                         if (*p == 0) {
-                                char *k;
+                                _cleanup_free_ char *k = NULL;
                                 size_t l;
 
                                 /* We found the beginning of the signature
@@ -5097,6 +5196,9 @@ int bus_message_parse_fields(sd_bus_message *m) {
                                 if (!k)
                                         return -ENOMEM;
 
+                                if (!signature_is_valid(k, true))
+                                        return -EBADMSG;
+
                                 free_and_replace(m->root_container.signature, k);
                                 break;
                         }
@@ -5109,29 +5211,34 @@ int bus_message_parse_fields(sd_bus_message *m) {
                  * table */
                 m->user_body_size = m->body_size - ((char*) m->footer + m->footer_accessible - p);
 
-                /* Pull out the offset table for the fields array */
-                sz = bus_gvariant_determine_word_size(m->fields_size, 0);
-                if (sz > 0) {
-                        size_t framing;
-                        void *q;
+                /* Pull out the offset table for the fields array, if any */
+                if (m->fields_size > 0) {
+                        sz = bus_gvariant_determine_word_size(m->fields_size, 0);
+                        if (sz > 0) {
+                                size_t framing;
+                                void *q;
 
-                        ri = m->fields_size - sz;
-                        r = message_peek_fields(m, &ri, 1, sz, &q);
-                        if (r < 0)
-                                return r;
+                                if (m->fields_size < sz)
+                                        return -EBADMSG;
 
-                        framing = bus_gvariant_read_word_le(q, sz);
-                        if (framing >= m->fields_size - sz)
-                                return -EBADMSG;
-                        if ((m->fields_size - framing) % sz != 0)
-                                return -EBADMSG;
+                                ri = m->fields_size - sz;
+                                r = message_peek_fields(m, &ri, 1, sz, &q);
+                                if (r < 0)
+                                        return r;
 
-                        ri = framing;
-                        r = message_peek_fields(m, &ri, 1, m->fields_size - framing, &offsets);
-                        if (r < 0)
-                                return r;
+                                framing = bus_gvariant_read_word_le(q, sz);
+                                if (framing >= m->fields_size - sz)
+                                        return -EBADMSG;
+                                if ((m->fields_size - framing) % sz != 0)
+                                        return -EBADMSG;
 
-                        n_offsets = (m->fields_size - framing) / sz;
+                                ri = framing;
+                                r = message_peek_fields(m, &ri, 1, m->fields_size - framing, &offsets);
+                                if (r < 0)
+                                        return r;
+
+                                n_offsets = (m->fields_size - framing) / sz;
+                        }
                 }
         } else
                 m->user_body_size = m->body_size;
@@ -5189,7 +5296,7 @@ int bus_message_parse_fields(sd_bus_message *m) {
                         if (!b)
                                 return -EBADMSG;
 
-                        sig = strndup(b+1, item_size - (b+1-(char*) q));
+                        sig = memdup_suffix0(b+1, item_size - (b+1-(char*) q));
                         if (!sig)
                                 return -ENOMEM;
 
@@ -5830,17 +5937,37 @@ int bus_message_remarshal(sd_bus *bus, sd_bus_message **m) {
 }
 
 _public_ int sd_bus_message_get_priority(sd_bus_message *m, int64_t *priority) {
+        static bool warned = false;
+
         assert_return(m, -EINVAL);
         assert_return(priority, -EINVAL);
 
-        *priority = m->priority;
+        if (!warned) {
+                log_debug("sd_bus_message_get_priority() is deprecated and always returns 0.");
+                warned = true;
+        }
+
+        *priority = 0;
         return 0;
 }
 
 _public_ int sd_bus_message_set_priority(sd_bus_message *m, int64_t priority) {
+        static bool warned = false;
+
         assert_return(m, -EINVAL);
         assert_return(!m->sealed, -EPERM);
 
-        m->priority = priority;
+        if (!warned) {
+                log_debug("sd_bus_message_set_priority() is deprecated and does nothing.");
+                warned = true;
+        }
+
+        return 0;
+}
+
+_public_ int sd_bus_message_sensitive(sd_bus_message *m) {
+        assert_return(m, -EINVAL);
+
+        m->sensitive = true;
         return 0;
 }

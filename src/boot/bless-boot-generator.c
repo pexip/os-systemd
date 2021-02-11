@@ -1,10 +1,10 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "efivars.h"
+#include "efi-loader.h"
 #include "generator.h"
 #include "log.h"
 #include "mkdir.h"

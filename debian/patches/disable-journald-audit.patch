@@ -9,10 +9,10 @@
  Before=sysinit.target
  
  [Service]
-@@ -28,7 +28,7 @@
- RestrictAddressFamilies=AF_UNIX AF_NETLINK
- RestrictNamespaces=yes
- RestrictRealtime=yes
+@@ -33,7 +33,7 @@
+ RestrictSUIDSGID=yes
+ RuntimeDirectory=systemd/journal
+ RuntimeDirectoryPreserve=yes
 -Sockets=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald-audit.socket
 +Sockets=systemd-journald.socket systemd-journald-dev-log.socket
  StandardOutput=null
@@ -20,8 +20,8 @@
  SystemCallErrorNumber=EPERM
 --- a/units/meson.build
 +++ b/units/meson.build
-@@ -92,8 +92,6 @@
-          'sockets.target.wants/'],
+@@ -113,8 +113,6 @@
+          'sysinit.target.wants/'],
          ['systemd-journal-gatewayd.socket',     'ENABLE_REMOTE HAVE_MICROHTTPD'],
          ['systemd-journal-remote.socket',       'ENABLE_REMOTE HAVE_MICROHTTPD'],
 -        ['systemd-journald-audit.socket',       '',

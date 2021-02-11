@@ -1,9 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
 #include "btrfs-util.h"
 #include "bus-common-errors.h"
-#include "bus-util.h"
+#include "bus-polkit.h"
 #include "fd-util.h"
 #include "io-util.h"
 #include "machine-image.h"
@@ -135,7 +135,6 @@ static int method_list_images(sd_bus_message *message, void *userdata, sd_bus_er
         _cleanup_hashmap_free_ Hashmap *images = NULL;
         Manager *m = userdata;
         Image *image;
-        Iterator i;
         int r;
 
         assert(message);
@@ -157,7 +156,7 @@ static int method_list_images(sd_bus_message *message, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        HASHMAP_FOREACH(image, images, i) {
+        HASHMAP_FOREACH(image, images) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error_state = SD_BUS_ERROR_NULL;
                 PortableState state = _PORTABLE_STATE_INVALID;
                 _cleanup_free_ char *p = NULL;
@@ -359,8 +358,8 @@ const sd_bus_vtable manager_vtable[] = {
         SD_BUS_METHOD("GetImage", "s", "o", method_get_image, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("ListImages", NULL, "a(ssbtttso)", method_list_images, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetImageOSRelease", "s", "a{ss}", method_get_image_os_release, SD_BUS_VTABLE_UNPRIVILEGED),
-        SD_BUS_METHOD("GetImageState", "s", "s", method_get_image_state, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("GetImageMetadata", "sas", "saya{say}", method_get_image_metadata, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_METHOD("GetImageState", "s", "s", method_get_image_state, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("AttachImage", "sassbs", "a(sss)", method_attach_image, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("DetachImage", "sb", "a(sss)", method_detach_image, SD_BUS_VTABLE_UNPRIVILEGED),
         SD_BUS_METHOD("RemoveImage", "s", NULL, method_remove_image, SD_BUS_VTABLE_UNPRIVILEGED),

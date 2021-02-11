@@ -1,10 +1,7 @@
 <?xml version='1.0'?> <!--*-nxml-*-->
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
-        "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
-
-<!--
-  SPDX-License-Identifier: LGPL-2.1+
--->
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
   <refentry id="journalctl"
             xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -377,9 +374,10 @@
                 <option>cat</option>
               </term>
               <listitem>
-                <para>generates a very terse output, only showing the
-                actual message of each journal entry with no metadata,
-                not even a timestamp.</para>
+                <para>generates a very terse output, only showing the actual message of each journal entry
+                with no metadata, not even a timestamp. If combined with the
+                <option>--output-fields=</option> option will output the listed fields for each log record,
+                instead of the message.</para>
               </listitem>
             </varlistentry>
 
@@ -401,10 +399,11 @@
       <varlistentry>
         <term><option>--output-fields=</option></term>
 
-        <listitem><para>A comma separated list of the fields which should be included in the output. This only has an
-        effect for the output modes which would normally show all fields (<option>verbose</option>,
-        <option>export</option>, <option>json</option>, <option>json-pretty</option>, <option>json-sse</option> and
-        <option>json-seq</option>). The <literal>__CURSOR</literal>, <literal>__REALTIME_TIMESTAMP</literal>,
+        <listitem><para>A comma separated list of the fields which should be included in the output. This has
+        an effect only for the output modes which would normally show all fields (<option>verbose</option>,
+        <option>export</option>, <option>json</option>, <option>json-pretty</option>,
+        <option>json-sse</option> and <option>json-seq</option>), as well as on <option>cat</option>. For the
+        former, the <literal>__CURSOR</literal>, <literal>__REALTIME_TIMESTAMP</literal>,
         <literal>__MONOTONIC_TIMESTAMP</literal>, and <literal>_BOOT_ID</literal> fields are always
         printed.</para></listitem>
       </varlistentry>
@@ -419,8 +418,13 @@
       <varlistentry>
         <term><option>--no-hostname</option></term>
 
-        <listitem><para>Don't show the hostname field of log messages originating from the local host. This switch only
-        has an effect on the <option>short</option> family of output modes (see above).</para></listitem>
+        <listitem><para>Don't show the hostname field of log messages originating from the local host. This
+        switch has an effect only on the <option>short</option> family of output modes (see above).
+        </para>
+
+        <para>Note: this option does not remove occurrences of the hostname from log entries themselves, so
+        it does not prevent the hostname from being visible in the logs.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -449,7 +453,7 @@
         <term><option>--quiet</option></term>
 
         <listitem><para>Suppresses all informational messages
-        (i.e. "-- Logs begin at …", "-- Reboot --"),
+        (i.e. "-- Journal begins at …", "-- Reboot --"),
         any warning messages regarding
         inaccessible system journals when run as a normal
         user.</para></listitem>
@@ -464,8 +468,8 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>-b <optional><replaceable>ID</replaceable></optional><optional><replaceable>±offset</replaceable></optional></option></term>
-        <term><option>--boot=<optional><replaceable>ID</replaceable></optional><optional><replaceable>±offset</replaceable></optional></option></term>
+        <term><option>-b <optional><optional><replaceable>ID</replaceable></optional><optional><replaceable>±offset</replaceable></optional>|<constant>all</constant></optional></option></term>
+        <term><option>--boot<optional>=<optional><replaceable>ID</replaceable></optional><optional><replaceable>±offset</replaceable></optional>|<constant>all</constant></optional></option></term>
 
         <listitem><para>Show messages from a specific boot. This will
         add a match for <literal>_BOOT_ID=</literal>.</para>
@@ -497,6 +501,10 @@
         <replaceable>offset</replaceable> is not specified, a value of
         zero is assumed, and the logs for the boot given by
         <replaceable>ID</replaceable> are shown.</para>
+
+        <para>The special argument <constant>all</constant> can be
+        used to negate the effect of an earlier use of
+        <option>-b</option>.</para>
         </listitem>
       </varlistentry>
 
@@ -543,7 +551,12 @@
         the unit
         (<literal>_SYSTEMD_UNIT=<replaceable>UNIT</replaceable></literal>),
         along with additional matches for messages from systemd and
-        messages about coredumps for the specified unit.</para>
+        messages about coredumps for the specified unit. A match
+        is also added for <literal>_SYSTEMD_SLICE=<replaceable>UNIT</replaceable></literal>,
+        such that if the provided <replaceable>UNIT</replaceable> is a
+        <citerefentry><refentrytitle>systemd.slice</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        unit, all logs of children of the slice will be shown.
+       </para>
 
         <para>This parameter can be specified multiple times.</para>
         </listitem>
@@ -557,7 +570,11 @@
         (<literal>_SYSTEMD_USER_UNIT=</literal> and
         <literal>_UID=</literal>) and additional matches for messages
         from session systemd and messages about coredumps for the
-        specified unit.</para>
+        specified unit. A match
+        is also added for <literal>_SYSTEMD_USER_SLICE=<replaceable>UNIT</replaceable></literal>,
+        such that if the provided <replaceable>UNIT</replaceable> is a
+        <citerefentry><refentrytitle>systemd.slice</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        unit, all logs of children of the unit will be shown.</para>
 
         <para>This parameter can be specified multiple times.</para>
         </listitem>
@@ -588,13 +605,23 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>--facility=</option></term>
+
+        <listitem><para>Filter output by syslog facility. Takes a comma-separated list of numbers or facility
+        names. The names are the usual syslog facilities as documented in
+        <citerefentry project='man-pages'><refentrytitle>syslog</refentrytitle><manvolnum>3</manvolnum></citerefentry>.
+        <option>--facility=help</option> may be used to display a list of known facility names and exit.
+        </para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>-g</option></term>
         <term><option>--grep=</option></term>
 
         <listitem><para>Filter output to entries where the <varname>MESSAGE=</varname>
         field matches the specified regular expression. PERL-compatible regular expressions
         are used, see
-        <citerefentry><refentrytitle>pcre2pattern</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+        <citerefentry project='url'><refentrytitle url='http://pcre.org/current/doc/html/pcre2pattern.html'>pcre2pattern</refentrytitle><manvolnum>3</manvolnum></citerefentry>
         for a detailed description of the syntax.</para>
 
         <para>If the pattern is all lowercase, matching is case insensitive.
@@ -606,7 +633,7 @@
       <varlistentry>
         <term><option>--case-sensitive<optional>=BOOLEAN</optional></option></term>
 
-        <listitem><para>Make pattern matching case sensitive or case insenstive.</para>
+        <listitem><para>Make pattern matching case sensitive or case insensitive.</para>
         </listitem>
       </varlistentry>
 
@@ -616,6 +643,17 @@
 
         <listitem><para>Start showing entries from the location in the
         journal specified by the passed cursor.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--cursor-file=<replaceable>FILE</replaceable></option></term>
+
+        <listitem><para>If <replaceable>FILE</replaceable> exists and contains a
+        cursor, start showing entries <emphasis>after</emphasis> this location.
+        Otherwise the show entries according the other given options. At the end,
+        write the cursor of the last entry to <replaceable>FILE</replaceable>. Use
+        this option to continually read the journal by sequentially calling
+        <command>journalctl</command>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -718,14 +756,39 @@
       <varlistentry>
         <term><option>--root=<replaceable>ROOT</replaceable></option></term>
 
-        <listitem><para>Takes a directory path as an argument. If
-        specified, journalctl will operate on journal directories and catalog file hierarchy
-        underneath the specified directory instead of the root
-        directory (e.g. <option>--update-catalog</option> will create
-        <filename><replaceable>ROOT</replaceable>/var/lib/systemd/catalog/database</filename>,
-        and journal files under <filename><replaceable>ROOT</replaceable>/run/journal</filename>
-        or <filename><replaceable>ROOT</replaceable>/var/log/journal</filename> will be displayed).
+        <listitem><para>Takes a directory path as an argument. If specified, <command>journalctl</command>
+        will operate on journal directories and catalog file hierarchy underneath the specified directory
+        instead of the root directory (e.g. <option>--update-catalog</option> will create
+        <filename><replaceable>ROOT</replaceable>/var/lib/systemd/catalog/database</filename>, and journal
+        files under <filename><replaceable>ROOT</replaceable>/run/journal/</filename> or
+        <filename><replaceable>ROOT</replaceable>/var/log/journal/</filename> will be displayed).
         </para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--image=<replaceable>IMAGE</replaceable></option></term>
+
+        <listitem><para>Takes a path to a disk image file or block device node. If specified,
+        <command>journalctl</command> will operate on the file system in the indicated disk image. This is
+        similar to <option>--root=</option> but operates on file systems stored in disk images or block
+        devices, thus providing an easy way to extract log data from disk images. The disk image should
+        either contain just a file system or a set of file systems within a GPT partition table, following
+        the <ulink url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions
+        Specification</ulink>. For further information on supported disk images, see
+        <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>'s
+        switch of the same name.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--namespace=<replaceable>NAMESPACE</replaceable></option></term>
+
+        <listitem><para>Takes a journal namespace identifier string as argument. If not specified the data
+        collected by the default namespace is shown. If specified shows the log data of the specified
+        namespace instead. If the namespace is specified as <literal>*</literal> data from all namespaces is
+        shown, interleaved. If the namespace identifier is prefixed with <literal>+</literal> data from the
+        specified namespace and the default namespace is shown, interleaved, but no other. For details about
+        journal namespaces see
+        <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -875,18 +938,34 @@
       <varlistentry>
         <term><option>--flush</option></term>
 
-        <listitem><para>Asks the journal daemon to flush any log data
-        stored in <filename>/run/log/journal</filename> into
-        <filename>/var/log/journal</filename>, if persistent storage
-        is enabled. This call does not return until the operation is
-        complete. Note that this call is idempotent: the data is only
-        flushed from <filename>/run/log/journal</filename> into
-        <filename>/var/log/journal</filename> once during system
-        runtime, and this command exits cleanly without executing any
-        operation if this has already happened. This command
-        effectively guarantees that all data is flushed to
-        <filename>/var/log/journal</filename> at the time it
-        returns.</para></listitem>
+        <listitem><para>Asks the journal daemon to flush any log data stored in
+        <filename>/run/log/journal/</filename> into <filename>/var/log/journal/</filename>, if persistent
+        storage is enabled. This call does not return until the operation is complete. Note that this call is
+        idempotent: the data is only flushed from <filename>/run/log/journal/</filename> into
+        <filename>/var/log/journal/</filename> once during system runtime (but see
+        <option>--relinquish-var</option> below), and this command exits cleanly without executing any
+        operation if this has already happened. This command effectively guarantees that all data is flushed
+        to <filename>/var/log/journal/</filename> at the time it returns.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--relinquish-var</option></term>
+
+        <listitem><para>Asks the journal daemon for the reverse operation to <option>--flush</option>: if
+        requested the daemon will write further log data to <filename>/run/log/journal/</filename> and stops
+        writing to <filename>/var/log/journal/</filename>. A subsequent call to <option>--flush</option>
+        causes the log output to switch back to <filename>/var/log/journal/</filename>, see
+        above.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--smart-relinquish-var</option></term>
+
+        <listitem><para>Similar to <option>--relinquish-var</option> but executes no operation if the root file
+        system and <filename>/var/lib/journal/</filename> reside on the same mount point. This operation is
+        used during system shutdown in order to make the journal daemon stop writing data to
+        <filename>/var/log/journal/</filename> in case that directory is located on a mount point that needs
+        to be unmounted.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -956,7 +1035,7 @@ journalctl _SYSTEMD_CGROUP=/user.slice/user-42.slice/session-c1.scope</programli
   + OBJECT_SYSTEMD_UNIT=<replaceable>name</replaceable>.service _UID=0
   + COREDUMP_UNIT=<replaceable>name</replaceable>.service _UID=0 MESSAGE_ID=fc2e22bc6ee647b6b90729ab34a250b1
     </programlisting>
-    (see <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+    (see <citerefentry><refentrytitle>systemd.journal-fields</refentrytitle><manvolnum>7</manvolnum></citerefentry>
     for an explanation of those patterns).
     </para>
 

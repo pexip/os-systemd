@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 /* linux/fs.h */
@@ -60,4 +60,8 @@
 /* linux/nsfs.h */
 #ifndef NS_GET_NSTYPE /* d95fa3c76a66b6d76b1e109ea505c55e66360f3c (4.11) */
 #define NS_GET_NSTYPE _IO(0xb7, 0x3)
+#endif
+
+#ifndef FS_PROJINHERIT_FL
+#define FS_PROJINHERIT_FL 0x20000000
 #endif

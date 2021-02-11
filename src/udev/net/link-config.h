@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 #include "sd-device.h"
@@ -12,13 +12,13 @@
 typedef struct link_config_ctx link_config_ctx;
 typedef struct link_config link_config;
 
-typedef enum MACPolicy {
-        MACPOLICY_PERSISTENT,
-        MACPOLICY_RANDOM,
-        MACPOLICY_NONE,
-        _MACPOLICY_MAX,
-        _MACPOLICY_INVALID = -1
-} MACPolicy;
+typedef enum MACAddressPolicy {
+        MAC_ADDRESS_POLICY_PERSISTENT,
+        MAC_ADDRESS_POLICY_RANDOM,
+        MAC_ADDRESS_POLICY_NONE,
+        _MAC_ADDRESS_POLICY_MAX,
+        _MAC_ADDRESS_POLICY_INVALID = -1
+} MACAddressPolicy;
 
 typedef enum NamePolicy {
         NAMEPOLICY_KERNEL,
@@ -36,53 +36,63 @@ struct link_config {
         char *filename;
 
         Set *match_mac;
+        Set *match_permanent_mac;
         char **match_path;
         char **match_driver;
         char **match_type;
         char **match_name;
-        Condition *match_host;
-        Condition *match_virt;
-        Condition *match_kernel_cmdline;
-        Condition *match_kernel_version;
-        Condition *match_arch;
+        char **match_property;
+        LIST_HEAD(Condition, conditions);
 
         char *description;
         struct ether_addr *mac;
-        MACPolicy mac_policy;
+        MACAddressPolicy mac_address_policy;
         NamePolicy *name_policy;
+        NamePolicy *alternative_names_policy;
         char *name;
+        char **alternative_names;
         char *alias;
         uint32_t mtu;
-        size_t speed;
+        uint64_t speed;
         Duplex duplex;
         int autonegotiation;
-        uint32_t advertise[2];
+        uint32_t advertise[N_ADVERTISE];
         WakeOnLan wol;
         NetDevPort port;
         int features[_NET_DEV_FEAT_MAX];
         netdev_channels channels;
+        netdev_ring_param ring;
+        int rx_flow_control;
+        int tx_flow_control;
+        int autoneg_flow_control;
 
         LIST_FIELDS(link_config, links);
 };
 
 int link_config_ctx_new(link_config_ctx **ret);
 void link_config_ctx_free(link_config_ctx *ctx);
+DEFINE_TRIVIAL_CLEANUP_FUNC(link_config_ctx*, link_config_ctx_free);
 
+int link_load_one(link_config_ctx *ctx, const char *filename);
 int link_config_load(link_config_ctx *ctx);
 bool link_config_should_reload(link_config_ctx *ctx);
 
-int link_config_get(link_config_ctx *ctx, sd_device *device, struct link_config **ret);
-int link_config_apply(link_config_ctx *ctx, struct link_config *config, sd_device *device, const char **name);
+int link_config_get(link_config_ctx *ctx, sd_device *device, link_config **ret);
+int link_config_apply(link_config_ctx *ctx, const link_config *config, sd_device *device, const char **ret_name);
 int link_get_driver(link_config_ctx *ctx, sd_device *device, char **ret);
 
 const char *name_policy_to_string(NamePolicy p) _const_;
 NamePolicy name_policy_from_string(const char *p) _pure_;
 
-const char *mac_policy_to_string(MACPolicy p) _const_;
-MACPolicy mac_policy_from_string(const char *p) _pure_;
+const char *alternative_names_policy_to_string(NamePolicy p) _const_;
+NamePolicy alternative_names_policy_from_string(const char *p) _pure_;
+
+const char *mac_address_policy_to_string(MACAddressPolicy p) _const_;
+MACAddressPolicy mac_address_policy_from_string(const char *p) _pure_;
 
 /* gperf lookup function */
 const struct ConfigPerfItem* link_config_gperf_lookup(const char *key, GPERF_LEN_TYPE length);
 
-CONFIG_PARSER_PROTOTYPE(config_parse_mac_policy);
+CONFIG_PARSER_PROTOTYPE(config_parse_mac_address_policy);
 CONFIG_PARSER_PROTOTYPE(config_parse_name_policy);
+CONFIG_PARSER_PROTOTYPE(config_parse_alternative_names_policy);

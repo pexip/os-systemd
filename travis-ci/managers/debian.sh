@@ -9,13 +9,25 @@
 # export CONT_NAME="my-fancy-container"
 # travis-ci/managers/debian.sh SETUP RUN CLEANUP
 
-PHASES=(${@:-SETUP RUN RUN_ASAN CLEANUP})
+PHASES=(${@:-SETUP RUN RUN_ASAN_UBSAN CLEANUP})
 DEBIAN_RELEASE="${DEBIAN_RELEASE:-testing}"
-CONT_NAME="${CONT_NAME:-debian-$DEBIAN_RELEASE-$RANDOM}"
+CONT_NAME="${CONT_NAME:-systemd-debian-$DEBIAN_RELEASE}"
 DOCKER_EXEC="${DOCKER_EXEC:-docker exec -it $CONT_NAME}"
 DOCKER_RUN="${DOCKER_RUN:-docker run}"
 REPO_ROOT="${REPO_ROOT:-$PWD}"
-ADDITIONAL_DEPS=(python3-libevdev python3-pyparsing clang)
+ADDITIONAL_DEPS=(
+    clang
+    fdisk
+    libfdisk-dev
+    libp11-kit-dev
+    libpwquality-dev
+    libssl-dev
+    libzstd-dev
+    perl
+    python3-libevdev
+    python3-pyparsing
+    zstd
+)
 
 function info() {
     echo -e "\033[33;1m$1\033[0m"
@@ -32,27 +44,34 @@ for phase in "${PHASES[@]}"; do
             info "Using Debian $DEBIAN_RELEASE"
             printf "FROM debian:$DEBIAN_RELEASE\nRUN bash -c 'apt-get -y update && apt-get install -y systemd'\n" | docker build -t debian-with-systemd/latest -
             info "Starting container $CONT_NAME"
-            $DOCKER_RUN -v $REPO_ROOT:/build:rw \
+            $DOCKER_RUN -v $REPO_ROOT:/build:rw -e container=docker \
                         -w /build --privileged=true --name $CONT_NAME \
-                        -dit --net=host debian-with-systemd/latest /usr/bin/systemd
+                        -dit --net=host debian-with-systemd/latest /bin/systemd
             $DOCKER_EXEC bash -c "echo deb-src http://deb.debian.org/debian $DEBIAN_RELEASE main >>/etc/apt/sources.list"
+            # Wait for the container to properly boot up, otherwise we were
+            # running following apt-get commands during the initializing/starting
+            # (early/late bootup) phase, which caused nasty race conditions
+            $DOCKER_EXEC bash -c 'systemctl is-system-running --wait || :'
             $DOCKER_EXEC apt-get -y update
             $DOCKER_EXEC apt-get -y build-dep systemd
             $DOCKER_EXEC apt-get -y install "${ADDITIONAL_DEPS[@]}"
             ;;
-        RUN|RUN_CLANG)
+        RUN|RUN_GCC|RUN_CLANG)
             if [[ "$phase" = "RUN_CLANG" ]]; then
                 ENV_VARS="-e CC=clang -e CXX=clang++"
+                MESON_ARGS="--optimization=1"
             fi
-            docker exec $ENV_VARS -it $CONT_NAME meson --werror -Dtests=unsafe -Dslow-tests=true -Dsplit-usr=true build
+            docker exec $ENV_VARS -it $CONT_NAME meson --werror -Dtests=unsafe -Dslow-tests=true -Dfuzz-tests=true -Dsplit-usr=true -Dman=true $MESON_ARGS build
             $DOCKER_EXEC ninja -v -C build
             docker exec -e "TRAVIS=$TRAVIS" -it $CONT_NAME ninja -C build test
-            $DOCKER_EXEC tools/check-directives.sh
             ;;
-        RUN_ASAN|RUN_CLANG_ASAN)
-            if [[ "$phase" = "RUN_CLANG_ASAN" ]]; then
+        RUN_ASAN_UBSAN|RUN_GCC_ASAN_UBSAN|RUN_CLANG_ASAN_UBSAN)
+            if [[ "$phase" = "RUN_CLANG_ASAN_UBSAN" ]]; then
                 ENV_VARS="-e CC=clang -e CXX=clang++"
-                MESON_ARGS="-Db_lundef=false" # See https://github.com/mesonbuild/meson/issues/764
+                # Build fuzzer regression tests only with clang (for now),
+                # see: https://github.com/systemd/systemd/pull/15886#issuecomment-632689604
+                # -Db_lundef=false: See https://github.com/mesonbuild/meson/issues/764
+                MESON_ARGS="-Db_lundef=false -Dfuzz-tests=true --optimization=1"
             fi
             docker exec $ENV_VARS -it $CONT_NAME meson --werror -Dtests=unsafe -Db_sanitize=address,undefined -Dsplit-usr=true $MESON_ARGS build
             $DOCKER_EXEC ninja -v -C build

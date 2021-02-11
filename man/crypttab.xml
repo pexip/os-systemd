@@ -1,15 +1,16 @@
 <?xml version="1.0"?>
 <!--*-nxml-*-->
-<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN" "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!--
-  SPDX-License-Identifier: LGPL-2.1+
+  SPDX-License-Identifier: LGPL-2.1-or-later
 
   This is based on crypttab(5) from Fedora's initscripts package, which in
   turn is based on Debian's version.
 
   The Red Hat version has been written by Miloslav Trmac <mitr@redhat.com>.
 -->
-<refentry id="crypttab" conditional='HAVE_LIBCRYPTSETUP'>
+<refentry id="crypttab" conditional='HAVE_LIBCRYPTSETUP' xmlns:xi="http://www.w3.org/2001/XInclude">
 
   <refentryinfo>
     <title>crypttab</title>
@@ -40,7 +41,7 @@
     character are ignored. Each of the remaining lines describes one
     encrypted block device. Fields are delimited by white space.</para>
 
-    <para>Each line is in the form<programlisting><replaceable>name</replaceable> <replaceable>encrypted-device</replaceable> <replaceable>password</replaceable> <replaceable>options</replaceable></programlisting>
+    <para>Each line is in the form<programlisting><replaceable>volume-name</replaceable> <replaceable>encrypted-device</replaceable> <replaceable>key-file</replaceable> <replaceable>options</replaceable></programlisting>
     The first two fields are mandatory, the remaining two are
     optional.</para>
 
@@ -52,24 +53,22 @@
     it is opened as a LUKS device; otherwise, it is assumed to be in
     raw dm-crypt (plain mode) format.</para>
 
-    <para>The first field contains the name of the resulting encrypted
-    block device; the device is set up within
-    <filename>/dev/mapper/</filename>.</para>
+    <para>The first field contains the name of the resulting encrypted volume; its block device is set up
+    below <filename>/dev/mapper/</filename>.</para>
 
     <para>The second field contains a path to the underlying block
     device or file, or a specification of a block device via
     <literal>UUID=</literal> followed by the UUID.</para>
 
-    <para>The third field specifies the encryption password. If the
-    field is not present or the password is set to
-    <literal>none</literal> or <literal>-</literal>, the password has
-    to be manually entered during system boot. Otherwise, the field is
-    interpreted as an absolute path to a file containing the encryption
-    password. For swap encryption, <filename>/dev/urandom</filename>
-    or the hardware device <filename>/dev/hw_random</filename> can be
-    used as the password file; using <filename>/dev/random</filename>
-    may prevent boot completion if the system does not have enough
-    entropy to generate a truly random encryption key.</para>
+    <para>The third field specifies an absolute path to a file with the encryption key. Optionally,
+    the path may be followed by <literal>:</literal> and an fstab device specification (e.g. starting with
+    <literal>LABEL=</literal> or similar); in which case the path is taken relative to the device file system
+    root. If the field is not present or is <literal>none</literal> or <literal>-</literal>, a key file
+    named after the volume to unlock (i.e. the first column of the line), suffixed with
+    <filename>.key</filename> is automatically loaded from the <filename>/etc/cryptsetup-keys.d/</filename>
+    and <filename>/run/cryptsetup-keys.d/</filename> directories, if present. Otherwise, the password has to
+    be manually entered during system boot. For swap encryption, <filename>/dev/urandom</filename> may be
+    used as key file.</para>
 
     <para>The fourth field, if present, is a comma-delimited list of
     options. The following options are recognized:</para>
@@ -79,12 +78,12 @@
       <varlistentry>
         <term><option>cipher=</option></term>
 
-        <listitem><para>Specifies the cipher to use. See
-        <citerefentry project='die-net'><refentrytitle>cryptsetup</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        for possible values and the default value of this option. A
-        cipher with unpredictable IV values, such as
-        <literal>aes-cbc-essiv:sha256</literal>, is
-        recommended.</para></listitem>
+        <listitem><para>Specifies the cipher to use. See <citerefentry
+        project='die-net'><refentrytitle>cryptsetup</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        for possible values and the default value of this option. A cipher with unpredictable IV values, such
+        as <literal>aes-cbc-essiv:sha256</literal>, is recommended. Embedded commas in the cipher
+        specification need to be escaped by preceding them with a backslash, see example below.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -113,7 +112,12 @@
         relevant for LUKS devices. See
         <citerefentry project='die-net'><refentrytitle>cryptsetup</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         for possible values and the default value of this
-        option.</para></listitem>
+        option.</para>
+
+        <para>Optionally, the path may be followed by <literal>:</literal> and an fstab device specification
+        (e.g. starting with <literal>UUID=</literal> or similar); in which case, the path is relative to the
+        device file system root. The device gets mounted automatically for LUKS device activation duration only.
+        </para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -138,6 +142,15 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>keyfile-erase</option></term>
+
+        <listitem><para>If enabled, the specified key file is erased after the volume is activated or when
+        activation fails. This is in particular useful when the key file is only acquired transiently before
+        activation (e.g. via a file in <filename>/run/</filename>, generated by a service running before
+        activation), and shall be removed after use. Defaults to off.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>key-slot=</option></term>
 
         <listitem><para>Specifies the key slot to compare the
@@ -151,6 +164,17 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>keyfile-timeout=</option></term>
+
+        <listitem><para> Specifies the timeout for the device on
+        which the key file resides and falls back to a password if
+        it could not be mounted. See
+        <citerefentry><refentrytitle>systemd-cryptsetup-generator</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        for key files on external devices.
+        </para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>luks</option></term>
 
         <listitem><para>Force LUKS mode. When this mode is used, the
@@ -158,6 +182,13 @@
         LUKS header on the device: <option>cipher=</option>,
         <option>hash=</option>,
         <option>size=</option>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>bitlk</option></term>
+
+        <listitem><para>Decrypt Bitlocker drive. Encryption parameters
+        are deduced by cryptsetup from Bitlocker header.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -196,11 +227,11 @@
         <term><option>nofail</option></term>
 
         <listitem><para>This device will not be a hard dependency of
-        <filename>cryptsetup.target</filename>. It'll be still pulled in and started, but the system
+        <filename>cryptsetup.target</filename>. It'll still be pulled in and started, but the system
         will not wait for the device to show up and be unlocked, and boot will not fail if this is
         unsuccessful. Note that other units that depend on the unlocked device may still fail. In
-        particular, if the device is used for a mount point, the mount point itself is also needs to
-        have <option>noauto</option> option, or the boot will fail if the device is not unlocked
+        particular, if the device is used for a mount point, the mount point itself also needs to
+        have the <option>nofail</option> option, or the boot will fail if the device is not unlocked
         successfully.</para></listitem>
       </varlistentry>
 
@@ -222,6 +253,47 @@
 
         <listitem><para>Set up the encrypted block device in read-only
         mode.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>same-cpu-crypt</option></term>
+
+        <listitem><para>Perform encryption using the same cpu that IO was submitted on. The default is to use
+        an unbound workqueue so that encryption work is automatically balanced between available CPUs.</para>
+
+        <para>This requires kernel 4.0 or newer.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>submit-from-crypt-cpus</option></term>
+
+        <listitem><para>Disable offloading writes to a separate thread after encryption. There are some
+        situations where offloading write requests from the encryption threads to a dedicated thread degrades
+        performance significantly. The default is to offload write requests to a dedicated thread because it
+        benefits the CFQ scheduler to have writes submitted using the same context.</para>
+
+        <para>This requires kernel 4.0 or newer.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>no-read-workqueue</option></term>
+
+        <listitem><para>Bypass dm-crypt internal workqueue and process read requests synchronously. The
+        default is to queue these requests and process them asynchronously.</para>
+
+        <para>This requires kernel 5.9 or newer.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><option>no-write-workqueue</option></term>
+
+        <listitem><para>Bypass dm-crypt internal workqueue and process write requests synchronously. The
+        default is to queue these requests and process them asynchronously.</para>
+
+        <para>This requires kernel 5.9 or newer.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -356,18 +428,17 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>tmp</option></term>
+        <term><option>tmp=</option></term>
 
-        <listitem><para>The encrypted block device will be prepared
-        for using it as <filename>/tmp</filename>; it will be
-        formatted using
-        <citerefentry project='man-pages'><refentrytitle>mke2fs</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
-        This option implies <option>plain</option>.</para>
+        <listitem><para>The encrypted block device will be prepared for using it as
+        <filename>/tmp/</filename>; it will be formatted using <citerefentry
+        project='man-pages'><refentrytitle>mkfs</refentrytitle><manvolnum>8</manvolnum></citerefentry>. Takes
+        a file system type as argument, such as <literal>ext4</literal>, <literal>xfs</literal> or
+        <literal>btrfs</literal>. If no argument is specified defaults to <literal>ext4</literal>. This
+        option implies <option>plain</option>.</para>
 
-        <para>WARNING: Using the <option>tmp</option> option will
-        destroy the contents of the named partition during every boot,
-        so make sure the underlying block device is specified
-        correctly.</para></listitem>
+        <para>WARNING: Using the <option>tmp</option> option will destroy the contents of the named partition
+        during every boot, so make sure the underlying block device is specified correctly.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -381,9 +452,31 @@
       <varlistentry>
         <term><option>verify</option></term>
 
-        <listitem><para> If the encryption password is read from
-        console, it has to be entered twice to prevent
-        typos.</para></listitem>
+        <listitem><para>If the encryption password is read from console, it has to be entered twice to
+        prevent typos.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>pkcs11-uri=</option></term>
+
+        <listitem><para>Takes a <ulink url="https://tools.ietf.org/html/rfc7512">RFC7512 PKCS#11 URI</ulink>
+        pointing to a private RSA key which is used to decrypt the key specified in the third column of the
+        line. This is useful for unlocking encrypted volumes through security tokens or smartcards. See below
+        for an example how to set up this mechanism for unlocking a LUKS volume with a YubiKey security
+        token. The specified URI can refer directly to a private RSA key stored on a token or alternatively
+        just to a slot or token, in which case a search for a suitable private RSA key will be performed.  In
+        this case if multiple suitable objects are found the token is refused. The key configured in the
+        third column is passed as is to RSA decryption. The resulting decrypted key is then base64 encoded
+        before it is used to unlock the LUKS volume.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>try-empty-password=</option></term>
+
+        <listitem><para>Takes a boolean argument. If enabled, right before asking the user for a password it
+        is first attempted to unlock the volume with an empty password. This is useful for systems that are
+        initialized with an encrypted volume with only an empty password set, which shall be replaced with a
+        suitable password during first boot, but after activation.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -399,6 +492,25 @@
         </para></listitem>
       </varlistentry>
 
+      <varlistentry>
+        <term><option>x-initrd.attach</option></term>
+
+        <listitem><para>Setup this encrypted block device in the initramfs, similarly to
+        <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+        units marked with <option>x-initrd.mount</option>.</para>
+
+        <para>Although it's not necessary to mark the mount entry for the root file system with
+        <option>x-initrd.mount</option>, <option>x-initrd.attach</option> is still recommended with
+        the encrypted block device containing the root file system as otherwise systemd will
+        attempt to detach the device during the regular system shutdown while it's still in
+        use. With this option the device will still be detached but later after the root file
+        system is unmounted.</para>
+
+        <para>All other encrypted block devices that contain file systems mounted in the initramfs
+        should use this option.</para>
+        </listitem>
+      </varlistentry>
+
     </variablelist>
 
     <para>At early boot and when the system manager configuration is
@@ -407,17 +519,43 @@
   </refsect1>
 
   <refsect1>
-    <title>Example</title>
+    <title>Examples</title>
     <example>
       <title>/etc/crypttab example</title>
-      <para>Set up four encrypted block devices. One using LUKS for
-      normal storage, another one for usage as a swap device and two
-      TrueCrypt volumes.</para>
+      <para>Set up four encrypted block devices. One using LUKS for normal storage, another one for usage as
+      a swap device and two TrueCrypt volumes. For the fourth device, the option string is interpreted as two
+      options <literal>cipher=xchacha12,aes-adiantum-plain64</literal>,
+      <literal>keyfile-timeout=10s</literal>.</para>
 
       <programlisting>luks       UUID=2505567a-9e27-4efe-a4d5-15ad146c258b
 swap       /dev/sda7       /dev/urandom       swap
 truecrypt  /dev/sda2       /etc/container_password  tcrypt
-hidden     /mnt/tc_hidden  /dev/null    tcrypt-hidden,tcrypt-keyfile=/etc/keyfile</programlisting>
+hidden     /mnt/tc_hidden  /dev/null    tcrypt-hidden,tcrypt-keyfile=/etc/keyfile
+external   /dev/sda3       keyfile:LABEL=keydev keyfile-timeout=10s,cipher=xchacha12\,aes-adiantum-plain64
+</programlisting>
+    </example>
+
+    <example>
+      <title>Yubikey-based Volume Unlocking Example</title>
+
+      <para>The PKCS#11 logic allows hooking up any compatible security token that is capable of storing RSA
+      decryption keys. Here's an example how to set up a Yubikey security token for this purpose, using
+      <citerefentry project='debian'><refentrytitle>ykmap</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+      from the yubikey-manager project:</para>
+
+<programlisting><xi:include href="yubikey-crypttab.sh" parse="text" /></programlisting>
+
+<para>A few notes on the above:</para>
+
+<itemizedlist>
+  <listitem><para>We use RSA (and not ECC), since Yubikeys support PKCS#11 Decrypt() only for RSA keys</para></listitem>
+  <listitem><para>We use RSA2048, which is the longest key size current Yubikeys support</para></listitem>
+  <listitem><para>LUKS key size must be shorter than 2048bit due to RSA padding, hence we use 128 bytes</para></listitem>
+  <listitem><para>We use Yubikey key slot 9d, since that's apparently the keyslot to use for decryption purposes,
+  <ulink url="https://developers.yubico.com/PIV/Introduction/Certificate_slots.html">see
+  documentation</ulink>.</para></listitem>
+</itemizedlist>
+
     </example>
   </refsect1>
 

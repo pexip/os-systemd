@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
 typedef struct Mount Mount;
@@ -59,8 +59,11 @@ struct Mount {
         bool lazy_unmount;
         bool force_unmount;
 
+        bool read_write_only;
+
         MountResult result;
         MountResult reload_result;
+        MountResult clean_result;
 
         mode_t directory_mode;
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-2.1+
+# SPDX-License-Identifier: LGPL-2.1-or-later
 #
 # systemd is free software; you can redistribute it and/or modify it
 # under the terms of the GNU Lesser General Public License as published by
@@ -52,8 +52,8 @@ def test_invalids(*, user):
     test_line('w /unresolved/argument/sandwich - - - - "%v%Y%v"', user=user)
     test_line('w /unresolved/filename/%Y - - - - "whatever"', user=user)
     test_line('w /unresolved/filename/sandwich/%v%Y%v - - - - "whatever"', user=user)
-    test_line('w - - - - - "no file specfied"', user=user)
-    test_line('C - - - - - "no file specfied"', user=user)
+    test_line('w - - - - - "no file specified"', user=user)
+    test_line('C - - - - - "no file specified"', user=user)
     test_line('C non/absolute/path - - - - -', user=user)
     test_line('b - - - - - -', user=user)
     test_line('b 1234 - - - - -', user=user)

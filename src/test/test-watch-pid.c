@@ -1,10 +1,9 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "log.h"
 #include "manager.h"
 #include "rm-rf.h"
 #include "service.h"
-#include "test-helper.h"
 #include "tests.h"
 
 int main(int argc, char *argv[]) {
@@ -17,11 +16,14 @@ int main(int argc, char *argv[]) {
 
         if (getuid() != 0)
                 return log_tests_skipped("not root");
-        r = enter_cgroup_subroot();
+        r = enter_cgroup_subroot(NULL);
         if (r == -ENOMEDIUM)
                 return log_tests_skipped("cgroupfs not available");
 
-        assert_se(set_unit_path(get_testdata_dir()) >= 0);
+        _cleanup_free_ char *unit_dir = NULL;
+        assert_se(get_testdata_dir("units/", &unit_dir) >= 0);
+        assert_se(set_unit_path(unit_dir) >= 0);
+
         assert_se(runtime_dir = setup_fake_runtime_dir());
 
         assert_se(manager_new(UNIT_FILE_USER, MANAGER_TEST_RUN_BASIC, &m) >= 0);
@@ -42,25 +44,25 @@ int main(int argc, char *argv[]) {
         assert_se(hashmap_isempty(m->watch_pids));
         assert_se(manager_get_unit_by_pid(m, 4711) == NULL);
 
-        assert_se(unit_watch_pid(a, 4711) >= 0);
+        assert_se(unit_watch_pid(a, 4711, false) >= 0);
         assert_se(manager_get_unit_by_pid(m, 4711) == a);
 
-        assert_se(unit_watch_pid(a, 4711) >= 0);
+        assert_se(unit_watch_pid(a, 4711, false) >= 0);
         assert_se(manager_get_unit_by_pid(m, 4711) == a);
 
-        assert_se(unit_watch_pid(b, 4711) >= 0);
+        assert_se(unit_watch_pid(b, 4711, false) >= 0);
         u = manager_get_unit_by_pid(m, 4711);
         assert_se(u == a || u == b);
 
-        assert_se(unit_watch_pid(b, 4711) >= 0);
+        assert_se(unit_watch_pid(b, 4711, false) >= 0);
         u = manager_get_unit_by_pid(m, 4711);
         assert_se(u == a || u == b);
 
-        assert_se(unit_watch_pid(c, 4711) >= 0);
+        assert_se(unit_watch_pid(c, 4711, false) >= 0);
         u = manager_get_unit_by_pid(m, 4711);
         assert_se(u == a || u == b || u == c);
 
-        assert_se(unit_watch_pid(c, 4711) >= 0);
+        assert_se(unit_watch_pid(c, 4711, false) >= 0);
         u = manager_get_unit_by_pid(m, 4711);
         assert_se(u == a || u == b || u == c);
 

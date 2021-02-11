@@ -1,4 +1,7 @@
-/* SPDX-License-Identifier: LGPL-2.1+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <unistd.h>
+#include <sys/types.h>
 
 #include "bus-internal.h"
 #include "bus-message.h"
@@ -7,12 +10,12 @@
 #include "bus-util.h"
 #include "string-util.h"
 
-_public_ int sd_bus_emit_signal(
+_public_ int sd_bus_emit_signalv(
                 sd_bus *bus,
                 const char *path,
                 const char *interface,
                 const char *member,
-                const char *types, ...) {
+                const char *types, va_list ap) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         int r;
@@ -29,11 +32,7 @@ _public_ int sd_bus_emit_signal(
                 return r;
 
         if (!isempty(types)) {
-                va_list ap;
-
-                va_start(ap, types);
                 r = sd_bus_message_appendv(m, types, ap);
-                va_end(ap);
                 if (r < 0)
                         return r;
         }
@@ -41,7 +40,24 @@ _public_ int sd_bus_emit_signal(
         return sd_bus_send(bus, m, NULL);
 }
 
-_public_ int sd_bus_call_method_async(
+_public_ int sd_bus_emit_signal(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *member,
+                const char *types, ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, types);
+        r = sd_bus_emit_signalv(bus, path, interface, member, types, ap);
+        va_end(ap);
+
+        return r;
+}
+
+_public_ int sd_bus_call_method_asyncv(
                 sd_bus *bus,
                 sd_bus_slot **slot,
                 const char *destination,
@@ -50,7 +66,7 @@ _public_ int sd_bus_call_method_async(
                 const char *member,
                 sd_bus_message_handler_t callback,
                 void *userdata,
-                const char *types, ...) {
+                const char *types, va_list ap) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         int r;
@@ -67,11 +83,7 @@ _public_ int sd_bus_call_method_async(
                 return r;
 
         if (!isempty(types)) {
-                va_list ap;
-
-                va_start(ap, types);
                 r = sd_bus_message_appendv(m, types, ap);
-                va_end(ap);
                 if (r < 0)
                         return r;
         }
@@ -79,7 +91,28 @@ _public_ int sd_bus_call_method_async(
         return sd_bus_call_async(bus, slot, m, callback, userdata, 0);
 }
 
-_public_ int sd_bus_call_method(
+_public_ int sd_bus_call_method_async(
+                sd_bus *bus,
+                sd_bus_slot **slot,
+                const char *destination,
+                const char *path,
+                const char *interface,
+                const char *member,
+                sd_bus_message_handler_t callback,
+                void *userdata,
+                const char *types, ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, types);
+        r = sd_bus_call_method_asyncv(bus, slot, destination, path, interface, member, callback, userdata, types, ap);
+        va_end(ap);
+
+        return r;
+}
+
+_public_ int sd_bus_call_methodv(
                 sd_bus *bus,
                 const char *destination,
                 const char *path,
@@ -87,12 +120,13 @@ _public_ int sd_bus_call_method(
                 const char *member,
                 sd_bus_error *error,
                 sd_bus_message **reply,
-                const char *types, ...) {
+                const char *types, va_list ap) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         int r;
 
         bus_assert_return(bus, -EINVAL, error);
+        bus_assert_return(bus = bus_resolve(bus), -ENOPKG, error);
         bus_assert_return(!bus_pid_changed(bus), -ECHILD, error);
 
         if (!BUS_IS_OPEN(bus->state)) {
@@ -105,11 +139,7 @@ _public_ int sd_bus_call_method(
                 goto fail;
 
         if (!isempty(types)) {
-                va_list ap;
-
-                va_start(ap, types);
                 r = sd_bus_message_appendv(m, types, ap);
-                va_end(ap);
                 if (r < 0)
                         goto fail;
         }
@@ -120,9 +150,29 @@ fail:
         return sd_bus_error_set_errno(error, r);
 }
 
-_public_ int sd_bus_reply_method_return(
-                sd_bus_message *call,
+_public_ int sd_bus_call_method(
+                sd_bus *bus,
+                const char *destination,
+                const char *path,
+                const char *interface,
+                const char *member,
+                sd_bus_error *error,
+                sd_bus_message **reply,
                 const char *types, ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, types);
+        r = sd_bus_call_methodv(bus, destination, path, interface, member, error, reply, types, ap);
+        va_end(ap);
+
+        return r;
+}
+
+_public_ int sd_bus_reply_method_returnv(
+                sd_bus_message *call,
+                const char *types, va_list ap) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         int r;
@@ -144,16 +194,26 @@ _public_ int sd_bus_reply_method_return(
                 return r;
 
         if (!isempty(types)) {
-                va_list ap;
-
-                va_start(ap, types);
                 r = sd_bus_message_appendv(m, types, ap);
-                va_end(ap);
                 if (r < 0)
                         return r;
         }
 
         return sd_bus_send(call->bus, m, NULL);
+}
+
+_public_ int sd_bus_reply_method_return(
+                sd_bus_message *call,
+                const char *types, ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, types);
+        r = sd_bus_reply_method_returnv(call, types, ap);
+        va_end(ap);
+
+        return r;
 }
 
 _public_ int sd_bus_reply_method_error(
@@ -183,14 +243,13 @@ _public_ int sd_bus_reply_method_error(
         return sd_bus_send(call->bus, m, NULL);
 }
 
-_public_ int sd_bus_reply_method_errorf(
+_public_ int sd_bus_reply_method_errorfv(
                 sd_bus_message *call,
                 const char *name,
                 const char *format,
-                ...) {
+                va_list ap) {
 
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        va_list ap;
 
         assert_return(call, -EINVAL);
         assert_return(call->sealed, -EPERM);
@@ -204,11 +263,25 @@ _public_ int sd_bus_reply_method_errorf(
         if (call->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED)
                 return 0;
 
-        va_start(ap, format);
         bus_error_setfv(&error, name, format, ap);
-        va_end(ap);
 
         return sd_bus_reply_method_error(call, &error);
+}
+
+_public_ int sd_bus_reply_method_errorf(
+                sd_bus_message *call,
+                const char *name,
+                const char *format,
+                ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, format);
+        r = sd_bus_reply_method_errorfv(call, name, format, ap);
+        va_end(ap);
+
+        return r;
 }
 
 _public_ int sd_bus_reply_method_errno(
@@ -238,14 +311,13 @@ _public_ int sd_bus_reply_method_errno(
         return sd_bus_reply_method_error(call, &berror);
 }
 
-_public_ int sd_bus_reply_method_errnof(
+_public_ int sd_bus_reply_method_errnofv(
                 sd_bus_message *call,
                 int error,
                 const char *format,
-                ...) {
+                va_list ap) {
 
         _cleanup_(sd_bus_error_free) sd_bus_error berror = SD_BUS_ERROR_NULL;
-        va_list ap;
 
         assert_return(call, -EINVAL);
         assert_return(call->sealed, -EPERM);
@@ -259,11 +331,25 @@ _public_ int sd_bus_reply_method_errnof(
         if (call->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED)
                 return 0;
 
-        va_start(ap, format);
         sd_bus_error_set_errnofv(&berror, error, format, ap);
-        va_end(ap);
 
         return sd_bus_reply_method_error(call, &berror);
+}
+
+_public_ int sd_bus_reply_method_errnof(
+                sd_bus_message *call,
+                int error,
+                const char *format,
+                ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, format);
+        r = sd_bus_reply_method_errnofv(call, error, format, ap);
+        va_end(ap);
+
+        return r;
 }
 
 _public_ int sd_bus_get_property(
@@ -280,6 +366,7 @@ _public_ int sd_bus_get_property(
         int r;
 
         bus_assert_return(bus, -EINVAL, error);
+        bus_assert_return(bus = bus_resolve(bus), -ENOPKG, error);
         bus_assert_return(isempty(interface) || interface_name_is_valid(interface), -EINVAL, error);
         bus_assert_return(member_name_is_valid(member), -EINVAL, error);
         bus_assert_return(reply, -EINVAL, error);
@@ -291,7 +378,10 @@ _public_ int sd_bus_get_property(
                 goto fail;
         }
 
-        r = sd_bus_call_method(bus, destination, path, "org.freedesktop.DBus.Properties", "Get", error, &rep, "ss", strempty(interface), member);
+        r = sd_bus_call_method(bus, destination, path,
+                               "org.freedesktop.DBus.Properties", "Get",
+                               error, &rep,
+                               "ss", strempty(interface), member);
         if (r < 0)
                 return r;
 
@@ -321,6 +411,7 @@ _public_ int sd_bus_get_property_trivial(
         int r;
 
         bus_assert_return(bus, -EINVAL, error);
+        bus_assert_return(bus = bus_resolve(bus), -ENOPKG, error);
         bus_assert_return(isempty(interface) || interface_name_is_valid(interface), -EINVAL, error);
         bus_assert_return(member_name_is_valid(member), -EINVAL, error);
         bus_assert_return(bus_type_is_trivial(type), -EINVAL, error);
@@ -365,6 +456,7 @@ _public_ int sd_bus_get_property_string(
         int r;
 
         bus_assert_return(bus, -EINVAL, error);
+        bus_assert_return(bus = bus_resolve(bus), -ENOPKG, error);
         bus_assert_return(isempty(interface) || interface_name_is_valid(interface), -EINVAL, error);
         bus_assert_return(member_name_is_valid(member), -EINVAL, error);
         bus_assert_return(ret, -EINVAL, error);
@@ -413,6 +505,7 @@ _public_ int sd_bus_get_property_strv(
         int r;
 
         bus_assert_return(bus, -EINVAL, error);
+        bus_assert_return(bus = bus_resolve(bus), -ENOPKG, error);
         bus_assert_return(isempty(interface) || interface_name_is_valid(interface), -EINVAL, error);
         bus_assert_return(member_name_is_valid(member), -EINVAL, error);
         bus_assert_return(ret, -EINVAL, error);
@@ -441,20 +534,20 @@ fail:
         return sd_bus_error_set_errno(error, r);
 }
 
-_public_ int sd_bus_set_property(
+_public_ int sd_bus_set_propertyv(
                 sd_bus *bus,
                 const char *destination,
                 const char *path,
                 const char *interface,
                 const char *member,
                 sd_bus_error *error,
-                const char *type, ...) {
+                const char *type, va_list ap) {
 
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        va_list ap;
         int r;
 
         bus_assert_return(bus, -EINVAL, error);
+        bus_assert_return(bus = bus_resolve(bus), -ENOPKG, error);
         bus_assert_return(isempty(interface) || interface_name_is_valid(interface), -EINVAL, error);
         bus_assert_return(member_name_is_valid(member), -EINVAL, error);
         bus_assert_return(signature_is_single(type, false), -EINVAL, error);
@@ -477,9 +570,7 @@ _public_ int sd_bus_set_property(
         if (r < 0)
                 goto fail;
 
-        va_start(ap, type);
         r = sd_bus_message_appendv(m, type, ap);
-        va_end(ap);
         if (r < 0)
                 goto fail;
 
@@ -493,13 +584,34 @@ fail:
         return sd_bus_error_set_errno(error, r);
 }
 
-_public_ int sd_bus_query_sender_creds(sd_bus_message *call, uint64_t mask, sd_bus_creds **creds) {
+_public_ int sd_bus_set_property(
+                sd_bus *bus,
+                const char *destination,
+                const char *path,
+                const char *interface,
+                const char *member,
+                sd_bus_error *error,
+                const char *type, ...) {
+
+        va_list ap;
+        int r;
+
+        va_start(ap, type);
+        r = sd_bus_set_propertyv(bus, destination, path, interface, member, error, type, ap);
+        va_end(ap);
+
+        return r;
+}
+
+_public_ int sd_bus_query_sender_creds(sd_bus_message *call, uint64_t mask, sd_bus_creds **ret) {
         sd_bus_creds *c;
+        int r;
 
         assert_return(call, -EINVAL);
         assert_return(call->sealed, -EPERM);
         assert_return(call->bus, -EINVAL);
         assert_return(!bus_pid_changed(call->bus), -ECHILD);
+        assert_return(ret, -EINVAL);
 
         if (!BUS_IS_OPEN(call->bus->state))
                 return -ENOTCONN;
@@ -508,7 +620,7 @@ _public_ int sd_bus_query_sender_creds(sd_bus_message *call, uint64_t mask, sd_b
 
         /* All data we need? */
         if (c && (mask & ~c->mask) == 0) {
-                *creds = sd_bus_creds_ref(c);
+                *ret = sd_bus_creds_ref(c);
                 return 0;
         }
 
@@ -519,15 +631,22 @@ _public_ int sd_bus_query_sender_creds(sd_bus_message *call, uint64_t mask, sd_b
 
                 if (call->sender)
                         /* There's a sender, but the creds are missing. */
-                        return sd_bus_get_name_creds(call->bus, call->sender, mask, creds);
+                        return sd_bus_get_name_creds(call->bus, call->sender, mask, ret);
                 else
                         /* There's no sender. For direct connections
                          * the credentials of the AF_UNIX peer matter,
                          * which may be queried via sd_bus_get_owner_creds(). */
-                        return sd_bus_get_owner_creds(call->bus, mask, creds);
+                        return sd_bus_get_owner_creds(call->bus, mask, ret);
         }
 
-        return bus_creds_extend_by_pid(c, mask, creds);
+        r = bus_creds_extend_by_pid(c, mask, ret);
+        if (r == -ESRCH) {
+                /* Process doesn't exist anymore? propagate the few things we have */
+                *ret = sd_bus_creds_ref(c);
+                return 0;
+        }
+
+        return r;
 }
 
 _public_ int sd_bus_query_sender_privilege(sd_bus_message *call, int capability) {
