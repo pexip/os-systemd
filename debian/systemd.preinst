@@ -19,3 +19,15 @@ if [ "$1" = "upgrade" ] && dpkg --compare-versions "$2" lt-nl "245.4-2~"; then
     rm -f /etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service
     # Don't bother with cleaning up the systemd-timesync group
 fi
+
+# Stop dodgy units that will cause new version of systemd to spin upon upgrade
+if [ "$1" = "upgrade" ] && dpkg --compare-versions "$2" lt-nl "247.3-1pexip2"; then
+    pex_path_units=$(systemctl list-unit-files --type=path | awk '/.*\.path/ { print $1; }')
+
+    for pex_unit in ${pex_path_units}; do
+        pex_unit_path=$(systemctl show -p FragmentPath "${pex_unit}" | sed 's/FragmentPath=//')
+        if grep -q '^PathExists' "${pex_unit_path}"; then
+            systemctl stop "${pex_unit}"
+        fi
+    done
+fi

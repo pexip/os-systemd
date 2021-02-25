@@ -1,3 +1,9 @@
+systemd (247.3-1pexip2) pexip; urgency=medium
+
+  * Stop broken path units before upgrade
+
+ -- Huw Jones <huw@pexip.com>  Thu, 25 Feb 2021 16:02:26 +0000
+
 systemd (247.3-1pexip1) pexip; urgency=medium
 
   * New upstream release
