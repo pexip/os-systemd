@@ -1,3 +1,19 @@
+systemd (247.3-6pexip1) pexip; urgency=medium
+
+  * New upstream release with security fix
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Mon, 26 Jul 2021 10:41:15 +0100
+
+systemd (247.3-6) unstable; urgency=high
+
+  * Non-maintainer upload (acked by maintainers)
+  * unit-name: generate a clear error code when converting an overly long fs
+    path to a unit name
+  * basic/unit-name: do not use strdupa() on a path (CVE-2021-33910)
+  * basic/unit-name: adjust comments
+
+ -- Salvatore Bonaccorso <carnil@debian.org>  Tue, 13 Jul 2021 19:29:24 +0200
+
 systemd (247.3-5pexip1) pexip; urgency=medium
 
   * New upstream release
