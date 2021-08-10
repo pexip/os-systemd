@@ -1,0 +1,31 @@
+commit 795125cd1142c0eee7138d72bad2ff344e1b5468
+Author: Lennart Poettering <lennart@poettering.net>
+Date:   Tue May 25 23:08:50 2021 +0200
+
+    core: log about all errors in path_spec_watch()
+    
+    So far we logged about most, but not all errors. Adding log to all
+    errors.
+
+diff --git a/src/core/path.c b/src/core/path.c
+index 0512287baf..355f6c645d 100644
+--- a/src/core/path.c
++++ b/src/core/path.c
+@@ -55,13 +55,15 @@ int path_spec_watch(PathSpec *s, sd_event_io_handler_t handler) {
+ 
+         s->inotify_fd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
+         if (s->inotify_fd < 0) {
+-                r = -errno;
++                r = log_error_errno(errno, "Failed to allocate inotify fd: %m");
+                 goto fail;
+         }
+ 
+         r = sd_event_add_io(s->unit->manager->event, &s->event_source, s->inotify_fd, EPOLLIN, handler, s);
+-        if (r < 0)
++        if (r < 0) {
++                log_error_errno(r, "Failed to add inotify fd to event loop: %m");
+                 goto fail;
++        }
+ 
+         (void) sd_event_source_set_description(s->event_source, "path");
+ 

@@ -34,4 +34,4 @@ debian/test-disable-DnsmasqClientTest.test_resolved_etc_hosts-in.patch
 debian/Downgrade-a-couple-of-warnings-to-debug.patch
 pexip/disable-journald-audit.patch
 pexip/install-avoid-utf8.patch
-
+pexip/log_inotify_errors.patch
