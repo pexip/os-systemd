@@ -1,0 +1,119 @@
+diff --git a/src/core/path.c b/src/core/path.c
+index ca3a91d..d20b595 100644
+--- a/src/core/path.c
++++ b/src/core/path.c
+@@ -197,9 +197,13 @@ static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_no
+ 
+         case PATH_CHANGED:
+         case PATH_MODIFIED:
++                log_debug("%d: initial %d, from_trigger_notify %d, previous_exists %d",
++                                __LINE__, initial, from_trigger_notify, s->previous_exists);
+                 b = access(s->path, F_OK) >= 0;
+                 good = !initial && !from_trigger_notify && b != s->previous_exists;
++                log_debug("%d: initial %d, from_trigger_notify %d, previous_exists %d, b %d, good %d",
++                                __LINE__, initial, from_trigger_notify, s->previous_exists, b, good);
+                 s->previous_exists = b;
+                 break;
+ 
+         default:
+@@ -442,10 +446,12 @@ static int path_coldplug(Unit *u) {
+ 
+         if (p->deserialized_state != p->state) {
+ 
+-                if (IN_SET(p->deserialized_state, PATH_WAITING, PATH_RUNNING))
++                if (IN_SET(p->deserialized_state, PATH_WAITING, PATH_RUNNING)) {
++                        log_unit_debug(UNIT(p), "%d: calling path_enter_waiting()",  __LINE__);
+                         path_enter_waiting(p, true, false);
+-                else
++                } else {
+                         path_set_state(p, p->deserialized_state);
++                }
+         }
+ 
+         return 0;
+@@ -483,6 +489,9 @@ static void path_enter_running(Path *p) {
+         if (r < 0)
+                 goto fail;
+ 
++        log_unit_debug(UNIT(p), "%d: setting PATH_RUNNING",
++                        __LINE__);
++
+         path_set_state(p, PATH_RUNNING);
+         path_unwatch(p);
+ 
+@@ -498,9 +507,14 @@ static bool path_check_good(Path *p, bool initial, bool from_trigger_notify) {
+ 
+         assert(p);
+ 
+-        LIST_FOREACH(spec, s, p->specs)
+-                if (path_spec_check_good(s, initial, from_trigger_notify))
++        LIST_FOREACH(spec, s, p->specs) {
++                log_debug("%d: initial %d, from_trigger_notify %d",
++                                __LINE__, initial, from_trigger_notify);
++                if (path_spec_check_good(s, initial, from_trigger_notify)) {
++                        log_debug("%d returning true",  __LINE__);
+                         return true;
++                }
++        }
+ 
+         return false;
+ }
+@@ -512,11 +526,14 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
+         /* If the triggered unit is already running, so are we */
+         trigger = UNIT_TRIGGER(UNIT(p));
+         if (trigger && !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(trigger))) {
++                log_unit_debug(UNIT(p), "%d: already triggered!",  __LINE__);
+                 path_set_state(p, PATH_RUNNING);
+                 path_unwatch(p);
+                 return;
+         }
+ 
++        log_unit_debug(UNIT(p), "%d: initial %d, from_trigger_notify %d",
++                        __LINE__, initial, from_trigger_notify);
+         if (path_check_good(p, initial, from_trigger_notify)) {
+                 log_unit_debug(UNIT(p), "Got triggered.");
+                 path_enter_running(p);
+@@ -531,6 +548,8 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
+          * might have appeared/been removed by now, so we must
+          * recheck */
+ 
++        log_unit_debug(UNIT(p), "%d: initial %d, from_trigger_notify %d",
++                        __LINE__, initial, from_trigger_notify);
+         if (path_check_good(p, false, from_trigger_notify)) {
+                 log_unit_debug(UNIT(p), "Got triggered.");
+                 path_enter_running(p);
+@@ -581,6 +600,7 @@ static int path_start(Unit *u) {
+         path_mkdir(p);
+ 
+         p->result = PATH_SUCCESS;
++        log_unit_debug(u, "%d: calling path_enter_waiting()",  __LINE__);
+         path_enter_waiting(p, true, false);
+ 
+         return 1;
+@@ -592,6 +612,7 @@ static int path_stop(Unit *u) {
+         assert(p);
+         assert(IN_SET(p->state, PATH_WAITING, PATH_RUNNING));
+ 
++        log_unit_debug(u, "%d: calling path_enter_dead()",  __LINE__);
+         path_enter_dead(p, PATH_SUCCESS);
+         return 1;
+ }
+@@ -620,6 +641,8 @@ static int path_serialize(Unit *u, FILE *f, FDSet *fds) {
+                                              type,
+                                              s->previous_exists,
+                                              escaped);
++                log_unit_debug(u, "%d serialized previous_exists %d",
++                                __LINE__, s->previous_exists);
+         }
+ 
+         return 0;
+@@ -662,6 +685,9 @@ static int path_deserialize_item(Unit *u, const char *key, const char *value, FD
+                         PathType type;
+                         PathSpec *s;
+ 
++                        log_unit_debug(u, "%d deserialized previous_exists %d",
++                                        __LINE__, previous_exists);
++
+                         type = path_type_from_string(type_str);
+                         if (type < 0) {
+                                 log_unit_warning(u, "Unknown path type \"%s\", ignoring.", type_str);

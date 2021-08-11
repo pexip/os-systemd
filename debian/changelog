@@ -1,3 +1,9 @@
+systemd (247.3-6pexip3) pexip; urgency=medium
+
+  * Add massive amounts of debug for path unit handling. #23012
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Wed, 11 Aug 2021 16:27:21 +0100
+
 systemd (247.3-6pexip2) pexip; urgency=medium
 
   * Add a patch from upstream to pick up on inotify failures. #23012.

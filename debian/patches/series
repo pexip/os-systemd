@@ -35,3 +35,4 @@ debian/Downgrade-a-couple-of-warnings-to-debug.patch
 pexip/disable-journald-audit.patch
 pexip/install-avoid-utf8.patch
 pexip/log_inotify_errors.patch
+pexip/path_debug.patch
