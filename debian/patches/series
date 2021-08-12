@@ -36,3 +36,4 @@ pexip/disable-journald-audit.patch
 pexip/install-avoid-utf8.patch
 pexip/log_inotify_errors.patch
 pexip/path_debug.patch
+pexip/log_inotify_overflow.patch
