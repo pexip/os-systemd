@@ -1,3 +1,13 @@
+systemd (247.3-6pexip4) pexip; urgency=medium
+
+  [Steve McIntyre]
+  * Add patch to log when inotify queue overflows
+
+  [John-Mark Bell]
+  * Add patch to close race in path units when being coldplugged. #23012
+
+ -- John-Mark Bell <jmb@pexip.com>  Thu, 12 Aug 2021 20:28:30 +0100
+
 systemd (247.3-6pexip3) pexip; urgency=medium
 
   * Add massive amounts of debug for path unit handling. #23012

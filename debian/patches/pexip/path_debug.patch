@@ -2,16 +2,18 @@ diff --git a/src/core/path.c b/src/core/path.c
 index ca3a91d..d20b595 100644
 --- a/src/core/path.c
 +++ b/src/core/path.c
-@@ -197,9 +197,13 @@ static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_no
+@@ -197,11 +197,15 @@ static bool path_spec_check_good(PathSpec *s, PathWaitingSource source) {
  
          case PATH_CHANGED:
          case PATH_MODIFIED:
-+                log_debug("%d: initial %d, from_trigger_notify %d, previous_exists %d",
-+                                __LINE__, initial, from_trigger_notify, s->previous_exists);
++                log_debug("%d: source %d, previous_exists %d",
++                                __LINE__, source, s->previous_exists);
                  b = access(s->path, F_OK) >= 0;
-                 good = !initial && !from_trigger_notify && b != s->previous_exists;
-+                log_debug("%d: initial %d, from_trigger_notify %d, previous_exists %d, b %d, good %d",
-+                                __LINE__, initial, from_trigger_notify, s->previous_exists, b, good);
+                 good = (source != PATH_WAITING_SOURCE_START) &&
+                        (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY) &&
+                         b != s->previous_exists;
++                log_debug("%d: source %d, previous_exists %d, b %d, good %d",
++                                __LINE__, source, s->previous_exists, b, good);
                  s->previous_exists = b;
                  break;
  
@@ -23,7 +25,7 @@ index ca3a91d..d20b595 100644
 -                if (IN_SET(p->deserialized_state, PATH_WAITING, PATH_RUNNING))
 +                if (IN_SET(p->deserialized_state, PATH_WAITING, PATH_RUNNING)) {
 +                        log_unit_debug(UNIT(p), "%d: calling path_enter_waiting()",  __LINE__);
-                         path_enter_waiting(p, true, false);
+                         path_enter_waiting(p, PATH_WAITING_SOURCE_COLDPLUG);
 -                else
 +                } else {
                          path_set_state(p, p->deserialized_state);
@@ -41,16 +43,15 @@ index ca3a91d..d20b595 100644
          path_set_state(p, PATH_RUNNING);
          path_unwatch(p);
  
-@@ -498,9 +507,14 @@ static bool path_check_good(Path *p, bool initial, bool from_trigger_notify) {
+@@ -498,9 +507,13 @@ static bool path_check_good(Path *p, PathWaitingSource source) {
  
          assert(p);
  
 -        LIST_FOREACH(spec, s, p->specs)
--                if (path_spec_check_good(s, initial, from_trigger_notify))
+-                if (path_spec_check_good(s, source))
 +        LIST_FOREACH(spec, s, p->specs) {
-+                log_debug("%d: initial %d, from_trigger_notify %d",
-+                                __LINE__, initial, from_trigger_notify);
-+                if (path_spec_check_good(s, initial, from_trigger_notify)) {
++                log_debug("%d: source %d", __LINE__, source);
++                if (path_spec_check_good(s, source)) {
 +                        log_debug("%d returning true",  __LINE__);
                          return true;
 +                }
@@ -58,7 +59,7 @@ index ca3a91d..d20b595 100644
  
          return false;
  }
-@@ -512,11 +526,14 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
+@@ -512,11 +525,13 @@ static void path_enter_waiting(Path *p, PathWaitingSource source)
          /* If the triggered unit is already running, so are we */
          trigger = UNIT_TRIGGER(UNIT(p));
          if (trigger && !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(trigger))) {
@@ -68,29 +69,27 @@ index ca3a91d..d20b595 100644
                  return;
          }
  
-+        log_unit_debug(UNIT(p), "%d: initial %d, from_trigger_notify %d",
-+                        __LINE__, initial, from_trigger_notify);
-         if (path_check_good(p, initial, from_trigger_notify)) {
++        log_unit_debug(UNIT(p), "%d: source %d", __LINE__, source);
+         if (path_check_good(p, source)) {
                  log_unit_debug(UNIT(p), "Got triggered.");
                  path_enter_running(p);
-@@ -531,6 +548,8 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
-          * might have appeared/been removed by now, so we must
-          * recheck */
+@@ -531,6 +546,7 @@ static void path_enter_waiting(Path *p, PathWaitingSource source)
+         if (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY)
+                 source = PATH_WAITING_SOURCE_DISPATCH_IO;
  
-+        log_unit_debug(UNIT(p), "%d: initial %d, from_trigger_notify %d",
-+                        __LINE__, initial, from_trigger_notify);
-         if (path_check_good(p, false, from_trigger_notify)) {
++        log_unit_debug(UNIT(p), "%d: source %d", __LINE__, source);
+         if (path_check_good(p, source)) {
                  log_unit_debug(UNIT(p), "Got triggered.");
                  path_enter_running(p);
-@@ -581,6 +600,7 @@ static int path_start(Unit *u) {
+@@ -581,6 +597,7 @@ static int path_start(Unit *u) {
          path_mkdir(p);
  
          p->result = PATH_SUCCESS;
 +        log_unit_debug(u, "%d: calling path_enter_waiting()",  __LINE__);
-         path_enter_waiting(p, true, false);
+         path_enter_waiting(p, PATH_WAITING_SOURCE_START);
  
          return 1;
-@@ -592,6 +612,7 @@ static int path_stop(Unit *u) {
+@@ -592,6 +609,7 @@ static int path_stop(Unit *u) {
          assert(p);
          assert(IN_SET(p->state, PATH_WAITING, PATH_RUNNING));
  
@@ -98,7 +97,7 @@ index ca3a91d..d20b595 100644
          path_enter_dead(p, PATH_SUCCESS);
          return 1;
  }
-@@ -620,6 +641,8 @@ static int path_serialize(Unit *u, FILE *f, FDSet *fds) {
+@@ -620,6 +638,8 @@ static int path_serialize(Unit *u, FILE *f, FDSet *fds) {
                                               type,
                                               s->previous_exists,
                                               escaped);
@@ -107,7 +106,7 @@ index ca3a91d..d20b595 100644
          }
  
          return 0;
-@@ -662,6 +685,9 @@ static int path_deserialize_item(Unit *u, const char *key, const char *value, FD
+@@ -662,6 +682,9 @@ static int path_deserialize_item(Unit *u, const char *key, const char *value, FD
                          PathType type;
                          PathSpec *s;
  

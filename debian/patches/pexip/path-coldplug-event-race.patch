@@ -1,0 +1,136 @@
+diff --git a/src/core/path.c b/src/core/path.c
+index ca3a91d..8d1b9f3 100644
+--- a/src/core/path.c
++++ b/src/core/path.c
+@@ -25,6 +25,13 @@
+ #include "unit-name.h"
+ #include "unit.h"
+ 
++typedef enum PathWaitingSource {
++       PATH_WAITING_SOURCE_START,
++       PATH_WAITING_SOURCE_COLDPLUG,
++       PATH_WAITING_SOURCE_DISPATCH_IO,
++       PATH_WAITING_SOURCE_TRIGGER_NOTIFY,
++} PathWaitingSource;
++
+ static const UnitActiveState state_translation_table[_PATH_STATE_MAX] = {
+         [PATH_DEAD] = UNIT_INACTIVE,
+         [PATH_WAITING] = UNIT_ACTIVE,
+@@ -174,7 +181,7 @@ int path_spec_fd_event(PathSpec *s, uint32_t revents) {
+         return r;
+ }
+ 
+-static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_notify) {
++static bool path_spec_check_good(PathSpec *s, PathWaitingSource source) {
+         bool b, good = false;
+ 
+         switch (s->type) {
+@@ -198,7 +205,9 @@ static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_no
+         case PATH_CHANGED:
+         case PATH_MODIFIED:
+                 b = access(s->path, F_OK) >= 0;
+-                good = !initial && !from_trigger_notify && b != s->previous_exists;
++                good = (source != PATH_WAITING_SOURCE_START) &&
++                       (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY) &&
++                        b != s->previous_exists;
+                 s->previous_exists = b;
+                 break;
+ 
+@@ -432,7 +441,7 @@ static void path_set_state(Path *p, PathState state) {
+         unit_notify(UNIT(p), state_translation_table[old_state], state_translation_table[state], 0);
+ }
+ 
+-static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify);
++static void path_enter_waiting(Path *p, PathWaitingSource source);
+ 
+ static int path_coldplug(Unit *u) {
+         Path *p = PATH(u);
+@@ -443,7 +452,7 @@ static int path_coldplug(Unit *u) {
+         if (p->deserialized_state != p->state) {
+ 
+                 if (IN_SET(p->deserialized_state, PATH_WAITING, PATH_RUNNING))
+-                        path_enter_waiting(p, true, false);
++                        path_enter_waiting(p, PATH_WAITING_SOURCE_COLDPLUG);
+                 else
+                         path_set_state(p, p->deserialized_state);
+         }
+@@ -493,19 +502,19 @@ fail:
+         path_enter_dead(p, PATH_FAILURE_RESOURCES);
+ }
+ 
+-static bool path_check_good(Path *p, bool initial, bool from_trigger_notify) {
++static bool path_check_good(Path *p, PathWaitingSource source) {
+         PathSpec *s;
+ 
+         assert(p);
+ 
+         LIST_FOREACH(spec, s, p->specs)
+-                if (path_spec_check_good(s, initial, from_trigger_notify))
++                if (path_spec_check_good(s, source))
+                         return true;
+ 
+         return false;
+ }
+ 
+-static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify) {
++static void path_enter_waiting(Path *p, PathWaitingSource source) {
+         Unit *trigger;
+         int r;
+ 
+@@ -517,7 +526,7 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
+                 return;
+         }
+ 
+-        if (path_check_good(p, initial, from_trigger_notify)) {
++        if (path_check_good(p, source)) {
+                 log_unit_debug(UNIT(p), "Got triggered.");
+                 path_enter_running(p);
+                 return;
+@@ -529,9 +538,13 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
+ 
+         /* Hmm, so now we have created inotify watches, but the file
+          * might have appeared/been removed by now, so we must
+-         * recheck */
++         * recheck. Ensure, however, that we do not treat the recheck
++         * as coming from either an initial or coldplug source. */
++
++        if (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY)
++                source = PATH_WAITING_SOURCE_DISPATCH_IO;
+ 
+-        if (path_check_good(p, false, from_trigger_notify)) {
++        if (path_check_good(p, source)) {
+                 log_unit_debug(UNIT(p), "Got triggered.");
+                 path_enter_running(p);
+                 return;
+@@ -581,7 +594,7 @@ static int path_start(Unit *u) {
+         path_mkdir(p);
+ 
+         p->result = PATH_SUCCESS;
+-        path_enter_waiting(p, true, false);
++        path_enter_waiting(p, PATH_WAITING_SOURCE_START);
+ 
+         return 1;
+ }
+@@ -733,7 +746,7 @@ static int path_dispatch_io(sd_event_source *source, int fd, uint32_t revents, v
+         if (changed)
+                 path_enter_running(p);
+         else
+-                path_enter_waiting(p, false, false);
++                path_enter_waiting(p, PATH_WAITING_SOURCE_DISPATCH_IO);
+ 
+         return 0;
+ 
+@@ -770,11 +783,11 @@ static void path_trigger_notify(Unit *u, Unit *other) {
+         if (p->state == PATH_RUNNING &&
+             UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other))) {
+                 log_unit_debug(UNIT(p), "Got notified about unit deactivation.");
+-                path_enter_waiting(p, false, true);
++                path_enter_waiting(p, PATH_WAITING_SOURCE_TRIGGER_NOTIFY);
+         } else if (p->state == PATH_WAITING &&
+                    !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other))) {
+                 log_unit_debug(UNIT(p), "Got notified about unit activation.");
+-                path_enter_waiting(p, false, true);
++                path_enter_waiting(p, PATH_WAITING_SOURCE_TRIGGER_NOTIFY);
+         }
+ }
+ 
