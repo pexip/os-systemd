@@ -25,18 +25,20 @@ index ca3a91d..8d1b9f3 100644
          bool b, good = false;
  
          switch (s->type) {
-@@ -198,7 +205,9 @@ static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_no
+@@ -198,7 +205,11 @@ static bool path_spec_check_good(PathSpec *s, bool initial, bool from_trigger_no
          case PATH_CHANGED:
          case PATH_MODIFIED:
                  b = access(s->path, F_OK) >= 0;
 -                good = !initial && !from_trigger_notify && b != s->previous_exists;
 +                good = (source != PATH_WAITING_SOURCE_START) &&
 +                       (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY) &&
++                       (source != PATH_WAITING_SOURCE_COLDPLUG ||
++                                s->previous_exists_deserialized) &&
 +                        b != s->previous_exists;
                  s->previous_exists = b;
                  break;
  
-@@ -432,7 +441,7 @@ static void path_set_state(Path *p, PathState state) {
+@@ -432,7 +443,7 @@ static void path_set_state(Path *p, PathState state) {
          unit_notify(UNIT(p), state_translation_table[old_state], state_translation_table[state], 0);
  }
  
@@ -45,7 +47,7 @@ index ca3a91d..8d1b9f3 100644
  
  static int path_coldplug(Unit *u) {
          Path *p = PATH(u);
-@@ -443,7 +452,7 @@ static int path_coldplug(Unit *u) {
+@@ -443,7 +454,7 @@ static int path_coldplug(Unit *u) {
          if (p->deserialized_state != p->state) {
  
                  if (IN_SET(p->deserialized_state, PATH_WAITING, PATH_RUNNING))
@@ -54,7 +56,7 @@ index ca3a91d..8d1b9f3 100644
                  else
                          path_set_state(p, p->deserialized_state);
          }
-@@ -493,19 +502,19 @@ fail:
+@@ -493,19 +504,19 @@ fail:
          path_enter_dead(p, PATH_FAILURE_RESOURCES);
  }
  
@@ -77,7 +79,7 @@ index ca3a91d..8d1b9f3 100644
          Unit *trigger;
          int r;
  
-@@ -517,7 +526,7 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
+@@ -517,7 +528,7 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
                  return;
          }
  
@@ -86,7 +88,7 @@ index ca3a91d..8d1b9f3 100644
                  log_unit_debug(UNIT(p), "Got triggered.");
                  path_enter_running(p);
                  return;
-@@ -529,9 +538,13 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
+@@ -529,9 +540,13 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify)
  
          /* Hmm, so now we have created inotify watches, but the file
           * might have appeared/been removed by now, so we must
@@ -102,7 +104,7 @@ index ca3a91d..8d1b9f3 100644
                  log_unit_debug(UNIT(p), "Got triggered.");
                  path_enter_running(p);
                  return;
-@@ -581,7 +594,7 @@ static int path_start(Unit *u) {
+@@ -581,7 +596,7 @@ static int path_start(Unit *u) {
          path_mkdir(p);
  
          p->result = PATH_SUCCESS;
@@ -111,7 +113,15 @@ index ca3a91d..8d1b9f3 100644
  
          return 1;
  }
-@@ -733,7 +746,7 @@ static int path_dispatch_io(sd_event_source *source, int fd, uint32_t revents, v
+@@ -679,6 +694,7 @@ static int path_deserialize_item(Unit *u, const char *key, const char *value, FD
+                                     path_equal(s->path, unescaped)) {
+ 
+                                         s->previous_exists = previous_exists;
++                                        s->previous_exists_deserialized = true;
+                                         break;
+                                 }
+                 }
+@@ -733,7 +749,7 @@ static int path_dispatch_io(sd_event_source *source, int fd, uint32_t revents, v
          if (changed)
                  path_enter_running(p);
          else
@@ -120,7 +130,7 @@ index ca3a91d..8d1b9f3 100644
  
          return 0;
  
-@@ -770,11 +783,11 @@ static void path_trigger_notify(Unit *u, Unit *other) {
+@@ -770,11 +786,11 @@ static void path_trigger_notify(Unit *u, Unit *other) {
          if (p->state == PATH_RUNNING &&
              UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other))) {
                  log_unit_debug(UNIT(p), "Got notified about unit deactivation.");
@@ -134,3 +144,15 @@ index ca3a91d..8d1b9f3 100644
          }
  }
  
+diff --git a/src/core/path.h b/src/core/path.h
+index fb33b12..0774f99 100644
+--- a/src/core/path.h
++++ b/src/core/path.h
+@@ -30,6 +30,7 @@ typedef struct PathSpec {
+         int primary_wd;
+ 
+         bool previous_exists;
++        bool previous_exists_deserialized;
+ } PathSpec;
+ 
+ int path_spec_watch(PathSpec *s, sd_event_io_handler_t handler);

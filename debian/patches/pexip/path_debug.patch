@@ -2,7 +2,7 @@ diff --git a/src/core/path.c b/src/core/path.c
 index ca3a91d..d20b595 100644
 --- a/src/core/path.c
 +++ b/src/core/path.c
-@@ -197,11 +197,15 @@ static bool path_spec_check_good(PathSpec *s, PathWaitingSource source) {
+@@ -197,13 +197,17 @@ static bool path_spec_check_good(PathSpec *s, PathWaitingSource source) {
  
          case PATH_CHANGED:
          case PATH_MODIFIED:
@@ -11,6 +11,8 @@ index ca3a91d..d20b595 100644
                  b = access(s->path, F_OK) >= 0;
                  good = (source != PATH_WAITING_SOURCE_START) &&
                         (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY) &&
+                        (source != PATH_WAITING_SOURCE_COLDPLUG ||
+                                 s->previous_exists_deserialized) &&
                          b != s->previous_exists;
 +                log_debug("%d: source %d, previous_exists %d, b %d, good %d",
 +                                __LINE__, source, s->previous_exists, b, good);
