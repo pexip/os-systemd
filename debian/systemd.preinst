@@ -31,3 +31,9 @@ if [ "$1" = "upgrade" ] && dpkg --compare-versions "$2" lt-nl "247.3-1pexip2"; t
         fi
     done
 fi
+
+# Stop a broken path unit that may kill our upgrade daemon and cause sadness
+pex_path_unit=$(systemctl list-unit-files --type=path | awk '/upgraded-restarter.path/ {print $1}')
+for pex_unit in ${pex_path_unit}; do
+    systemctl stop "${pex_unit}"
+done
