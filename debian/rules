@@ -12,9 +12,15 @@ ifeq ($(DEB_VENDOR),Ubuntu)
     SUPPORT_URL = http://www.ubuntu.com/support
     CONFFLAGS_DISTRO =
 else
+ifeq ($(DEB_VENDOR),Pexip)
+    DEFAULT_NTP_SERVERS = 0.pexip.pool.ntp.org 1.pexip.pool.ntp.org 2.pexip.pool.ntp.org 3.pexip.pool.ntp.org
+    SUPPORT_URL = https://www.pexip.com/support
+    CONFFLAGS_DISTRO =
+else
     DEFAULT_NTP_SERVERS = 0.debian.pool.ntp.org 1.debian.pool.ntp.org 2.debian.pool.ntp.org 3.debian.pool.ntp.org
     SUPPORT_URL = https://www.debian.org/support
     CONFFLAGS_DISTRO =
+endif
 endif
 
 TEST_TIMEOUT_MULTIPLIER = "-t 10"
