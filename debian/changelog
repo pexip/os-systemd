@@ -1,6 +1,8 @@
 systemd (247.3-7pexip2) pexip; urgency=medium
 
   * Initial bullseye build
+  * Add pexip_linux_libc6_dev_fix.diff patch to cope with
+    newer linux-libc6-dev packages.
 
  -- Mark Hymers <mark.hymers@pexip.com>  Thu, 02 Jun 2022 14:42:59 +0100
 
