@@ -7,11 +7,9 @@ Date:   Tue May 25 23:08:50 2021 +0200
     So far we logged about most, but not all errors. Adding log to all
     errors.
 
-diff --git a/src/core/path.c b/src/core/path.c
-index 0512287baf..355f6c645d 100644
 --- a/src/core/path.c
 +++ b/src/core/path.c
-@@ -55,13 +55,15 @@ int path_spec_watch(PathSpec *s, sd_event_io_handler_t handler) {
+@@ -62,13 +62,15 @@
  
          s->inotify_fd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
          if (s->inotify_fd < 0) {

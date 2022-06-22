@@ -20,7 +20,7 @@
  SystemCallErrorNumber=EPERM
 --- a/units/meson.build
 +++ b/units/meson.build
-@@ -113,8 +113,6 @@
+@@ -114,8 +114,6 @@
           'sysinit.target.wants/'],
          ['systemd-journal-gatewayd.socket',     'ENABLE_REMOTE HAVE_MICROHTTPD'],
          ['systemd-journal-remote.socket',       'ENABLE_REMOTE HAVE_MICROHTTPD'],

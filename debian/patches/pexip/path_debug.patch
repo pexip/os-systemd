@@ -1,8 +1,6 @@
-diff --git a/src/core/path.c b/src/core/path.c
-index ca3a91d..d20b595 100644
 --- a/src/core/path.c
 +++ b/src/core/path.c
-@@ -197,13 +197,17 @@ static bool path_spec_check_good(PathSpec *s, PathWaitingSource source) {
+@@ -206,12 +206,16 @@
  
          case PATH_CHANGED:
          case PATH_MODIFIED:
@@ -19,8 +17,7 @@ index ca3a91d..d20b595 100644
                  s->previous_exists = b;
                  break;
  
-         default:
-@@ -442,10 +446,12 @@ static int path_coldplug(Unit *u) {
+@@ -455,10 +459,12 @@
  
          if (p->deserialized_state != p->state) {
  
@@ -35,7 +32,7 @@ index ca3a91d..d20b595 100644
          }
  
          return 0;
-@@ -483,6 +489,9 @@ static void path_enter_running(Path *p) {
+@@ -496,6 +502,9 @@
          if (r < 0)
                  goto fail;
  
@@ -45,7 +42,7 @@ index ca3a91d..d20b595 100644
          path_set_state(p, PATH_RUNNING);
          path_unwatch(p);
  
-@@ -498,9 +507,13 @@ static bool path_check_good(Path *p, PathWaitingSource source) {
+@@ -511,9 +520,13 @@
  
          assert(p);
  
@@ -61,7 +58,7 @@ index ca3a91d..d20b595 100644
  
          return false;
  }
-@@ -512,11 +525,13 @@ static void path_enter_waiting(Path *p, PathWaitingSource source)
+@@ -525,11 +538,13 @@
          /* If the triggered unit is already running, so are we */
          trigger = UNIT_TRIGGER(UNIT(p));
          if (trigger && !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(trigger))) {
@@ -75,7 +72,7 @@ index ca3a91d..d20b595 100644
          if (path_check_good(p, source)) {
                  log_unit_debug(UNIT(p), "Got triggered.");
                  path_enter_running(p);
-@@ -531,6 +546,7 @@ static void path_enter_waiting(Path *p, PathWaitingSource source)
+@@ -548,6 +563,7 @@
          if (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY)
                  source = PATH_WAITING_SOURCE_DISPATCH_IO;
  
@@ -83,7 +80,7 @@ index ca3a91d..d20b595 100644
          if (path_check_good(p, source)) {
                  log_unit_debug(UNIT(p), "Got triggered.");
                  path_enter_running(p);
-@@ -581,6 +597,7 @@ static int path_start(Unit *u) {
+@@ -598,6 +614,7 @@
          path_mkdir(p);
  
          p->result = PATH_SUCCESS;
@@ -91,7 +88,7 @@ index ca3a91d..d20b595 100644
          path_enter_waiting(p, PATH_WAITING_SOURCE_START);
  
          return 1;
-@@ -592,6 +609,7 @@ static int path_stop(Unit *u) {
+@@ -609,6 +626,7 @@
          assert(p);
          assert(IN_SET(p->state, PATH_WAITING, PATH_RUNNING));
  
@@ -99,7 +96,7 @@ index ca3a91d..d20b595 100644
          path_enter_dead(p, PATH_SUCCESS);
          return 1;
  }
-@@ -620,6 +638,8 @@ static int path_serialize(Unit *u, FILE *f, FDSet *fds) {
+@@ -637,6 +655,8 @@
                                               type,
                                               s->previous_exists,
                                               escaped);
@@ -108,7 +105,7 @@ index ca3a91d..d20b595 100644
          }
  
          return 0;
-@@ -662,6 +682,9 @@ static int path_deserialize_item(Unit *u, const char *key, const char *value, FD
+@@ -679,6 +699,9 @@
                          PathType type;
                          PathSpec *s;
  

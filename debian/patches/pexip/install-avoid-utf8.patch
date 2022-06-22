@@ -1,6 +1,6 @@
 --- a/src/shared/install.c
 +++ b/src/shared/install.c
-@@ -344,9 +344,8 @@
+@@ -320,9 +320,8 @@
                  switch(changes[i].type) {
                  case UNIT_FILE_SYMLINK:
                          if (!quiet)

@@ -1,8 +1,6 @@
-diff --git a/src/core/path.c b/src/core/path.c
-index ca3a91d..84a18b3 100644
 --- a/src/core/path.c
 +++ b/src/core/path.c
-@@ -166,6 +166,9 @@ int path_spec_fd_event(PathSpec *s, uint32_t revents) {
+@@ -175,6 +175,9 @@
          }
  
          FOREACH_INOTIFY_EVENT(e, buffer, l) {
