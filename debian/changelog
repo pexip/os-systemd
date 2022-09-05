@@ -1,3 +1,9 @@
+systemd (247.3-7pexip5) pexip-bullseye; urgency=medium
+
+  * Bullseye rebuild for ARM64 inclusion
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Mon, 05 Sep 2022 10:36:05 +0100
+
 systemd (247.3-7pexip4) pexip-bullseye; urgency=medium
 
   * Rebuild for override changes
