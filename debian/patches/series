@@ -60,4 +60,3 @@ pexip/path-coldplug-event-race.patch
 pexip/log_inotify_errors.patch
 pexip/path_debug.patch
 pexip/log_inotify_overflow.patch
-pexip_linux_libc6_dev_fix.diff

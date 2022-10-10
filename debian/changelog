@@ -1,3 +1,10 @@
+systemd (247.3-7+deb11u1pexip1) pexip; urgency=medium
+
+  * New upstream release.
+  * Drop pexip_linux_libc6_dev_fix.diff patch; fixed upstream.
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Mon, 10 Oct 2022 16:27:15 +0100
+
 systemd (247.3-7+deb11u1) bullseye; urgency=medium
 
   * Drop bundled copy of linux/if_arp.h.
