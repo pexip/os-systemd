@@ -1,6 +1,8 @@
 systemd (247.3-7+deb11u1pexip2) pexip; urgency=medium
 
   * Build against OpenSSL 3
+  * debian/patches/pexip/openssl3-deprecations.patch: Avoid use of deprecated
+    OpenSSL APIs
 
  -- John-Mark Bell <jmb@pexip.com>  Thu, 12 May 2022 22:14:35 +0100
 

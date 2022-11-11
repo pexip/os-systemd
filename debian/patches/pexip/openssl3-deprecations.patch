@@ -1,0 +1,15 @@
+diff --git a/src/resolve/resolved-dnstls-openssl.c b/src/resolve/resolved-dnstls-openssl.c
+index defddb5..0437590 100644
+--- a/src/resolve/resolved-dnstls-openssl.c
++++ b/src/resolve/resolved-dnstls-openssl.c
+@@ -381,8 +381,10 @@ int dnstls_manager_init(Manager *manager) {
+ 
+         assert(manager);
+ 
++#if OPENSSL_VERSION_NUMBER < 0x30000000L
+         ERR_load_crypto_strings();
+         SSL_load_error_strings();
++#endif
+ 
+         manager->dnstls_data.ctx = SSL_CTX_new(TLS_client_method());
+         if (!manager->dnstls_data.ctx)
