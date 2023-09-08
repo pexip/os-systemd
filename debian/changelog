@@ -1,3 +1,24 @@
+systemd (247.3-7+deb11u4pexip1) pexip; urgency=medium
+
+  * New upstream release.
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Fri, 09 Sep 2023 16:33:49 +0100
+
+systemd (247.3-7+deb11u4) bullseye; urgency=medium
+
+  * backport patches to fix a calendar spec calculation hang on DST change
+    if TZ=Europe/Dublin (Closes: #1033540)
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 18 Jun 2023 15:55:54 +0100
+
+systemd (247.3-7+deb11u3) bullseye; urgency=medium
+
+  * udev: fix creating /dev/serial/by-id/ symlinks for USB devices.
+    (Closes: #1035094)
+  * Fix memory leak on daemon-reload
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 30 Apr 2023 13:56:31 +0100
+
 systemd (247.3-7+deb11u2pexip1) pexip; urgency=medium
 
   * New upstream release.
