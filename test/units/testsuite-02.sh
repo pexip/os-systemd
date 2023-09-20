@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-#set -ex
-#set -o pipefail
+# SPDX-License-Identifier: LGPL-2.1-or-later
+set -eux
+set -o pipefail
 
 NPROC=$(nproc)
 MAX_QUEUE_SIZE=${NPROC:-2}
-IFS=$'\n' TEST_LIST=($(ls /usr/lib/systemd/tests/test-*))
+TESTS_GLOB=${TESTS_GLOB:-test-*}
+mapfile -t TEST_LIST < <(find /usr/lib/systemd/tests/ -maxdepth 1 -type f -name "${TESTS_GLOB}")
 
-# reset state
-rm /failed-tests /skipped-tests /skipped
+# Reset state
+rm -fv /failed-tests /skipped-tests /skipped
+
+if ! systemd-detect-virt -qc; then
+    # Make sure ping works for unprivileged users (for test-bpf-firewall)
+    sysctl net.ipv4.ping_group_range="0 2147483647"
+fi
 
 # Check & report test results
 # Arguments:
@@ -47,6 +54,7 @@ function report_result() {
     systemd-cat cat "/$name.log"
 }
 
+set +x
 # Associative array for running tasks, where running[test-path]=PID
 declare -A running=()
 for task in "${TEST_LIST[@]}"; do
@@ -54,12 +62,11 @@ for task in "${TEST_LIST[@]}"; do
     # until one of the tasks finishes, so we can replace it.
     while [[ ${#running[@]} -ge $MAX_QUEUE_SIZE ]]; do
         for key in "${!running[@]}"; do
-            if ! kill -0 ${running[$key]} &>/dev/null; then
+            if ! kill -0 "${running[$key]}" &>/dev/null; then
                 # Task has finished, report its result and drop it from the queue
-                wait ${running[$key]}
-                ec=$?
+                wait "${running[$key]}" && ec=0 || ec=$?
                 report_result "$key" $ec
-                unset running["$key"]
+                unset "running[$key]"
                 # Break from inner for loop and outer while loop to skip
                 # the sleep below when we find a free slot in the queue
                 break 2
@@ -71,6 +78,7 @@ for task in "${TEST_LIST[@]}"; do
     done
 
     if [[ -x $task ]]; then
+        echo "Executing test '$task'"
         log_file="/${task##*/}.log"
         $task &>"$log_file" &
         running[$task]=$!
@@ -79,10 +87,15 @@ done
 
 # Wait for remaining running tasks
 for key in "${!running[@]}"; do
-    wait ${running[$key]}
-    ec=$?
+    echo "Waiting for test '$key' to finish"
+    wait ${running[$key]} && ec=0 || ec=$?
     report_result "$key" $ec
-    unset running["$key"]
+    unset "running[$key]"
 done
+
+set -x
+
+# Test logs are sometimes lost, as the system shuts down immediately after
+journalctl --sync
 
 exit 0

@@ -10,6 +10,7 @@
 #include "bus-locator.h"
 #include "bus-map-properties.h"
 #include "bus-unit-util.h"
+#include "chase-symlinks.h"
 #include "dropin.h"
 #include "env-util.h"
 #include "exit-status.h"
@@ -45,14 +46,14 @@ int acquire_bus(BusFocus focus, sd_bus **ret) {
         if (!buses[focus]) {
                 bool user;
 
-                user = arg_scope != UNIT_FILE_SYSTEM;
+                user = arg_scope != LOOKUP_SCOPE_SYSTEM;
 
                 if (focus == BUS_MANAGER)
                         r = bus_connect_transport_systemd(arg_transport, arg_host, user, &buses[focus]);
                 else
                         r = bus_connect_transport(arg_transport, arg_host, user, &buses[focus]);
                 if (r < 0)
-                        return bus_log_connect_error(r);
+                        return bus_log_connect_error(r, arg_transport);
 
                 (void) sd_bus_set_allow_interactive_authorization(buses[focus], arg_ask_password);
         }
@@ -62,9 +63,7 @@ int acquire_bus(BusFocus focus, sd_bus **ret) {
 }
 
 void release_busses(void) {
-        BusFocus w;
-
-        for (w = 0; w < _BUS_FOCUS_MAX; w++)
+        for (BusFocus w = 0; w < _BUS_FOCUS_MAX; w++)
                 buses[w] = sd_bus_flush_close_unref(buses[w]);
 }
 
@@ -74,7 +73,7 @@ void ask_password_agent_open_maybe(void) {
         if (arg_dry_run)
                 return;
 
-        if (arg_scope != UNIT_FILE_SYSTEM)
+        if (arg_scope != LOOKUP_SCOPE_SYSTEM)
                 return;
 
         ask_password_agent_open_if_enabled(arg_transport, arg_ask_password);
@@ -83,7 +82,7 @@ void ask_password_agent_open_maybe(void) {
 void polkit_agent_open_maybe(void) {
         /* Open the polkit agent as a child process if necessary */
 
-        if (arg_scope != UNIT_FILE_SYSTEM)
+        if (arg_scope != LOOKUP_SCOPE_SYSTEM)
                 return;
 
         polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
@@ -143,7 +142,7 @@ int get_state_one_unit(sd_bus *bus, const char *unit, UnitActiveState *ret_activ
 
         state = unit_active_state_from_string(buf);
         if (state < 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid unit state '%s' for: %s", buf, unit);
+                return log_error_errno(state, "Invalid unit state '%s' for: %s", buf, unit);
 
         *ret_active_state = state;
         return 0;
@@ -160,7 +159,6 @@ int get_unit_list(
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        size_t size = c;
         int r;
         bool fallback = false;
 
@@ -220,7 +218,7 @@ int get_unit_list(
                 if (!output_show_unit(&u, fallback ? patterns : NULL))
                         continue;
 
-                if (!GREEDY_REALLOC(*unit_infos, size, c+1))
+                if (!GREEDY_REALLOC(*unit_infos, c+1))
                         return log_oom();
 
                 (*unit_infos)[c++] = u;
@@ -236,8 +234,7 @@ int get_unit_list(
 
 int expand_unit_names(sd_bus *bus, char **names, const char* suffix, char ***ret, bool *ret_expanded) {
         _cleanup_strv_free_ char **mangled = NULL, **globs = NULL;
-        char **name;
-        int r, i;
+        int r;
 
         assert(bus);
         assert(ret);
@@ -263,17 +260,16 @@ int expand_unit_names(sd_bus *bus, char **names, const char* suffix, char ***ret
         if (expanded) {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
                 _cleanup_free_ UnitInfo *unit_infos = NULL;
-                size_t allocated, n;
+                size_t n;
 
                 r = get_unit_list(bus, NULL, globs, &unit_infos, 0, &reply);
                 if (r < 0)
                         return r;
 
                 n = strv_length(mangled);
-                allocated = n + 1;
 
-                for (i = 0; i < r; i++) {
-                        if (!GREEDY_REALLOC(mangled, allocated, n+2))
+                for (int i = 0; i < r; i++) {
+                        if (!GREEDY_REALLOC(mangled, n+2))
                                 return log_oom();
 
                         mangled[n] = strdup(unit_infos[i].id);
@@ -295,9 +291,6 @@ int check_triggering_units(sd_bus *bus, const char *unit) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_free_ char *n = NULL, *dbus_path = NULL, *load_state = NULL;
         _cleanup_strv_free_ char **triggered_by = NULL;
-        bool print_warning_label = true;
-        UnitActiveState active_state;
-        char **i;
         int r;
 
         r = unit_name_mangle(unit, 0, &n);
@@ -326,7 +319,10 @@ int check_triggering_units(sd_bus *bus, const char *unit) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get triggered by array of %s: %s", n, bus_error_message(&error, r));
 
+        bool first = true;
         STRV_FOREACH(i, triggered_by) {
+                UnitActiveState active_state;
+
                 r = get_state_one_unit(bus, *i, &active_state);
                 if (r < 0)
                         return r;
@@ -334,9 +330,9 @@ int check_triggering_units(sd_bus *bus, const char *unit) {
                 if (!IN_SET(active_state, UNIT_ACTIVE, UNIT_RELOADING))
                         continue;
 
-                if (print_warning_label) {
+                if (first) {
                         log_warning("Warning: Stopping %s, but it can still be activated by:", n);
-                        print_warning_label = false;
+                        first = false;
                 }
 
                 log_warning("  %s", *i);
@@ -381,16 +377,12 @@ int need_daemon_reload(sd_bus *bus, const char *unit) {
 void warn_unit_file_changed(const char *unit) {
         assert(unit);
 
-        log_warning("%sWarning:%s The unit file, source configuration file or drop-ins of %s changed on disk. Run 'systemctl%s daemon-reload' to reload units.",
-                    ansi_highlight_red(),
-                    ansi_normal(),
+        log_warning("Warning: The unit file, source configuration file or drop-ins of %s changed on disk. Run 'systemctl%s daemon-reload' to reload units.",
                     unit,
-                    arg_scope == UNIT_FILE_SYSTEM ? "" : " --user");
+                    arg_scope == LOOKUP_SCOPE_SYSTEM ? "" : " --user");
 }
 
 int unit_file_find_path(LookupPaths *lp, const char *unit_name, char **ret_unit_path) {
-        char **p;
-
         assert(lp);
         assert(unit_name);
 
@@ -439,12 +431,15 @@ int unit_find_paths(
         /**
          * Finds where the unit is defined on disk. Returns 0 if the unit is not found. Returns 1 if it is
          * found, and sets:
+         *
          * - the path to the unit in *ret_frament_path, if it exists on disk,
+         *
          * - and a strv of existing drop-ins in *ret_dropin_paths, if the arg is not NULL and any dropins
          *   were found.
          *
          * Returns -ERFKILL if the unit is masked, and -EKEYREJECTED if the unit file could not be loaded for
-         * some reason (the latter only applies if we are going through the service manager).
+         * some reason (the latter only applies if we are going through the service manager). As special
+         * exception it won't log for these two error cases.
          */
 
         assert(unit_name);
@@ -474,13 +469,13 @@ int unit_find_paths(
                         return log_error_errno(r, "Failed to get LoadState: %s", bus_error_message(&error, r));
 
                 if (streq(load_state, "masked"))
-                        return -ERFKILL;
+                        return -ERFKILL; /* special case: no logging */
                 if (streq(load_state, "not-found")) {
                         r = 0;
-                        goto not_found;
+                        goto finish;
                 }
                 if (!STR_IN_SET(load_state, "loaded", "bad-setting"))
-                        return -EKEYREJECTED;
+                        return -EKEYREJECTED; /* special case: no logging */
 
                 r = sd_bus_get_property_string(
                                 bus,
@@ -517,7 +512,7 @@ int unit_find_paths(
 
                 r = unit_file_find_fragment(*cached_id_map, *cached_name_map, unit_name, &_path, &names);
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to find fragment for '%s': %m", unit_name);
 
                 if (_path) {
                         path = strdup(_path);
@@ -534,6 +529,7 @@ int unit_find_paths(
                 }
         }
 
+ finish:
         if (isempty(path)) {
                 *ret_fragment_path = NULL;
                 r = 0;
@@ -550,7 +546,6 @@ int unit_find_paths(
                         *ret_dropin_paths = NULL;
         }
 
- not_found:
         if (r == 0 && !arg_force)
                 log_error("No files found for %s.", unit_name);
 
@@ -666,7 +661,6 @@ int unit_exists(LookupPaths *lp, const char *unit) {
 
 int append_unit_dependencies(sd_bus *bus, char **names, char ***ret) {
         _cleanup_strv_free_ char **with_deps = NULL;
-        char **name;
 
         assert(bus);
         assert(ret);
@@ -710,13 +704,14 @@ int maybe_extend_with_unit_dependencies(sd_bus *bus, char ***list) {
 int unit_get_dependencies(sd_bus *bus, const char *name, char ***ret) {
         _cleanup_strv_free_ char **deps = NULL;
 
-        static const struct bus_properties_map map[_DEPENDENCY_MAX][6] = {
+        static const struct bus_properties_map map[_DEPENDENCY_MAX][7] = {
                 [DEPENDENCY_FORWARD] = {
                         { "Requires",    "as", NULL, 0 },
                         { "Requisite",   "as", NULL, 0 },
                         { "Wants",       "as", NULL, 0 },
                         { "ConsistsOf",  "as", NULL, 0 },
                         { "BindsTo",     "as", NULL, 0 },
+                        { "Upholds",     "as", NULL, 0 },
                         {}
                 },
                 [DEPENDENCY_REVERSE] = {
@@ -725,6 +720,7 @@ int unit_get_dependencies(sd_bus *bus, const char *name, char ***ret) {
                         { "WantedBy",    "as", NULL, 0 },
                         { "PartOf",      "as", NULL, 0 },
                         { "BoundBy",     "as", NULL, 0 },
+                        { "UpheldBy",    "as", NULL, 0 },
                         {}
                 },
                 [DEPENDENCY_AFTER] = {
@@ -783,7 +779,7 @@ bool output_show_unit(const UnitInfo *u, char **patterns) {
         if (!strv_fnmatch_or_empty(patterns, u->id, FNM_NOESCAPE))
                 return false;
 
-        if (arg_types && !strv_find(arg_types, unit_type_suffix(u->id)))
+        if (arg_types && !strv_contains(arg_types, unit_type_suffix(u->id)))
                 return false;
 
         if (arg_all)
@@ -819,7 +815,7 @@ bool install_client_side(void) {
         if (!isempty(arg_root))
                 return true;
 
-        if (arg_scope == UNIT_FILE_GLOBAL)
+        if (arg_scope == LOOKUP_SCOPE_GLOBAL)
                 return true;
 
         /* Unsupported environment variable, mostly for debugging purposes */
@@ -860,7 +856,7 @@ UnitFileFlags unit_file_flags_from_args(void) {
 
 int mangle_names(const char *operation, char **original_names, char ***ret_mangled_names) {
         _cleanup_strv_free_ char **l = NULL;
-        char **i, **name;
+        char **i;
         int r;
 
         assert(ret_mangled_names);
@@ -873,18 +869,15 @@ int mangle_names(const char *operation, char **original_names, char ***ret_mangl
 
                 /* When enabling units qualified path names are OK, too, hence allow them explicitly. */
 
-                if (is_path(*name)) {
-                        *i = strdup(*name);
-                        if (!*i)
-                                return log_oom();
-                } else {
+                if (is_path(*name))
+                        r = path_make_absolute_cwd(*name, i);
+                else
                         r = unit_name_mangle_with_suffix(*name, operation,
                                                          arg_quiet ? 0 : UNIT_NAME_MANGLE_WARN,
                                                          ".service", i);
-                        if (r < 0) {
-                                *i = NULL;
-                                return log_error_errno(r, "Failed to mangle unit name: %m");
-                        }
+                if (r < 0) {
+                        *i = NULL;
+                        return log_error_errno(r, "Failed to mangle unit name or path '%s': %m", *name);
                 }
 
                 i++;
@@ -931,6 +924,6 @@ int halt_now(enum action a) {
                                              (arg_dry_run ? REBOOT_DRY_RUN : 0));
 
         default:
-                assert_not_reached("Unknown action.");
+                assert_not_reached();
         }
 }

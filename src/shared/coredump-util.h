@@ -14,13 +14,16 @@ typedef enum CoredumpFilter {
         COREDUMP_FILTER_PRIVATE_DAX,
         COREDUMP_FILTER_SHARED_DAX,
         _COREDUMP_FILTER_MAX,
-        _COREDUMP_FILTER_INVALID = -1,
+        _COREDUMP_FILTER_INVALID = -EINVAL,
 } CoredumpFilter;
 
 #define COREDUMP_FILTER_MASK_DEFAULT (1u << COREDUMP_FILTER_PRIVATE_ANONYMOUS | \
                                       1u << COREDUMP_FILTER_SHARED_ANONYMOUS | \
                                       1u << COREDUMP_FILTER_ELF_HEADERS | \
                                       1u << COREDUMP_FILTER_PRIVATE_HUGE)
+
+/* The kernel doesn't like UINT64_MAX and returns ERANGE, use UINT32_MAX to support future new flags */
+#define COREDUMP_FILTER_MASK_ALL UINT32_MAX
 
 const char* coredump_filter_to_string(CoredumpFilter i) _const_;
 CoredumpFilter coredump_filter_from_string(const char *s) _pure_;

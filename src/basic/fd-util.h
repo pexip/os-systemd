@@ -7,6 +7,10 @@
 #include <sys/socket.h>
 
 #include "macro.h"
+#include "stdio-util.h"
+
+/* maximum length of fdname */
+#define FDNAME_MAX 255
 
 /* Make sure we can distinguish fd 0 and NULL */
 #define FD_TO_PTR(fd) INT_TO_PTR((fd)+1)
@@ -41,8 +45,8 @@ static inline void fclosep(FILE **f) {
         safe_fclose(*f);
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(FILE*, pclose);
-DEFINE_TRIVIAL_CLEANUP_FUNC(DIR*, closedir);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(FILE*, pclose, NULL);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(DIR*, closedir, NULL);
 
 #define _cleanup_close_ _cleanup_(closep)
 #define _cleanup_fclose_ _cleanup_(fclosep)
@@ -52,8 +56,12 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(DIR*, closedir);
 
 int fd_nonblock(int fd, bool nonblock);
 int fd_cloexec(int fd, bool cloexec);
+int fd_cloexec_many(const int fds[], size_t n_fds, bool cloexec);
+
+int get_max_fd(void);
 
 int close_all_fds(const int except[], size_t n_except);
+int close_all_fds_without_malloc(const int except[], size_t n_except);
 
 int same_fd(int a, int b);
 
@@ -73,10 +81,6 @@ enum {
         ACQUIRE_NO_REGULAR  = 1 << 4,
 };
 
-int acquire_data_fd(const void *data, size_t size, unsigned flags);
-
-int fd_duplicate_data_fd(int fd);
-
 int fd_move_above_stdio(int fd);
 
 int rearrange_stdio(int original_input_fd, int original_output_fd, int original_error_fd);
@@ -88,13 +92,14 @@ static inline int make_null_stdio(void) {
 /* Like TAKE_PTR() but for file descriptors, resetting them to -1 */
 #define TAKE_FD(fd)                             \
         ({                                      \
-                int _fd_ = (fd);                \
-                (fd) = -1;                      \
-                _fd_;                           \
+                int *_fd_ = &(fd);              \
+                int _ret_ = *_fd_;              \
+                *_fd_ = -1;                     \
+                _ret_;                          \
         })
 
 /* Like free_and_replace(), but for file descriptors */
-#define CLOSE_AND_REPLACE(a, b)                 \
+#define close_and_replace(a, b)                 \
         ({                                      \
                 int *_fdp_ = &(a);              \
                 safe_close(*_fdp_);             \
@@ -102,7 +107,20 @@ static inline int make_null_stdio(void) {
                 0;                              \
         })
 
-
 int fd_reopen(int fd, int flags);
-
 int read_nr_open(void);
+int fd_get_diskseq(int fd, uint64_t *ret);
+
+/* The maximum length a buffer for a /proc/self/fd/<fd> path needs */
+#define PROC_FD_PATH_MAX \
+        (STRLEN("/proc/self/fd/") + DECIMAL_STR_MAX(int))
+
+static inline char *format_proc_fd_path(char buf[static PROC_FD_PATH_MAX], int fd) {
+        assert(buf);
+        assert(fd >= 0);
+        assert_se(snprintf_ok(buf, PROC_FD_PATH_MAX, "/proc/self/fd/%i", fd));
+        return buf;
+}
+
+#define FORMAT_PROC_FD_PATH(fd) \
+        format_proc_fd_path((char[PROC_FD_PATH_MAX]) {}, (fd))

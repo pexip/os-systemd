@@ -7,8 +7,15 @@
 #include "bus-message.h"
 #include "bus-signature.h"
 #include "bus-type.h"
-#include "bus-util.h"
 #include "string-util.h"
+
+_public_ int sd_bus_message_send(sd_bus_message *reply) {
+        assert_return(reply, -EINVAL);
+        assert_return(reply->bus, -EINVAL);
+        assert_return(!bus_pid_changed(reply->bus), -ECHILD);
+
+        return sd_bus_send(reply->bus, reply, NULL);
+}
 
 _public_ int sd_bus_emit_signalv(
                 sd_bus *bus,
@@ -199,7 +206,7 @@ _public_ int sd_bus_reply_method_returnv(
                         return r;
         }
 
-        return sd_bus_send(call->bus, m, NULL);
+        return sd_bus_message_send(m);
 }
 
 _public_ int sd_bus_reply_method_return(
@@ -240,7 +247,7 @@ _public_ int sd_bus_reply_method_error(
         if (r < 0)
                 return r;
 
-        return sd_bus_send(call->bus, m, NULL);
+        return sd_bus_message_send(m);
 }
 
 _public_ int sd_bus_reply_method_errorfv(
@@ -263,7 +270,7 @@ _public_ int sd_bus_reply_method_errorfv(
         if (call->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED)
                 return 0;
 
-        bus_error_setfv(&error, name, format, ap);
+        sd_bus_error_setfv(&error, name, format, ap);
 
         return sd_bus_reply_method_error(call, &error);
 }

@@ -7,12 +7,16 @@
 #include "sd-daemon.h"
 
 #include "bus-util.h"
+#include "dissect-image.h"
 #include "install.h"
 #include "main-func.h"
+#include "mount-util.h"
 #include "output-mode.h"
 #include "pager.h"
+#include "parse-argument.h"
 #include "path-util.h"
 #include "pretty-print.h"
+#include "process-util.h"
 #include "rlimit-util.h"
 #include "sigbus.h"
 #include "signal-util.h"
@@ -38,6 +42,7 @@
 #include "systemctl-list-units.h"
 #include "systemctl-log-setting.h"
 #include "systemctl-logind.h"
+#include "systemctl-mount.h"
 #include "systemctl-preset-all.h"
 #include "systemctl-reset-failed.h"
 #include "systemctl-service-watchdogs.h"
@@ -62,19 +67,19 @@ char **arg_states = NULL;
 char **arg_properties = NULL;
 bool arg_all = false;
 enum dependency arg_dependency = DEPENDENCY_FORWARD;
-const char *arg_job_mode = "replace";
-UnitFileScope arg_scope = UNIT_FILE_SYSTEM;
+const char *_arg_job_mode = NULL;
+LookupScope arg_scope = LOOKUP_SCOPE_SYSTEM;
 bool arg_wait = false;
 bool arg_no_block = false;
-bool arg_no_legend = false;
+int arg_legend = -1; /* -1: true, unless --quiet is passed, 1: true */
 PagerFlags arg_pager_flags = 0;
 bool arg_no_wtmp = false;
 bool arg_no_sync = false;
 bool arg_no_wall = false;
 bool arg_no_reload = false;
-bool arg_value = false;
+BusPrintPropertyFlags arg_print_flags = 0;
 bool arg_show_types = false;
-bool arg_ignore_inhibitors = false;
+int arg_check_inhibitors = -1;
 bool arg_dry_run = false;
 bool arg_quiet = false;
 bool arg_full = false;
@@ -86,9 +91,10 @@ bool arg_ask_password = false;
 bool arg_runtime = false;
 UnitFilePresetMode arg_preset_mode = UNIT_FILE_PRESET_FULL;
 char **arg_wall = NULL;
-const char *arg_kill_who = NULL;
+const char *arg_kill_whom = NULL;
 int arg_signal = SIGTERM;
 char *arg_root = NULL;
+char *arg_image = NULL;
 usec_t arg_when = 0;
 const char *arg_reboot_argument = NULL;
 enum action arg_action = ACTION_SYSTEMCTL;
@@ -105,19 +111,28 @@ bool arg_jobs_before = false;
 bool arg_jobs_after = false;
 char **arg_clean_what = NULL;
 TimestampStyle arg_timestamp_style = TIMESTAMP_PRETTY;
+bool arg_read_only = false;
+bool arg_mkdir = false;
+bool arg_marked = false;
 
-STATIC_DESTRUCTOR_REGISTER(arg_wall, strv_freep);
-STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_types, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_states, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_properties, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(_arg_job_mode, unsetp);
+STATIC_DESTRUCTOR_REGISTER(arg_wall, strv_freep);
+STATIC_DESTRUCTOR_REGISTER(arg_kill_whom, unsetp);
+STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_reboot_argument, unsetp);
+STATIC_DESTRUCTOR_REGISTER(arg_host, unsetp);
+STATIC_DESTRUCTOR_REGISTER(arg_boot_loader_entry, unsetp);
 STATIC_DESTRUCTOR_REGISTER(arg_clean_what, strv_freep);
 
 static int systemctl_help(void) {
         _cleanup_free_ char *link = NULL;
         int r;
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         r = terminal_urlify_man("systemctl", "1", &link);
         if (r < 0)
@@ -127,6 +142,8 @@ static int systemctl_help(void) {
                "%5$sQuery or send control commands to the system manager.%6$s\n"
                "\n%3$sUnit Commands:%4$s\n"
                "  list-units [PATTERN...]             List units currently in memory\n"
+               "  list-automounts [PATTERN...]        List automount units currently in memory,\n"
+               "                                      ordered by path\n"
                "  list-sockets [PATTERN...]           List socket units currently in memory,\n"
                "                                      ordered by address\n"
                "  list-timers [PATTERN...]            List timer units currently in memory,\n"
@@ -157,6 +174,10 @@ static int systemctl_help(void) {
                "  freeze PATTERN...                   Freeze execution of unit processes\n"
                "  thaw PATTERN...                     Resume execution of a frozen unit\n"
                "  set-property UNIT PROPERTY=VALUE... Sets one or more properties of a unit\n"
+               "  bind UNIT PATH [PATH]               Bind-mount a path from the host into a\n"
+               "                                      unit's namespace\n"
+               "  mount-image UNIT PATH [PATH [OPTS]] Mount an image from the host into a\n"
+               "                                      unit's namespace\n"
                "  service-log-level SERVICE [LEVEL]   Get/set logging threshold for service\n"
                "  service-log-target SERVICE [TARGET] Get/set logging target for service\n"
                "  reset-failed [PATTERN...]           Reset failed state for all, one, or more\n"
@@ -193,7 +214,7 @@ static int systemctl_help(void) {
                "  show-environment                    Dump environment\n"
                "  set-environment VARIABLE=VALUE...   Set one or more environment variables\n"
                "  unset-environment VARIABLE...       Unset one or more environment variables\n"
-               "  import-environment [VARIABLE...]    Import all or some environment variables\n"
+               "  import-environment VARIABLE...      Import all or some environment variables\n"
                "\n%3$sManager State Commands:%4$s\n"
                "  daemon-reload                       Reload systemd manager configuration\n"
                "  daemon-reexec                       Reexecute systemd manager\n"
@@ -241,8 +262,11 @@ static int systemctl_help(void) {
                "  -T --show-transaction  When enqueuing a unit job, show full transaction\n"
                "     --show-types        When showing sockets, explicitly show their type\n"
                "     --value             When showing properties, only print the value\n"
-               "  -i --ignore-inhibitors When shutting down or sleeping, ignore inhibitors\n"
-               "     --kill-who=WHO      Whom to send signal to\n"
+               "     --check-inhibitors=MODE\n"
+               "                         Whether to check inhibitors before shutting down,\n"
+               "                         sleeping, or hibernating\n"
+               "  -i                     Shortcut for --check-inhibitors=no\n"
+               "     --kill-whom=WHOM    Whom to send signal to\n"
                "  -s --signal=SIGNAL     Which signal to send\n"
                "     --what=RESOURCES    Which types of resources to remove\n"
                "     --now               Start or stop unit after enabling or disabling it\n"
@@ -256,21 +280,24 @@ static int systemctl_help(void) {
                "     --no-block          Do not wait until operation finished\n"
                "     --no-wall           Don't send wall message before halt/power-off/reboot\n"
                "     --no-reload         Don't reload daemon after en-/dis-abling unit files\n"
-               "     --no-legend         Do not print a legend (column headers and hints)\n"
+               "     --legend=BOOL       Enable/disable the legend (column headers and hints)\n"
                "     --no-pager          Do not pipe output into a pager\n"
                "     --no-ask-password   Do not ask for system passwords\n"
-               "     --global            Enable/disable/mask unit files globally\n"
-               "     --runtime           Enable/disable/mask unit files temporarily until next\n"
-               "                         reboot\n"
+               "     --global            Edit/enable/disable/mask default user unit files\n"
+               "                         globally\n"
+               "     --runtime           Edit/enable/disable/mask unit files temporarily until\n"
+               "                         next reboot\n"
                "  -f --force             When enabling unit files, override existing symlinks\n"
                "                         When shutting down, execute action immediately\n"
                "     --preset-mode=      Apply only enable, only disable, or all presets\n"
-               "     --root=PATH         Enable/disable/mask unit files in the specified root\n"
-               "                         directory\n"
+               "     --root=PATH         Edit/enable/disable/mask unit files in the specified\n"
+               "                         root directory\n"
+               "     --image=PATH        Edit/enable/disable/mask unit files in the specified\n"
+               "                         image\n"
                "  -n --lines=INTEGER     Number of journal entries to show\n"
                "  -o --output=STRING     Change journal output mode (short, short-precise,\n"
                "                             short-iso, short-iso-precise, short-full,\n"
-               "                             short-monotonic, short-unix,\n"
+               "                             short-monotonic, short-unix, short-delta,\n"
                "                             verbose, export, json, json-pretty, json-sse, cat)\n"
                "     --firmware-setup    Tell the firmware to show the setup menu on next boot\n"
                "     --boot-loader-menu=TIME\n"
@@ -278,108 +305,112 @@ static int systemctl_help(void) {
                "     --boot-loader-entry=NAME\n"
                "                         Boot into a specific boot loader entry on next boot\n"
                "     --plain             Print unit dependencies as a list instead of a tree\n"
-               "     --timestamp=FORMAT  Change format of printed timestamps.\n"
-               "                         'pretty' (default): 'Day YYYY-MM-DD HH:MM:SS TZ\n"
-               "                         'us': 'Day YYYY-MM-DD HH:MM:SS.UUUUUU TZ\n"
-               "                         'utc': 'Day YYYY-MM-DD HH:MM:SS UTC\n"
-               "                         'us+utc': 'Day YYYY-MM-DD HH:MM:SS.UUUUUU UTC\n"
-               "\nSee the %2$s for details.\n"
-               , program_invocation_short_name
-               , link
-               , ansi_underline(), ansi_normal()
-               , ansi_highlight(), ansi_normal()
-        );
+               "     --timestamp=FORMAT  Change format of printed timestamps (pretty, unix,\n"
+               "                             us, utc, us+utc)\n"
+               "     --read-only         Create read-only bind mount\n"
+               "     --mkdir             Create directory before mounting, if missing\n"
+               "     --marked            Restart/reload previously marked units\n"
+               "\nSee the %2$s for details.\n",
+               program_invocation_short_name,
+               link,
+               ansi_underline(),
+               ansi_normal(),
+               ansi_highlight(),
+               ansi_normal());
 
         return 0;
 }
 
 static void help_types(void) {
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("Available unit types:");
 
         DUMP_STRING_TABLE(unit_type, UnitType, _UNIT_TYPE_MAX);
 }
 
 static void help_states(void) {
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("Available unit load states:");
         DUMP_STRING_TABLE(unit_load_state, UnitLoadState, _UNIT_LOAD_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable unit active states:");
         DUMP_STRING_TABLE(unit_active_state, UnitActiveState, _UNIT_ACTIVE_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable unit file states:");
         DUMP_STRING_TABLE(unit_file_state, UnitFileState, _UNIT_FILE_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable automount unit substates:");
         DUMP_STRING_TABLE(automount_state, AutomountState, _AUTOMOUNT_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable device unit substates:");
         DUMP_STRING_TABLE(device_state, DeviceState, _DEVICE_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable mount unit substates:");
         DUMP_STRING_TABLE(mount_state, MountState, _MOUNT_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable path unit substates:");
         DUMP_STRING_TABLE(path_state, PathState, _PATH_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable scope unit substates:");
         DUMP_STRING_TABLE(scope_state, ScopeState, _SCOPE_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable service unit substates:");
         DUMP_STRING_TABLE(service_state, ServiceState, _SERVICE_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable slice unit substates:");
         DUMP_STRING_TABLE(slice_state, SliceState, _SLICE_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable socket unit substates:");
         DUMP_STRING_TABLE(socket_state, SocketState, _SOCKET_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable swap unit substates:");
         DUMP_STRING_TABLE(swap_state, SwapState, _SWAP_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable target unit substates:");
         DUMP_STRING_TABLE(target_state, TargetState, _TARGET_STATE_MAX);
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 puts("\nAvailable timer unit substates:");
         DUMP_STRING_TABLE(timer_state, TimerState, _TIMER_STATE_MAX);
 }
 
 static int systemctl_parse_argv(int argc, char *argv[]) {
         enum {
-                ARG_FAIL = 0x100,
+                ARG_FAIL = 0x100,            /* compatibility only */
                 ARG_REVERSE,
                 ARG_AFTER,
                 ARG_BEFORE,
+                ARG_CHECK_INHIBITORS,
                 ARG_DRY_RUN,
                 ARG_SHOW_TYPES,
-                ARG_IRREVERSIBLE,
-                ARG_IGNORE_DEPENDENCIES,
+                ARG_IRREVERSIBLE,            /* compatibility only */
+                ARG_IGNORE_DEPENDENCIES,     /* compatibility only */
                 ARG_VALUE,
                 ARG_VERSION,
                 ARG_USER,
                 ARG_SYSTEM,
                 ARG_GLOBAL,
                 ARG_NO_BLOCK,
-                ARG_NO_LEGEND,
+                ARG_LEGEND,
+                ARG_NO_LEGEND,                /* compatibility only */
                 ARG_NO_PAGER,
                 ARG_NO_WALL,
                 ARG_ROOT,
+                ARG_IMAGE,
                 ARG_NO_RELOAD,
-                ARG_KILL_WHO,
+                ARG_KILL_WHOM,
                 ARG_NO_ASK_PASSWORD,
                 ARG_FAILED,
                 ARG_RUNTIME,
@@ -397,6 +428,9 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 ARG_WHAT,
                 ARG_REBOOT_ARG,
                 ARG_TIMESTAMP_STYLE,
+                ARG_READ_ONLY,
+                ARG_MKDIR,
+                ARG_MARKED,
         };
 
         static const struct option options[] = {
@@ -409,28 +443,31 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 { "after",               no_argument,       NULL, ARG_AFTER               },
                 { "before",              no_argument,       NULL, ARG_BEFORE              },
                 { "show-types",          no_argument,       NULL, ARG_SHOW_TYPES          },
-                { "failed",              no_argument,       NULL, ARG_FAILED              }, /* compatibility only */
+                { "failed",              no_argument,       NULL, ARG_FAILED              },
                 { "full",                no_argument,       NULL, 'l'                     },
                 { "job-mode",            required_argument, NULL, ARG_JOB_MODE            },
                 { "fail",                no_argument,       NULL, ARG_FAIL                }, /* compatibility only */
                 { "irreversible",        no_argument,       NULL, ARG_IRREVERSIBLE        }, /* compatibility only */
                 { "ignore-dependencies", no_argument,       NULL, ARG_IGNORE_DEPENDENCIES }, /* compatibility only */
-                { "ignore-inhibitors",   no_argument,       NULL, 'i'                     },
+                { "ignore-inhibitors",   no_argument,       NULL, 'i'                     }, /* compatibility only */
+                { "check-inhibitors",    required_argument, NULL, ARG_CHECK_INHIBITORS    },
                 { "value",               no_argument,       NULL, ARG_VALUE               },
                 { "user",                no_argument,       NULL, ARG_USER                },
                 { "system",              no_argument,       NULL, ARG_SYSTEM              },
                 { "global",              no_argument,       NULL, ARG_GLOBAL              },
                 { "wait",                no_argument,       NULL, ARG_WAIT                },
                 { "no-block",            no_argument,       NULL, ARG_NO_BLOCK            },
-                { "no-legend",           no_argument,       NULL, ARG_NO_LEGEND           },
+                { "legend",              required_argument, NULL, ARG_LEGEND              },
+                { "no-legend",           no_argument,       NULL, ARG_NO_LEGEND           }, /* compatibility only */
                 { "no-pager",            no_argument,       NULL, ARG_NO_PAGER            },
                 { "no-wall",             no_argument,       NULL, ARG_NO_WALL             },
                 { "dry-run",             no_argument,       NULL, ARG_DRY_RUN             },
                 { "quiet",               no_argument,       NULL, 'q'                     },
                 { "root",                required_argument, NULL, ARG_ROOT                },
+                { "image",               required_argument, NULL, ARG_IMAGE               },
                 { "force",               no_argument,       NULL, 'f'                     },
                 { "no-reload",           no_argument,       NULL, ARG_NO_RELOAD           },
-                { "kill-who",            required_argument, NULL, ARG_KILL_WHO            },
+                { "kill-whom",           required_argument, NULL, ARG_KILL_WHOM           },
                 { "signal",              required_argument, NULL, 's'                     },
                 { "no-ask-password",     no_argument,       NULL, ARG_NO_ASK_PASSWORD     },
                 { "host",                required_argument, NULL, 'H'                     },
@@ -452,6 +489,9 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 { "what",                required_argument, NULL, ARG_WHAT                },
                 { "reboot-argument",     required_argument, NULL, ARG_REBOOT_ARG          },
                 { "timestamp",           required_argument, NULL, ARG_TIMESTAMP_STYLE     },
+                { "read-only",           no_argument,       NULL, ARG_READ_ONLY           },
+                { "mkdir",               no_argument,       NULL, ARG_MKDIR               },
+                { "marked",              no_argument,       NULL, ARG_MARKED              },
                 {}
         };
 
@@ -473,14 +513,12 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 case ARG_VERSION:
                         return version();
 
-                case 't': {
-                        const char *p;
-
+                case 't':
                         if (isempty(optarg))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "--type= requires arguments.");
 
-                        for (p = optarg;;) {
+                        for (const char *p = optarg;;) {
                                 _cleanup_free_ char *type = NULL;
 
                                 r = extract_first_word(&p, &type, ",", 0);
@@ -514,10 +552,9 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         }
 
                         break;
-                }
 
                 case 'P':
-                        arg_value = true;
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_ONLY_VALUE, true);
                         _fallthrough_;
 
                 case 'p':
@@ -527,10 +564,8 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                                 arg_properties = new0(char*, 1);
                                 if (!arg_properties)
                                         return log_oom();
-                        } else {
-                                const char *p;
-
-                                for (p = optarg;;) {
+                        } else
+                                for (const char *p = optarg;;) {
                                         _cleanup_free_ char *prop = NULL;
 
                                         r = extract_first_word(&p, &prop, ",", 0);
@@ -542,14 +577,14 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                                         if (strv_consume(&arg_properties, TAKE_PTR(prop)) < 0)
                                                 return log_oom();
                                 }
-                        }
 
                         /* If the user asked for a particular property, show it, even if it is empty. */
-                        arg_all = true;
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_SHOW_EMPTY, true);
 
                         break;
 
                 case 'a':
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_SHOW_EMPTY, true);
                         arg_all = true;
                         break;
 
@@ -572,35 +607,35 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_VALUE:
-                        arg_value = true;
+                        SET_FLAG(arg_print_flags, BUS_PRINT_PROPERTY_ONLY_VALUE, true);
                         break;
 
                 case ARG_JOB_MODE:
-                        arg_job_mode = optarg;
+                        _arg_job_mode = optarg;
                         break;
 
                 case ARG_FAIL:
-                        arg_job_mode = "fail";
+                        _arg_job_mode = "fail";
                         break;
 
                 case ARG_IRREVERSIBLE:
-                        arg_job_mode = "replace-irreversibly";
+                        _arg_job_mode = "replace-irreversibly";
                         break;
 
                 case ARG_IGNORE_DEPENDENCIES:
-                        arg_job_mode = "ignore-dependencies";
+                        _arg_job_mode = "ignore-dependencies";
                         break;
 
                 case ARG_USER:
-                        arg_scope = UNIT_FILE_USER;
+                        arg_scope = LOOKUP_SCOPE_USER;
                         break;
 
                 case ARG_SYSTEM:
-                        arg_scope = UNIT_FILE_SYSTEM;
+                        arg_scope = LOOKUP_SCOPE_SYSTEM;
                         break;
 
                 case ARG_GLOBAL:
-                        arg_scope = UNIT_FILE_GLOBAL;
+                        arg_scope = LOOKUP_SCOPE_GLOBAL;
                         break;
 
                 case ARG_WAIT:
@@ -612,7 +647,14 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_NO_LEGEND:
-                        arg_no_legend = true;
+                        arg_legend = false;
+                        break;
+
+                case ARG_LEGEND:
+                        r = parse_boolean_argument("--legend", optarg, NULL);
+                        if (r < 0)
+                                return r;
+                        arg_legend = r;
                         break;
 
                 case ARG_NO_PAGER:
@@ -624,7 +666,13 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_ROOT:
-                        r = parse_path_argument_and_warn(optarg, false, &arg_root);
+                        r = parse_path_argument(optarg, false, &arg_root);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case ARG_IMAGE:
+                        r = parse_path_argument(optarg, false, &arg_image);
                         if (r < 0)
                                 return r;
                         break;
@@ -645,6 +693,10 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
 
                 case 'q':
                         arg_quiet = true;
+
+                        if (arg_legend < 0)
+                                arg_legend = false;
+
                         break;
 
                 case 'f':
@@ -655,21 +707,14 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         arg_no_reload = true;
                         break;
 
-                case ARG_KILL_WHO:
-                        arg_kill_who = optarg;
+                case ARG_KILL_WHOM:
+                        arg_kill_whom = optarg;
                         break;
 
                 case 's':
-                        if (streq(optarg, "help")) {
-                                DUMP_STRING_TABLE(signal, int, _NSIG);
-                                return 0;
-                        }
-
-                        arg_signal = signal_from_string(optarg);
-                        if (arg_signal < 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Failed to parse signal string %s.",
-                                                       optarg);
+                        r = parse_signal_argument(optarg, &arg_signal);
+                        if (r <= 0)
+                                return r;
                         break;
 
                 case ARG_NO_ASK_PASSWORD:
@@ -710,13 +755,24 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                                                        optarg);
 
                         if (OUTPUT_MODE_IS_JSON(arg_output)) {
-                                arg_no_legend = true;
+                                arg_legend = false;
                                 arg_plain = true;
                         }
                         break;
 
                 case 'i':
-                        arg_ignore_inhibitors = true;
+                        arg_check_inhibitors = 0;
+                        break;
+
+                case ARG_CHECK_INHIBITORS:
+                        if (streq(optarg, "auto"))
+                                arg_check_inhibitors = -1;
+                        else {
+                                r = parse_boolean(optarg);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to parse --check-inhibitors= argument: %s", optarg);
+                                arg_check_inhibitors = r;
+                        }
                         break;
 
                 case ARG_PLAIN:
@@ -748,14 +804,12 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         arg_boot_loader_entry = empty_to_null(optarg);
                         break;
 
-                case ARG_STATE: {
-                        const char *p;
-
+                case ARG_STATE:
                         if (isempty(optarg))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "--state= requires arguments.");
 
-                        for (p = optarg;;) {
+                        for (const char *p = optarg;;) {
                                 _cleanup_free_ char *s = NULL;
 
                                 r = extract_first_word(&p, &s, ",", 0);
@@ -773,7 +827,6 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                                         return log_oom();
                         }
                         break;
-                }
 
                 case 'r':
                         if (geteuid() != 0)
@@ -785,7 +838,7 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
 
                 case ARG_PRESET_MODE:
                         if (streq(optarg, "help")) {
-                                DUMP_STRING_TABLE(unit_file_preset_mode, UnitFilePresetMode, _UNIT_FILE_PRESET_MAX);
+                                DUMP_STRING_TABLE(unit_file_preset_mode, UnitFilePresetMode, _UNIT_FILE_PRESET_MODE_MAX);
                                 return 0;
                         }
 
@@ -813,13 +866,11 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         arg_with_dependencies = true;
                         break;
 
-                case ARG_WHAT: {
-                        const char *p;
-
+                case ARG_WHAT:
                         if (isempty(optarg))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--what= requires arguments.");
 
-                        for (p = optarg;;) {
+                        for (const char *p = optarg;;) {
                                 _cleanup_free_ char *k = NULL;
 
                                 r = extract_first_word(&p, &k, ",", 0);
@@ -843,7 +894,6 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         }
 
                         break;
-                }
 
                 case ARG_REBOOT_ARG:
                         arg_reboot_argument = optarg;
@@ -862,6 +912,18 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
 
                         break;
 
+                case ARG_READ_ONLY:
+                        arg_read_only = true;
+                        break;
+
+                case ARG_MKDIR:
+                        arg_mkdir = true;
+                        break;
+
+                case ARG_MARKED:
+                        arg_marked = true;
+                        break;
+
                 case '.':
                         /* Output an error mimicking getopt, and print a hint afterwards */
                         log_error("%s: invalid option -- '.'", program_invocation_name);
@@ -874,10 +936,15 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
-        if (arg_transport != BUS_TRANSPORT_LOCAL && arg_scope != UNIT_FILE_SYSTEM)
+        /* If we are in --user mode, there's no point in talking to PolicyKit or the infra to query system
+         * passwords */
+        if (arg_scope != LOOKUP_SCOPE_SYSTEM)
+                arg_ask_password = false;
+
+        if (arg_transport == BUS_TRANSPORT_REMOTE && arg_scope != LOOKUP_SCOPE_SYSTEM)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Cannot access user instance remotely.");
 
@@ -885,175 +952,197 @@ static int systemctl_parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "--wait may not be combined with --no-block.");
 
+        bool do_reload_or_restart = streq_ptr(argv[optind], "reload-or-restart");
+        if (arg_marked) {
+                if (!do_reload_or_restart)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--marked may only be used with 'reload-or-restart'.");
+                if (optind + 1 < argc)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "No additional arguments allowed with 'reload-or-restart --marked'.");
+                if (arg_wait)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--marked --wait is not supported.");
+                if (arg_show_transaction)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--marked --show-transaction is not supported.");
+
+        } else if (do_reload_or_restart) {
+                if (optind + 1 >= argc)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "List of units to restart/reload is required.");
+        }
+
+        if (arg_image && arg_root)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root= or --image=, the combination of both is not supported.");
+
         return 1;
 }
 
-static int parse_argv(int argc, char *argv[]) {
+int systemctl_dispatch_parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        if (program_invocation_short_name) {
+        if (invoked_as(argv, "halt")) {
+                arg_action = ACTION_HALT;
+                return halt_parse_argv(argc, argv);
 
-                if (strstr(program_invocation_short_name, "halt")) {
-                        arg_action = ACTION_HALT;
-                        return halt_parse_argv(argc, argv);
+        } else if (invoked_as(argv, "poweroff")) {
+                arg_action = ACTION_POWEROFF;
+                return halt_parse_argv(argc, argv);
 
-                } else if (strstr(program_invocation_short_name, "poweroff")) {
-                        arg_action = ACTION_POWEROFF;
-                        return halt_parse_argv(argc, argv);
+        } else if (invoked_as(argv, "reboot")) {
+                if (kexec_loaded())
+                        arg_action = ACTION_KEXEC;
+                else
+                        arg_action = ACTION_REBOOT;
+                return halt_parse_argv(argc, argv);
 
-                } else if (strstr(program_invocation_short_name, "reboot")) {
-                        if (kexec_loaded())
-                                arg_action = ACTION_KEXEC;
-                        else
-                                arg_action = ACTION_REBOOT;
-                        return halt_parse_argv(argc, argv);
+        } else if (invoked_as(argv, "shutdown")) {
+                arg_action = ACTION_POWEROFF;
+                return shutdown_parse_argv(argc, argv);
 
-                } else if (strstr(program_invocation_short_name, "shutdown")) {
-                        arg_action = ACTION_POWEROFF;
-                        return shutdown_parse_argv(argc, argv);
+        } else if (invoked_as(argv, "init")) {
 
-                } else if (strstr(program_invocation_short_name, "init")) {
+                /* Matches invocations as "init" as well as "telinit", which are synonymous when run
+                 * as PID != 1 on SysV.
+                 *
+                 * On SysV "telinit" was the official command to communicate with PID 1, but "init" would
+                 * redirect itself to "telinit" if called with PID != 1. We follow the same logic here still,
+                 * though we add one level of indirection, as we implement "telinit" in "systemctl". Hence,
+                 * for us if you invoke "init" you get "systemd", but it will execve() "systemctl"
+                 * immediately with argv[] unmodified if PID is != 1. If you invoke "telinit" you directly
+                 * get "systemctl". In both cases we shall do the same thing, which is why we do
+                 * invoked_as(argv, "init") here, as a quick way to match both.
+                 *
+                 * Also see redirect_telinit() in src/core/main.c. */
 
-                        /* Matches invocations as "init" as well as "telinit", which are synonymous when run
-                         * as PID != 1 on SysV.
-                         *
-                         * On SysV "telinit" was the official command to communicate with PID 1, but "init" would
-                         * redirect itself to "telinit" if called with PID != 1. We follow the same logic here still,
-                         * though we add one level of indirection, as we implement "telinit" in "systemctl". Hence, for
-                         * us if you invoke "init" you get "systemd", but it will execve() "systemctl" immediately with
-                         * argv[] unmodified if PID is != 1. If you invoke "telinit" you directly get "systemctl". In
-                         * both cases we shall do the same thing, which is why we do strstr(p_i_s_n, "init") here, as a
-                         * quick way to match both.
-                         *
-                         * Also see redirect_telinit() in src/core/main.c. */
-
-                        if (sd_booted() > 0) {
-                                arg_action = _ACTION_INVALID;
-                                return telinit_parse_argv(argc, argv);
-                        } else {
-                                /* Hmm, so some other init system is running, we need to forward this request to
-                                 * it. For now we simply guess that it is Upstart. */
-
-                                (void) rlimit_nofile_safe();
-                                execv(TELINIT, argv);
-
-                                return log_error_errno(SYNTHETIC_ERRNO(EIO),
-                                                       "Couldn't find an alternative telinit implementation to spawn.");
-                        }
-
-                } else if (strstr(program_invocation_short_name, "runlevel")) {
-                        arg_action = ACTION_RUNLEVEL;
-                        return runlevel_parse_argv(argc, argv);
+                if (sd_booted() > 0) {
+                        arg_action = _ACTION_INVALID;
+                        return telinit_parse_argv(argc, argv);
+                } else {
+                        /* Hmm, so some other init system is running, we need to forward this request to it.
+                         */
+                        arg_action = ACTION_TELINIT;
+                        return 1;
                 }
+
+        } else if (invoked_as(argv, "runlevel")) {
+                arg_action = ACTION_RUNLEVEL;
+                return runlevel_parse_argv(argc, argv);
         }
 
         arg_action = ACTION_SYSTEMCTL;
         return systemctl_parse_argv(argc, argv);
 }
 
+#ifndef FUZZ_SYSTEMCTL_PARSE_ARGV
 static int systemctl_main(int argc, char *argv[]) {
         static const Verb verbs[] = {
-                { "list-units",            VERB_ANY, VERB_ANY, VERB_DEFAULT|VERB_ONLINE_ONLY, list_units },
-                { "list-unit-files",       VERB_ANY, VERB_ANY, 0,                list_unit_files         },
-                { "list-sockets",          VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, list_sockets            },
-                { "list-timers",           VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, list_timers             },
-                { "list-jobs",             VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, list_jobs               },
-                { "list-machines",         VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, list_machines           },
-                { "clear-jobs",            VERB_ANY, 1,        VERB_ONLINE_ONLY, trivial_method          },
-                { "cancel",                VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, cancel_job              },
-                { "start",                 2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              },
-                { "stop",                  2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              },
-                { "condstop",              2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              }, /* For compatibility with ALTLinux */
-                { "reload",                2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              },
-                { "restart",               2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              },
-                { "try-restart",           2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              },
-                { "reload-or-restart",     2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              },
-                { "reload-or-try-restart", 2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              }, /* For compatibility with old systemctl <= 228 */
-                { "try-reload-or-restart", 2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              },
-                { "force-reload",          2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              }, /* For compatibility with SysV */
-                { "condreload",            2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              }, /* For compatibility with ALTLinux */
-                { "condrestart",           2,        VERB_ANY, VERB_ONLINE_ONLY, start_unit              }, /* For compatibility with RH */
-                { "isolate",               2,        2,        VERB_ONLINE_ONLY, start_unit              },
-                { "kill",                  2,        VERB_ANY, VERB_ONLINE_ONLY, kill_unit               },
-                { "clean",                 2,        VERB_ANY, VERB_ONLINE_ONLY, clean_or_freeze_unit    },
-                { "freeze",                2,        VERB_ANY, VERB_ONLINE_ONLY, clean_or_freeze_unit    },
-                { "thaw",                  2,        VERB_ANY, VERB_ONLINE_ONLY, clean_or_freeze_unit    },
-                { "is-active",             2,        VERB_ANY, VERB_ONLINE_ONLY, check_unit_active       },
-                { "check",                 2,        VERB_ANY, VERB_ONLINE_ONLY, check_unit_active       }, /* deprecated alias of is-active */
-                { "is-failed",             2,        VERB_ANY, VERB_ONLINE_ONLY, check_unit_failed       },
-                { "show",                  VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, show                    },
-                { "cat",                   2,        VERB_ANY, VERB_ONLINE_ONLY, cat                     },
-                { "status",                VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, show                    },
-                { "help",                  VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, show                    },
-                { "daemon-reload",         VERB_ANY, 1,        VERB_ONLINE_ONLY, daemon_reload           },
-                { "daemon-reexec",         VERB_ANY, 1,        VERB_ONLINE_ONLY, daemon_reload           },
-                { "log-level",             VERB_ANY, 2,        VERB_ONLINE_ONLY, log_setting             },
-                { "log-target",            VERB_ANY, 2,        VERB_ONLINE_ONLY, log_setting             },
-                { "service-log-level",     2,        3,        VERB_ONLINE_ONLY, service_log_setting     },
-                { "service-log-target",    2,        3,        VERB_ONLINE_ONLY, service_log_setting     },
-                { "service-watchdogs",     VERB_ANY, 2,        VERB_ONLINE_ONLY, service_watchdogs       },
-                { "show-environment",      VERB_ANY, 1,        VERB_ONLINE_ONLY, show_environment        },
-                { "set-environment",       2,        VERB_ANY, VERB_ONLINE_ONLY, set_environment         },
-                { "unset-environment",     2,        VERB_ANY, VERB_ONLINE_ONLY, set_environment         },
-                { "import-environment",    VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, import_environment      },
-                { "halt",                  VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "poweroff",              VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "reboot",                VERB_ANY, 2,        VERB_ONLINE_ONLY, start_system_special    },
-                { "kexec",                 VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "suspend",               VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "hibernate",             VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "hybrid-sleep",          VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "suspend-then-hibernate",VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "default",               VERB_ANY, 1,        VERB_ONLINE_ONLY, start_special           },
-                { "rescue",                VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "emergency",             VERB_ANY, 1,        VERB_ONLINE_ONLY, start_system_special    },
-                { "exit",                  VERB_ANY, 2,        VERB_ONLINE_ONLY, start_special           },
-                { "reset-failed",          VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, reset_failed            },
-                { "enable",                2,        VERB_ANY, 0,                enable_unit             },
-                { "disable",               2,        VERB_ANY, 0,                enable_unit             },
-                { "is-enabled",            2,        VERB_ANY, 0,                unit_is_enabled         },
-                { "reenable",              2,        VERB_ANY, 0,                enable_unit             },
-                { "preset",                2,        VERB_ANY, 0,                enable_unit             },
-                { "preset-all",            VERB_ANY, 1,        0,                preset_all              },
-                { "mask",                  2,        VERB_ANY, 0,                enable_unit             },
-                { "unmask",                2,        VERB_ANY, 0,                enable_unit             },
-                { "link",                  2,        VERB_ANY, 0,                enable_unit             },
-                { "revert",                2,        VERB_ANY, 0,                enable_unit             },
-                { "switch-root",           2,        VERB_ANY, VERB_ONLINE_ONLY, switch_root             },
-                { "list-dependencies",     VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, list_dependencies       },
-                { "set-default",           2,        2,        0,                set_default             },
-                { "get-default",           VERB_ANY, 1,        0,                get_default             },
-                { "set-property",          3,        VERB_ANY, VERB_ONLINE_ONLY, set_property            },
-                { "is-system-running",     VERB_ANY, 1,        0,                is_system_running       },
-                { "add-wants",             3,        VERB_ANY, 0,                add_dependency          },
-                { "add-requires",          3,        VERB_ANY, 0,                add_dependency          },
-                { "edit",                  2,        VERB_ANY, VERB_ONLINE_ONLY, edit                    },
+                { "list-units",            VERB_ANY, VERB_ANY, VERB_DEFAULT|VERB_ONLINE_ONLY, verb_list_units },
+                { "list-unit-files",       VERB_ANY, VERB_ANY, 0,                verb_list_unit_files         },
+                { "list-automounts",       VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_automounts         },
+                { "list-sockets",          VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_sockets            },
+                { "list-timers",           VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_timers             },
+                { "list-jobs",             VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_jobs               },
+                { "list-machines",         VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_machines           },
+                { "clear-jobs",            VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_trivial_method          },
+                { "cancel",                VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_cancel                  },
+                { "start",                 2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   },
+                { "stop",                  2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   },
+                { "condstop",              2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   }, /* For compatibility with ALTLinux */
+                { "reload",                2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   },
+                { "restart",               2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   },
+                { "try-restart",           2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   },
+                { "reload-or-restart",     VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_start                   },
+                { "reload-or-try-restart", 2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   }, /* For compatibility with old systemctl <= 228 */
+                { "try-reload-or-restart", 2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   },
+                { "force-reload",          2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   }, /* For compatibility with SysV */
+                { "condreload",            2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   }, /* For compatibility with ALTLinux */
+                { "condrestart",           2,        VERB_ANY, VERB_ONLINE_ONLY, verb_start                   }, /* For compatibility with RH */
+                { "isolate",               2,        2,        VERB_ONLINE_ONLY, verb_start                   },
+                { "kill",                  2,        VERB_ANY, VERB_ONLINE_ONLY, verb_kill                    },
+                { "clean",                 2,        VERB_ANY, VERB_ONLINE_ONLY, verb_clean_or_freeze         },
+                { "freeze",                2,        VERB_ANY, VERB_ONLINE_ONLY, verb_clean_or_freeze         },
+                { "thaw",                  2,        VERB_ANY, VERB_ONLINE_ONLY, verb_clean_or_freeze         },
+                { "is-active",             2,        VERB_ANY, VERB_ONLINE_ONLY, verb_is_active               },
+                { "check",                 2,        VERB_ANY, VERB_ONLINE_ONLY, verb_is_active               }, /* deprecated alias of is-active */
+                { "is-failed",             2,        VERB_ANY, VERB_ONLINE_ONLY, verb_is_failed               },
+                { "show",                  VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_show                    },
+                { "cat",                   2,        VERB_ANY, VERB_ONLINE_ONLY, verb_cat                     },
+                { "status",                VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_show                    },
+                { "help",                  VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_show                    },
+                { "daemon-reload",         1,        1,        VERB_ONLINE_ONLY, verb_daemon_reload           },
+                { "daemon-reexec",         1,        1,        VERB_ONLINE_ONLY, verb_daemon_reload           },
+                { "log-level",             VERB_ANY, 2,        VERB_ONLINE_ONLY, verb_log_setting             },
+                { "log-target",            VERB_ANY, 2,        VERB_ONLINE_ONLY, verb_log_setting             },
+                { "service-log-level",     2,        3,        VERB_ONLINE_ONLY, verb_service_log_setting     },
+                { "service-log-target",    2,        3,        VERB_ONLINE_ONLY, verb_service_log_setting     },
+                { "service-watchdogs",     VERB_ANY, 2,        VERB_ONLINE_ONLY, verb_service_watchdogs       },
+                { "show-environment",      VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_show_environment        },
+                { "set-environment",       2,        VERB_ANY, VERB_ONLINE_ONLY, verb_set_environment         },
+                { "unset-environment",     2,        VERB_ANY, VERB_ONLINE_ONLY, verb_set_environment         },
+                { "import-environment",    VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_import_environment      },
+                { "halt",                  VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "poweroff",              VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "reboot",                VERB_ANY, 2,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "kexec",                 VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "suspend",               VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "hibernate",             VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "hybrid-sleep",          VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "suspend-then-hibernate",VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "default",               VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_special           },
+                { "rescue",                VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "emergency",             VERB_ANY, 1,        VERB_ONLINE_ONLY, verb_start_system_special    },
+                { "exit",                  VERB_ANY, 2,        VERB_ONLINE_ONLY, verb_start_special           },
+                { "reset-failed",          VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_reset_failed            },
+                { "enable",                2,        VERB_ANY, 0,                verb_enable                  },
+                { "disable",               2,        VERB_ANY, 0,                verb_enable                  },
+                { "is-enabled",            2,        VERB_ANY, 0,                verb_is_enabled              },
+                { "reenable",              2,        VERB_ANY, 0,                verb_enable                  },
+                { "preset",                2,        VERB_ANY, 0,                verb_enable                  },
+                { "preset-all",            VERB_ANY, 1,        0,                verb_preset_all              },
+                { "mask",                  2,        VERB_ANY, 0,                verb_enable                  },
+                { "unmask",                2,        VERB_ANY, 0,                verb_enable                  },
+                { "link",                  2,        VERB_ANY, 0,                verb_enable                  },
+                { "revert",                2,        VERB_ANY, 0,                verb_enable                  },
+                { "switch-root",           2,        VERB_ANY, VERB_ONLINE_ONLY, verb_switch_root             },
+                { "list-dependencies",     VERB_ANY, VERB_ANY, VERB_ONLINE_ONLY, verb_list_dependencies       },
+                { "set-default",           2,        2,        0,                verb_set_default             },
+                { "get-default",           VERB_ANY, 1,        0,                verb_get_default             },
+                { "set-property",          3,        VERB_ANY, VERB_ONLINE_ONLY, verb_set_property            },
+                { "is-system-running",     VERB_ANY, 1,        0,                verb_is_system_running       },
+                { "add-wants",             3,        VERB_ANY, 0,                verb_add_dependency          },
+                { "add-requires",          3,        VERB_ANY, 0,                verb_add_dependency          },
+                { "edit",                  2,        VERB_ANY, VERB_ONLINE_ONLY, verb_edit                    },
+                { "bind",                  3,        4,        VERB_ONLINE_ONLY, verb_bind                    },
+                { "mount-image",           4,        5,        VERB_ONLINE_ONLY, verb_mount_image             },
                 {}
         };
 
         const Verb *verb = verbs_find_verb(argv[optind], verbs);
         if (verb && (verb->flags & VERB_ONLINE_ONLY) && arg_root)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Verb '%s' cannot be used with --root=.",
+                                       "Verb '%s' cannot be used with --root= or --image=.",
                                        argv[optind] ?: verb->verb);
 
         return dispatch_verb(argc, argv, verbs, NULL);
 }
 
 static int run(int argc, char *argv[]) {
+        _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
+        _cleanup_(umount_and_rmdir_and_freep) char *mounted_dir = NULL;
         int r;
 
         setlocale(LC_ALL, "");
-        log_parse_environment_cli();
-        log_open();
+        log_setup();
 
         /* The journal merging logic potentially needs a lot of fds. */
         (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
 
         sigbus_install();
 
-        r = parse_argv(argc, argv);
+        r = systemctl_dispatch_parse_argv(argc, argv);
         if (r <= 0)
                 goto finish;
 
@@ -1065,6 +1154,25 @@ static int run(int argc, char *argv[]) {
         }
 
         /* systemctl_main() will print an error message for the bus connection, but only if it needs to */
+
+        if (arg_image) {
+                assert(!arg_root);
+
+                r = mount_image_privately_interactively(
+                                arg_image,
+                                DISSECT_IMAGE_GENERIC_ROOT |
+                                DISSECT_IMAGE_REQUIRE_ROOT |
+                                DISSECT_IMAGE_RELAX_VAR_CHECK |
+                                DISSECT_IMAGE_VALIDATE_OS,
+                                &mounted_dir,
+                                &loop_device);
+                if (r < 0)
+                        return r;
+
+                arg_root = strdup(mounted_dir);
+                if (!arg_root)
+                        return log_oom();
+        }
 
         switch (arg_action) {
 
@@ -1099,8 +1207,16 @@ static int run(int argc, char *argv[]) {
                 r = logind_cancel_shutdown();
                 break;
 
+        case ACTION_SHOW_SHUTDOWN:
+                r = logind_show_shutdown();
+                break;
+
         case ACTION_RUNLEVEL:
                 r = runlevel_main();
+                break;
+
+        case ACTION_TELINIT:
+                r = exec_telinit(argv);
                 break;
 
         case ACTION_EXIT:
@@ -1110,12 +1226,12 @@ static int run(int argc, char *argv[]) {
         case ACTION_SUSPEND_THEN_HIBERNATE:
         case ACTION_EMERGENCY:
         case ACTION_DEFAULT:
-                /* systemctl verbs with no equivalent in the legacy commands.  These cannot appear in
-                 * arg_action.  Fall through. */
+                /* systemctl verbs with no equivalent in the legacy commands. These cannot appear in
+                 * arg_action. Fall through. */
 
         case _ACTION_INVALID:
         default:
-                assert_not_reached("Unknown action");
+                assert_not_reached();
         }
 
 finish:
@@ -1126,3 +1242,4 @@ finish:
 }
 
 DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);
+#endif

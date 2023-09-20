@@ -7,31 +7,21 @@
 
 #include "alloc-util.h"
 #include "macro.h"
+#include "string-util-fundamental.h"
 
 /* What is interpreted as whitespace? */
-#define WHITESPACE        " \t\n\r"
-#define NEWLINE           "\n\r"
-#define QUOTES            "\"\'"
-#define COMMENTS          "#;"
-#define GLOB_CHARS        "*?["
-#define DIGITS            "0123456789"
-#define LOWERCASE_LETTERS "abcdefghijklmnopqrstuvwxyz"
-#define UPPERCASE_LETTERS "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-#define LETTERS           LOWERCASE_LETTERS UPPERCASE_LETTERS
-#define ALPHANUMERICAL    LETTERS DIGITS
-#define HEXDIGITS         DIGITS "abcdefABCDEF"
-
-#define streq(a,b) (strcmp((a),(b)) == 0)
-#define strneq(a, b, n) (strncmp((a), (b), (n)) == 0)
-#define strcaseeq(a,b) (strcasecmp((a),(b)) == 0)
-#define strncaseeq(a, b, n) (strncasecmp((a), (b), (n)) == 0)
-
-int strcmp_ptr(const char *a, const char *b) _pure_;
-int strcasecmp_ptr(const char *a, const char *b) _pure_;
-
-static inline bool streq_ptr(const char *a, const char *b) {
-        return strcmp_ptr(a, b) == 0;
-}
+#define WHITESPACE          " \t\n\r"
+#define NEWLINE             "\n\r"
+#define QUOTES              "\"\'"
+#define COMMENTS            "#;"
+#define GLOB_CHARS          "*?["
+#define DIGITS              "0123456789"
+#define LOWERCASE_LETTERS   "abcdefghijklmnopqrstuvwxyz"
+#define UPPERCASE_LETTERS   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+#define LETTERS             LOWERCASE_LETTERS UPPERCASE_LETTERS
+#define ALPHANUMERICAL      LETTERS DIGITS
+#define HEXDIGITS           DIGITS "abcdefABCDEF"
+#define LOWERCASE_HEXDIGITS DIGITS "abcdef"
 
 static inline char* strstr_ptr(const char *haystack, const char *needle) {
         if (!haystack || !needle)
@@ -39,8 +29,16 @@ static inline char* strstr_ptr(const char *haystack, const char *needle) {
         return strstr(haystack, needle);
 }
 
-static inline const char* strempty(const char *s) {
-        return s ?: "";
+static inline char *strstrafter(const char *haystack, const char *needle) {
+        char *p;
+
+        /* Returns NULL if not found, or pointer to first character after needle if found */
+
+        p = strstr_ptr(haystack, needle);
+        if (!p)
+                return NULL;
+
+        return p + strlen(needle);
 }
 
 static inline const char* strnull(const char *s) {
@@ -49,10 +47,6 @@ static inline const char* strnull(const char *s) {
 
 static inline const char *strna(const char *s) {
         return s ?: "n/a";
-}
-
-static inline const char* yes_no(bool b) {
-        return b ? "yes" : "no";
 }
 
 static inline const char* true_false(bool b) {
@@ -71,12 +65,12 @@ static inline const char* enable_disable(bool b) {
         return b ? "enable" : "disable";
 }
 
-static inline bool isempty(const char *p) {
-        return !p || !p[0];
-}
-
 static inline const char *empty_to_null(const char *p) {
         return isempty(p) ? NULL : p;
+}
+
+static inline const char *empty_to_na(const char *p) {
+        return isempty(p) ? "n/a" : p;
 }
 
 static inline const char *empty_to_dash(const char *str) {
@@ -92,29 +86,6 @@ static inline bool empty_or_dash(const char *str) {
 static inline const char *empty_or_dash_to_null(const char *p) {
         return empty_or_dash(p) ? NULL : p;
 }
-
-static inline char *startswith(const char *s, const char *prefix) {
-        size_t l;
-
-        l = strlen(prefix);
-        if (strncmp(s, prefix, l) == 0)
-                return (char*) s + l;
-
-        return NULL;
-}
-
-static inline char *startswith_no_case(const char *s, const char *prefix) {
-        size_t l;
-
-        l = strlen(prefix);
-        if (strncasecmp(s, prefix, l) == 0)
-                return (char*) s + l;
-
-        return NULL;
-}
-
-char *endswith(const char *s, const char *postfix) _pure_;
-char *endswith_no_case(const char *s, const char *postfix) _pure_;
 
 char *first_word(const char *s, const char *word) _pure_;
 
@@ -171,6 +142,14 @@ static inline bool _pure_ in_charset(const char *s, const char* charset) {
         return s[strspn(s, charset)] == '\0';
 }
 
+static inline bool char_is_cc(char p) {
+        /* char is unsigned on some architectures, e.g. aarch64. So, compiler may warn the condition
+         * p >= 0 is always true. See #19543. Hence, let's cast to unsigned before the comparison. Note
+         * that the cast in the right hand side is redundant, as according to the C standard, compilers
+         * automatically cast a signed value to unsigned when comparing with an unsigned variable. Just
+         * for safety and readability. */
+        return (uint8_t) p < (uint8_t) ' ' || p == 127;
+}
 bool string_has_cc(const char *p, const char *ok) _pure_;
 
 char *ellipsize_mem(const char *s, size_t old_length_bytes, size_t new_length_columns, unsigned percent);
@@ -185,13 +164,18 @@ char *cellescape(char *buf, size_t len, const char *s);
 
 char* strshorten(char *s, size_t l);
 
+int strgrowpad0(char **s, size_t l);
+
 char *strreplace(const char *text, const char *old_string, const char *new_string);
 
 char *strip_tab_ansi(char **ibuf, size_t *_isz, size_t highlight[2]);
 
-char *strextend_with_separator(char **x, const char *separator, ...) _sentinel_;
+char *strextend_with_separator_internal(char **x, const char *separator, ...) _sentinel_;
+#define strextend_with_separator(x, separator, ...) strextend_with_separator_internal(x, separator, __VA_ARGS__, NULL)
+#define strextend(x, ...) strextend_with_separator_internal(x, NULL, __VA_ARGS__, NULL)
 
-#define strextend(x, ...) strextend_with_separator(x, NULL, __VA_ARGS__)
+int strextendf_with_separator(char **x, const char *separator, const char *format, ...) _printf_(3,4);
+#define strextendf(x, ...) strextendf_with_separator(x, NULL, __VA_ARGS__)
 
 char *strrep(const char *s, unsigned n);
 
@@ -199,42 +183,22 @@ int split_pair(const char *s, const char *sep, char **l, char **r);
 
 int free_and_strdup(char **p, const char *s);
 static inline int free_and_strdup_warn(char **p, const char *s) {
-        if (free_and_strdup(p, s) < 0)
+        int r;
+
+        r = free_and_strdup(p, s);
+        if (r < 0)
                 return log_oom();
-        return 0;
+        return r;
 }
 int free_and_strndup(char **p, const char *s, size_t l);
 
 bool string_is_safe(const char *p) _pure_;
-
-static inline size_t strlen_ptr(const char *s) {
-        if (!s)
-                return 0;
-
-        return strlen(s);
-}
 
 DISABLE_WARNING_STRINGOP_TRUNCATION;
 static inline void strncpy_exact(char *buf, const char *src, size_t buf_len) {
         strncpy(buf, src, buf_len);
 }
 REENABLE_WARNING;
-
-/* Like startswith(), but operates on arbitrary memory blocks */
-static inline void *memory_startswith(const void *p, size_t sz, const char *token) {
-        assert(token);
-
-        size_t n = strlen(token);
-        if (sz < n)
-                return NULL;
-
-        assert(p);
-
-        if (memcmp(p, token, n) != 0)
-                return NULL;
-
-        return (uint8_t*) p + n;
-}
 
 /* Like startswith_no_case(), but operates on arbitrary memory blocks.
  * It works only for ASCII strings.
@@ -255,17 +219,13 @@ static inline void *memory_startswith_no_case(const void *p, size_t sz, const ch
         return (uint8_t*) p + n;
 }
 
-static inline char* str_realloc(char **p) {
-        /* Reallocate *p to actual size */
+static inline char* str_realloc(char *p) {
+        /* Reallocate *p to actual size. Ignore failure, and return the original string on error. */
 
-        if (!*p)
+        if (!p)
                 return NULL;
 
-        char *t = realloc(*p, strlen(*p) + 1);
-        if (!t)
-                return NULL;
-
-        return (*p = t);
+        return realloc(p, strlen(p) + 1) ?: p;
 }
 
 char* string_erase(char *x);
@@ -277,3 +237,9 @@ int string_contains_word_strv(const char *string, const char *separators, char *
 static inline int string_contains_word(const char *string, const char *separators, const char *word) {
         return string_contains_word_strv(string, separators, STRV_MAKE(word), NULL);
 }
+
+bool streq_skip_trailing_chars(const char *s1, const char *s2, const char *ok);
+
+char *string_replace_char(char *str, char old_char, char new_char);
+
+size_t strspn_from_end(const char *str, const char *accept);

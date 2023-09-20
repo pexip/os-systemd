@@ -7,6 +7,7 @@
 
 #include "alloc-util.h"
 #include "dns-domain.h"
+#include "glyph-util.h"
 #include "hashmap.h"
 #include "hexdecoct.h"
 #include "hostname-util.h"
@@ -168,24 +169,18 @@ int dns_label_unescape_suffix(const char *name, const char **label_terminal, cha
 
         /* Skip current terminal character (and accept domain names ending it ".") */
         if (*terminal == 0)
-                terminal--;
+                terminal = PTR_SUB1(terminal, name);
         if (terminal >= name && *terminal == '.')
-                terminal--;
+                terminal = PTR_SUB1(terminal, name);
 
         /* Point name to the last label, and terminal to the preceding terminal symbol (or make it a NULL pointer) */
-        for (;;) {
-                if (terminal < name) {
-                        /* Reached the first label, so indicate that there are no more */
-                        terminal = NULL;
-                        break;
-                }
-
+        while (terminal) {
                 /* Find the start of the last label */
                 if (*terminal == '.') {
                         const char *y;
                         unsigned slashes = 0;
 
-                        for (y = terminal - 1; y >= name && *y == '\\'; y--)
+                        for (y = PTR_SUB1(terminal, name); y && *y == '\\'; y = PTR_SUB1(y, name))
                                 slashes++;
 
                         if (slashes % 2 == 0) {
@@ -198,7 +193,7 @@ int dns_label_unescape_suffix(const char *name, const char **label_terminal, cha
                         }
                 }
 
-                terminal--;
+                terminal = PTR_SUB1(terminal, name);
         }
 
         r = dns_label_unescape(&name, dest, sz, 0);
@@ -241,9 +236,8 @@ int dns_label_escape(const char *p, size_t l, char *dest, size_t sz) {
                         sz -= 2;
 
                 } else if (IN_SET(*p, '_', '-') ||
-                           (*p >= '0' && *p <= '9') ||
-                           (*p >= 'a' && *p <= 'z') ||
-                           (*p >= 'A' && *p <= 'Z')) {
+                           ascii_isdigit(*p) ||
+                           ascii_isalpha(*p)) {
 
                         /* Proper character */
 
@@ -407,7 +401,7 @@ int dns_label_undo_idna(const char *encoded, size_t encoded_size, char *decoded,
 
 int dns_name_concat(const char *a, const char *b, DNSLabelFlags flags, char **_ret) {
         _cleanup_free_ char *ret = NULL;
-        size_t n = 0, allocated = 0;
+        size_t n = 0;
         const char *p;
         bool first = true;
         int r;
@@ -439,7 +433,7 @@ int dns_name_concat(const char *a, const char *b, DNSLabelFlags flags, char **_r
                 }
 
                 if (_ret) {
-                        if (!GREEDY_REALLOC(ret, allocated, n + !first + DNS_LABEL_ESCAPED_MAX))
+                        if (!GREEDY_REALLOC(ret, n + !first + DNS_LABEL_ESCAPED_MAX))
                                 return -ENOMEM;
 
                         r = dns_label_escape(label, r, ret + n + !first, DNS_LABEL_ESCAPED_MAX);
@@ -456,12 +450,8 @@ int dns_name_concat(const char *a, const char *b, DNSLabelFlags flags, char **_r
                                 return r;
                 }
 
-                if (!first)
-                        n++;
-                else
-                        first = false;
-
-                n += r;
+                n += r + !first;
+                first = false;
         }
 
 finish:
@@ -471,12 +461,12 @@ finish:
         if (_ret) {
                 if (n == 0) {
                         /* Nothing appended? If so, generate at least a single dot, to indicate the DNS root domain */
-                        if (!GREEDY_REALLOC(ret, allocated, 2))
+                        if (!GREEDY_REALLOC(ret, 2))
                                 return -ENOMEM;
 
                         ret[n++] = '.';
                 } else {
-                        if (!GREEDY_REALLOC(ret, allocated, n + 1))
+                        if (!GREEDY_REALLOC(ret, n + 1))
                                 return -ENOMEM;
                 }
 
@@ -680,7 +670,7 @@ int dns_name_change_suffix(const char *name, const char *old_suffix, const char 
         }
 
         /* Found it! Now generate the new name */
-        prefix = strndupa(name, saved_before - name);
+        prefix = strndupa_safe(name, saved_before - name);
 
         r = dns_name_concat(prefix, new_suffix, 0, ret);
         if (r < 0)
@@ -743,12 +733,12 @@ int dns_name_reverse(int family, const union in_addr_union *a, char **ret) {
         return 0;
 }
 
-int dns_name_address(const char *p, int *family, union in_addr_union *address) {
+int dns_name_address(const char *p, int *ret_family, union in_addr_union *ret_address) {
         int r;
 
         assert(p);
-        assert(family);
-        assert(address);
+        assert(ret_family);
+        assert(ret_address);
 
         r = dns_name_endswith(p, "in-addr.arpa");
         if (r < 0)
@@ -777,11 +767,11 @@ int dns_name_address(const char *p, int *family, union in_addr_union *address) {
                 if (r <= 0)
                         return r;
 
-                *family = AF_INET;
-                address->in.s_addr = htobe32(((uint32_t) a[3] << 24) |
-                                             ((uint32_t) a[2] << 16) |
-                                             ((uint32_t) a[1] << 8) |
-                                              (uint32_t) a[0]);
+                *ret_family = AF_INET;
+                ret_address->in.s_addr = htobe32(((uint32_t) a[3] << 24) |
+                                                 ((uint32_t) a[2] << 16) |
+                                                 ((uint32_t) a[1] << 8) |
+                                                 (uint32_t) a[0]);
 
                 return 1;
         }
@@ -822,10 +812,13 @@ int dns_name_address(const char *p, int *family, union in_addr_union *address) {
                 if (r <= 0)
                         return r;
 
-                *family = AF_INET6;
-                address->in6 = a;
+                *ret_family = AF_INET6;
+                ret_address->in6 = a;
                 return 1;
         }
+
+        *ret_family = AF_UNSPEC;
+        *ret_address = IN_ADDR_NULL;
 
         return 0;
 }
@@ -913,15 +906,13 @@ static bool srv_type_label_is_valid(const char *label, size_t n) {
                 return false;
 
         /* Second char must be a letter */
-        if (!(label[1] >= 'A' && label[1] <= 'Z') &&
-            !(label[1] >= 'a' && label[1] <= 'z'))
+        if (!ascii_isalpha(label[1]))
                 return false;
 
         /* Third and further chars must be alphanumeric or a hyphen */
         for (k = 2; k < n; k++) {
-                if (!(label[k] >= 'A' && label[k] <= 'Z') &&
-                    !(label[k] >= 'a' && label[k] <= 'z') &&
-                    !(label[k] >= '0' && label[k] <= '9') &&
+                if (!ascii_isalpha(label[k]) &&
+                    !ascii_isdigit(label[k]) &&
                     label[k] != '-')
                         return false;
         }
@@ -982,7 +973,7 @@ bool dns_service_name_is_valid(const char *name) {
         l = strlen(name);
         if (l <= 0)
                 return false;
-        if (l > 63)
+        if (l > DNS_LABEL_MAX)
                 return false;
 
         return true;
@@ -1025,14 +1016,14 @@ static bool dns_service_name_label_is_valid(const char *label, size_t n) {
         if (memchr(label, 0, n))
                 return false;
 
-        s = strndupa(label, n);
+        s = strndupa_safe(label, n);
         return dns_service_name_is_valid(s);
 }
 
-int dns_service_split(const char *joined, char **_name, char **_type, char **_domain) {
+int dns_service_split(const char *joined, char **ret_name, char **ret_type, char **ret_domain) {
         _cleanup_free_ char *name = NULL, *type = NULL, *domain = NULL;
-        const char *p = joined, *q = NULL, *d = NULL;
-        char a[DNS_LABEL_MAX], b[DNS_LABEL_MAX], c[DNS_LABEL_MAX];
+        const char *p = joined, *q = NULL, *d = joined;
+        char a[DNS_LABEL_MAX+1], b[DNS_LABEL_MAX+1], c[DNS_LABEL_MAX+1];
         int an, bn, cn, r;
         unsigned x = 0;
 
@@ -1052,6 +1043,9 @@ int dns_service_split(const char *joined, char **_name, char **_type, char **_do
                         return bn;
 
                 if (bn > 0) {
+                        if (!srv_type_label_is_valid(b, bn))
+                                goto finish;
+
                         x++;
 
                         /* If there was a second label, try to get the third one */
@@ -1060,64 +1054,58 @@ int dns_service_split(const char *joined, char **_name, char **_type, char **_do
                         if (cn < 0)
                                 return cn;
 
-                        if (cn > 0)
+                        if (cn > 0 && srv_type_label_is_valid(c, cn))
                                 x++;
-                } else
-                        cn = 0;
-        } else
-                an = 0;
-
-        if (x >= 2 && srv_type_label_is_valid(b, bn)) {
-
-                if (x >= 3 && srv_type_label_is_valid(c, cn)) {
-
-                        if (dns_service_name_label_is_valid(a, an)) {
-                                /* OK, got <name> . <type> . <type2> . <domain> */
-
-                                name = strndup(a, an);
-                                if (!name)
-                                        return -ENOMEM;
-
-                                type = strjoin(b, ".", c);
-                                if (!type)
-                                        return -ENOMEM;
-
-                                d = p;
-                                goto finish;
-                        }
-
-                } else if (srv_type_label_is_valid(a, an)) {
-
-                        /* OK, got <type> . <type2> . <domain> */
-
-                        name = NULL;
-
-                        type = strjoin(a, ".", b);
-                        if (!type)
-                                return -ENOMEM;
-
-                        d = q;
-                        goto finish;
                 }
         }
 
-        name = NULL;
-        type = NULL;
-        d = joined;
+        switch (x) {
+        case 2:
+                if (!srv_type_label_is_valid(a, an))
+                        break;
+
+                /* OK, got <type> . <type2> . <domain> */
+
+                name = NULL;
+
+                type = strjoin(a, ".", b);
+                if (!type)
+                        return -ENOMEM;
+
+                d = q;
+                break;
+
+        case 3:
+                if (!dns_service_name_label_is_valid(a, an))
+                        break;
+
+                /* OK, got <name> . <type> . <type2> . <domain> */
+
+                name = strndup(a, an);
+                if (!name)
+                        return -ENOMEM;
+
+                type = strjoin(b, ".", c);
+                if (!type)
+                        return -ENOMEM;
+
+                d = p;
+                break;
+        }
 
 finish:
         r = dns_name_normalize(d, 0, &domain);
         if (r < 0)
                 return r;
 
-        if (_domain)
-                *_domain = TAKE_PTR(domain);
+        if (ret_domain)
+                *ret_domain = TAKE_PTR(domain);
 
-        if (_type)
-                *_type = TAKE_PTR(type);
+        if (ret_type)
+                *ret_type = TAKE_PTR(type);
 
-        if (_name)
-                *_name = TAKE_PTR(name);
+        if (ret_name)
+                *ret_name = TAKE_PTR(name);
 
         return 0;
 }
@@ -1188,13 +1176,11 @@ int dns_name_skip(const char *a, unsigned n_labels, const char **ret) {
 
 int dns_name_count_labels(const char *name) {
         unsigned n = 0;
-        const char *p;
         int r;
 
         assert(name);
 
-        p = name;
-        for (;;) {
+        for (const char *p = name;;) {
                 r = dns_name_parent(&p);
                 if (r < 0)
                         return r;
@@ -1207,7 +1193,7 @@ int dns_name_count_labels(const char *name) {
                 n++;
         }
 
-        return (int) n;
+        return n;
 }
 
 int dns_name_equal_skip(const char *a, unsigned n_labels, const char *b) {
@@ -1299,7 +1285,7 @@ int dns_name_apply_idna(const char *name, char **ret) {
                 r = sym_idn2_lookup_u8((uint8_t*) name, (uint8_t**) &t,
                                        IDN2_NFC_INPUT | IDN2_TRANSITIONAL);
 
-        log_debug("idn2_lookup_u8: %s → %s", name, t);
+        log_debug("idn2_lookup_u8: %s %s %s", name, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), t);
         if (r == IDN2_OK) {
                 if (!startswith(name, "xn--")) {
                         _cleanup_free_ char *s = NULL;
@@ -1308,18 +1294,20 @@ int dns_name_apply_idna(const char *name, char **ret) {
                         if (r != IDN2_OK) {
                                 log_debug("idn2_to_unicode_8z8z(\"%s\") failed: %d/%s",
                                           t, r, sym_idn2_strerror(r));
+                                *ret = NULL;
                                 return 0;
                         }
 
                         if (!streq_ptr(name, s)) {
-                                log_debug("idn2 roundtrip failed: \"%s\" → \"%s\" → \"%s\", ignoring.",
-                                          name, t, s);
+                                log_debug("idn2 roundtrip failed: \"%s\" %s \"%s\" %s \"%s\", ignoring.",
+                                          name, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), t,
+                                          special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), s);
+                                *ret = NULL;
                                 return 0;
                         }
                 }
 
                 *ret = TAKE_PTR(t);
-
                 return 1; /* *ret has been written */
         }
 
@@ -1329,10 +1317,11 @@ int dns_name_apply_idna(const char *name, char **ret) {
                 return 0;
         if (IN_SET(r, IDN2_TOO_BIG_DOMAIN, IDN2_TOO_BIG_LABEL))
                 return -ENOSPC;
+
         return -EINVAL;
 #elif HAVE_LIBIDN
         _cleanup_free_ char *buf = NULL;
-        size_t n = 0, allocated = 0;
+        size_t n = 0;
         bool first = true;
         int r, q;
 
@@ -1354,7 +1343,7 @@ int dns_name_apply_idna(const char *name, char **ret) {
                 if (q > 0)
                         r = q;
 
-                if (!GREEDY_REALLOC(buf, allocated, n + !first + DNS_LABEL_ESCAPED_MAX))
+                if (!GREEDY_REALLOC(buf, n + !first + DNS_LABEL_ESCAPED_MAX))
                         return -ENOMEM;
 
                 r = dns_label_escape(label, r, buf + n + !first, DNS_LABEL_ESCAPED_MAX);
@@ -1372,7 +1361,7 @@ int dns_name_apply_idna(const char *name, char **ret) {
         if (n > DNS_HOSTNAME_MAX)
                 return -EINVAL;
 
-        if (!GREEDY_REALLOC(buf, allocated, n + 1))
+        if (!GREEDY_REALLOC(buf, n + 1))
                 return -ENOMEM;
 
         buf[n] = 0;
@@ -1411,4 +1400,19 @@ int dns_name_dot_suffixed(const char *name) {
                 if (r == 0)
                         return false;
         }
+}
+
+bool dns_name_dont_resolve(const char *name) {
+
+        /* Never respond to some of the domains listed in RFC6303 */
+        if (dns_name_endswith(name, "0.in-addr.arpa") > 0 ||
+            dns_name_equal(name, "255.255.255.255.in-addr.arpa") > 0 ||
+            dns_name_equal(name, "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa") > 0)
+                return true;
+
+        /* Never respond to some of the domains listed in RFC6761 */
+        if (dns_name_endswith(name, "invalid") > 0)
+                return true;
+
+        return false;
 }

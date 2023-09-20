@@ -3,11 +3,14 @@
 #include <errno.h>
 #include <netdb.h>
 #include <nss.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "env-util.h"
 #include "errno-util.h"
+#include "glyph-util.h"
 #include "in-addr-util.h"
 #include "macro.h"
 #include "nss-util.h"
@@ -17,10 +20,31 @@
 #include "strv.h"
 #include "varlink.h"
 
+static JsonDispatchFlags json_dispatch_flags = 0;
+
+static void setup_logging(void) {
+        log_parse_environment_variables();
+
+        if (DEBUG_LOGGING)
+                json_dispatch_flags = JSON_LOG;
+}
+
+static void setup_logging_once(void) {
+        static pthread_once_t once = PTHREAD_ONCE_INIT;
+        assert_se(pthread_once(&once, setup_logging) == 0);
+}
+
+#define NSS_ENTRYPOINT_BEGIN                    \
+        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);       \
+        setup_logging_once()
+
 NSS_GETHOSTBYNAME_PROTOTYPES(resolve);
 NSS_GETHOSTBYADDR_PROTOTYPES(resolve);
 
 static bool error_shall_fallback(const char *error_id) {
+        /* The Varlink errors where we shall signal "please fallback" back to the NSS stack, so that some
+         * fallback module can be loaded. (These are mostly all Varlink-internal errors, as apparently we
+         * then were unable to even do IPC with systemd-resolved.) */
         return STR_IN_SET(error_id,
                           VARLINK_ERROR_DISCONNECTED,
                           VARLINK_ERROR_TIMEOUT,
@@ -28,6 +52,16 @@ static bool error_shall_fallback(const char *error_id) {
                           VARLINK_ERROR_INTERFACE_NOT_FOUND,
                           VARLINK_ERROR_METHOD_NOT_FOUND,
                           VARLINK_ERROR_METHOD_NOT_IMPLEMENTED);
+}
+
+static bool error_shall_try_again(const char *error_id) {
+        /* The Varlink errors where we shall signal "can't answer now but might be able to later" back to the
+         * NSS stack. These are all errors that indicate lack of configuration or network problems. */
+        return STR_IN_SET(error_id,
+                          "io.systemd.Resolve.NoNameServers",
+                          "io.systemd.Resolve.QueryTimedOut",
+                          "io.systemd.Resolve.MaxAttemptsReached",
+                          "io.systemd.Resolve.NetworkDown");
 }
 
 static int connect_to_resolved(Varlink **ret) {
@@ -49,7 +83,7 @@ static int connect_to_resolved(Varlink **ret) {
 static uint32_t ifindex_to_scopeid(int family, const void *a, int ifindex) {
         struct in6_addr in6;
 
-        if (family != AF_INET6)
+        if (family != AF_INET6 || ifindex == 0)
                 return 0;
 
         /* Some apps can't deal with the scope ID attached to non-link-local addresses. Hence, let's suppress that. */
@@ -57,21 +91,20 @@ static uint32_t ifindex_to_scopeid(int family, const void *a, int ifindex) {
         assert(sizeof(in6) == FAMILY_ADDRESS_SIZE(AF_INET6));
         memcpy(&in6, a, sizeof(struct in6_addr));
 
-        return IN6_IS_ADDR_LINKLOCAL(&in6) ? ifindex : 0;
+        return in6_addr_is_link_local(&in6) ? ifindex : 0;
 }
 
 static int json_dispatch_ifindex(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        int *ifi = userdata;
-        intmax_t t;
+        int *ifi = ASSERT_PTR(userdata);
+        int64_t t;
 
         assert(variant);
-        assert(ifi);
 
         if (!json_variant_is_integer(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an integer.", strna(name));
 
         t = json_variant_integer(variant);
-        if (t <= 0 || t > INT_MAX)
+        if (t > INT_MAX)
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is out of bounds for an interface index.", strna(name));
 
         *ifi = (int) t;
@@ -79,11 +112,10 @@ static int json_dispatch_ifindex(const char *name, JsonVariant *variant, JsonDis
 }
 
 static int json_dispatch_family(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        int *family = userdata;
-        intmax_t t;
+        int *family = ASSERT_PTR(userdata);
+        int64_t t;
 
         assert(variant);
-        assert(family);
 
         if (!json_variant_is_integer(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an integer.", strna(name));
@@ -124,13 +156,12 @@ typedef struct AddressParameters {
 } AddressParameters;
 
 static int json_dispatch_address(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        AddressParameters *p = userdata;
+        AddressParameters *p = ASSERT_PTR(userdata);
         union in_addr_union buf = {};
         JsonVariant *i;
         size_t n, k = 0;
 
         assert(variant);
-        assert(p);
 
         if (!json_variant_is_array(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an array.", strna(name));
@@ -140,14 +171,16 @@ static int json_dispatch_address(const char *name, JsonVariant *variant, JsonDis
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is array of unexpected size.", strna(name));
 
         JSON_VARIANT_ARRAY_FOREACH(i, variant) {
-                intmax_t b;
+                int64_t b;
 
                 if (!json_variant_is_integer(i))
                         return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Element %zu of JSON field '%s' is not an integer.", k, strna(name));
 
                 b = json_variant_integer(i);
                 if (b < 0 || b > 0xff)
-                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Element %zu of JSON field '%s' is out of range 0…255.", k, strna(name));
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                        "Element %zu of JSON field '%s' is out of range 0%s255.",
+                                        k, strna(name), special_glyph(SPECIAL_GLYPH_ELLIPSIS));
 
                 buf.bytes[k++] = (uint8_t) b;
         }
@@ -165,6 +198,31 @@ static const JsonDispatch address_parameters_dispatch_table[] = {
         {}
 };
 
+static uint64_t query_flag(
+                const char *name,
+                const int value,
+                uint64_t flag) {
+        int r;
+
+        r = getenv_bool_secure(name);
+        if (r >= 0)
+                return r == value ? flag : 0;
+        if (r != -ENXIO)
+                log_debug_errno(r, "Failed to parse $%s, ignoring.", name);
+        return 0;
+}
+
+static uint64_t query_flags(void) {
+        /* Allow callers to turn off validation, synthetization, caching, etc., when we resolve via
+         * nss-resolve. */
+        return  query_flag("SYSTEMD_NSS_RESOLVE_VALIDATE", 0, SD_RESOLVED_NO_VALIDATE) |
+                query_flag("SYSTEMD_NSS_RESOLVE_SYNTHESIZE", 0, SD_RESOLVED_NO_SYNTHESIZE) |
+                query_flag("SYSTEMD_NSS_RESOLVE_CACHE", 0, SD_RESOLVED_NO_CACHE) |
+                query_flag("SYSTEMD_NSS_RESOLVE_ZONE", 0, SD_RESOLVED_NO_ZONE) |
+                query_flag("SYSTEMD_NSS_RESOLVE_TRUST_ANCHOR", 0, SD_RESOLVED_NO_TRUST_ANCHOR) |
+                query_flag("SYSTEMD_NSS_RESOLVE_NETWORK", 0, SD_RESOLVED_NO_NETWORK);
+}
+
 enum nss_status _nss_resolve_gethostbyname4_r(
                 const char *name,
                 struct gaih_addrtuple **pat,
@@ -172,18 +230,14 @@ enum nss_status _nss_resolve_gethostbyname4_r(
                 int *errnop, int *h_errnop,
                 int32_t *ttlp) {
 
-        _cleanup_(resolve_hostname_reply_destroy) ResolveHostnameReply p = {};
-        _cleanup_(json_variant_unrefp) JsonVariant *cparams = NULL;
-        struct gaih_addrtuple *r_tuple = NULL, *r_tuple_first = NULL;
         _cleanup_(varlink_unrefp) Varlink *link = NULL;
-        const char *canonical = NULL, *error_id = NULL;
-        JsonVariant *entry, *rparams;
-        size_t l, ms, idx, c = 0;
-        char *r_name;
+        _cleanup_(json_variant_unrefp) JsonVariant *cparams = NULL;
+        _cleanup_(resolve_hostname_reply_destroy) ResolveHostnameReply p = {};
+        JsonVariant *rparams, *entry;
         int r;
 
         PROTECT_ERRNO;
-        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
+        NSS_ENTRYPOINT_BEGIN;
 
         assert(name);
         assert(pat);
@@ -196,7 +250,8 @@ enum nss_status _nss_resolve_gethostbyname4_r(
                 goto fail;
 
         r = json_build(&cparams, JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("name", JSON_BUILD_STRING(name))));
+                                       JSON_BUILD_PAIR("name", JSON_BUILD_STRING(name)),
+                                       JSON_BUILD_PAIR("flags", JSON_BUILD_UNSIGNED(query_flags()))));
         if (r < 0)
                 goto fail;
 
@@ -205,25 +260,29 @@ enum nss_status _nss_resolve_gethostbyname4_r(
          * DNSSEC errors and suchlike. (We don't use UNAVAIL in this case so that the nsswitch.conf
          * configuration can distinguish such executed but negative replies from complete failure to
          * talk to resolved). */
+        const char *error_id;
         r = varlink_call(link, "io.systemd.Resolve.ResolveHostname", cparams, &rparams, &error_id, NULL);
         if (r < 0)
                 goto fail;
         if (!isempty(error_id)) {
-                if (!error_shall_fallback(error_id))
-                        goto not_found;
-                goto fail;
+                if (error_shall_try_again(error_id))
+                        goto try_again;
+                if (error_shall_fallback(error_id))
+                        goto fail;
+                goto not_found;
         }
 
-        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, NULL, 0, &p);
+        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, NULL, json_dispatch_flags, &p);
         if (r < 0)
                 goto fail;
         if (json_variant_is_blank_object(p.addresses))
                 goto not_found;
 
+        size_t n_addresses = 0;
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, 0, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -235,13 +294,13 @@ enum nss_status _nss_resolve_gethostbyname4_r(
                         goto fail;
                 }
 
-                c++;
+                n_addresses++;
         }
 
-        canonical = p.name ?: name;
+        const char *canonical = p.name ?: name;
+        size_t l = strlen(canonical);
+        size_t idx, ms = ALIGN(l+1) + ALIGN(sizeof(struct gaih_addrtuple)) * n_addresses;
 
-        l = strlen(canonical);
-        ms = ALIGN(l+1) + ALIGN(sizeof(struct gaih_addrtuple)) * c;
         if (buflen < ms) {
                 UNPROTECT_ERRNO;
                 *errnop = ERANGE;
@@ -250,17 +309,18 @@ enum nss_status _nss_resolve_gethostbyname4_r(
         }
 
         /* First, append name */
-        r_name = buffer;
-        memcpy(r_name, canonical, l+1);
-        idx = ALIGN(l+1);
+        char *r_name = buffer;
+        memcpy(r_name, canonical, l + 1);
+        idx = ALIGN(l + 1);
 
         /* Second, append addresses */
-        r_tuple_first = (struct gaih_addrtuple*) (buffer + idx);
+        struct gaih_addrtuple *r_tuple = NULL,
+                *r_tuple_first = (struct gaih_addrtuple*) (buffer + idx);
 
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, 0, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -277,7 +337,7 @@ enum nss_status _nss_resolve_gethostbyname4_r(
                 idx += ALIGN(sizeof(struct gaih_addrtuple));
         }
 
-        assert(r_tuple);
+        assert(r_tuple);  /* We had at least one address, so r_tuple must be set */
         r_tuple->next = NULL;  /* Override last next pointer */
 
         assert(idx == ms);
@@ -306,6 +366,12 @@ fail:
 not_found:
         *h_errnop = HOST_NOT_FOUND;
         return NSS_STATUS_NOTFOUND;
+
+try_again:
+        UNPROTECT_ERRNO;
+        *errnop = -r;
+        *h_errnop = TRY_AGAIN;
+        return NSS_STATUS_TRYAGAIN;
 }
 
 enum nss_status _nss_resolve_gethostbyname3_r(
@@ -317,17 +383,14 @@ enum nss_status _nss_resolve_gethostbyname3_r(
                 int32_t *ttlp,
                 char **canonp) {
 
-        _cleanup_(resolve_hostname_reply_destroy) ResolveHostnameReply p = {};
-        _cleanup_(json_variant_unrefp) JsonVariant *cparams = NULL;
-        char *r_name, *r_aliases, *r_addr, *r_addr_list;
         _cleanup_(varlink_unrefp) Varlink *link = NULL;
-        const char *canonical, *error_id = NULL;
-        size_t l, idx, ms, alen, i = 0, c = 0;
-        JsonVariant *entry, *rparams;
+        _cleanup_(json_variant_unrefp) JsonVariant *cparams = NULL;
+        _cleanup_(resolve_hostname_reply_destroy) ResolveHostnameReply p = {};
+        JsonVariant *rparams, *entry;
         int r;
 
         PROTECT_ERRNO;
-        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
+        NSS_ENTRYPOINT_BEGIN;
 
         assert(name);
         assert(result);
@@ -348,29 +411,34 @@ enum nss_status _nss_resolve_gethostbyname3_r(
                 goto fail;
 
         r = json_build(&cparams, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("name", JSON_BUILD_STRING(name)),
-                                                   JSON_BUILD_PAIR("family", JSON_BUILD_INTEGER(af))));
+                                                   JSON_BUILD_PAIR("family", JSON_BUILD_INTEGER(af)),
+                                                   JSON_BUILD_PAIR("flags", JSON_BUILD_UNSIGNED(query_flags()))));
         if (r < 0)
                 goto fail;
 
+        const char *error_id;
         r = varlink_call(link, "io.systemd.Resolve.ResolveHostname", cparams, &rparams, &error_id, NULL);
         if (r < 0)
                 goto fail;
         if (!isempty(error_id)) {
-                if (!error_shall_fallback(error_id))
-                        goto not_found;
-                goto fail;
+                if (error_shall_try_again(error_id))
+                        goto try_again;
+                if (error_shall_fallback(error_id))
+                        goto fail;
+                goto not_found;
         }
 
-        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, NULL, 0, &p);
+        r = json_dispatch(rparams, resolve_hostname_reply_dispatch_table, NULL, json_dispatch_flags, &p);
         if (r < 0)
                 goto fail;
         if (json_variant_is_blank_object(p.addresses))
                 goto not_found;
 
+        size_t n_addresses = 0;
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, 0, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -382,15 +450,15 @@ enum nss_status _nss_resolve_gethostbyname3_r(
                         goto fail;
                 }
 
-                c++;
+                n_addresses++;
         }
 
-        canonical = p.name ?: name;
+        const char *canonical = p.name ?: name;
 
-        alen = FAMILY_ADDRESS_SIZE(af);
-        l = strlen(canonical);
+        size_t alen = FAMILY_ADDRESS_SIZE(af);
+        size_t l = strlen(canonical);
 
-        ms = ALIGN(l+1) + c*ALIGN(alen) + (c+2) * sizeof(char*);
+        size_t idx, ms = ALIGN(l + 1) + n_addresses * ALIGN(alen) + (n_addresses + 2) * sizeof(char*);
 
         if (buflen < ms) {
                 UNPROTECT_ERRNO;
@@ -400,22 +468,23 @@ enum nss_status _nss_resolve_gethostbyname3_r(
         }
 
         /* First, append name */
-        r_name = buffer;
+        char *r_name = buffer;
         memcpy(r_name, canonical, l+1);
         idx = ALIGN(l+1);
 
         /* Second, create empty aliases array */
-        r_aliases = buffer + idx;
+        char *r_aliases = buffer + idx;
         ((char**) r_aliases)[0] = NULL;
         idx += sizeof(char*);
 
         /* Third, append addresses */
-        r_addr = buffer + idx;
+        char *r_addr = buffer + idx;
 
+        size_t i = 0;
         JSON_VARIANT_ARRAY_FOREACH(entry, p.addresses) {
                 AddressParameters q = {};
 
-                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, 0, &q);
+                r = json_dispatch(entry, address_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
@@ -431,16 +500,16 @@ enum nss_status _nss_resolve_gethostbyname3_r(
                 i++;
         }
 
-        assert(i == c);
-        idx += c * ALIGN(alen);
+        assert(i == n_addresses);
+        idx += n_addresses * ALIGN(alen);
 
         /* Fourth, append address pointer array */
-        r_addr_list = buffer + idx;
-        for (i = 0; i < c; i++)
+        char *r_addr_list = buffer + idx;
+        for (i = 0; i < n_addresses; i++)
                 ((char**) r_addr_list)[i] = r_addr + i*ALIGN(alen);
 
         ((char**) r_addr_list)[i] = NULL;
-        idx += (c+1) * sizeof(char*);
+        idx += (n_addresses + 1) * sizeof(char*);
 
         assert(idx == ms);
 
@@ -472,6 +541,12 @@ fail:
 not_found:
         *h_errnop = HOST_NOT_FOUND;
         return NSS_STATUS_NOTFOUND;
+
+try_again:
+        UNPROTECT_ERRNO;
+        *errnop = -r;
+        *h_errnop = TRY_AGAIN;
+        return NSS_STATUS_TRYAGAIN;
 }
 
 typedef struct ResolveAddressReply {
@@ -503,8 +578,8 @@ static void name_parameters_destroy(NameParameters *p) {
 }
 
 static const JsonDispatch name_parameters_dispatch_table[] = {
-        { "ifindex", JSON_VARIANT_INTEGER,  json_dispatch_ifindex, offsetof(NameParameters, ifindex), 0              },
-        { "name",    JSON_VARIANT_UNSIGNED, json_dispatch_string,  offsetof(NameParameters, name),    JSON_MANDATORY },
+        { "ifindex", JSON_VARIANT_INTEGER, json_dispatch_ifindex, offsetof(NameParameters, ifindex), 0              },
+        { "name",    JSON_VARIANT_STRING,  json_dispatch_string,  offsetof(NameParameters, name),    JSON_MANDATORY },
         {}
 };
 
@@ -516,18 +591,14 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
                 int *errnop, int *h_errnop,
                 int32_t *ttlp) {
 
-        _cleanup_(resolve_address_reply_destroy) ResolveAddressReply p = {};
-        _cleanup_(json_variant_unrefp) JsonVariant *cparams = NULL;
-        char *r_name, *r_aliases, *r_addr, *r_addr_list;
         _cleanup_(varlink_unrefp) Varlink *link = NULL;
-        JsonVariant *entry, *rparams;
-        const char *n, *error_id;
-        unsigned c = 0, i = 0;
-        size_t ms = 0, idx;
+        _cleanup_(json_variant_unrefp) JsonVariant *cparams = NULL;
+        _cleanup_(resolve_address_reply_destroy) ResolveAddressReply p = {};
+        JsonVariant *rparams, *entry;
         int r;
 
         PROTECT_ERRNO;
-        BLOCK_SIGNALS(NSS_SIGNALS_BLOCK);
+        NSS_ENTRYPOINT_BEGIN;
 
         assert(addr);
         assert(result);
@@ -552,38 +623,45 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
                 goto fail;
 
         r = json_build(&cparams, JSON_BUILD_OBJECT(JSON_BUILD_PAIR("address", JSON_BUILD_BYTE_ARRAY(addr, len)),
-                                                   JSON_BUILD_PAIR("family", JSON_BUILD_INTEGER(af))));
+                                                   JSON_BUILD_PAIR("family", JSON_BUILD_INTEGER(af)),
+                                                   JSON_BUILD_PAIR("flags", JSON_BUILD_UNSIGNED(query_flags()))));
         if (r < 0)
                 goto fail;
 
+        const char* error_id;
         r = varlink_call(link, "io.systemd.Resolve.ResolveAddress", cparams, &rparams, &error_id, NULL);
         if (r < 0)
                 goto fail;
         if (!isempty(error_id)) {
-                if (!error_shall_fallback(error_id))
-                        goto not_found;
-                goto fail;
+                if (error_shall_try_again(error_id))
+                        goto try_again;
+                if (error_shall_fallback(error_id))
+                        goto fail;
+                goto not_found;
         }
 
-        r = json_dispatch(rparams, resolve_address_reply_dispatch_table, NULL, 0, &p);
+        r = json_dispatch(rparams, resolve_address_reply_dispatch_table, NULL, json_dispatch_flags, &p);
         if (r < 0)
                 goto fail;
         if (json_variant_is_blank_object(p.names))
                 goto not_found;
 
+        size_t ms = 0, idx;
+
         JSON_VARIANT_ARRAY_FOREACH(entry, p.names) {
                 _cleanup_(name_parameters_destroy) NameParameters q = {};
 
-                r = json_dispatch(entry, name_parameters_dispatch_table, NULL, 0, &q);
+                r = json_dispatch(entry, name_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
                 ms += ALIGN(strlen(q.name) + 1);
         }
 
-        ms += ALIGN(len) +                                           /* the address */
-              2 * sizeof(char*) +                                    /* pointers to the address, plus trailing NULL */
-              json_variant_elements(p.names) * sizeof(char*);        /* pointers to aliases, plus trailing NULL */
+        size_t n_names = json_variant_elements(p.names);
+        ms += ALIGN(len) +                    /* the address */
+              2 * sizeof(char*) +             /* pointer to the address, plus trailing NULL */
+              n_names * sizeof(char*);        /* pointers to aliases, plus trailing NULL */
 
         if (buflen < ms) {
                 UNPROTECT_ERRNO;
@@ -593,44 +671,43 @@ enum nss_status _nss_resolve_gethostbyaddr2_r(
         }
 
         /* First, place address */
-        r_addr = buffer;
+        char *r_addr = buffer;
         memcpy(r_addr, addr, len);
         idx = ALIGN(len);
 
         /* Second, place address list */
-        r_addr_list = buffer + idx;
+        char *r_addr_list = buffer + idx;
         ((char**) r_addr_list)[0] = r_addr;
         ((char**) r_addr_list)[1] = NULL;
         idx += sizeof(char*) * 2;
 
-        /* Third, reserve space for the aliases array */
-        r_aliases = buffer + idx;
-        idx += sizeof(char*) * c;
+        /* Third, reserve space for the aliases array, plus trailing NULL */
+        char *r_aliases = buffer + idx;
+        idx += sizeof(char*) * n_names;
 
         /* Fourth, place aliases */
-        i = 0;
-        r_name = buffer + idx;
+        char *r_name = buffer + idx;
+
+        size_t i = 0;
         JSON_VARIANT_ARRAY_FOREACH(entry, p.names) {
                 _cleanup_(name_parameters_destroy) NameParameters q = {};
-                size_t l;
-                char *z;
 
-                r = json_dispatch(entry, name_parameters_dispatch_table, NULL, 0, &q);
+                r = json_dispatch(entry, name_parameters_dispatch_table, NULL, json_dispatch_flags, &q);
                 if (r < 0)
                         goto fail;
 
-                l = strlen(q.name);
-                z = buffer + idx;
-                memcpy(z, n, l+1);
+                size_t l = strlen(q.name);
+                char *z = buffer + idx;
+                memcpy(z, q.name, l + 1);
 
                 if (i > 0)
-                        ((char**) r_aliases)[i-1] = z;
+                        ((char**) r_aliases)[i - 1] = z;
                 i++;
 
-                idx += ALIGN(l+1);
+                idx += ALIGN(l + 1);
         }
+        ((char**) r_aliases)[n_names - 1] = NULL;
 
-        ((char**) r_aliases)[c-1] = NULL;
         assert(idx == ms);
 
         result->h_name = r_name;
@@ -658,6 +735,12 @@ fail:
 not_found:
         *h_errnop = HOST_NOT_FOUND;
         return NSS_STATUS_NOTFOUND;
+
+try_again:
+        UNPROTECT_ERRNO;
+        *errnop = -r;
+        *h_errnop = TRY_AGAIN;
+        return NSS_STATUS_TRYAGAIN;
 }
 
 NSS_GETHOSTBYNAME_FALLBACKS(resolve);

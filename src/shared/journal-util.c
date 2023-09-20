@@ -10,10 +10,6 @@
 #include "user-util.h"
 
 static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
-#if HAVE_ACL
-        _cleanup_strv_free_ char **g = NULL;
-        const char* dir;
-#endif
         int r;
 
         assert(j);
@@ -31,6 +27,9 @@ static int access_check_var_log_journal(sd_journal *j, bool want_other_users) {
                 return 0;
 
 #if HAVE_ACL
+        _cleanup_strv_free_ char **g = NULL;
+        const char* dir;
+
         if (laccess("/run/log/journal", F_OK) >= 0)
                 dir = "/run/log/journal";
         else
@@ -127,6 +126,10 @@ int journal_access_check_and_warn(sd_journal *j, bool quiet, bool want_other_use
 
                 case EBADMSG:
                         log_warning_errno(err, "Journal file %s corrupted, ignoring file.", path);
+                        break;
+
+                case ETOOMANYREFS:
+                        log_warning_errno(err, "Too many journal files (limit is at %u) in scope, ignoring file '%s'.", JOURNAL_FILES_MAX, path);
                         break;
 
                 default:

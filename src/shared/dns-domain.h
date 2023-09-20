@@ -6,23 +6,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "dns-def.h"
 #include "hashmap.h"
 #include "in-addr-util.h"
-
-/* Length of a single label, with all escaping removed, excluding any trailing dot or NUL byte */
-#define DNS_LABEL_MAX 63
-
-/* Worst case length of a single label, with all escaping applied and room for a trailing NUL byte. */
-#define DNS_LABEL_ESCAPED_MAX (DNS_LABEL_MAX*4+1)
-
-/* Maximum length of a full hostname, consisting of a series of unescaped labels, and no trailing dot or NUL byte */
-#define DNS_HOSTNAME_MAX 253
-
-/* Maximum length of a full hostname, on the wire, including the final NUL byte */
-#define DNS_WIRE_FORMAT_HOSTNAME_MAX 255
-
-/* Maximum number of labels per valid hostname */
-#define DNS_N_LABELS_MAX 127
 
 typedef enum DNSLabelFlags {
         DNS_LABEL_LDH                = 1 << 0, /* Follow the "LDH" rule — only letters, digits, and internal hyphens. */
@@ -54,8 +40,8 @@ static inline int dns_name_normalize(const char *s, DNSLabelFlags flags, char **
 static inline int dns_name_is_valid(const char *s) {
         int r;
 
-        /* dns_name_normalize() verifies as a side effect */
-        r = dns_name_normalize(s, 0, NULL);
+        /* dns_name_concat() verifies as a side effect */
+        r = dns_name_concat(s, NULL, 0, NULL);
         if (r == -EINVAL)
                 return 0;
         if (r < 0)
@@ -72,6 +58,10 @@ static inline int dns_name_is_valid_ldh(const char *s) {
         if (r < 0)
                 return r;
         return 1;
+}
+
+static inline bool dns_name_is_empty(const char *s) {
+        return isempty(s) || streq(s, ".");
 }
 
 void dns_name_hash_func(const char *s, struct siphash *state);
@@ -98,7 +88,7 @@ bool dnssd_srv_type_is_valid(const char *name);
 bool dns_service_name_is_valid(const char *name);
 
 int dns_service_join(const char *name, const char *type, const char *domain, char **ret);
-int dns_service_split(const char *joined, char **name, char **type, char **domain);
+int dns_service_split(const char *joined, char **ret_name, char **ret_type, char **ret_domain);
 
 int dns_name_suffix(const char *name, unsigned n_labels, const char **ret);
 int dns_name_count_labels(const char *name);
@@ -113,3 +103,5 @@ int dns_name_apply_idna(const char *name, char **ret);
 int dns_name_is_valid_or_address(const char *name);
 
 int dns_name_dot_suffixed(const char *name);
+
+bool dns_name_dont_resolve(const char *name);

@@ -10,6 +10,7 @@
 #include "sd-ndisc.h"
 
 #include "alloc-util.h"
+#include "fd-util.h"
 #include "hexdecoct.h"
 #include "icmp6-util.h"
 #include "socket-util.h"
@@ -22,7 +23,6 @@ static struct ether_addr mac_addr = {
 };
 
 static bool verbose = false;
-static sd_event_source *test_hangcheck;
 static int test_fd[2];
 static sd_ndisc *test_timeout_nd;
 
@@ -31,7 +31,6 @@ static send_ra_t send_ra_function;
 
 static void router_dump(sd_ndisc_router *rt) {
         struct in6_addr addr;
-        char buf[FORMAT_TIMESTAMP_MAX];
         uint8_t hop_limit;
         uint64_t t, flags;
         uint32_t mtu;
@@ -42,10 +41,11 @@ static void router_dump(sd_ndisc_router *rt) {
         assert_se(rt);
 
         log_info("--");
-        assert_se(sd_ndisc_router_get_address(rt, &addr) == -ENODATA);
+        assert_se(sd_ndisc_router_get_address(rt, &addr) >= 0);
+        log_info("Sender: %s", IN6_ADDR_TO_STRING(&addr));
 
         assert_se(sd_ndisc_router_get_timestamp(rt, CLOCK_REALTIME, &t) >= 0);
-        log_info("Timestamp: %s", format_timestamp(buf, sizeof(buf), t));
+        log_info("Timestamp: %s", FORMAT_TIMESTAMP(t));
 
         assert_se(sd_ndisc_router_get_timestamp(rt, CLOCK_MONOTONIC, &t) >= 0);
         log_info("Monotonic: %" PRIu64, t);
@@ -107,7 +107,6 @@ static void router_dump(sd_ndisc_router *rt) {
                         unsigned prefix_len;
                         uint8_t pfl;
                         struct in6_addr a;
-                        char buff[INET6_ADDRSTRLEN];
 
                         assert_se(sd_ndisc_router_prefix_get_valid_lifetime(rt, &lifetime_valid) >= 0);
                         log_info("Valid Lifetime: %" PRIu32, lifetime_valid);
@@ -124,7 +123,7 @@ static void router_dump(sd_ndisc_router *rt) {
                         log_info("Prefix Length: %u", prefix_len);
 
                         assert_se(sd_ndisc_router_prefix_get_address(rt, &a) >= 0);
-                        log_info("Prefix: %s", inet_ntop(AF_INET6, &a, buff, sizeof(buff)));
+                        log_info("Prefix: %s", IN6_ADDR_TO_STRING(&a));
 
                         break;
                 }
@@ -137,10 +136,8 @@ static void router_dump(sd_ndisc_router *rt) {
                         n = sd_ndisc_router_rdnss_get_addresses(rt, &a);
                         assert_se(n > 0);
 
-                        for (i = 0; i < n; i++) {
-                                char buff[INET6_ADDRSTRLEN];
-                                log_info("DNS: %s", inet_ntop(AF_INET6, a + i, buff, sizeof(buff)));
-                        }
+                        for (i = 0; i < n; i++)
+                                log_info("DNS: %s", IN6_ADDR_TO_STRING(a + i));
 
                         assert_se(sd_ndisc_router_rdnss_get_lifetime(rt, &lt) >= 0);
                         log_info("Lifetime: %" PRIu32, lt);
@@ -167,13 +164,6 @@ static void router_dump(sd_ndisc_router *rt) {
         }
 }
 
-static int test_rs_hangcheck(sd_event_source *s, uint64_t usec,
-                             void *userdata) {
-        assert_se(false);
-
-        return 0;
-}
-
 int icmp6_bind_router_solicitation(int ifindex) {
         assert_se(ifindex == 42);
 
@@ -187,12 +177,27 @@ int icmp6_bind_router_advertisement(int ifindex) {
         return -ENOSYS;
 }
 
-int icmp6_receive(int fd, void *iov_base, size_t iov_len,
-                  struct in6_addr *dst, triple_timestamp *timestamp) {
+static struct in6_addr dummy_link_local = {
+        .s6_addr = {
+                0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x12, 0x34, 0x56, 0xff, 0xfe, 0x78, 0x9a, 0xbc,
+        },
+};
+
+int icmp6_receive(
+                int fd,
+                void *iov_base,
+                size_t iov_len,
+                struct in6_addr *ret_sender,
+                triple_timestamp *ret_timestamp) {
+
         assert_se(read (fd, iov_base, iov_len) == (ssize_t)iov_len);
 
-        if (timestamp)
-                triple_timestamp_get(timestamp);
+        if (ret_timestamp)
+                triple_timestamp_get(ret_timestamp);
+
+        if (ret_sender)
+                *ret_sender = dummy_link_local;
 
         return 0;
 }
@@ -232,7 +237,7 @@ int icmp6_send_router_solicitation(int s, const struct ether_addr *ether_addr) {
         return send_ra_function(0);
 }
 
-static void test_callback(sd_ndisc *nd, sd_ndisc_event event, sd_ndisc_router *rt, void *userdata) {
+static void test_callback(sd_ndisc *nd, sd_ndisc_event_t event, sd_ndisc_router *rt, void *userdata) {
         sd_event *e = userdata;
         static unsigned idx = 0;
         uint64_t flags_array[] = {
@@ -243,7 +248,6 @@ static void test_callback(sd_ndisc *nd, sd_ndisc_event event, sd_ndisc_router *r
                 ND_RA_FLAG_MANAGED
         };
         uint64_t flags;
-        uint32_t mtu;
 
         assert_se(nd);
 
@@ -264,17 +268,12 @@ static void test_callback(sd_ndisc *nd, sd_ndisc_event event, sd_ndisc_router *r
                 return;
         }
 
-        assert_se(sd_ndisc_get_mtu(nd, &mtu) == -ENODATA);
-
         sd_event_exit(e, 0);
 }
 
-static void test_rs(void) {
-        sd_event *e;
-        sd_ndisc *nd;
-
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
+TEST(rs) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
 
         send_ra_function = send_ra;
 
@@ -289,28 +288,21 @@ static void test_rs(void) {
         assert_se(sd_ndisc_set_mac(nd, &mac_addr) >= 0);
         assert_se(sd_ndisc_set_callback(nd, test_callback, e) >= 0);
 
-        assert_se(sd_event_add_time_relative(
-                                  e, &test_hangcheck, clock_boottime_or_monotonic(),
-                                  30 * USEC_PER_SEC, 0,
-                                  test_rs_hangcheck, NULL) >= 0);
+        assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
+                                             30 * USEC_PER_SEC, 0,
+                                             NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
 
         assert_se(sd_ndisc_stop(nd) >= 0);
         assert_se(sd_ndisc_start(nd) >= 0);
         assert_se(sd_ndisc_start(nd) >= 0);
         assert_se(sd_ndisc_stop(nd) >= 0);
+        test_fd[1] = safe_close(test_fd[1]);
 
         assert_se(sd_ndisc_start(nd) >= 0);
 
-        sd_event_loop(e);
+        assert_se(sd_event_loop(e) >= 0);
 
-        test_hangcheck = sd_event_source_unref(test_hangcheck);
-
-        nd = sd_ndisc_unref(nd);
-        assert_se(!nd);
-
-        close(test_fd[1]);
-
-        sd_event_unref(e);
+        test_fd[1] = safe_close(test_fd[1]);
 }
 
 static int test_timeout_value(uint8_t flags) {
@@ -318,9 +310,6 @@ static int test_timeout_value(uint8_t flags) {
         static usec_t last = 0;
         sd_ndisc *nd = test_timeout_nd;
         usec_t min, max;
-        char time_string_min[FORMAT_TIMESPAN_MAX];
-        char time_string_nd[FORMAT_TIMESPAN_MAX];
-        char time_string_max[FORMAT_TIMESPAN_MAX];
 
         assert_se(nd);
         assert_se(nd->event);
@@ -348,17 +337,12 @@ static int test_timeout_value(uint8_t flags) {
                         NDISC_MAX_ROUTER_SOLICITATION_INTERVAL / 10;
         }
 
-        format_timespan(time_string_min, FORMAT_TIMESPAN_MAX,
-                        min, USEC_PER_MSEC);
-        format_timespan(time_string_nd, FORMAT_TIMESPAN_MAX,
-                        nd->retransmit_time, USEC_PER_MSEC);
-        format_timespan(time_string_max, FORMAT_TIMESPAN_MAX,
-                        max, USEC_PER_MSEC);
-
         log_info("backoff timeout interval %2d %s%s <= %s <= %s",
                  count,
-                 (last * 2 > NDISC_MAX_ROUTER_SOLICITATION_INTERVAL)? "(max) ": "",
-                 time_string_min, time_string_nd, time_string_max);
+                 last * 2 > NDISC_MAX_ROUTER_SOLICITATION_INTERVAL ? "(max) ": "",
+                 FORMAT_TIMESPAN(min, USEC_PER_MSEC),
+                 FORMAT_TIMESPAN(nd->retransmit_time, USEC_PER_MSEC),
+                 FORMAT_TIMESPAN(max, USEC_PER_MSEC));
 
         assert_se(min <= nd->retransmit_time);
         assert_se(max >= nd->retransmit_time);
@@ -370,12 +354,9 @@ static int test_timeout_value(uint8_t flags) {
         return 0;
 }
 
-static void test_timeout(void) {
-        sd_event *e;
-        sd_ndisc *nd;
-
-        if (verbose)
-                printf("* %s\n", __FUNCTION__);
+TEST(timeout) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_ndisc_unrefp) sd_ndisc *nd = NULL;
 
         send_ra_function = test_timeout_value;
 
@@ -391,28 +372,15 @@ static void test_timeout(void) {
         assert_se(sd_ndisc_set_ifindex(nd, 42) >= 0);
         assert_se(sd_ndisc_set_mac(nd, &mac_addr) >= 0);
 
-        assert_se(sd_event_add_time_relative(
-                                  e, &test_hangcheck, clock_boottime_or_monotonic(),
-                                  30 * USEC_PER_SEC, 0,
-                                  test_rs_hangcheck, NULL) >= 0);
+        assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
+                                             30 * USEC_PER_SEC, 0,
+                                             NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
 
         assert_se(sd_ndisc_start(nd) >= 0);
 
-        sd_event_loop(e);
+        assert_se(sd_event_loop(e) >= 0);
 
-        test_hangcheck = sd_event_source_unref(test_hangcheck);
-
-        nd = sd_ndisc_unref(nd);
-
-        sd_event_unref(e);
+        test_fd[1] = safe_close(test_fd[1]);
 }
 
-int main(int argc, char *argv[]) {
-
-        test_setup_logging(LOG_DEBUG);
-
-        test_rs();
-        test_timeout();
-
-        return 0;
-}
+DEFINE_TEST_MAIN(LOG_DEBUG);

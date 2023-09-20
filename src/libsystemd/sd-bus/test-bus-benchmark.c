@@ -8,10 +8,10 @@
 #include "alloc-util.h"
 #include "bus-internal.h"
 #include "bus-kernel.h"
-#include "bus-util.h"
 #include "def.h"
 #include "fd-util.h"
 #include "missing_resource.h"
+#include "string-util.h"
 #include "time-util.h"
 #include "util.h"
 
@@ -57,7 +57,7 @@ static void server(sd_bus *b, size_t *result) {
                         return;
 
                 } else if (!sd_bus_message_is_signal(m, NULL, NULL))
-                        assert_not_reached("Unknown method");
+                        assert_not_reached();
         }
 }
 

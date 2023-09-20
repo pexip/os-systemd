@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 
+#include "bus-print-properties.h"
 #include "bus-util.h"
 #include "install.h"
 #include "output-mode.h"
@@ -29,9 +30,11 @@ enum action {
         ACTION_RELOAD,
         ACTION_REEXEC,
         ACTION_RUNLEVEL,
+        ACTION_TELINIT,
         ACTION_CANCEL_SHUTDOWN,
+        ACTION_SHOW_SHUTDOWN,
         _ACTION_MAX,
-        _ACTION_INVALID = -1
+        _ACTION_INVALID = -EINVAL,
 };
 
 enum dependency {
@@ -47,19 +50,19 @@ extern char **arg_states;
 extern char **arg_properties;
 extern bool arg_all;
 extern enum dependency arg_dependency;
-extern const char *arg_job_mode;
-extern UnitFileScope arg_scope;
+extern const char *_arg_job_mode;
+extern LookupScope arg_scope;
 extern bool arg_wait;
 extern bool arg_no_block;
-extern bool arg_no_legend;
+extern int arg_legend;
 extern PagerFlags arg_pager_flags;
 extern bool arg_no_wtmp;
 extern bool arg_no_sync;
 extern bool arg_no_wall;
 extern bool arg_no_reload;
-extern bool arg_value;
+extern BusPrintPropertyFlags arg_print_flags;
 extern bool arg_show_types;
-extern bool arg_ignore_inhibitors;
+extern int arg_check_inhibitors;
 extern bool arg_dry_run;
 extern bool arg_quiet;
 extern bool arg_full;
@@ -71,7 +74,7 @@ extern bool arg_ask_password;
 extern bool arg_runtime;
 extern UnitFilePresetMode arg_preset_mode;
 extern char **arg_wall;
-extern const char *arg_kill_who;
+extern const char *arg_kill_whom;
 extern int arg_signal;
 extern char *arg_root;
 extern usec_t arg_when;
@@ -90,3 +93,12 @@ extern bool arg_jobs_before;
 extern bool arg_jobs_after;
 extern char **arg_clean_what;
 extern TimestampStyle arg_timestamp_style;
+extern bool arg_read_only;
+extern bool arg_mkdir;
+extern bool arg_marked;
+
+static inline const char* arg_job_mode(void) {
+        return _arg_job_mode ?: "replace";
+}
+
+int systemctl_dispatch_parse_argv(int argc, char *argv[]);

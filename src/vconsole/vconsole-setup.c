@@ -11,6 +11,7 @@
 #include <linux/vt.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sysexits.h>
 #include <termios.h>
@@ -20,6 +21,7 @@
 
 #include "alloc-util.h"
 #include "env-file.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "io-util.h"
@@ -40,13 +42,7 @@ static int verify_vc_device(int fd) {
                 TIOCL_GETFGCONSOLE,
         };
 
-        int r;
-
-        r = ioctl(fd, TIOCLINUX, data);
-        if (r < 0)
-                return -errno;
-
-        return r;
+        return RET_NERRNO(ioctl(fd, TIOCLINUX, data));
 }
 
 static int verify_vc_allocation(unsigned idx) {
@@ -54,10 +50,7 @@ static int verify_vc_allocation(unsigned idx) {
 
         xsprintf(vcname, "/dev/vcs%u", idx);
 
-        if (access(vcname, F_OK) < 0)
-                return -errno;
-
-        return 0;
+        return RET_NERRNO(access(vcname, F_OK));
 }
 
 static int verify_vc_allocation_byfd(int fd) {
@@ -77,7 +70,7 @@ static int verify_vc_kbmode(int fd) {
          * Otherwise we would (likely) interfere with X11's processing of the
          * key events.
          *
-         * http://lists.freedesktop.org/archives/systemd-devel/2013-February/008573.html
+         * https://lists.freedesktop.org/archives/systemd-devel/2013-February/008573.html
          */
 
         if (ioctl(fd, KDGKBMODE, &curr_mode) < 0)
@@ -146,7 +139,7 @@ static int keyboard_load_and_wait(const char *vc, const char *map, const char *m
         args[i++] = NULL;
 
         if (DEBUG_LOGGING) {
-                _cleanup_free_ char *cmd;
+                _cleanup_free_ char *cmd = NULL;
 
                 cmd = strv_join((char**) args, " ");
                 log_debug("Executing \"%s\"...", strnull(cmd));
@@ -189,7 +182,7 @@ static int font_load_and_wait(const char *vc, const char *font, const char *map,
         args[i++] = NULL;
 
         if (DEBUG_LOGGING) {
-                _cleanup_free_ char *cmd;
+                _cleanup_free_ char *cmd = NULL;
 
                 cmd = strv_join((char**) args, " ");
                 log_debug("Executing \"%s\"...", strnull(cmd));
@@ -430,7 +423,7 @@ int main(int argc, char **argv) {
         unsigned idx = 0;
         int r;
 
-        log_setup_service();
+        log_setup();
 
         umask(0022);
 

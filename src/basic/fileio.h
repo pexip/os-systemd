@@ -2,11 +2,11 @@
 #pragma once
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <sys/stat.h>
-#include <sys/fcntl.h>
 #include <sys/types.h>
 
 #include "macro.h"
@@ -15,16 +15,18 @@
 #define LONG_LINE_MAX (1U*1024U*1024U)
 
 typedef enum {
-        WRITE_STRING_FILE_CREATE            = 1 << 0,
-        WRITE_STRING_FILE_TRUNCATE          = 1 << 1,
-        WRITE_STRING_FILE_ATOMIC            = 1 << 2,
-        WRITE_STRING_FILE_AVOID_NEWLINE     = 1 << 3,
-        WRITE_STRING_FILE_VERIFY_ON_FAILURE = 1 << 4,
-        WRITE_STRING_FILE_SYNC              = 1 << 5,
-        WRITE_STRING_FILE_DISABLE_BUFFER    = 1 << 6,
-        WRITE_STRING_FILE_NOFOLLOW          = 1 << 7,
-        WRITE_STRING_FILE_MKDIR_0755        = 1 << 8,
-        WRITE_STRING_FILE_MODE_0600         = 1 << 9,
+        WRITE_STRING_FILE_CREATE                     = 1 << 0,
+        WRITE_STRING_FILE_TRUNCATE                   = 1 << 1,
+        WRITE_STRING_FILE_ATOMIC                     = 1 << 2,
+        WRITE_STRING_FILE_AVOID_NEWLINE              = 1 << 3,
+        WRITE_STRING_FILE_VERIFY_ON_FAILURE          = 1 << 4,
+        WRITE_STRING_FILE_VERIFY_IGNORE_NEWLINE      = 1 << 5,
+        WRITE_STRING_FILE_SYNC                       = 1 << 6,
+        WRITE_STRING_FILE_DISABLE_BUFFER             = 1 << 7,
+        WRITE_STRING_FILE_NOFOLLOW                   = 1 << 8,
+        WRITE_STRING_FILE_MKDIR_0755                 = 1 << 9,
+        WRITE_STRING_FILE_MODE_0600                  = 1 << 10,
+        WRITE_STRING_FILE_SUPPRESS_REDUNDANT_VIRTUAL = 1 << 11,
 
         /* And before you wonder, why write_string_file_atomic_label_ts() is a separate function instead of just one
            more flag here: it's about linking: we don't want to pull -lselinux into all users of write_string_file()
@@ -38,6 +40,7 @@ typedef enum {
         READ_FULL_FILE_UNHEX               = 1 << 2, /* hex decode what we read */
         READ_FULL_FILE_WARN_WORLD_READABLE = 1 << 3, /* if regular file, log at LOG_WARNING level if access mode above 0700 */
         READ_FULL_FILE_CONNECT_SOCKET      = 1 << 4, /* if socket inode, connect to it and read off it */
+        READ_FULL_FILE_FAIL_WHEN_LARGER    = 1 << 5, /* fail loading if file is larger than specified size */
 } ReadFullFileFlags;
 
 int fopen_unlocked(const char *path, const char *options, FILE **ret);
@@ -60,14 +63,23 @@ static inline int write_string_file(const char *fn, const char *line, WriteStrin
 int write_string_filef(const char *fn, WriteStringFileFlags flags, const char *format, ...) _printf_(3, 4);
 
 int read_one_line_file(const char *filename, char **line);
-int read_full_file_full(int dir_fd, const char *filename, ReadFullFileFlags flags, const char *bind_name, char **contents, size_t *size);
-static inline int read_full_file(const char *filename, char **contents, size_t *size) {
-        return read_full_file_full(AT_FDCWD, filename, 0, NULL, contents, size);
+int read_full_file_full(int dir_fd, const char *filename, uint64_t offset, size_t size, ReadFullFileFlags flags, const char *bind_name, char **ret_contents, size_t *ret_size);
+static inline int read_full_file(const char *filename, char **ret_contents, size_t *ret_size) {
+        return read_full_file_full(AT_FDCWD, filename, UINT64_MAX, SIZE_MAX, 0, NULL, ret_contents, ret_size);
 }
-int read_full_virtual_file(const char *filename, char **ret_contents, size_t *ret_size);
-int read_full_stream_full(FILE *f, const char *filename, ReadFullFileFlags flags, char **contents, size_t *size);
-static inline int read_full_stream(FILE *f, char **contents, size_t *size) {
-        return read_full_stream_full(f, NULL, 0, contents, size);
+
+int read_virtual_file_fd(int fd, size_t max_size, char **ret_contents, size_t *ret_size);
+int read_virtual_file_at(int dir_fd, const char *filename, size_t max_size, char **ret_contents, size_t *ret_size);
+static inline int read_virtual_file(const char *filename, size_t max_size, char **ret_contents, size_t *ret_size) {
+        return read_virtual_file_at(AT_FDCWD, filename, max_size, ret_contents, ret_size);
+}
+static inline int read_full_virtual_file(const char *filename, char **ret_contents, size_t *ret_size) {
+        return read_virtual_file(filename, SIZE_MAX, ret_contents, ret_size);
+}
+
+int read_full_stream_full(FILE *f, const char *filename, uint64_t offset, size_t size, ReadFullFileFlags flags, char **ret_contents, size_t *ret_size);
+static inline int read_full_stream(FILE *f, char **ret_contents, size_t *ret_size) {
+        return read_full_stream_full(f, NULL, UINT64_MAX, SIZE_MAX, 0, ret_contents, ret_size);
 }
 
 int verify_file(const char *fn, const char *blob, bool accept_extra_nl);
@@ -79,16 +91,8 @@ int get_proc_field(const char *filename, const char *pattern, const char *termin
 DIR *xopendirat(int dirfd, const char *name, int flags);
 int xfopenat(int dir_fd, const char *path, const char *mode, int flags, FILE **ret);
 
-int search_and_fopen(const char *path, const char *mode, const char *root, const char **search, FILE **_f);
-int search_and_fopen_nulstr(const char *path, const char *mode, const char *root, const char *search, FILE **_f);
-
-int chase_symlinks_and_fopen_unlocked(
-                const char *path,
-                const char *root,
-                unsigned chase_flags,
-                const char *open_flags,
-                FILE **ret_file,
-                char **ret_path);
+int search_and_fopen(const char *path, const char *mode, const char *root, const char **search, FILE **ret, char **ret_path);
+int search_and_fopen_nulstr(const char *path, const char *mode, const char *root, const char *search, FILE **ret, char **ret_path);
 
 int fflush_and_check(FILE *f);
 int fflush_sync_and_check(FILE *f);
@@ -106,6 +110,12 @@ typedef enum ReadLineFlags {
 
 int read_line_full(FILE *f, size_t limit, ReadLineFlags flags, char **ret);
 
+static inline bool file_offset_beyond_memory_size(off_t x) {
+        if (x < 0) /* off_t is signed, filter that out */
+                return false;
+        return (uint64_t) x > (uint64_t) SIZE_MAX;
+}
+
 static inline int read_line(FILE *f, size_t limit, char **ret) {
         return read_line_full(f, limit, 0, ret);
 }
@@ -118,6 +128,4 @@ int safe_fgetc(FILE *f, char *ret);
 
 int warn_file_is_world_accessible(const char *filename, struct stat *st, const char *unit, unsigned line);
 
-int sync_rights(int from, int to);
-
-int rename_and_apply_smack_floor_label(const char *temp_path, const char *dest_path);
+int fopen_mode_to_flags(const char *mode);

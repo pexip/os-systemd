@@ -16,14 +16,8 @@
                           CLONE_NEWUSER|                                \
                           CLONE_NEWUTS))
 
-#define NAMESPACE_FLAGS_INITIAL  ((unsigned long) -1)
+#define NAMESPACE_FLAGS_INITIAL  ULONG_MAX
 
 int namespace_flags_from_string(const char *name, unsigned long *ret);
 int namespace_flags_to_string(unsigned long flags, char **ret);
-
-struct namespace_flag_map {
-        unsigned long flag;
-        const char *name;
-};
-
-extern const struct namespace_flag_map namespace_flag_map[];
+const char *namespace_single_flag_to_string(unsigned long flag);

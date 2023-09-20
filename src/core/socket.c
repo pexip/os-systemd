@@ -14,6 +14,7 @@
 #include "bpf-firewall.h"
 #include "bus-error.h"
 #include "bus-util.h"
+#include "chase-symlinks.h"
 #include "copy.h"
 #include "dbus-socket.h"
 #include "dbus-unit.h"
@@ -22,18 +23,18 @@
 #include "exit-status.h"
 #include "fd-util.h"
 #include "format-util.h"
-#include "fs-util.h"
 #include "in-addr-util.h"
 #include "io-util.h"
 #include "ip-protocol-list.h"
 #include "label.h"
 #include "log.h"
-#include "mkdir.h"
+#include "mkdir-label.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
 #include "selinux-util.h"
 #include "serialize.h"
+#include "service.h"
 #include "signal-util.h"
 #include "smack-util.h"
 #include "socket.h"
@@ -81,7 +82,7 @@ static void socket_init(Unit *u) {
         assert(u);
         assert(u->load_state == UNIT_STUB);
 
-        s->backlog = SOMAXCONN;
+        s->backlog = SOMAXCONN_DELUXE;
         s->timeout_usec = u->manager->default_timeout_start_usec;
         s->directory_mode = 0755;
         s->socket_mode = 0666;
@@ -99,7 +100,7 @@ static void socket_init(Unit *u) {
         s->control_command_id = _SOCKET_EXEC_COMMAND_INVALID;
 
         s->trigger_limit.interval = USEC_INFINITY;
-        s->trigger_limit.burst = (unsigned) -1;
+        s->trigger_limit.burst = UINT_MAX;
 }
 
 static void socket_unwatch_control_pid(Socket *s) {
@@ -108,8 +109,7 @@ static void socket_unwatch_control_pid(Socket *s) {
         if (s->control_pid <= 0)
                 return;
 
-        unit_unwatch_pid(UNIT(s), s->control_pid);
-        s->control_pid = 0;
+        unit_unwatch_pid(UNIT(s), TAKE_PID(s->control_pid));
 }
 
 static void socket_cleanup_fd_list(SocketPort *p) {
@@ -120,6 +120,19 @@ static void socket_cleanup_fd_list(SocketPort *p) {
         p->n_auxiliary_fds = 0;
 }
 
+SocketPort *socket_port_free(SocketPort *p) {
+        if (!p)
+                return NULL;
+
+        sd_event_source_unref(p->event_source);
+
+        socket_cleanup_fd_list(p);
+        safe_close(p->fd);
+        free(p->path);
+
+        return mfree(p);
+}
+
 void socket_free_ports(Socket *s) {
         SocketPort *p;
 
@@ -127,13 +140,7 @@ void socket_free_ports(Socket *s) {
 
         while ((p = s->ports)) {
                 LIST_REMOVE(port, s->ports, p);
-
-                sd_event_source_unref(p->event_source);
-
-                socket_cleanup_fd_list(p);
-                safe_close(p->fd);
-                free(p->path);
-                free(p);
+                socket_port_free(p);
         }
 }
 
@@ -174,7 +181,7 @@ static void socket_done(Unit *u) {
 
         s->fdname = mfree(s->fdname);
 
-        s->timer_event_source = sd_event_source_unref(s->timer_event_source);
+        s->timer_event_source = sd_event_source_disable_unref(s->timer_event_source);
 }
 
 static int socket_arm_timer(Socket *s, usec_t usec) {
@@ -208,8 +215,6 @@ static int socket_arm_timer(Socket *s, usec_t usec) {
 }
 
 static bool have_non_accept_socket(Socket *s) {
-        SocketPort *p;
-
         assert(s);
 
         if (!s->accept)
@@ -228,7 +233,6 @@ static bool have_non_accept_socket(Socket *s) {
 }
 
 static int socket_add_mount_dependencies(Socket *s) {
-        SocketPort *p;
         int r;
 
         assert(s);
@@ -313,7 +317,7 @@ static int socket_add_extras(Socket *s) {
         if (s->trigger_limit.interval == USEC_INFINITY)
                 s->trigger_limit.interval = 2 * USEC_PER_SEC;
 
-        if (s->trigger_limit.burst == (unsigned) -1) {
+        if (s->trigger_limit.burst == UINT_MAX) {
                 if (s->accept)
                         s->trigger_limit.burst = 200;
                 else
@@ -368,7 +372,6 @@ static int socket_add_extras(Socket *s) {
 
 static const char *socket_find_symlink_target(Socket *s) {
         const char *found = NULL;
-        SocketPort *p;
 
         LIST_FOREACH(port, p, s->ports) {
                 const char *f = NULL;
@@ -402,35 +405,23 @@ static int socket_verify(Socket *s) {
         assert(s);
         assert(UNIT(s)->load_state == UNIT_LOADED);
 
-        if (!s->ports) {
-                log_unit_error(UNIT(s), "Unit has no Listen setting (ListenStream=, ListenDatagram=, ListenFIFO=, ...). Refusing.");
-                return -ENOEXEC;
-        }
+        if (!s->ports)
+                return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Unit has no Listen setting (ListenStream=, ListenDatagram=, ListenFIFO=, ...). Refusing.");
 
-        if (s->accept && have_non_accept_socket(s)) {
-                log_unit_error(UNIT(s), "Unit configured for accepting sockets, but sockets are non-accepting. Refusing.");
-                return -ENOEXEC;
-        }
+        if (s->accept && have_non_accept_socket(s))
+                return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Unit configured for accepting sockets, but sockets are non-accepting. Refusing.");
 
-        if (s->accept && s->max_connections <= 0) {
-                log_unit_error(UNIT(s), "MaxConnection= setting too small. Refusing.");
-                return -ENOEXEC;
-        }
+        if (s->accept && s->max_connections <= 0)
+                return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "MaxConnection= setting too small. Refusing.");
 
-        if (s->accept && UNIT_DEREF(s->service)) {
-                log_unit_error(UNIT(s), "Explicit service configuration for accepting socket units not supported. Refusing.");
-                return -ENOEXEC;
-        }
+        if (s->accept && UNIT_DEREF(s->service))
+                return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Explicit service configuration for accepting socket units not supported. Refusing.");
 
-        if (s->exec_context.pam_name && s->kill_context.kill_mode != KILL_CONTROL_GROUP) {
-                log_unit_error(UNIT(s), "Unit has PAM enabled. Kill mode must be set to 'control-group'. Refusing.");
-                return -ENOEXEC;
-        }
+        if (s->exec_context.pam_name && s->kill_context.kill_mode != KILL_CONTROL_GROUP)
+                return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Unit has PAM enabled. Kill mode must be set to 'control-group'. Refusing.");
 
-        if (!strv_isempty(s->symlinks) && !socket_find_symlink_target(s)) {
-                log_unit_error(UNIT(s), "Unit has symlinks set but none or more than one node in the file system. Refusing.");
-                return -ENOEXEC;
-        }
+        if (!strv_isempty(s->symlinks) && !socket_find_symlink_target(s))
+                return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Unit has symlinks set but none or more than one node in the file system. Refusing.");
 
         return 0;
 }
@@ -445,7 +436,7 @@ static void peer_address_hash_func(const SocketPeer *s, struct siphash *state) {
         else if (s->peer.sa.sa_family == AF_VSOCK)
                 siphash24_compress(&s->peer.vm.svm_cid, sizeof(s->peer.vm.svm_cid), state);
         else
-                assert_not_reached("Unknown address family.");
+                assert_not_reached();
 }
 
 static int peer_address_compare_func(const SocketPeer *x, const SocketPeer *y) {
@@ -455,7 +446,7 @@ static int peer_address_compare_func(const SocketPeer *x, const SocketPeer *y) {
         if (r != 0)
                 return r;
 
-        switch(x->peer.sa.sa_family) {
+        switch (x->peer.sa.sa_family) {
         case AF_INET:
                 return memcmp(&x->peer.in.sin_addr, &y->peer.in.sin_addr, sizeof(x->peer.in.sin_addr));
         case AF_INET6:
@@ -463,7 +454,7 @@ static int peer_address_compare_func(const SocketPeer *x, const SocketPeer *y) {
         case AF_VSOCK:
                 return CMP(x->peer.vm.svm_cid, y->peer.vm.svm_cid);
         }
-        assert_not_reached("Black sheep in the family!");
+        assert_not_reached();
 }
 
 DEFINE_PRIVATE_HASH_OPS(peer_address_hash_ops, SocketPeer, peer_address_hash_func, peer_address_compare_func);
@@ -474,10 +465,6 @@ static int socket_load(Unit *u) {
 
         assert(u);
         assert(u->load_state == UNIT_STUB);
-
-        r = set_ensure_allocated(&s->peers_by_address, &peer_address_hash_ops);
-        if (r < 0)
-                return r;
 
         r = unit_load_fragment_and_dropin(u, true);
         if (r < 0)
@@ -497,12 +484,13 @@ static int socket_load(Unit *u) {
 static SocketPeer *socket_peer_new(void) {
         SocketPeer *p;
 
-        p = new0(SocketPeer, 1);
+        p = new(SocketPeer, 1);
         if (!p)
                 return NULL;
 
-        p->n_ref = 1;
-
+        *p = (SocketPeer) {
+                .n_ref = 1,
+        };
         return p;
 }
 
@@ -519,20 +507,25 @@ DEFINE_TRIVIAL_REF_UNREF_FUNC(SocketPeer, socket_peer, socket_peer_free);
 
 int socket_acquire_peer(Socket *s, int fd, SocketPeer **p) {
         _cleanup_(socket_peer_unrefp) SocketPeer *remote = NULL;
-        SocketPeer sa = {}, *i;
-        socklen_t salen = sizeof(sa.peer);
+        SocketPeer sa = {
+                .peer_salen = sizeof(union sockaddr_union),
+        }, *i;
         int r;
 
         assert(fd >= 0);
         assert(s);
 
-        if (getpeername(fd, &sa.peer.sa, &salen) < 0)
+        if (getpeername(fd, &sa.peer.sa, &sa.peer_salen) < 0)
                 return log_unit_error_errno(UNIT(s), errno, "getpeername failed: %m");
 
         if (!IN_SET(sa.peer.sa.sa_family, AF_INET, AF_INET6, AF_VSOCK)) {
                 *p = NULL;
                 return 0;
         }
+
+        r = set_ensure_allocated(&s->peers_by_address, &peer_address_hash_ops);
+        if (r < 0)
+                return r;
 
         i = set_get(s->peers_by_address, &sa);
         if (i) {
@@ -545,7 +538,7 @@ int socket_acquire_peer(Socket *s, int fd, SocketPeer **p) {
                 return log_oom();
 
         remote->peer = sa.peer;
-        remote->peer_salen = salen;
+        remote->peer_salen = sa.peer_salen;
 
         r = set_put(s->peers_by_address, remote);
         if (r < 0)
@@ -554,7 +547,6 @@ int socket_acquire_peer(Socket *s, int fd, SocketPeer **p) {
         remote->socket = s;
 
         *p = TAKE_PTR(remote);
-
         return 1;
 }
 
@@ -570,15 +562,12 @@ _const_ static const char* listen_lookup(int family, int type) {
         else if (type == SOCK_SEQPACKET)
                 return "ListenSequentialPacket";
 
-        assert_not_reached("Unknown socket type");
+        assert_not_reached();
         return NULL;
 }
 
 static void socket_dump(Unit *u, FILE *f, const char *prefix) {
-        char time_string[FORMAT_TIMESPAN_MAX];
-        SocketExecCommand c;
         Socket *s = SOCKET(u);
-        SocketPort *p;
         const char *prefix2, *str;
 
         assert(s);
@@ -735,12 +724,12 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
         if (s->keep_alive_time > 0)
                 fprintf(f,
                         "%sKeepAliveTimeSec: %s\n",
-                        prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->keep_alive_time, USEC_PER_SEC));
+                        prefix, FORMAT_TIMESPAN(s->keep_alive_time, USEC_PER_SEC));
 
         if (s->keep_alive_interval > 0)
                 fprintf(f,
                         "%sKeepAliveIntervalSec: %s\n",
-                        prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->keep_alive_interval, USEC_PER_SEC));
+                        prefix, FORMAT_TIMESPAN(s->keep_alive_interval, USEC_PER_SEC));
 
         if (s->keep_alive_cnt > 0)
                 fprintf(f,
@@ -750,23 +739,21 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
         if (s->defer_accept > 0)
                 fprintf(f,
                         "%sDeferAcceptSec: %s\n",
-                        prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->defer_accept, USEC_PER_SEC));
+                        prefix, FORMAT_TIMESPAN(s->defer_accept, USEC_PER_SEC));
 
         LIST_FOREACH(port, p, s->ports) {
 
                 switch (p->type) {
                 case SOCKET_SOCKET: {
                         _cleanup_free_ char *k = NULL;
-                        const char *t;
                         int r;
 
                         r = socket_address_print(&p->address, &k);
-                        if (r < 0)
-                                t = strerror_safe(r);
-                        else
-                                t = k;
-
-                        fprintf(f, "%s%s: %s\n", prefix, listen_lookup(socket_address_family(&p->address), p->address.type), t);
+                        if (r < 0) {
+                                errno = -r;
+                                fprintf(f, "%s%s: %m\n", prefix, listen_lookup(socket_address_family(&p->address), p->address.type));
+                        } else
+                                fprintf(f, "%s%s: %s\n", prefix, listen_lookup(socket_address_family(&p->address), p->address.type), k);
                         break;
                 }
                 case SOCKET_SPECIAL:
@@ -786,7 +773,7 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
         fprintf(f,
                 "%sTriggerLimitIntervalSec: %s\n"
                 "%sTriggerLimitBurst: %u\n",
-                prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->trigger_limit.interval, USEC_PER_SEC),
+                prefix, FORMAT_TIMESPAN(s->trigger_limit.interval, USEC_PER_SEC),
                 prefix, s->trigger_limit.burst);
 
         str = ip_protocol_to_name(s->socket_protocol);
@@ -794,8 +781,6 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
                 fprintf(f, "%sSocketProtocol: %s\n", prefix, str);
 
         if (!strv_isempty(s->symlinks)) {
-                char **q;
-
                 fprintf(f, "%sSymlinks:", prefix);
                 STRV_FOREACH(q, s->symlinks)
                         fprintf(f, " %s", *q);
@@ -805,12 +790,12 @@ static void socket_dump(Unit *u, FILE *f, const char *prefix) {
 
         fprintf(f,
                 "%sTimeoutSec: %s\n",
-                prefix, format_timespan(time_string, FORMAT_TIMESPAN_MAX, s->timeout_usec, USEC_PER_SEC));
+                prefix, FORMAT_TIMESPAN(s->timeout_usec, USEC_PER_SEC));
 
         exec_context_dump(&s->exec_context, f, prefix);
         kill_context_dump(&s->kill_context, f, prefix);
 
-        for (c = 0; c < _SOCKET_EXEC_COMMAND_MAX; c++) {
+        for (SocketExecCommand c = 0; c < _SOCKET_EXEC_COMMAND_MAX; c++) {
                 if (!s->exec_command[c])
                         continue;
 
@@ -878,14 +863,12 @@ static int instance_from_socket(int fd, unsigned nr, char **instance) {
                                      be16toh(remote.in6.sin6_port)) < 0)
                                 return -ENOMEM;
                 } else {
-                        char a[INET6_ADDRSTRLEN], b[INET6_ADDRSTRLEN];
-
                         if (asprintf(&r,
                                      "%u-%s:%u-%s:%u",
                                      nr,
-                                     inet_ntop(AF_INET6, &local.in6.sin6_addr, a, sizeof(a)),
+                                     IN6_ADDR_TO_STRING(&local.in6.sin6_addr),
                                      be16toh(local.in6.sin6_port),
-                                     inet_ntop(AF_INET6, &remote.in6.sin6_addr, b, sizeof(b)),
+                                     IN6_ADDR_TO_STRING(&remote.in6.sin6_addr),
                                      be16toh(remote.in6.sin6_port)) < 0)
                                 return -ENOMEM;
                 }
@@ -928,7 +911,7 @@ static int instance_from_socket(int fd, unsigned nr, char **instance) {
                 break;
 
         default:
-                assert_not_reached("Unhandled socket type.");
+                assert_not_reached();
         }
 
         *instance = r;
@@ -936,9 +919,6 @@ static int instance_from_socket(int fd, unsigned nr, char **instance) {
 }
 
 static void socket_close_fds(Socket *s) {
-        SocketPort *p;
-        char **i;
-
         assert(s);
 
         LIST_FOREACH(port, p, s->ports) {
@@ -946,7 +926,7 @@ static void socket_close_fds(Socket *s) {
 
                 was_open = p->fd >= 0;
 
-                p->event_source = sd_event_source_unref(p->event_source);
+                p->event_source = sd_event_source_disable_unref(p->event_source);
                 p->fd = safe_close(p->fd);
                 socket_cleanup_fd_list(p);
 
@@ -981,6 +961,8 @@ static void socket_close_fds(Socket *s) {
         if (s->remove_on_stop)
                 STRV_FOREACH(i, s->symlinks)
                         (void) unlink(*i);
+
+        /* Note that we don't return NULL here, since s has not been freed. */
 }
 
 static void socket_apply_socket_options(Socket *s, SocketPort *p, int fd) {
@@ -1282,7 +1264,6 @@ static int mq_address_create(
 
 static int socket_symlink(Socket *s) {
         const char *p;
-        char **i;
         int r;
 
         assert(s);
@@ -1306,7 +1287,8 @@ static int socket_symlink(Socket *s) {
                 }
 
                 if (r < 0)
-                        log_unit_warning_errno(UNIT(s), r, "Failed to create symlink %s → %s, ignoring: %m", p, *i);
+                        log_unit_warning_errno(UNIT(s), r, "Failed to create symlink %s %s %s, ignoring: %m",
+                                               p, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), *i);
         }
 
         return 0;
@@ -1331,7 +1313,7 @@ static int usbffs_select_ep(const struct dirent *d) {
 
 static int usbffs_dispatch_eps(SocketPort *p) {
         _cleanup_free_ struct dirent **ent = NULL;
-        size_t n, k, i;
+        size_t n, k;
         int r;
 
         r = scandir(p->path, &ent, usbffs_select_ep, alphasort);
@@ -1348,7 +1330,7 @@ static int usbffs_dispatch_eps(SocketPort *p) {
         p->n_auxiliary_fds = n;
 
         k = 0;
-        for (i = 0; i < n; ++i) {
+        for (size_t i = 0; i < n; ++i) {
                 _cleanup_free_ char *ep = NULL;
 
                 ep = path_make_absolute(ent[i]->d_name, p->path);
@@ -1357,7 +1339,7 @@ static int usbffs_dispatch_eps(SocketPort *p) {
                         goto fail;
                 }
 
-                path_simplify(ep, false);
+                path_simplify(ep);
 
                 r = usbffs_address_create(ep);
                 if (r < 0)
@@ -1375,7 +1357,7 @@ fail:
         p->n_auxiliary_fds = 0;
 
 clear:
-        for (i = 0; i < n; ++i)
+        for (size_t i = 0; i < n; ++i)
                 free(ent[i]);
 
         return r;
@@ -1432,39 +1414,40 @@ static int socket_determine_selinux_label(Socket *s, char **ret) {
         assert(s);
         assert(ret);
 
-        if (s->selinux_context_from_net) {
-                /* If this is requested, get the label from the network label */
+        Unit *service;
+        ExecCommand *c;
+        const char *exec_context;
+        _cleanup_free_ char *path = NULL;
 
-                r = mac_selinux_get_our_label(ret);
-                if (r == -EOPNOTSUPP)
-                        goto no_label;
+        r = socket_load_service_unit(s, -1, &service);
+        if (r == -ENODATA)
+                goto no_label;
+        if (r < 0)
+                return r;
 
-        } else {
-                /* Otherwise, get it from the executable we are about to start. */
+        exec_context = SERVICE(service)->exec_context.selinux_context;
+        if (exec_context) {
+                char *con;
 
-                Unit *service;
-                ExecCommand *c;
-                _cleanup_free_ char *path = NULL;
+                con = strdup(exec_context);
+                if (!con)
+                        return -ENOMEM;
 
-                r = socket_load_service_unit(s, -1, &service);
-                if (r == -ENODATA)
-                        goto no_label;
-                if (r < 0)
-                        return r;
-
-                c = SERVICE(service)->exec_command[SERVICE_EXEC_START];
-                if (!c)
-                        goto no_label;
-
-                r = chase_symlinks(c->path, SERVICE(service)->exec_context.root_directory, CHASE_PREFIX_ROOT, &path, NULL);
-                if (r < 0)
-                        goto no_label;
-
-                r = mac_selinux_get_create_label_from_exe(path, ret);
-                if (IN_SET(r, -EPERM, -EOPNOTSUPP))
-                        goto no_label;
+                *ret = TAKE_PTR(con);
+                return 0;
         }
 
+        c = SERVICE(service)->exec_command[SERVICE_EXEC_START];
+        if (!c)
+                goto no_label;
+
+        r = chase_symlinks(c->path, SERVICE(service)->exec_context.root_directory, CHASE_PREFIX_ROOT, &path, NULL);
+        if (r < 0)
+                goto no_label;
+
+        r = mac_selinux_get_create_label_from_exe(path, ret);
+        if (IN_SET(r, -EPERM, -EOPNOTSUPP))
+                goto no_label;
         return r;
 
 no_label:
@@ -1557,9 +1540,17 @@ static int socket_address_listen_in_cgroup(
         if (s->exec_context.network_namespace_path &&
             s->exec_runtime &&
             s->exec_runtime->netns_storage_socket[0] >= 0) {
-                r = open_netns_path(s->exec_runtime->netns_storage_socket, s->exec_context.network_namespace_path);
+                r = open_shareable_ns_path(s->exec_runtime->netns_storage_socket, s->exec_context.network_namespace_path, CLONE_NEWNET);
                 if (r < 0)
                         return log_unit_error_errno(UNIT(s), r, "Failed to open network namespace path %s: %m", s->exec_context.network_namespace_path);
+        }
+
+        if (s->exec_context.ipc_namespace_path &&
+            s->exec_runtime &&
+            s->exec_runtime->ipcns_storage_socket[0] >= 0) {
+                r = open_shareable_ns_path(s->exec_runtime->ipcns_storage_socket, s->exec_context.ipc_namespace_path, CLONE_NEWIPC);
+                if (r < 0)
+                        return log_unit_error_errno(UNIT(s), r, "Failed to open IPC namespace path %s: %m", s->exec_context.ipc_namespace_path);
         }
 
         if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, pair) < 0)
@@ -1578,7 +1569,7 @@ static int socket_address_listen_in_cgroup(
                     s->exec_runtime->netns_storage_socket[0] >= 0) {
 
                         if (ns_type_supported(NAMESPACE_NET)) {
-                                r = setup_netns(s->exec_runtime->netns_storage_socket);
+                                r = setup_shareable_ns(s->exec_runtime->netns_storage_socket, CLONE_NEWNET);
                                 if (r < 0) {
                                         log_unit_error_errno(UNIT(s), r, "Failed to join network namespace: %m");
                                         _exit(EXIT_NETWORK);
@@ -1621,13 +1612,12 @@ static int socket_address_listen_in_cgroup(
         return fd;
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(Socket *, socket_close_fds);
+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(Socket *, socket_close_fds, NULL);
 
-static int socket_open_fds(Socket *_s) {
-        _cleanup_(socket_close_fdsp) Socket *s = _s;
+static int socket_open_fds(Socket *orig_s) {
+        _cleanup_(socket_close_fdsp) Socket *s = orig_s;
         _cleanup_(mac_selinux_freep) char *label = NULL;
         bool know_label = false;
-        SocketPort *p;
         int r;
 
         assert(s);
@@ -1728,7 +1718,7 @@ static int socket_open_fds(Socket *_s) {
                         break;
                 }
                 default:
-                        assert_not_reached("Unknown port type");
+                        assert_not_reached();
                 }
         }
 
@@ -1737,7 +1727,6 @@ static int socket_open_fds(Socket *_s) {
 }
 
 static void socket_unwatch_fds(Socket *s) {
-        SocketPort *p;
         int r;
 
         assert(s);
@@ -1756,7 +1745,6 @@ static void socket_unwatch_fds(Socket *s) {
 }
 
 static int socket_watch_fds(Socket *s) {
-        SocketPort *p;
         int r;
 
         assert(s);
@@ -1794,7 +1782,6 @@ enum {
 
 static int socket_check_open(Socket *s) {
         bool have_open = false, have_closed = false;
-        SocketPort *p;
 
         assert(s);
 
@@ -1836,7 +1823,7 @@ static void socket_set_state(Socket *s, SocketState state) {
                     SOCKET_FINAL_SIGKILL,
                     SOCKET_CLEANING)) {
 
-                s->timer_event_source = sd_event_source_unref(s->timer_event_source);
+                s->timer_event_source = sd_event_source_disable_unref(s->timer_event_source);
                 socket_unwatch_control_pid(s);
                 s->control_command = NULL;
                 s->control_command_id = _SOCKET_EXEC_COMMAND_INVALID;
@@ -1998,7 +1985,6 @@ static int socket_chown(Socket *s, pid_t *_pid) {
         if (r == 0) {
                 uid_t uid = UID_INVALID;
                 gid_t gid = GID_INVALID;
-                SocketPort *p;
 
                 /* Child */
 
@@ -2050,7 +2036,7 @@ static int socket_chown(Socket *s, pid_t *_pid) {
         return 0;
 
 fail:
-        s->timer_event_source = sd_event_source_unref(s->timer_event_source);
+        s->timer_event_source = sd_event_source_disable_unref(s->timer_event_source);
         return r;
 }
 
@@ -2297,7 +2283,7 @@ fail:
 }
 
 static void flush_ports(Socket *s) {
-        SocketPort *p;
+        assert(s);
 
         /* Flush all incoming traffic, regardless if actual bytes or new connections, so that this socket isn't busy
          * anymore */
@@ -2342,11 +2328,9 @@ static void socket_enter_running(Socket *s, int cfd_in) {
         if (cfd < 0) {
                 bool pending = false;
                 Unit *other;
-                void *v;
 
-                /* If there's already a start pending don't bother to
-                 * do anything */
-                HASHMAP_FOREACH_KEY(v, other, UNIT(s)->dependencies[UNIT_TRIGGERS])
+                /* If there's already a start pending don't bother to do anything */
+                UNIT_FOREACH_DEPENDENCY(other, UNIT(s), UNIT_ATOM_TRIGGERS)
                         if (unit_active_or_pending(other)) {
                                 pending = true;
                                 break;
@@ -2377,10 +2361,12 @@ static void socket_enter_running(Socket *s, int cfd_in) {
 
                 if (s->max_connections_per_source > 0) {
                         r = socket_acquire_peer(s, cfd, &p);
-                        if (ERRNO_IS_DISCONNECT(r))
-                                return;
-                        if (r < 0) /* We didn't have enough resources to acquire peer information, let's fail. */
+                        if (r < 0) {
+                                if (ERRNO_IS_DISCONNECT(r))
+                                        return;
+                                /* We didn't have enough resources to acquire peer information, let's fail. */
                                 goto fail;
+                        }
                         if (r > 0 && p->n_ref > s->max_connections_per_source) {
                                 _cleanup_free_ char *t = NULL;
 
@@ -2406,7 +2392,7 @@ static void socket_enter_running(Socket *s, int cfd_in) {
 
                 s->n_accepted++;
 
-                r = service_set_socket_fd(SERVICE(service), cfd, s, s->selinux_context_from_net);
+                r = service_set_socket_fd(SERVICE(service), cfd, s, p, s->selinux_context_from_net);
                 if (ERRNO_IS_DISCONNECT(r))
                         return;
                 if (r < 0)
@@ -2414,8 +2400,6 @@ static void socket_enter_running(Socket *s, int cfd_in) {
 
                 TAKE_FD(cfd); /* We passed ownership of the fd to the service now. Forget it here. */
                 s->n_connections++;
-
-                SERVICE(service)->peer = TAKE_PTR(p); /* Pass ownership of the peer reference */
 
                 r = manager_add_job(UNIT(s)->manager, JOB_START, service, JOB_REPLACE, NULL, &error, NULL);
                 if (r < 0) {
@@ -2507,26 +2491,16 @@ static int socket_start(Unit *u) {
 
                 service = SERVICE(UNIT_DEREF(s->service));
 
-                if (UNIT(service)->load_state != UNIT_LOADED) {
-                        log_unit_error(u, "Socket service %s not loaded, refusing.", UNIT(service)->id);
-                        return -ENOENT;
-                }
+                if (UNIT(service)->load_state != UNIT_LOADED)
+                        return log_unit_error_errno(u, SYNTHETIC_ERRNO(ENOENT), "Socket service %s not loaded, refusing.", UNIT(service)->id);
 
                 /* If the service is already active we cannot start the
                  * socket */
-                if (!IN_SET(service->state, SERVICE_DEAD, SERVICE_FAILED, SERVICE_AUTO_RESTART)) {
-                        log_unit_error(u, "Socket service %s already active, refusing.", UNIT(service)->id);
-                        return -EBUSY;
-                }
+                if (!IN_SET(service->state, SERVICE_DEAD, SERVICE_FAILED, SERVICE_AUTO_RESTART))
+                        return log_unit_error_errno(u, SYNTHETIC_ERRNO(EBUSY), "Socket service %s already active, refusing.", UNIT(service)->id);
         }
 
         assert(IN_SET(s->state, SOCKET_DEAD, SOCKET_FAILED));
-
-        r = unit_test_start_limit(u);
-        if (r < 0) {
-                socket_enter_dead(s, SOCKET_FAILURE_START_LIMIT_HIT);
-                return r;
-        }
 
         r = unit_acquire_invocation_id(u);
         if (r < 0)
@@ -2580,7 +2554,6 @@ static int socket_stop(Unit *u) {
 
 static int socket_serialize(Unit *u, FILE *f, FDSet *fds) {
         Socket *s = SOCKET(u);
-        SocketPort *p;
         int r;
 
         assert(u);
@@ -2632,13 +2605,6 @@ static int socket_serialize(Unit *u, FILE *f, FDSet *fds) {
         }
 
         return 0;
-}
-
-static void socket_port_take_fd(SocketPort *p, FDSet *fds, int fd) {
-        assert(p);
-
-        safe_close(p->fd);
-        p->fd = fdset_remove(fds, fd);
 }
 
 static int socket_deserialize_item(Unit *u, const char *key, const char *value, FDSet *fds) {
@@ -2698,85 +2664,122 @@ static int socket_deserialize_item(Unit *u, const char *key, const char *value, 
                 }
         } else if (streq(key, "fifo")) {
                 int fd, skip = 0;
-                SocketPort *p;
 
                 if (sscanf(value, "%i %n", &fd, &skip) < 1 || fd < 0 || !fdset_contains(fds, fd))
                         log_unit_debug(u, "Failed to parse fifo value: %s", value);
-                else
+                else {
+                        bool found = false;
+
                         LIST_FOREACH(port, p, s->ports)
-                                if (p->type == SOCKET_FIFO &&
+                                if (p->fd < 0 &&
+                                    p->type == SOCKET_FIFO &&
                                     path_equal_or_files_same(p->path, value+skip, 0)) {
-                                        socket_port_take_fd(p, fds, fd);
+                                        p->fd = fdset_remove(fds, fd);
+                                        found = true;
                                         break;
                                 }
+                        if (!found)
+                                log_unit_debug(u, "No matching fifo socket found: %s", value+skip);
+                }
 
         } else if (streq(key, "special")) {
                 int fd, skip = 0;
-                SocketPort *p;
 
                 if (sscanf(value, "%i %n", &fd, &skip) < 1 || fd < 0 || !fdset_contains(fds, fd))
                         log_unit_debug(u, "Failed to parse special value: %s", value);
-                else
+                else {
+                        bool found = false;
+
                         LIST_FOREACH(port, p, s->ports)
-                                if (p->type == SOCKET_SPECIAL &&
+                                if (p->fd < 0 &&
+                                    p->type == SOCKET_SPECIAL &&
                                     path_equal_or_files_same(p->path, value+skip, 0)) {
-                                        socket_port_take_fd(p, fds, fd);
+                                        p->fd = fdset_remove(fds, fd);
+                                        found = true;
                                         break;
                                 }
+                        if (!found)
+                                log_unit_debug(u, "No matching special socket found: %s", value+skip);
+                }
 
         } else if (streq(key, "mqueue")) {
                 int fd, skip = 0;
-                SocketPort *p;
 
                 if (sscanf(value, "%i %n", &fd, &skip) < 1 || fd < 0 || !fdset_contains(fds, fd))
                         log_unit_debug(u, "Failed to parse mqueue value: %s", value);
-                else
+                else {
+                        bool found = false;
+
                         LIST_FOREACH(port, p, s->ports)
-                                if (p->type == SOCKET_MQUEUE &&
+                                if (p->fd < 0 &&
+                                    p->type == SOCKET_MQUEUE &&
                                     streq(p->path, value+skip)) {
-                                        socket_port_take_fd(p, fds, fd);
+                                        p->fd = fdset_remove(fds, fd);
+                                        found = true;
                                         break;
                                 }
+                        if (!found)
+                                log_unit_debug(u, "No matching mqueue socket found: %s", value+skip);
+                }
 
         } else if (streq(key, "socket")) {
                 int fd, type, skip = 0;
-                SocketPort *p;
 
                 if (sscanf(value, "%i %i %n", &fd, &type, &skip) < 2 || fd < 0 || type < 0 || !fdset_contains(fds, fd))
                         log_unit_debug(u, "Failed to parse socket value: %s", value);
-                else
+                else {
+                        bool found = false;
+
                         LIST_FOREACH(port, p, s->ports)
-                                if (socket_address_is(&p->address, value+skip, type)) {
-                                        socket_port_take_fd(p, fds, fd);
+                                if (p->fd < 0 &&
+                                    socket_address_is(&p->address, value+skip, type)) {
+                                        p->fd = fdset_remove(fds, fd);
+                                        found = true;
                                         break;
                                 }
+                        if (!found)
+                                log_unit_debug(u, "No matching %s socket found: %s",
+                                               socket_address_type_to_string(type), value+skip);
+                }
 
         } else if (streq(key, "netlink")) {
                 int fd, skip = 0;
-                SocketPort *p;
 
                 if (sscanf(value, "%i %n", &fd, &skip) < 1 || fd < 0 || !fdset_contains(fds, fd))
                         log_unit_debug(u, "Failed to parse socket value: %s", value);
-                else
+                else {
+                        bool found = false;
+
                         LIST_FOREACH(port, p, s->ports)
-                                if (socket_address_is_netlink(&p->address, value+skip)) {
-                                        socket_port_take_fd(p, fds, fd);
+                                if (p->fd < 0 &&
+                                    socket_address_is_netlink(&p->address, value+skip)) {
+                                        p->fd = fdset_remove(fds, fd);
+                                        found = true;
                                         break;
                                 }
+                        if (!found)
+                                log_unit_debug(u, "No matching netlink socket found: %s", value+skip);
+                }
 
         } else if (streq(key, "ffs")) {
                 int fd, skip = 0;
-                SocketPort *p;
 
                 if (sscanf(value, "%i %n", &fd, &skip) < 1 || fd < 0 || !fdset_contains(fds, fd))
                         log_unit_debug(u, "Failed to parse ffs value: %s", value);
-                else
+                else {
+                        bool found = false;
+
                         LIST_FOREACH(port, p, s->ports)
-                                if (p->type == SOCKET_USB_FUNCTION &&
+                                if (p->fd < 0 &&
+                                    p->type == SOCKET_USB_FUNCTION &&
                                     path_equal_or_files_same(p->path, value+skip, 0)) {
-                                        socket_port_take_fd(p, fds, fd);
+                                        p->fd = fdset_remove(fds, fd);
+                                        found = true;
                                         break;
                                 }
+                        if (!found)
+                                log_unit_debug(u, "No matching ffs socket found: %s", value+skip);
+                }
 
         } else
                 log_unit_debug(UNIT(s), "Unknown serialization key: %s", key);
@@ -2786,7 +2789,6 @@ static int socket_deserialize_item(Unit *u, const char *key, const char *value, 
 
 static void socket_distribute_fds(Unit *u, FDSet *fds) {
         Socket *s = SOCKET(u);
-        SocketPort *p;
 
         assert(u);
 
@@ -2984,10 +2986,9 @@ shortcut:
 }
 
 static int socket_dispatch_io(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        SocketPort *p = userdata;
+        SocketPort *p = ASSERT_PTR(userdata);
         int cfd = -1;
 
-        assert(p);
         assert(fd >= 0);
 
         if (p->socket->state != SOCKET_LISTENING)
@@ -3045,7 +3046,7 @@ static void socket_sigchld_event(Unit *u, pid_t pid, int code, int status) {
         else if (code == CLD_DUMPED)
                 f = SOCKET_FAILURE_CORE_DUMP;
         else
-                assert_not_reached("Unknown sigchld code");
+                assert_not_reached();
 
         if (s->control_command) {
                 exec_status_exit(&s->control_command->exec_status, &s->exec_context, pid, code, status);
@@ -3123,7 +3124,7 @@ static void socket_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                         break;
 
                 default:
-                        assert_not_reached("Uh, control process died at wrong time.");
+                        assert_not_reached();
                 }
         }
 
@@ -3200,7 +3201,7 @@ static int socket_dispatch_timer(sd_event_source *source, usec_t usec, void *use
                 break;
 
         default:
-                assert_not_reached("Timeout at wrong time.");
+                assert_not_reached();
         }
 
         return 0;
@@ -3208,7 +3209,6 @@ static int socket_dispatch_timer(sd_event_source *source, usec_t usec, void *use
 
 int socket_collect_fds(Socket *s, int **fds) {
         size_t k = 0, n = 0;
-        SocketPort *p;
         int *rfds;
 
         assert(s);
@@ -3232,11 +3232,9 @@ int socket_collect_fds(Socket *s, int **fds) {
                 return -ENOMEM;
 
         LIST_FOREACH(port, p, s->ports) {
-                size_t i;
-
                 if (p->fd >= 0)
                         rfds[k++] = p->fd;
-                for (i = 0; i < p->n_auxiliary_fds; ++i)
+                for (size_t i = 0; i < p->n_auxiliary_fds; ++i)
                         rfds[k++] = p->auxiliary_fds[i];
         }
 
@@ -3388,7 +3386,7 @@ static int socket_clean(Unit *u, ExecCleanMask mask) {
 fail:
         log_unit_warning_errno(u, r, "Failed to initiate cleaning: %m");
         s->clean_result = SOCKET_FAILURE_RESOURCES;
-        s->timer_event_source = sd_event_source_unref(s->timer_event_source);
+        s->timer_event_source = sd_event_source_disable_unref(s->timer_event_source);
         return r;
 }
 
@@ -3400,25 +3398,40 @@ static int socket_can_clean(Unit *u, ExecCleanMask *ret) {
         return exec_context_get_clean_mask(&s->exec_context, ret);
 }
 
+static int socket_can_start(Unit *u) {
+        Socket *s = SOCKET(u);
+        int r;
+
+        assert(s);
+
+        r = unit_test_start_limit(u);
+        if (r < 0) {
+                socket_enter_dead(s, SOCKET_FAILURE_START_LIMIT_HIT);
+                return r;
+        }
+
+        return 1;
+}
+
 static const char* const socket_exec_command_table[_SOCKET_EXEC_COMMAND_MAX] = {
-        [SOCKET_EXEC_START_PRE] = "ExecStartPre",
+        [SOCKET_EXEC_START_PRE]   = "ExecStartPre",
         [SOCKET_EXEC_START_CHOWN] = "ExecStartChown",
-        [SOCKET_EXEC_START_POST] = "ExecStartPost",
-        [SOCKET_EXEC_STOP_PRE] = "ExecStopPre",
-        [SOCKET_EXEC_STOP_POST] = "ExecStopPost"
+        [SOCKET_EXEC_START_POST]  = "ExecStartPost",
+        [SOCKET_EXEC_STOP_PRE]    = "ExecStopPre",
+        [SOCKET_EXEC_STOP_POST]   = "ExecStopPost"
 };
 
 DEFINE_STRING_TABLE_LOOKUP(socket_exec_command, SocketExecCommand);
 
 static const char* const socket_result_table[_SOCKET_RESULT_MAX] = {
-        [SOCKET_SUCCESS] = "success",
-        [SOCKET_FAILURE_RESOURCES] = "resources",
-        [SOCKET_FAILURE_TIMEOUT] = "timeout",
-        [SOCKET_FAILURE_EXIT_CODE] = "exit-code",
-        [SOCKET_FAILURE_SIGNAL] = "signal",
-        [SOCKET_FAILURE_CORE_DUMP] = "core-dump",
-        [SOCKET_FAILURE_START_LIMIT_HIT] = "start-limit-hit",
-        [SOCKET_FAILURE_TRIGGER_LIMIT_HIT] = "trigger-limit-hit",
+        [SOCKET_SUCCESS]                         = "success",
+        [SOCKET_FAILURE_RESOURCES]               = "resources",
+        [SOCKET_FAILURE_TIMEOUT]                 = "timeout",
+        [SOCKET_FAILURE_EXIT_CODE]               = "exit-code",
+        [SOCKET_FAILURE_SIGNAL]                  = "signal",
+        [SOCKET_FAILURE_CORE_DUMP]               = "core-dump",
+        [SOCKET_FAILURE_START_LIMIT_HIT]         = "start-limit-hit",
+        [SOCKET_FAILURE_TRIGGER_LIMIT_HIT]       = "trigger-limit-hit",
         [SOCKET_FAILURE_SERVICE_START_LIMIT_HIT] = "service-start-limit-hit"
 };
 
@@ -3426,8 +3439,8 @@ DEFINE_STRING_TABLE_LOOKUP(socket_result, SocketResult);
 
 static const char* const socket_timestamping_table[_SOCKET_TIMESTAMPING_MAX] = {
         [SOCKET_TIMESTAMPING_OFF] = "off",
-        [SOCKET_TIMESTAMPING_US] = "us",
-        [SOCKET_TIMESTAMPING_NS] = "ns",
+        [SOCKET_TIMESTAMPING_US]  = "us",
+        [SOCKET_TIMESTAMPING_NS]  = "ns",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(socket_timestamping, SocketTimestamping);
@@ -3447,7 +3460,7 @@ SocketTimestamping socket_timestamping_from_string_harder(const char *p) {
          * too. */
         if (streq(p, "nsec"))
                 return SOCKET_TIMESTAMPING_NS;
-        if (STR_IN_SET(p, "usec", "µs"))
+        if (STR_IN_SET(p, "usec", "µs", "μs")) /* Accept both small greek letter mu + micro sign unicode codepoints */
                 return SOCKET_TIMESTAMPING_US;
 
         r = parse_boolean(p);
@@ -3515,10 +3528,6 @@ const UnitVTable socket_vtable = {
         .bus_commit_properties = bus_socket_commit_properties,
 
         .status_message_formats = {
-                /*.starting_stopping = {
-                        [0] = "Starting socket %s...",
-                        [1] = "Stopping socket %s...",
-                },*/
                 .finished_start_job = {
                         [JOB_DONE]       = "Listening on %s.",
                         [JOB_FAILED]     = "Failed to listen on %s.",
@@ -3530,4 +3539,6 @@ const UnitVTable socket_vtable = {
                         [JOB_TIMEOUT]    = "Timed out stopping %s.",
                 },
         },
+
+        .can_start = socket_can_start,
 };

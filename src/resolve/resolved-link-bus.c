@@ -9,6 +9,7 @@
 #include "bus-get-properties.h"
 #include "bus-message-util.h"
 #include "bus-polkit.h"
+#include "log-link.h"
 #include "parse-util.h"
 #include "resolve-util.h"
 #include "resolved-bus.h"
@@ -31,10 +32,9 @@ static int property_get_dns_over_tls_mode(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
 
         assert(reply);
-        assert(l);
 
         return sd_bus_message_append(reply, "s", dns_over_tls_mode_to_string(link_get_dns_over_tls_mode(l)));
 }
@@ -49,12 +49,10 @@ static int property_get_dns_internal(
                 sd_bus_error *error,
                 bool extended) {
 
-        Link *l = userdata;
-        DnsServer *s;
+        Link *l = ASSERT_PTR(userdata);
         int r;
 
         assert(reply);
-        assert(l);
 
         r = sd_bus_message_open_container(reply, 'a', extended ? "(iayqs)" : "(iay)");
         if (r < 0)
@@ -142,12 +140,10 @@ static int property_get_domains(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Link *l = userdata;
-        DnsSearchDomain *d;
+        Link *l = ASSERT_PTR(userdata);
         int r;
 
         assert(reply);
-        assert(l);
 
         r = sd_bus_message_open_container(reply, 'a', "(sb)");
         if (r < 0)
@@ -171,10 +167,9 @@ static int property_get_default_route(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
 
         assert(reply);
-        assert(l);
 
         /* Return what is configured, if there's something configured */
         if (l->default_route >= 0)
@@ -196,11 +191,10 @@ static int property_get_scopes_mask(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         uint64_t mask;
 
         assert(reply);
-        assert(l);
 
         mask =  (l->unicast_scope ? SD_RESOLVED_DNS : 0) |
                 (l->llmnr_ipv4_scope ? SD_RESOLVED_LLMNR_IPV4 : 0) |
@@ -220,12 +214,11 @@ static int property_get_ntas(
                 void *userdata,
                 sd_bus_error *error) {
 
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         const char *name;
         int r;
 
         assert(reply);
-        assert(l);
 
         r = sd_bus_message_open_container(reply, 'a', "s");
         if (r < 0)
@@ -252,13 +245,14 @@ static int verify_unmanaged_link(Link *l, sd_bus_error *error) {
 }
 
 static int bus_link_method_set_dns_servers_internal(sd_bus_message *message, void *userdata, sd_bus_error *error, bool extended) {
+        _cleanup_free_ char *j = NULL;
         struct in_addr_full **dns;
-        Link *l = userdata;
+        bool changed = false;
+        Link *l = ASSERT_PTR(userdata);
         size_t n;
         int r;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -279,6 +273,23 @@ static int bus_link_method_set_dns_servers_internal(sd_bus_message *message, voi
                 goto finalize;
         }
 
+        for (size_t i = 0; i < n; i++) {
+                const char *s;
+
+                s = in_addr_full_to_string(dns[i]);
+                if (!s) {
+                        r = -ENOMEM;
+                        goto finalize;
+                }
+
+                if (!strextend_with_separator(&j, ", ", s)) {
+                        r = -ENOMEM;
+                        goto finalize;
+                }
+        }
+
+        bus_client_log(message, "DNS server change");
+
         dns_server_mark_all(l->dns_servers);
 
         for (size_t i = 0; i < n; i++) {
@@ -293,16 +304,26 @@ static int bus_link_method_set_dns_servers_internal(sd_bus_message *message, voi
                                 dns_server_unlink_all(l->dns_servers);
                                 goto finalize;
                         }
+
+                        changed = true;
                 }
 
         }
 
-        dns_server_unlink_marked(l->dns_servers);
-        link_allocate_scopes(l);
+        changed = dns_server_unlink_marked(l->dns_servers) || changed;
 
-        (void) link_save_user(l);
-        (void) manager_write_resolv_conf(l->manager);
-        (void) manager_send_changed(l->manager, "DNS");
+        if (changed) {
+                link_allocate_scopes(l);
+
+                (void) link_save_user(l);
+                (void) manager_write_resolv_conf(l->manager);
+                (void) manager_send_changed(l->manager, "DNS");
+
+                if (j)
+                        log_link_info(l, "Bus client set DNS server list to: %s", j);
+                else
+                        log_link_info(l, "Bus client reset DNS server list.");
+        }
 
         r = sd_bus_reply_method_return(message, NULL);
 
@@ -323,11 +344,12 @@ int bus_link_method_set_dns_servers_ex(sd_bus_message *message, void *userdata, 
 }
 
 int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Link *l = userdata;
+        _cleanup_free_ char *j = NULL;
+        Link *l = ASSERT_PTR(userdata);
+        bool changed = false;
         int r;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -338,6 +360,7 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
                 return r;
 
         for (;;) {
+                _cleanup_free_ char *prefixed = NULL;
                 const char *name;
                 int route_only;
 
@@ -353,7 +376,18 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
                 if (r == 0)
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid search domain %s", name);
                 if (!route_only && dns_name_is_root(name))
-                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Root domain is not suitable as search domain");
+                        return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Root domain is not suitable as search domain");
+
+                if (route_only) {
+                        prefixed = strjoin("~", name);
+                        if (!prefixed)
+                                return -ENOMEM;
+
+                        name = prefixed;
+                }
+
+                if (!strextend_with_separator(&j, ", ", name))
+                        return -ENOMEM;
         }
 
         r = sd_bus_message_rewind(message, false);
@@ -368,6 +402,8 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
                 return r;
         if (r == 0)
                 return 1; /* Polkit will call us back */
+
+        bus_client_log(message, "dns domains change");
 
         dns_search_domain_mark_all(l->search_domains);
 
@@ -392,6 +428,8 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
                         r = dns_search_domain_new(l->manager, &d, DNS_SEARCH_DOMAIN_LINK, l, name);
                         if (r < 0)
                                 goto clear;
+
+                        changed = true;
                 }
 
                 d->route_only = route_only;
@@ -401,10 +439,17 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 goto clear;
 
-        dns_search_domain_unlink_marked(l->search_domains);
+        changed = dns_search_domain_unlink_marked(l->search_domains) || changed;
 
-        (void) link_save_user(l);
-        (void) manager_write_resolv_conf(l->manager);
+        if (changed) {
+                (void) link_save_user(l);
+                (void) manager_write_resolv_conf(l->manager);
+
+                if (j)
+                        log_link_info(l, "Bus client set search domain list to: %s", j);
+                else
+                        log_link_info(l, "Bus client reset search domain list.");
+        }
 
         return sd_bus_reply_method_return(message, NULL);
 
@@ -414,11 +459,10 @@ clear:
 }
 
 int bus_link_method_set_default_route(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         int r, b;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -437,24 +481,27 @@ int bus_link_method_set_default_route(sd_bus_message *message, void *userdata, s
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
+        bus_client_log(message, "dns default route change");
+
         if (l->default_route != b) {
                 l->default_route = b;
 
                 (void) link_save_user(l);
                 (void) manager_write_resolv_conf(l->manager);
+
+                log_link_info(l, "Bus client set default route setting: %s", yes_no(b));
         }
 
         return sd_bus_reply_method_return(message, NULL);
 }
 
 int bus_link_method_set_llmnr(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         ResolveSupport mode;
         const char *llmnr;
         int r;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -481,23 +528,28 @@ int bus_link_method_set_llmnr(sd_bus_message *message, void *userdata, sd_bus_er
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        l->llmnr_support = mode;
-        link_allocate_scopes(l);
-        link_add_rrs(l, false);
+        bus_client_log(message, "LLMNR change");
 
-        (void) link_save_user(l);
+        if (l->llmnr_support != mode) {
+                l->llmnr_support = mode;
+                link_allocate_scopes(l);
+                link_add_rrs(l, false);
+
+                (void) link_save_user(l);
+
+                log_link_info(l, "Bus client set LLMNR setting: %s", resolve_support_to_string(mode));
+        }
 
         return sd_bus_reply_method_return(message, NULL);
 }
 
 int bus_link_method_set_mdns(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         ResolveSupport mode;
         const char *mdns;
         int r;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -524,23 +576,28 @@ int bus_link_method_set_mdns(sd_bus_message *message, void *userdata, sd_bus_err
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        l->mdns_support = mode;
-        link_allocate_scopes(l);
-        link_add_rrs(l, false);
+        bus_client_log(message, "mDNS change");
 
-        (void) link_save_user(l);
+        if (l->mdns_support != mode) {
+                l->mdns_support = mode;
+                link_allocate_scopes(l);
+                link_add_rrs(l, false);
+
+                (void) link_save_user(l);
+
+                log_link_info(l, "Bus client set MulticastDNS setting: %s", resolve_support_to_string(mode));
+        }
 
         return sd_bus_reply_method_return(message, NULL);
 }
 
 int bus_link_method_set_dns_over_tls(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         const char *dns_over_tls;
         DnsOverTlsMode mode;
         int r;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -567,21 +624,28 @@ int bus_link_method_set_dns_over_tls(sd_bus_message *message, void *userdata, sd
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        link_set_dns_over_tls_mode(l, mode);
+        bus_client_log(message, "D-o-T change");
 
-        (void) link_save_user(l);
+        if (l->dns_over_tls_mode != mode) {
+                link_set_dns_over_tls_mode(l, mode);
+                link_allocate_scopes(l);
+
+                (void) link_save_user(l);
+
+                log_link_info(l, "Bus client set DNSOverTLS setting: %s",
+                              mode < 0 ? "default" : dns_over_tls_mode_to_string(mode));
+        }
 
         return sd_bus_reply_method_return(message, NULL);
 }
 
 int bus_link_method_set_dnssec(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         const char *dnssec;
         DnssecMode mode;
         int r;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -608,9 +672,17 @@ int bus_link_method_set_dnssec(sd_bus_message *message, void *userdata, sd_bus_e
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        link_set_dnssec_mode(l, mode);
+        bus_client_log(message, "DNSSEC change");
 
-        (void) link_save_user(l);
+        if (l->dnssec_mode != mode) {
+                link_set_dnssec_mode(l, mode);
+                link_allocate_scopes(l);
+
+                (void) link_save_user(l);
+
+                log_link_info(l, "Bus client set DNSSEC setting: %s",
+                              mode < 0 ? "default" : dnssec_mode_to_string(mode));
+        }
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -618,12 +690,11 @@ int bus_link_method_set_dnssec(sd_bus_message *message, void *userdata, sd_bus_e
 int bus_link_method_set_dnssec_negative_trust_anchors(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         _cleanup_set_free_free_ Set *ns = NULL;
         _cleanup_strv_free_ char **ntas = NULL;
-        Link *l = userdata;
+        _cleanup_free_ char *j = NULL;
+        Link *l = ASSERT_PTR(userdata);
         int r;
-        char **i;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -648,6 +719,9 @@ int bus_link_method_set_dnssec_negative_trust_anchors(sd_bus_message *message, v
                 r = set_put_strdup(&ns, *i);
                 if (r < 0)
                         return r;
+
+                if (!strextend_with_separator(&j, ", ", *i))
+                        return -ENOMEM;
         }
 
         r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
@@ -659,20 +733,28 @@ int bus_link_method_set_dnssec_negative_trust_anchors(sd_bus_message *message, v
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
-        set_free_free(l->dnssec_negative_trust_anchors);
-        l->dnssec_negative_trust_anchors = TAKE_PTR(ns);
+        bus_client_log(message, "DNSSEC NTA change");
 
-        (void) link_save_user(l);
+        if (!set_equal(ns, l->dnssec_negative_trust_anchors)) {
+                set_free_free(l->dnssec_negative_trust_anchors);
+                l->dnssec_negative_trust_anchors = TAKE_PTR(ns);
+
+                (void) link_save_user(l);
+
+                if (j)
+                        log_link_info(l, "Bus client set NTA list to: %s", j);
+                else
+                        log_link_info(l, "Bus client reset NTA list.");
+        }
 
         return sd_bus_reply_method_return(message, NULL);
 }
 
 int bus_link_method_revert(sd_bus_message *message, void *userdata, sd_bus_error *error) {
-        Link *l = userdata;
+        Link *l = ASSERT_PTR(userdata);
         int r;
 
         assert(message);
-        assert(l);
 
         r = verify_unmanaged_link(l, error);
         if (r < 0)
@@ -687,6 +769,8 @@ int bus_link_method_revert(sd_bus_message *message, void *userdata, sd_bus_error
         if (r == 0)
                 return 1; /* Polkit will call us back */
 
+        bus_client_log(message, "revert");
+
         link_flush_settings(l);
         link_allocate_scopes(l);
         link_add_rrs(l, false);
@@ -700,7 +784,7 @@ int bus_link_method_revert(sd_bus_message *message, void *userdata, sd_bus_error
 
 static int link_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
         _cleanup_free_ char *e = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Link *link;
         int ifindex, r;
 
@@ -708,7 +792,6 @@ static int link_object_find(sd_bus *bus, const char *path, const char *interface
         assert(path);
         assert(interface);
         assert(found);
-        assert(m);
 
         r = sd_bus_path_decode(path, "/org/freedesktop/resolve1/link", &e);
         if (r <= 0)
@@ -743,13 +826,12 @@ char *link_bus_path(const Link *link) {
 
 static int link_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_strv_free_ char **l = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Link *link;
         unsigned c = 0;
 
         assert(bus);
         assert(path);
-        assert(m);
         assert(nodes);
 
         l = new0(char*, hashmap_size(m->links) + 1);

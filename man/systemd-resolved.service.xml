@@ -59,12 +59,19 @@
       <command>systemd-resolved</command>.</para></listitem>
 
       <listitem><para>Additionally, <command>systemd-resolved</command> provides a local DNS stub listener on
-      IP address 127.0.0.53 on the local loopback interface. Programs issuing DNS requests directly,
-      bypassing any local API may be directed to this stub, in order to connect them to
+      the IP addresses 127.0.0.53 and 127.0.0.54 on the local loopback interface. Programs issuing DNS
+      requests directly, bypassing any local API may be directed to this stub, in order to connect them to
       <command>systemd-resolved</command>. Note however that it is strongly recommended that local programs
       use the glibc NSS or bus APIs instead (as described above), as various network resolution concepts
       (such as link-local addressing, or LLMNR Unicode domains) cannot be mapped to the unicast DNS
-      protocol.</para></listitem>
+      protocol.</para>
+
+      <para id="proxy-stub">The DNS stub resolver on 127.0.0.53 provides the full feature set of the local
+      resolver, which includes offering LLMNR/MulticastDNS resolution. The DNS stub resolver on 127.0.0.54
+      provides a more limited resolver, that operates in "proxy" mode only, i.e. it will pass most DNS
+      messages relatively unmodified to the current upstream DNS servers and back, but not try to process the
+      messages locally, and hence does not validate DNSSEC, or offer up LLMNR/MulticastDNS. (It will
+      translate to DNS-over-TLS communication if needed however.)</para></listitem>
     </itemizedlist>
 
     <para>The DNS servers contacted are determined from the global settings in
@@ -87,7 +94,7 @@
   <refsect1>
     <title>Synthetic Records</title>
 
-    <para><command>systemd-resolved</command> synthetizes DNS resource records (RRs) for the following
+    <para><command>systemd-resolved</command> synthesizes DNS resource records (RRs) for the following
     cases:</para>
 
     <itemizedlist>
@@ -104,6 +111,13 @@
       gateway addresses, ordered by their metric. This assigns a stable hostname to the current gateway,
       useful for referencing it independently of the current network configuration state.</para></listitem>
 
+      <listitem><para>The hostname <literal>_outbound</literal> is resolved to the local IPv4 and IPv6
+      addresses that are most likely used for communication with other hosts. This is determined by
+      requesting a routing decision to the configured default gateways from the kernel and then using the
+      local IP addresses selected by this decision. This hostname is only available if there is at least one
+      local default gateway configured. This assigns a stable hostname to the local outbound IP addresses,
+      useful for referencing them independently of the current network configuration state.</para></listitem>
+
       <listitem><para>The mappings defined in <filename>/etc/hosts</filename> are resolved to their
       configured addresses and back, but they will not affect lookups for non-address types (like MX).
       Support for <filename>/etc/hosts</filename> may be disabled with <varname>ReadEtcHosts=no</varname>,
@@ -115,8 +129,8 @@
   <refsect1>
     <title>Protocols and Routing</title>
 
-    <para>Lookup requests are routed to the available DNS servers, LLMNR, and MulticastDNS interfaces
-    according to the following rules:</para>
+    <para>The lookup requests that <filename>systemd-resolved.service</filename> receives are routed to the
+    available DNS servers, LLMNR, and MulticastDNS interfaces according to the following rules:</para>
 
     <itemizedlist>
       <listitem><para>Names for which synthetic records are generated (the local hostname,
@@ -126,18 +140,19 @@
 
       <listitem><para>Single-label names are resolved using LLMNR on all local interfaces where LLMNR is
       enabled. Lookups for IPv4 addresses are only sent via LLMNR on IPv4, and lookups for IPv6 addresses are
-      only sent via LLMNR on IPv6. Note that lookups for single-label synthetized names are not routed to
+      only sent via LLMNR on IPv6. Note that lookups for single-label synthesized names are not routed to
       LLMNR, MulticastDNS or unicast DNS.</para></listitem>
 
-      <listitem><para>Queries for the address records (A and AAAA) of single-label non-synthetized names are
+      <listitem><para>Queries for the address records (A and AAAA) of single-label non-synthesized names are
       resolved via unicast DNS using search domains. For any interface which defines search domains, such
-      look-ups are routed to that interface, suffixed with each of the search domains defined on that
-      interface in turn. When global search domains are defined, such look-ups are routed to all interfaces,
-      suffixed by each of the global search domains in turn. Additionally, lookup of single-label names via
-      unicast DNS may be enabled with the <varname>ResolveUnicastSingleLabel=yes</varname> setting. The
-      details of which servers are queried and how the final reply is chosen are described below. Note that
-      this means that address queries for single-label names are never sent out to remote DNS servers by
-      default, and resoulution is only possible if search domains are defined.</para></listitem>
+      look-ups are routed to the servers defined for that interface, suffixed with each of those search
+      domains. When global search domains are defined, such look-ups are routed to the global servers. For
+      each search domain, queries are performed by suffixing the name with each of the search domains in
+      turn. Additionally, lookup of single-label names via unicast DNS may be enabled with the
+      <varname>ResolveUnicastSingleLabel=yes</varname> setting. The details of which servers are queried and
+      how the final reply is chosen are described below. Note that this means that address queries for
+      single-label names are never sent out to remote DNS servers by default, and resolution is only
+      possible if search domains are defined.</para></listitem>
 
       <listitem><para>Multi-label names with the domain suffix <literal>.local</literal> are resolved using
       MulticastDNS on all local interfaces where MulticastDNS is enabled. As with LLMNR, IPv4 address lookups
@@ -172,7 +187,8 @@
     <citerefentry><refentrytitle>resolved.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry> for a
     description of globally configured DNS settings.</para>
 
-    <para>The following query routing logic applies for unicast DNS traffic:</para>
+    <para>The following query routing logic applies for unicast DNS lookups initiated by
+    <filename>systemd-resolved.service</filename>:</para>
 
     <itemizedlist>
       <listitem><para>If a name to look up matches (that is: is equal to or has as suffix) any of the
@@ -203,7 +219,7 @@
     determined based on the configured DNS domains for a link: if there's a route-only domain other than
     <literal>~.</literal>, it defaults to false, otherwise to true.</para>
 
-    <para>Effectively this means: in order to support single-label non-synthetized names, define appropriate
+    <para>Effectively this means: in order to support single-label non-synthesized names, define appropriate
     search domains. In order to preferably route all DNS queries not explicitly matched by routing domain
     configuration to a specific link, configure a <literal>~.</literal> route-only domain on it. This will
     ensure that other links will not be considered for these queries (unless they too carry such a routing
@@ -223,19 +239,33 @@
 
     <para>This section provides a short summary of differences in the stub resolver implemented by
     <citerefentry><refentrytitle>nss-resolve</refentrytitle><manvolnum>8</manvolnum></citerefentry> together
-    with <command>systemd-resolved</command> and the tranditional stub resolver implemented in
-    <citerefentry><refentrytitle>nss-dns</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+    with <command>systemd-resolved</command> and the traditional stub resolver implemented in
+    <filename>nss-dns</filename>.</para>
 
     <itemizedlist>
       <listitem><para>Some names are always resolved internally (see Synthetic Records above). Traditionally
-      they would be resolved by <filename>nss-files</filename>, and only if provided in
-      <filename>/etc/hosts</filename>.</para></listitem>
+      they would be resolved by <filename>nss-files</filename> if provided in
+      <filename>/etc/hosts</filename>. But note that the details of how a query is constructed are under the
+      control of the client library. <filename>nss-dns</filename> will first try to resolve names using
+      search domains and even if those queries are routed to <filename>systemd-resolved</filename>, it will
+      send them out over the network using the usual rules for multi-label name routing <footnote><para>For
+      example, if <filename>/etc/resolv.conf</filename> has <programlisting>nameserver 127.0.0.53
+search foobar.com barbar.com
+      </programlisting>and we look up <literal>localhost</literal>, <filename>nss-dns</filename> will send
+      the following queries to <filename>systemd-resolved</filename> listening on 127.0.0.53:53: first
+      <literal>localhost.foobar.com</literal>, then <literal>localhost.barbar.com</literal>, and finally
+      <literal>localhost</literal>. If (hopefully) the first two queries fail,
+      <filename>systemd-resolved</filename> will synthesize an answer for the third query.</para>
+
+      <para>When using <filename>nss-dns</filename> with any search domains, it is thus crucial to always
+      configure <filename>nss-files</filename> with higher priority and provide mappings for names that
+      should not be resolved using search domains.</para></footnote>.</para></listitem>
 
       <listitem><para>Single-label names are not resolved for A and AAAA records using unicast DNS (unless
       overridden with <varname>ResolveUnicastSingleLabel=</varname>, see
       <citerefentry><refentrytitle>resolved.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>).
       This is similar to the <option>no-tld-query</option> option being set in
-      <citerefentry><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+      <citerefentry project='man-pages'><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
       </para></listitem>
 
       <listitem><para>Search domains are not used for <emphasis>suffixing</emphasis> of multi-label names.
@@ -246,13 +276,13 @@
       has failed, as absolute, while other names would be resolved in opposite order. The
       <varname>ndots</varname> option in <filename>/etc/resolv.conf</filename> was used to control how many
       dots the name needs to have to be resolved as relative first. This stub resolver does not implement
-      this at all: multi-label names are only resolved as FQDNs. (There are currently more than 1500
-      top-level domain names defined, and new ones are added regularly, often using "attractive" names that
-      are also likely to be used locally. Not looking up multi-label names in this fashion avoids fragility
-      in both directions: a valid global name could be obscured by a local name, and resolution of a relative
-      local name could suddenly break when a new top-level domain is created, or when a new subdomain of a
-      top-level domain in registered. Resolving any given name as either relative or absolute avoids this
-      ambiguity.)</para></listitem>
+      this at all: multi-label names are only resolved as FQDNs.<footnote><para>There are currently more than
+      1500 top-level domain names defined, and new ones are added regularly, often using "attractive" names
+      that are also likely to be used locally. Not looking up multi-label names in this fashion avoids
+      fragility in both directions: a valid global name could be obscured by a local name, and resolution of
+      a relative local name could suddenly break when a new top-level domain is created, or when a new
+      subdomain of a top-level domain in registered. Resolving any given name as either relative or absolute
+      avoids this ambiguity.</para></footnote></para></listitem>
 
       <listitem><para>This resolver has a notion of the special <literal>.local</literal> domain used for
       MulticastDNS, and will not route queries with that suffix to unicast DNS servers unless explicitly
@@ -270,8 +300,8 @@
 
       <listitem><para>Environment variables <varname>$LOCALDOMAIN</varname> and
       <varname>$RES_OPTIONS</varname> described in
-      <citerefentry><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry> are not
-      supported currently.</para></listitem>
+      <citerefentry project='man-pages'><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+      are not supported currently.</para></listitem>
     </itemizedlist>
   </refsect1>
 
@@ -285,11 +315,11 @@
     <itemizedlist>
       <listitem><para><command>systemd-resolved</command> maintains the
       <filename>/run/systemd/resolve/stub-resolv.conf</filename> file for compatibility with traditional
-      Linux programs. This file may be symlinked from <filename>/etc/resolv.conf</filename>. This file lists
-      the 127.0.0.53 DNS stub (see above) as the only DNS server. It also contains a list of search domains
-      that are in use by systemd-resolved. The list of search domains is always kept up-to-date. Note that
-      <filename>/run/systemd/resolve/stub-resolv.conf</filename> should not be used directly by applications,
-      but only through a symlink from <filename>/etc/resolv.conf</filename>. This file may be symlinked from
+      Linux programs. This file lists the 127.0.0.53 DNS stub (see above) as the only DNS server. It also
+      contains a list of search domains that are in use by systemd-resolved. The list of search domains is
+      always kept up-to-date. Note that <filename>/run/systemd/resolve/stub-resolv.conf</filename> should not
+      be used directly by applications, but only through a symlink from
+      <filename>/etc/resolv.conf</filename>. This file may be symlinked from
       <filename>/etc/resolv.conf</filename> in order to connect all local clients that bypass local DNS APIs
       to <command>systemd-resolved</command> with correct search domains settings. This mode of operation is
       recommended.</para></listitem>

@@ -136,7 +136,7 @@ _public_ int sd_pid_get_cgroup(pid_t pid, char **cgroup) {
 }
 
 _public_ int sd_peer_get_session(int fd, char **session) {
-        struct ucred ucred = {};
+        struct ucred ucred = UCRED_INVALID;
         int r;
 
         assert_return(fd >= 0, -EBADF);
@@ -269,13 +269,11 @@ _public_ int sd_uid_get_state(uid_t uid, char**state) {
                 return r;
 
         r = parse_env_file(NULL, p, "STATE", &s);
-        if (r == -ENOENT) {
+        if (r == -ENOENT)
                 r = free_and_strdup(&s, "offline");
-                if (r < 0)
-                        return r;
-        } else if (r < 0)
+        if (r < 0)
                 return r;
-        else if (isempty(s))
+        if (isempty(s))
                 return -EIO;
 
         *state = TAKE_PTR(s);
@@ -585,8 +583,8 @@ _public_ int sd_session_get_class(const char *session, char **class) {
 
 _public_ int sd_session_get_desktop(const char *session, char **desktop) {
         _cleanup_free_ char *escaped = NULL;
-        char *t;
         int r;
+        ssize_t l;
 
         assert_return(desktop, -EINVAL);
 
@@ -594,11 +592,9 @@ _public_ int sd_session_get_desktop(const char *session, char **desktop) {
         if (r < 0)
                 return r;
 
-        r = cunescape(escaped, 0, &t);
-        if (r < 0)
-                return r;
-
-        *desktop = t;
+        l = cunescape(escaped, 0, desktop);
+        if (l < 0)
+                return l;
         return 0;
 }
 
@@ -775,8 +771,7 @@ _public_ int sd_get_sessions(char ***sessions) {
 }
 
 _public_ int sd_get_uids(uid_t **users) {
-        _cleanup_closedir_ DIR *d;
-        struct dirent *de;
+        _cleanup_closedir_ DIR *d = NULL;
         int r = 0;
         unsigned n = 0;
         _cleanup_free_ uid_t *l = NULL;
@@ -794,8 +789,6 @@ _public_ int sd_get_uids(uid_t **users) {
         FOREACH_DIRENT_ALL(de, d, return -errno) {
                 int k;
                 uid_t uid;
-
-                dirent_ensure_type(d, de);
 
                 if (!dirent_is_file(de))
                         continue;
@@ -847,7 +840,7 @@ _public_ int sd_get_machine_names(char ***machines) {
 
                 /* Filter out the unit: symlinks */
                 for (a = b = l; *a; a++) {
-                        if (startswith(*a, "unit:") || !machine_name_is_valid(*a))
+                        if (startswith(*a, "unit:") || !hostname_is_valid(*a, 0))
                                 free(*a);
                         else {
                                 *b = *a;
@@ -877,7 +870,7 @@ _public_ int sd_machine_get_class(const char *machine, char **class) {
                 if (!c)
                         return -ENOMEM;
         } else {
-                if (!machine_name_is_valid(machine))
+                if (!hostname_is_valid(machine, 0))
                         return -EINVAL;
 
                 p = strjoina("/run/systemd/machines/", machine);
@@ -899,7 +892,7 @@ _public_ int sd_machine_get_ifindices(const char *machine, int **ret_ifindices) 
         const char *p;
         int r;
 
-        assert_return(machine_name_is_valid(machine), -EINVAL);
+        assert_return(hostname_is_valid(machine, 0), -EINVAL);
 
         p = strjoina("/run/systemd/machines/", machine);
         r = parse_env_file(NULL, p, "NETIF", &netif_line);
@@ -1003,7 +996,7 @@ _public_ int sd_login_monitor_new(const char *category, sd_login_monitor **m) {
 
 _public_ sd_login_monitor* sd_login_monitor_unref(sd_login_monitor *m) {
         if (m)
-                close_nointr(MONITOR_TO_FD(m));
+                (void) close_nointr(MONITOR_TO_FD(m));
 
         return NULL;
 }
@@ -1043,9 +1036,9 @@ _public_ int sd_login_monitor_get_timeout(sd_login_monitor *m, uint64_t *timeout
         assert_return(m, -EINVAL);
         assert_return(timeout_usec, -EINVAL);
 
-        /* For now we will only return (uint64_t) -1, since we don't
+        /* For now we will only return UINT64_MAX, since we don't
          * need any timeout. However, let's have this API to keep our
          * options open should we later on need it. */
-        *timeout_usec = (uint64_t) -1;
+        *timeout_usec = UINT64_MAX;
         return 0;
 }

@@ -7,9 +7,34 @@
 
 #include "dlfcn-util.h"
 #include "locale-util.h"
+#include "log.h"
+#include "strv.h"
 #include "terminal-util.h"
 
 #define ANSI_WHITE_ON_BLACK "\033[40;37;1m"
+#define UNICODE_FULL_BLOCK       u8"█"
+#define UNICODE_LOWER_HALF_BLOCK u8"▄"
+#define UNICODE_UPPER_HALF_BLOCK u8"▀"
+
+static void *qrcode_dl = NULL;
+
+static QRcode* (*sym_QRcode_encodeString)(const char *string, int version, QRecLevel level, QRencodeMode hint, int casesensitive) = NULL;
+static void (*sym_QRcode_free)(QRcode *qrcode) = NULL;
+
+int dlopen_qrencode(void) {
+        int r;
+
+        FOREACH_STRING(s, "libqrencode.so.4", "libqrencode.so.3") {
+                r = dlopen_many_sym_or_warn(
+                        &qrcode_dl, s, LOG_DEBUG,
+                        DLSYM_ARG(QRcode_encodeString),
+                        DLSYM_ARG(QRcode_free));
+                if (r >= 0)
+                        break;
+        }
+
+        return r;
+}
 
 static void print_border(FILE *output, unsigned width) {
         /* Four rows of border */
@@ -17,7 +42,7 @@ static void print_border(FILE *output, unsigned width) {
                 fputs(ANSI_WHITE_ON_BLACK, output);
 
                 for (unsigned x = 0; x < 4 + width + 4; x++)
-                        fputs("\342\226\210", output);
+                        fputs(UNICODE_FULL_BLOCK, output);
 
                 fputs(ANSI_NORMAL "\n", output);
         }
@@ -37,7 +62,7 @@ static void write_qrcode(FILE *output, QRcode *qr) {
 
                 fputs(ANSI_WHITE_ON_BLACK, output);
                 for (unsigned x = 0; x < 4; x++)
-                        fputs("\342\226\210", output);
+                        fputs(UNICODE_FULL_BLOCK, output);
 
                 for (unsigned x = 0; x < (unsigned) qr->width; x++) {
                         bool a, b;
@@ -48,15 +73,15 @@ static void write_qrcode(FILE *output, QRcode *qr) {
                         if (a && b)
                                 fputc(' ', output);
                         else if (a)
-                                fputs("\342\226\204", output);
+                                fputs(UNICODE_LOWER_HALF_BLOCK, output);
                         else if (b)
-                                fputs("\342\226\200", output);
+                                fputs(UNICODE_UPPER_HALF_BLOCK, output);
                         else
-                                fputs("\342\226\210", output);
+                                fputs(UNICODE_FULL_BLOCK, output);
                 }
 
                 for (unsigned x = 0; x < 4; x++)
-                        fputs("\342\226\210", output);
+                        fputs(UNICODE_FULL_BLOCK, output);
                 fputs(ANSI_NORMAL "\n", output);
         }
 
@@ -65,9 +90,6 @@ static void write_qrcode(FILE *output, QRcode *qr) {
 }
 
 int print_qrcode(FILE *out, const char *header, const char *string) {
-        QRcode* (*sym_QRcode_encodeString)(const char *string, int version, QRecLevel level, QRencodeMode hint, int casesensitive);
-        void (*sym_QRcode_free)(QRcode *qrcode);
-        _cleanup_(dlclosep) void *dl = NULL;
         QRcode* qr;
         int r;
 
@@ -76,21 +98,11 @@ int print_qrcode(FILE *out, const char *header, const char *string) {
         if (!is_locale_utf8() || !colors_enabled())
                 return -EOPNOTSUPP;
 
-        dl = dlopen("libqrencode.so.4", RTLD_LAZY);
-        if (!dl)
-                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                       "QRCODE support is not installed: %s", dlerror());
-
-        r = dlsym_many_and_warn(
-                        dl,
-                        LOG_DEBUG,
-                        &sym_QRcode_encodeString, "QRcode_encodeString",
-                        &sym_QRcode_free, "QRcode_free",
-                        NULL);
+        r = dlopen_qrencode();
         if (r < 0)
                 return r;
 
-        qr = sym_QRcode_encodeString(string, 0, QR_ECLEVEL_L, QR_MODE_8, 0);
+        qr = sym_QRcode_encodeString(string, 0, QR_ECLEVEL_L, QR_MODE_8, 1);
         if (!qr)
                 return -ENOMEM;
 

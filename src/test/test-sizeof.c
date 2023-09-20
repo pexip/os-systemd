@@ -3,6 +3,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/timex.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
@@ -53,10 +54,14 @@ int main(void) {
         info(unsigned char);
         info(short unsigned);
         info(unsigned);
-        info(long unsigned);
-        info(long long unsigned);
+        info(unsigned long);
+        info(unsigned long long);
+#ifdef __GLIBC__
         info(__syscall_ulong_t);
         info(__syscall_slong_t);
+#endif
+        info(intmax_t);
+        info(uintmax_t);
 
         info(float);
         info(double);
@@ -74,13 +79,17 @@ int main(void) {
         info(ssize_t);
         info(time_t);
         info(usec_t);
+#ifdef __GLIBC__
         info(__time_t);
+#endif
         info(pid_t);
         info(uid_t);
         info(gid_t);
         info(socklen_t);
 
+#ifdef __GLIBC__
         info(__cpu_mask);
+#endif
 
         info(enum Enum);
         info(enum BigEnum);
@@ -88,6 +97,16 @@ int main(void) {
         assert_cc(sizeof(enum BigEnum2) == 8);
         printf("big_enum2_pos → %zu\n", sizeof(big_enum2_pos));
         printf("big_enum2_neg → %zu\n", sizeof(big_enum2_neg));
+
+        printf("timeval: %zu\n", sizeof(struct timeval));
+        printf("timespec: %zu\n", sizeof(struct timespec));
+
+        void *x = malloc(100);
+
+        printf("local variable: %p\n", &function_pointer);
+        printf("glibc function: %p\n", memcpy);
+        printf("heap allocation: %p\n", x);
+        free(x);
 
         return 0;
 }

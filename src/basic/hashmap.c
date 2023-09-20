@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <errno.h>
+#include <fnmatch.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -112,7 +113,7 @@ assert_cc(IDX_FIRST == _IDX_SWAP_END);
 assert_cc(IDX_FIRST == _IDX_ITERATOR_FIRST);
 
 /* Storage space for the "swap" buckets.
- * All entry types can fit into a ordered_hashmap_entry. */
+ * All entry types can fit into an ordered_hashmap_entry. */
 struct swap_entries {
         struct ordered_hashmap_entry e[_IDX_SWAP_END - _IDX_SWAP_BEGIN];
 };
@@ -162,7 +163,7 @@ struct _packed_ indirect_storage {
         unsigned n_buckets;                /* number of buckets */
 
         unsigned idx_lowest_entry;         /* Index below which all buckets are free.
-                                              Makes "while(hashmap_steal_first())" loops
+                                              Makes "while (hashmap_steal_first())" loops
                                               O(n) instead of O(n^2) for unordered hashmaps. */
         uint8_t  _pad[3];                  /* padding for the whole HashmapBase */
         /* The bitfields in HashmapBase complete the alignment of the whole thing. */
@@ -230,7 +231,7 @@ struct Set {
 
 typedef struct CacheMem {
         const void **ptr;
-        size_t n_populated, n_allocated;
+        size_t n_populated;
         bool active:1;
 } CacheMem;
 
@@ -401,7 +402,7 @@ static struct hashmap_base_entry* bucket_at_virtual(HashmapBase *h, struct swap_
         if (idx < _IDX_SWAP_END)
                 return &bucket_at_swap(swap, idx)->p.b;
 
-        assert_not_reached("Invalid index");
+        assert_not_reached();
 }
 
 static dib_raw_t* dib_raw_ptr(HashmapBase *h) {
@@ -513,7 +514,7 @@ static void* entry_value(HashmapBase *h, struct hashmap_base_entry *e) {
                 return (void*) e->key;
 
         default:
-                assert_not_reached("Unknown hashmap type");
+                assert_not_reached();
         }
 }
 
@@ -770,16 +771,15 @@ static void shared_hash_key_initialize(void) {
 static struct HashmapBase* hashmap_base_new(const struct hash_ops *hash_ops, enum HashmapType type  HASHMAP_DEBUG_PARAMS) {
         HashmapBase *h;
         const struct hashmap_type_info *hi = &hashmap_type_info[type];
-        bool up;
 
-        up = mempool_enabled();
+        bool use_pool = mempool_enabled && mempool_enabled();
 
-        h = up ? mempool_alloc0_tile(hi->mempool) : malloc0(hi->head_size);
+        h = use_pool ? mempool_alloc0_tile(hi->mempool) : malloc0(hi->head_size);
         if (!h)
                 return NULL;
 
         h->type = type;
-        h->from_pool = up;
+        h->from_pool = use_pool;
         h->hash_ops = hash_ops ?: &trivial_hash_ops;
 
         if (type == HASHMAP_TYPE_ORDERED) {
@@ -843,6 +843,16 @@ int _ordered_hashmap_ensure_allocated(OrderedHashmap **h, const struct hash_ops 
 
 int _set_ensure_allocated(Set **s, const struct hash_ops *hash_ops  HASHMAP_DEBUG_PARAMS) {
         return hashmap_base_ensure_allocated((HashmapBase**)s, hash_ops, HASHMAP_TYPE_SET  HASHMAP_DEBUG_PASS_ARGS);
+}
+
+int _hashmap_ensure_put(Hashmap **h, const struct hash_ops *hash_ops, const void *key, void *value  HASHMAP_DEBUG_PARAMS) {
+        int r;
+
+        r = _hashmap_ensure_allocated(h, hash_ops  HASHMAP_DEBUG_PASS_ARGS);
+        if (r < 0)
+                return r;
+
+        return hashmap_put(*h, key, value);
 }
 
 int _ordered_hashmap_ensure_put(OrderedHashmap **h, const struct hash_ops *hash_ops, const void *key, void *value  HASHMAP_DEBUG_PARAMS) {
@@ -1180,7 +1190,7 @@ static int resize_buckets(HashmapBase *h, unsigned entries_add) {
                 } while (rehash_next);
         }
 
-        assert(n_rehashed == n_entries(h));
+        assert_se(n_rehashed == n_entries(h));
 
         return 1;
 }
@@ -1737,11 +1747,11 @@ HashmapBase* _hashmap_copy(HashmapBase *h  HASHMAP_DEBUG_PARAMS) {
                 r = set_merge((Set*)copy, (Set*)h);
                 break;
         default:
-                assert_not_reached("Unknown hashmap type");
+                assert_not_reached();
         }
 
         if (r < 0)
-                return _hashmap_free(copy, false, false);
+                return _hashmap_free(copy, NULL, NULL);
 
         return copy;
 }
@@ -1750,6 +1760,9 @@ char** _hashmap_get_strv(HashmapBase *h) {
         char **sv;
         Iterator i;
         unsigned idx, n;
+
+        if (!h)
+                return new0(char*, 1);
 
         sv = new(char*, n_entries(h)+1);
         if (!sv)
@@ -1828,7 +1841,7 @@ int _hashmap_put_strdup_full(Hashmap **h, const struct hash_ops *hash_ops, const
         return r;
 }
 
-int _set_put_strdup_full(Set **s, const struct hash_ops *hash_ops, const char *p  HASHMAP_DEBUG_PARAMS) {
+int _set_put_strndup_full(Set **s, const struct hash_ops *hash_ops, const char *p, size_t n  HASHMAP_DEBUG_PARAMS) {
         char *c;
         int r;
 
@@ -1839,10 +1852,13 @@ int _set_put_strdup_full(Set **s, const struct hash_ops *hash_ops, const char *p
         if (r < 0)
                 return r;
 
-        if (set_contains(*s, (char*) p))
-                return 0;
+        if (n == SIZE_MAX) {
+                if (set_contains(*s, (char*) p))
+                        return 0;
 
-        c = strdup(p);
+                c = strdup(p);
+        } else
+                c = strndup(p, n);
         if (!c)
                 return -ENOMEM;
 
@@ -1851,12 +1867,11 @@ int _set_put_strdup_full(Set **s, const struct hash_ops *hash_ops, const char *p
 
 int _set_put_strdupv_full(Set **s, const struct hash_ops *hash_ops, char **l  HASHMAP_DEBUG_PARAMS) {
         int n = 0, r;
-        char **i;
 
         assert(s);
 
         STRV_FOREACH(i, l) {
-                r = _set_put_strdup_full(s, hash_ops, *i  HASHMAP_DEBUG_PASS_ARGS);
+                r = _set_put_strndup_full(s, hash_ops, *i, SIZE_MAX  HASHMAP_DEBUG_PASS_ARGS);
                 if (r < 0)
                         return r;
 
@@ -1867,11 +1882,10 @@ int _set_put_strdupv_full(Set **s, const struct hash_ops *hash_ops, char **l  HA
 }
 
 int set_put_strsplit(Set *s, const char *v, const char *separators, ExtractFlags flags) {
-        const char *p = v;
+        const char *p = ASSERT_PTR(v);
         int r;
 
         assert(s);
-        assert(v);
 
         for (;;) {
                 char *word;
@@ -1887,10 +1901,10 @@ int set_put_strsplit(Set *s, const char *v, const char *separators, ExtractFlags
 }
 
 /* expand the cachemem if needed, return true if newly (re)activated. */
-static int cachemem_maintain(CacheMem *mem, unsigned size) {
+static int cachemem_maintain(CacheMem *mem, size_t size) {
         assert(mem);
 
-        if (!GREEDY_REALLOC(mem->ptr, mem->n_allocated, size)) {
+        if (!GREEDY_REALLOC(mem->ptr, size)) {
                 if (size > 0)
                         return -ENOMEM;
         }
@@ -1905,7 +1919,7 @@ static int cachemem_maintain(CacheMem *mem, unsigned size) {
 
 int iterated_cache_get(IteratedCache *cache, const void ***res_keys, const void ***res_values, unsigned *res_n_entries) {
         bool sync_keys = false, sync_values = false;
-        unsigned size;
+        size_t size;
         int r;
 
         assert(cache);
@@ -1978,8 +1992,8 @@ IteratedCache* iterated_cache_free(IteratedCache *cache) {
 }
 
 int set_strjoin(Set *s, const char *separator, bool wrap_with_separator, char **ret) {
-        size_t separator_len, allocated = 0, len = 0;
         _cleanup_free_ char *str = NULL;
+        size_t separator_len, len = 0;
         const char *value;
         bool first;
 
@@ -2003,7 +2017,7 @@ int set_strjoin(Set *s, const char *separator, bool wrap_with_separator, char **
                 if (l == 0)
                         continue;
 
-                if (!GREEDY_REALLOC(str, allocated, len + l + (first ? 0 : separator_len) + (wrap_with_separator ? separator_len : 0) + 1))
+                if (!GREEDY_REALLOC(str, len + l + (first ? 0 : separator_len) + (wrap_with_separator ? separator_len : 0) + 1))
                         return -ENOMEM;
 
                 if (separator_len > 0 && !first) {
@@ -2025,4 +2039,62 @@ int set_strjoin(Set *s, const char *separator, bool wrap_with_separator, char **
 
         *ret = TAKE_PTR(str);
         return 0;
+}
+
+bool set_equal(Set *a, Set *b) {
+        void *p;
+
+        /* Checks whether each entry of 'a' is also in 'b' and vice versa, i.e. the two sets contain the same
+         * entries */
+
+        if (a == b)
+                return true;
+
+        if (set_isempty(a) && set_isempty(b))
+                return true;
+
+        if (set_size(a) != set_size(b)) /* Cheap check that hopefully catches a lot of inequality cases
+                                         * already */
+                return false;
+
+        SET_FOREACH(p, a)
+                if (!set_contains(b, p))
+                        return false;
+
+        /* If we have the same hashops, then we don't need to check things backwards given we compared the
+         * size and that all of a is in b. */
+        if (a->b.hash_ops == b->b.hash_ops)
+                return true;
+
+        SET_FOREACH(p, b)
+                if (!set_contains(a, p))
+                        return false;
+
+        return true;
+}
+
+static bool set_fnmatch_one(Set *patterns, const char *needle) {
+        const char *p;
+
+        assert(needle);
+
+        /* Any failure of fnmatch() is treated as equivalent to FNM_NOMATCH, i.e. as non-matching pattern */
+
+        SET_FOREACH(p, patterns)
+                if (fnmatch(p, needle, 0) == 0)
+                        return true;
+
+        return false;
+}
+
+bool set_fnmatch(Set *include_patterns, Set *exclude_patterns, const char *needle) {
+        assert(needle);
+
+        if (set_fnmatch_one(exclude_patterns, needle))
+                return false;
+
+        if (set_isempty(include_patterns))
+                return true;
+
+        return set_fnmatch_one(include_patterns, needle);
 }

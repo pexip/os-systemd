@@ -41,14 +41,14 @@ static int help(void) {
                "  -p --property=KEY=VALUE  Set a global property for all events\n"
                "  -m --children-max=N      Maximum number of children\n"
                "     --ping                Wait for udev to respond to a ping message\n"
-               "  -t --timeout=SECONDS     Maximum time to block for a reply\n"
-               , program_invocation_short_name);
+               "  -t --timeout=SECONDS     Maximum time to block for a reply\n",
+               program_invocation_short_name);
 
         return 0;
 }
 
 int control_main(int argc, char *argv[], void *userdata) {
-        _cleanup_(udev_ctrl_unrefp) struct udev_ctrl *uctrl = NULL;
+        _cleanup_(udev_ctrl_unrefp) UdevCtrl *uctrl = NULL;
         usec_t timeout = 60 * USEC_PER_SEC;
         int c, r;
 
@@ -143,7 +143,7 @@ int control_main(int argc, char *argv[], void *userdata) {
 
                         r = safe_atou(optarg, &i);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse maximum number of events '%s': %m", optarg);
+                                return log_error_errno(r, "Failed to parse maximum number of children '%s': %m", optarg);
 
                         r = udev_ctrl_send_set_children_max(uctrl, i);
                         if (r == -ENOANO)
@@ -171,7 +171,7 @@ int control_main(int argc, char *argv[], void *userdata) {
                 case '?':
                         return -EINVAL;
                 default:
-                        assert_not_reached("Unknown option.");
+                        assert_not_reached();
                 }
 
         if (optind < argc)

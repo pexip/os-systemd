@@ -18,7 +18,7 @@
 
   <refnamediv>
     <refname>systemd-dissect</refname>
-    <refpurpose>Dissect file system OS images</refpurpose>
+    <refpurpose>Dissect Discoverable Disk Images (DDIs)</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
@@ -27,6 +27,9 @@
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--mount</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg></command>
+    </cmdsynopsis>
+    <cmdsynopsis>
+      <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--umount</option> <arg choice="plain"><replaceable>PATH</replaceable></arg></command>
     </cmdsynopsis>
     <cmdsynopsis>
       <command>systemd-dissect <arg choice="opt" rep="repeat">OPTIONS</arg> <option>--copy-from</option> <arg choice="plain"><replaceable>IMAGE</replaceable></arg> <arg choice="plain"><replaceable>PATH</replaceable></arg> <arg choice="opt"><replaceable>TARGET</replaceable></arg></command>
@@ -40,7 +43,7 @@
     <title>Description</title>
 
     <para><command>systemd-dissect</command> is a tool for introspecting and interacting with file system OS
-    disk images. It supports four different operations:</para>
+    disk images, specifically Discoverable Disk Images (DDIs). It supports five different operations:</para>
 
     <orderedlist>
       <listitem><para>Show general OS image information, including the image's
@@ -50,6 +53,10 @@
       <listitem><para>Mount an OS image to a local directory. In this mode it will dissect the OS image and
       mount the included partitions according to their designation onto a directory and possibly
       sub-directories.</para></listitem>
+
+      <listitem><para>Unmount an OS image from a local directory. In this mode it will recursively unmount
+      the mounted partitions and remove the underlying loop device, including all the partition sub-devices.
+      </para></listitem>
 
       <listitem><para>Copy files and directories in and out of an OS image.</para></listitem>
     </orderedlist>
@@ -103,10 +110,7 @@
         multiple nested mounts are established. This command expects two arguments: a path to an image file
         and a path to a directory where to mount the image.</para>
 
-        <para>To unmount an OS image mounted like this use <citerefentry
-        project='man-pages'><refentrytitle>umount</refentrytitle><manvolnum>8</manvolnum></citerefentry>'s
-        <option>-R</option> switch (for recursive operation), so that the OS image and all nested partition
-        mounts are unmounted.</para>
+        <para>To unmount an OS image mounted like this use the <option>--umount</option> operation.</para>
 
         <para>When the OS image contains LUKS encrypted or Verity integrity protected file systems
         appropriate volumes are automatically set up and marked for automatic disassembly when the image is
@@ -126,6 +130,23 @@
         <term><option>-M</option></term>
 
         <listitem><para>This is a shortcut for <option>--mount --mkdir</option>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--umount</option></term>
+        <term><option>-u</option></term>
+
+        <listitem><para>Unmount an OS image from the specified directory. This command expects one argument:
+        a directory where an OS image was mounted.</para>
+
+        <para>All mounted partitions will be recursively unmounted, and the underlying loop device will be
+        removed, along with all its partition sub-devices.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>-U</option></term>
+
+        <listitem><para>This is a shortcut for <option>--umount --rmdir</option>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -162,15 +183,6 @@
         operation begins.</para></listitem>
       </varlistentry>
 
-      <varlistentry>
-        <term><option>--json=</option><replaceable>MODE</replaceable></term>
-
-        <listitem><para>Shows output formatted as JSON. Expects one of <literal>short</literal> (for the
-        shortest possible output without any redundant whitespace or line breaks), <literal>pretty</literal>
-        (for a pretty version of the same, with indentation and line breaks) or <literal>off</literal> (to turn
-        off json output).</para></listitem>
-      </varlistentry>
-
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
@@ -196,11 +208,33 @@
         <term><option>--fsck=no</option></term>
 
         <listitem><para>Turn off automatic file system checking. By default when an image is accessed for
-        writing (by <option>--mount</option> or <option>--add</option>) the file systems contained in the OS
-        image are automatically checked using the appropriate <citerefentry
+        writing (by <option>--mount</option> or <option>--copy-to</option>) the file systems contained in the
+        OS image are automatically checked using the appropriate <citerefentry
         project='man-pages'><refentrytitle>fsck</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         command, in automatic fixing mode. This behavior may be switched off using
         <option>--fsck=no</option>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>--growfs=no</option></term>
+
+        <listitem><para>Turn off automatic growing of accessed file systems to their partition size, if
+        marked for that in the GPT partition table. By default when an image is accessed for writing (by
+        <option>--mount</option> or <option>--copy-to</option>) the file systems contained in the OS image
+        are automatically grown to their partition sizes, if bit 59 in the GPT partition flags is set for
+        partition types that are defined by the <ulink
+        url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions Specification</ulink>. This
+        behavior may be switched off using <option>--growfs=no</option>. File systems are grown automatically
+        on access if all of the following conditions are met:</para>
+        <orderedlist>
+          <listitem><para>The file system is mounted writable</para></listitem>
+          <listitem><para>The file system currently is smaller than the partition it is contained in (and thus can be grown)</para></listitem>
+          <listitem><para>The image contains a GPT partition table</para></listitem>
+          <listitem><para>The file system is stored on a partition defined by the Discoverable Partitions Specification</para></listitem>
+          <listitem><para>Bit 59 of the GPT partition flags for this partition is set, as per specification</para></listitem>
+          <listitem><para>The <option>--growfs=no</option> option is not passed.</para></listitem>
+        </orderedlist>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -212,11 +246,18 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>--rmdir</option></term>
+
+        <listitem><para>If combined with <option>--umount</option> the specified directory where the OS image
+        is mounted is removed after unmounting the OS image.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>--discard=</option></term>
 
         <listitem><para>Takes one of <literal>disabled</literal>, <literal>loop</literal>,
         <literal>all</literal>, <literal>crypto</literal>. If <literal>disabled</literal> the image is
-        accessed with empty block discarding turned off. if <literal>loop</literal> discarding is enabled if
+        accessed with empty block discarding turned off. If <literal>loop</literal> discarding is enabled if
         operating on a regular file. If <literal>crypt</literal> discarding is enabled even on encrypted file
         systems. If <literal>all</literal> discarding is unconditionally enabled.</para></listitem>
       </varlistentry>
@@ -226,17 +267,21 @@
         <term><option>--root-hash-sig=</option></term>
         <term><option>--verity-data=</option></term>
 
-        <listitem><para>Configure various aspects of Verity data integrity for the OS
-        image. <option>--root-hash=</option> expects a hex-encoding top-level Verity hash to use for setting
-        up the Verity integrity protection. <option>--root-hash-sig=</option> expects the path to a file
-        containing a PKCS#7 signature file for the hash. This signature is passed to the kernel during
-        activation, which will match it against signature keys available in the kernel
-        keyring. <option>--verity-data=</option> expects the path to a file with the Verity data to use for
-        the OS image, in case it is stored in a detached file. It is recommended to embed the Verity data
-        directly in the image, using the Verity mechanisms in the <ulink
-        url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions Specification</ulink>.</para></listitem>
+        <listitem><para>Configure various aspects of Verity data integrity for the OS image. Option
+        <option>--root-hash=</option> specifies a hex-encoded top-level Verity hash to use for setting up the
+        Verity integrity protection. Option <option>--root-hash-sig=</option> specifies the path to a file
+        containing a PKCS#7 signature for the hash. This signature is passed to the kernel during activation,
+        which will match it against signature keys available in the kernel keyring.  Option
+        <option>--verity-data=</option> specifies a path to a file with the Verity data to use for the OS
+        image, in case it is stored in a detached file. It is recommended to embed the Verity data directly
+        in the image, using the Verity mechanisms in the <ulink
+        url="https://systemd.io/DISCOVERABLE_PARTITIONS">Discoverable Partitions Specification</ulink>.
+        </para></listitem>
       </varlistentry>
 
+      <xi:include href="standard-options.xml" xpointer="no-pager" />
+      <xi:include href="standard-options.xml" xpointer="no-legend" />
+      <xi:include href="standard-options.xml" xpointer="json" />
     </variablelist>
 
   </refsect1>

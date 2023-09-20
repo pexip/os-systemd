@@ -5,4 +5,7 @@
  */
 #pragma once
 
-EFI_STATUS graphics_mode(BOOLEAN on);
+#include <efi.h>
+#include <stdbool.h>
+
+EFI_STATUS graphics_mode(bool on);

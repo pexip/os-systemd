@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "alloc-util.h"
+#include "env-util.h"
 #include "hostname-util.h"
 #include "local-addresses.h"
 #include "missing_network.h"
@@ -76,12 +77,12 @@ static int synthesize_localhost_rr(Manager *m, const DnsResourceKey *key, int if
 
                 rr->a.in_addr.s_addr = htobe32(INADDR_LOOPBACK);
 
-                r = dns_answer_add(*answer, rr, dns_synthesize_ifindex(ifindex), DNS_ANSWER_AUTHENTICATED);
+                r = dns_answer_add(*answer, rr, dns_synthesize_ifindex(ifindex), DNS_ANSWER_AUTHENTICATED, NULL);
                 if (r < 0)
                         return r;
         }
 
-        if (IN_SET(key->type, DNS_TYPE_AAAA, DNS_TYPE_ANY)) {
+        if (IN_SET(key->type, DNS_TYPE_AAAA, DNS_TYPE_ANY) && socket_ipv6_is_enabled()) {
                 _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
 
                 rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_AAAA, dns_resource_key_name(key));
@@ -90,7 +91,7 @@ static int synthesize_localhost_rr(Manager *m, const DnsResourceKey *key, int if
 
                 rr->aaaa.in6_addr = in6addr_loopback;
 
-                r = dns_answer_add(*answer, rr, dns_synthesize_ifindex(ifindex), DNS_ANSWER_AUTHENTICATED);
+                r = dns_answer_add(*answer, rr, dns_synthesize_ifindex(ifindex), DNS_ANSWER_AUTHENTICATED, NULL);
                 if (r < 0)
                         return r;
         }
@@ -109,7 +110,7 @@ static int answer_add_ptr(DnsAnswer **answer, const char *from, const char *to, 
         if (!rr->ptr.name)
                 return -ENOMEM;
 
-        return dns_answer_add(*answer, rr, ifindex, flags);
+        return dns_answer_add(*answer, rr, ifindex, flags, NULL);
 }
 
 static int synthesize_localhost_ptr(Manager *m, const DnsResourceKey *key, int ifindex, DnsAnswer **answer) {
@@ -155,7 +156,7 @@ static int answer_add_addresses_rr(
                 if (r < 0)
                         return r;
 
-                r = dns_answer_add(*answer, rr, addresses[j].ifindex, DNS_ANSWER_AUTHENTICATED);
+                r = dns_answer_add(*answer, rr, addresses[j].ifindex, DNS_ANSWER_AUTHENTICATED, NULL);
                 if (r < 0)
                         return r;
         }
@@ -197,7 +198,7 @@ static int answer_add_addresses_ptr(
                 if (r < 0)
                         return r;
 
-                r = dns_answer_add(*answer, rr, addresses[j].ifindex, DNS_ANSWER_AUTHENTICATED);
+                r = dns_answer_add(*answer, rr, addresses[j].ifindex, DNS_ANSWER_AUTHENTICATED, NULL);
                 if (r < 0)
                         return r;
 
@@ -234,7 +235,7 @@ static int synthesize_system_hostname_rr(Manager *m, const DnsResourceKey *key, 
                                         .address.in.s_addr = htobe32(0x7F000002),
                                 };
 
-                        if (IN_SET(af, AF_INET6, AF_UNSPEC))
+                        if (IN_SET(af, AF_INET6, AF_UNSPEC) && socket_ipv6_is_enabled())
                                 buffer[n++] = (struct local_address) {
                                         .family = AF_INET6,
                                         .ifindex = dns_synthesize_ifindex(ifindex),
@@ -311,27 +312,33 @@ static int synthesize_system_hostname_ptr(Manager *m, int af, const union in_add
         return added;
 }
 
-static int synthesize_gateway_rr(Manager *m, const DnsResourceKey *key, int ifindex, DnsAnswer **answer) {
+static int synthesize_gateway_rr(
+                Manager *m,
+                const DnsResourceKey *key,
+                int ifindex,
+                int (*lookup)(sd_netlink *context, int ifindex, int af, struct local_address **ret), /* either local_gateways() or local_outbound() */
+                DnsAnswer **answer) {
         _cleanup_free_ struct local_address *addresses = NULL;
         int n = 0, af, r;
 
         assert(m);
         assert(key);
+        assert(lookup);
         assert(answer);
 
         af = dns_type_to_af(key->type);
         if (af >= 0) {
-                n = local_gateways(m->rtnl, ifindex, af, &addresses);
+                n = lookup(m->rtnl, ifindex, af, &addresses);
                 if (n < 0) /* < 0 means: error */
                         return n;
 
                 if (n == 0) { /* == 0 means we have no gateway */
                         /* See if there's a gateway on the other protocol */
                         if (af == AF_INET)
-                                n = local_gateways(m->rtnl, ifindex, AF_INET6, NULL);
+                                n = lookup(m->rtnl, ifindex, AF_INET6, NULL);
                         else {
                                 assert(af == AF_INET6);
-                                n = local_gateways(m->rtnl, ifindex, AF_INET, NULL);
+                                n = lookup(m->rtnl, ifindex, AF_INET, NULL);
                         }
                         if (n <= 0) /* error (if < 0) or really no gateway at all (if == 0) */
                                 return n;
@@ -388,7 +395,15 @@ int dns_synthesize_answer(
 
                 name = dns_resource_key_name(key);
 
-                if (is_localhost(name)) {
+                if (dns_name_is_empty(name)) {
+                        /* Do nothing. */
+
+                } else if (dns_name_dont_resolve(name)) {
+                        /* Synthesize NXDOMAIN for some of the domains in RFC6303 + RFC6761 */
+                        nxdomain = true;
+                        continue;
+
+                } else if (is_localhost(name)) {
 
                         r = synthesize_localhost_rr(m, key, ifindex, &answer);
                         if (r < 0)
@@ -396,15 +411,27 @@ int dns_synthesize_answer(
 
                 } else if (manager_is_own_hostname(m, name)) {
 
+                        if (getenv_bool("SYSTEMD_RESOLVED_SYNTHESIZE_HOSTNAME") == 0)
+                                continue;
                         r = synthesize_system_hostname_rr(m, key, ifindex, &answer);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to synthesize system hostname RRs: %m");
 
                 } else if (is_gateway_hostname(name)) {
 
-                        r = synthesize_gateway_rr(m, key, ifindex, &answer);
+                        r = synthesize_gateway_rr(m, key, ifindex, local_gateways, &answer);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to synthesize gateway RRs: %m");
+                        if (r == 0) { /* if we have no gateway return NXDOMAIN */
+                                nxdomain = true;
+                                continue;
+                        }
+
+                } else if (is_outbound_hostname(name)) {
+
+                        r = synthesize_gateway_rr(m, key, ifindex, local_outbounds, &answer);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to synthesize outbound RRs: %m");
                         if (r == 0) { /* if we have no gateway return NXDOMAIN */
                                 nxdomain = true;
                                 continue;
@@ -420,6 +447,9 @@ int dns_synthesize_answer(
                 } else if (dns_name_address(name, &af, &address) > 0) {
                         int v, w;
 
+                        if (getenv_bool("SYSTEMD_RESOLVED_SYNTHESIZE_HOSTNAME") == 0)
+                                continue;
+
                         v = synthesize_system_hostname_ptr(m, af, &address, ifindex, &answer);
                         if (v < 0)
                                 return log_error_errno(v, "Failed to synthesize system hostname PTR RR: %m");
@@ -430,6 +460,10 @@ int dns_synthesize_answer(
 
                         if (v == 0 && w == 0) /* This IP address is neither a local one nor a gateway */
                                 continue;
+
+                        /* Note that we never synthesize reverse PTR for _outbound, since those are local
+                         * addresses and thus mapped to the local hostname anyway, hence they already have a
+                         * mapping. */
 
                 } else
                         continue;

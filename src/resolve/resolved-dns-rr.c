@@ -47,8 +47,8 @@ DnsResourceKey* dns_resource_key_new_redirect(const DnsResourceKey *key, const D
         if (cname->key->type == DNS_TYPE_CNAME)
                 return dns_resource_key_new(key->class, key->type, cname->cname.name);
         else {
+                _cleanup_free_ char *destination = NULL;
                 DnsResourceKey *k;
-                char *destination = NULL;
 
                 r = dns_name_change_suffix(dns_resource_key_name(key), dns_resource_key_name(cname->key), cname->dname.name, &destination);
                 if (r < 0)
@@ -58,8 +58,9 @@ DnsResourceKey* dns_resource_key_new_redirect(const DnsResourceKey *key, const D
 
                 k = dns_resource_key_new_consume(key->class, key->type, destination);
                 if (!k)
-                        return mfree(destination);
+                        return NULL;
 
+                TAKE_PTR(destination);
                 return k;
         }
 }
@@ -118,7 +119,7 @@ DnsResourceKey* dns_resource_key_ref(DnsResourceKey *k) {
 
         /* Static/const keys created with DNS_RESOURCE_KEY_CONST will
          * set this to -1, they should not be reffed/unreffed */
-        assert(k->n_ref != (unsigned) -1);
+        assert(k->n_ref != UINT_MAX);
 
         assert(k->n_ref > 0);
         k->n_ref++;
@@ -130,7 +131,7 @@ DnsResourceKey* dns_resource_key_unref(DnsResourceKey *k) {
         if (!k)
                 return NULL;
 
-        assert(k->n_ref != (unsigned) -1);
+        assert(k->n_ref != UINT_MAX);
         assert(k->n_ref > 0);
 
         if (k->n_ref == 1) {
@@ -244,6 +245,9 @@ int dns_resource_key_match_cname_or_dname(const DnsResourceKey *key, const DnsRe
         if (cname->class != key->class && key->class != DNS_CLASS_ANY)
                 return 0;
 
+        if (!dns_type_may_redirect(key->type))
+                return 0;
+
         if (cname->type == DNS_TYPE_CNAME)
                 r = dns_name_equal(dns_resource_key_name(key), dns_resource_key_name(cname));
         else if (cname->type == DNS_TYPE_DNAME)
@@ -294,21 +298,17 @@ static void dns_resource_key_hash_func(const DnsResourceKey *k, struct siphash *
 }
 
 static int dns_resource_key_compare_func(const DnsResourceKey *x, const DnsResourceKey *y) {
-        int ret;
+        int r;
 
-        ret = dns_name_compare_func(dns_resource_key_name(x), dns_resource_key_name(y));
-        if (ret != 0)
-                return ret;
+        r = dns_name_compare_func(dns_resource_key_name(x), dns_resource_key_name(y));
+        if (r != 0)
+                return r;
 
-        ret = CMP(x->type, y->type);
-        if (ret != 0)
-                return ret;
+        r = CMP(x->type, y->type);
+        if (r != 0)
+                return r;
 
-        ret = CMP(x->class, y->class);
-        if (ret != 0)
-                return ret;
-
-        return 0;
+        return CMP(x->class, y->class);
 }
 
 DEFINE_HASH_OPS(dns_resource_key_hash_ops, DnsResourceKey, dns_resource_key_hash_func, dns_resource_key_compare_func);
@@ -323,10 +323,10 @@ char* dns_resource_key_to_string(const DnsResourceKey *key, char *buf, size_t bu
         c = dns_class_to_string(key->class);
         t = dns_type_to_string(key->type);
 
-        snprintf(buf, buf_size, "%s %s%s%.0u %s%s%.0u",
-                 dns_resource_key_name(key),
-                 strempty(c), c ? "" : "CLASS", c ? 0 : key->class,
-                 strempty(t), t ? "" : "TYPE", t ? 0 : key->type);
+        (void) snprintf(buf, buf_size, "%s %s%s%.0u %s%s%.0u",
+                        dns_resource_key_name(key),
+                        strempty(c), c ? "" : "CLASS", c ? 0u : key->class,
+                        strempty(t), t ? "" : "TYPE", t ? 0u : key->type);
 
         return ans;
 }
@@ -346,9 +346,9 @@ bool dns_resource_key_reduce(DnsResourceKey **a, DnsResourceKey **b) {
                 return false;
 
         /* We refuse merging const keys */
-        if ((*a)->n_ref == (unsigned) -1)
+        if ((*a)->n_ref == UINT_MAX)
                 return false;
-        if ((*b)->n_ref == (unsigned) -1)
+        if ((*b)->n_ref == UINT_MAX)
                 return false;
 
         /* Already the same? */
@@ -360,13 +360,10 @@ bool dns_resource_key_reduce(DnsResourceKey **a, DnsResourceKey **b) {
                 return false;
 
         /* Keep the one which already has more references. */
-        if ((*a)->n_ref > (*b)->n_ref) {
-                dns_resource_key_unref(*b);
-                *b = dns_resource_key_ref(*a);
-        } else {
-                dns_resource_key_unref(*a);
-                *a = dns_resource_key_ref(*b);
-        }
+        if ((*a)->n_ref > (*b)->n_ref)
+                DNS_RESOURCE_KEY_REPLACE(*b, dns_resource_key_ref(*a));
+        else
+                DNS_RESOURCE_KEY_REPLACE(*a, dns_resource_key_ref(*b));
 
         return true;
 }
@@ -382,8 +379,8 @@ DnsResourceRecord* dns_resource_record_new(DnsResourceKey *key) {
                 .n_ref = 1,
                 .key = dns_resource_key_ref(key),
                 .expiry = USEC_INFINITY,
-                .n_skip_labels_signer = (unsigned) -1,
-                .n_skip_labels_source = (unsigned) -1,
+                .n_skip_labels_signer = UINT8_MAX,
+                .n_skip_labels_source = UINT8_MAX,
         };
 
         return rr;
@@ -403,7 +400,7 @@ static DnsResourceRecord* dns_resource_record_free(DnsResourceRecord *rr) {
         assert(rr);
 
         if (rr->key) {
-                switch(rr->key->type) {
+                switch (rr->key->type) {
 
                 case DNS_TYPE_SRV:
                         free(rr->srv.name);
@@ -784,7 +781,6 @@ static char *format_types(Bitmap *types) {
 }
 
 static char *format_txt(DnsTxtItem *first) {
-        DnsTxtItem *i;
         size_t c = 1;
         char *p, *s;
 
@@ -796,14 +792,12 @@ static char *format_txt(DnsTxtItem *first) {
                 return NULL;
 
         LIST_FOREACH(items, i, first) {
-                size_t j;
-
                 if (i != first)
                         *(p++) = ' ';
 
                 *(p++) = '"';
 
-                for (j = 0; j < i->length; j++) {
+                for (size_t j = 0; j < i->length; j++) {
                         if (i->data[j] < ' ' || i->data[j] == '"' || i->data[j] >= 127) {
                                 *(p++) = '\\';
                                 *(p++) = '0' + (i->data[j] / 100);
@@ -821,8 +815,8 @@ static char *format_txt(DnsTxtItem *first) {
 }
 
 const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
-        _cleanup_free_ char *t = NULL;
-        char *s, k[DNS_RESOURCE_KEY_STRING_MAX];
+        _cleanup_free_ char *s = NULL, *t = NULL;
+        char k[DNS_RESOURCE_KEY_STRING_MAX];
         int r;
 
         assert(rr);
@@ -872,18 +866,15 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                         return NULL;
                 break;
 
-        case DNS_TYPE_A: {
-                _cleanup_free_ char *x = NULL;
-
-                r = in_addr_to_string(AF_INET, (const union in_addr_union*) &rr->a.in_addr, &x);
+        case DNS_TYPE_A:
+                r = in_addr_to_string(AF_INET, (const union in_addr_union*) &rr->a.in_addr, &t);
                 if (r < 0)
                         return NULL;
 
-                s = strjoin(k, " ", x);
+                s = strjoin(k, " ", t);
                 if (!s)
                         return NULL;
                 break;
-        }
 
         case DNS_TYPE_AAAA:
                 r = in_addr_to_string(AF_INET6, (const union in_addr_union*) &rr->aaaa.in6_addr, &t);
@@ -966,7 +957,6 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
 
         case DNS_TYPE_DNSKEY: {
                 _cleanup_free_ char *alg = NULL;
-                char *ss;
                 uint16_t key_tag;
 
                 key_tag = dnssec_keytag(rr, true);
@@ -975,7 +965,7 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                 if (r < 0)
                         return NULL;
 
-                r = asprintf(&s, "%s %u %u %s",
+                r = asprintf(&t, "%s %u %u %s",
                              k,
                              rr->dnskey.flags,
                              rr->dnskey.protocol,
@@ -983,24 +973,22 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                 if (r < 0)
                         return NULL;
 
-                r = base64_append(&s, r,
+                r = base64_append(&t, r,
                                   rr->dnskey.key, rr->dnskey.key_size,
                                   8, columns());
                 if (r < 0)
                         return NULL;
 
-                r = asprintf(&ss, "%s\n"
+                r = asprintf(&s, "%s\n"
                              "        -- Flags:%s%s%s\n"
                              "        -- Key tag: %u",
-                             s,
+                             t,
                              rr->dnskey.flags & DNSKEY_FLAG_SEP ? " SEP" : "",
                              rr->dnskey.flags & DNSKEY_FLAG_REVOKE ? " REVOKE" : "",
                              rr->dnskey.flags & DNSKEY_FLAG_ZONE_KEY ? " ZONE_KEY" : "",
                              key_tag);
                 if (r < 0)
                         return NULL;
-                free(s);
-                s = ss;
 
                 break;
         }
@@ -1094,14 +1082,8 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                 break;
         }
 
-        case DNS_TYPE_TLSA: {
-                const char *cert_usage, *selector, *matching_type;
-
-                cert_usage = tlsa_cert_usage_to_string(rr->tlsa.cert_usage);
-                selector = tlsa_selector_to_string(rr->tlsa.selector);
-                matching_type = tlsa_matching_type_to_string(rr->tlsa.matching_type);
-
-                t = hexmem(rr->sshfp.fingerprint, rr->sshfp.fingerprint_size);
+        case DNS_TYPE_TLSA:
+                t = hexmem(rr->tlsa.data, rr->tlsa.data_size);
                 if (!t)
                         return NULL;
 
@@ -1115,27 +1097,24 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                              rr->tlsa.selector,
                              rr->tlsa.matching_type,
                              t,
-                             cert_usage,
-                             selector,
-                             matching_type);
+                             tlsa_cert_usage_to_string(rr->tlsa.cert_usage),
+                             tlsa_selector_to_string(rr->tlsa.selector),
+                             tlsa_matching_type_to_string(rr->tlsa.matching_type));
                 if (r < 0)
                         return NULL;
 
                 break;
-        }
 
-        case DNS_TYPE_CAA: {
-                _cleanup_free_ char *value;
-
-                value = octescape(rr->caa.value, rr->caa.value_size);
-                if (!value)
+        case DNS_TYPE_CAA:
+                t = octescape(rr->caa.value, rr->caa.value_size);
+                if (!t)
                         return NULL;
 
                 r = asprintf(&s, "%s %u %s \"%s\"%s%s%s%.0u",
                              k,
                              rr->caa.flags,
                              rr->caa.tag,
-                             value,
+                             t,
                              rr->caa.flags ? "\n        -- Flags:" : "",
                              rr->caa.flags & CAA_FLAG_CRITICAL ? " critical" : "",
                              rr->caa.flags & ~CAA_FLAG_CRITICAL ? " " : "",
@@ -1144,9 +1123,8 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                         return NULL;
 
                 break;
-        }
 
-        case DNS_TYPE_OPENPGPKEY: {
+        case DNS_TYPE_OPENPGPKEY:
                 r = asprintf(&s, "%s", k);
                 if (r < 0)
                         return NULL;
@@ -1157,29 +1135,31 @@ const char *dns_resource_record_to_string(DnsResourceRecord *rr) {
                 if (r < 0)
                         return NULL;
                 break;
-        }
 
         default:
-                t = hexmem(rr->generic.data, rr->generic.data_size);
-                if (!t)
-                        return NULL;
-
                 /* Format as documented in RFC 3597, Section 5 */
-                r = asprintf(&s, "%s \\# %zu %s", k, rr->generic.data_size, t);
+                if (rr->generic.data_size == 0)
+                        r = asprintf(&s, "%s \\# 0", k);
+                else {
+                        t = hexmem(rr->generic.data, rr->generic.data_size);
+                        if (!t)
+                                return NULL;
+                        r = asprintf(&s, "%s \\# %zu %s", k, rr->generic.data_size, t);
+                }
                 if (r < 0)
                         return NULL;
                 break;
         }
 
         rr->to_string = s;
-        return s;
+        return TAKE_PTR(s);
 }
 
 ssize_t dns_resource_record_payload(DnsResourceRecord *rr, void **out) {
         assert(rr);
         assert(out);
 
-        switch(rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
+        switch (rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
         case DNS_TYPE_SRV:
         case DNS_TYPE_PTR:
         case DNS_TYPE_NS:
@@ -1242,8 +1222,10 @@ int dns_resource_record_to_wire_format(DnsResourceRecord *rr, bool canonical) {
                 return 0;
 
         r = dns_packet_append_rr(&packet, rr, 0, &start, &rds);
-        if (r < 0)
+        if (r < 0) {
+                dns_packet_unref(&packet);
                 return r;
+        }
 
         assert(start == 0);
         assert(packet._data);
@@ -1269,7 +1251,7 @@ int dns_resource_record_signer(DnsResourceRecord *rr, const char **ret) {
 
         /* Returns the RRset's signer, if it is known. */
 
-        if (rr->n_skip_labels_signer == (unsigned) -1)
+        if (rr->n_skip_labels_signer == UINT8_MAX)
                 return -ENODATA;
 
         n = dns_resource_key_name(rr->key);
@@ -1292,7 +1274,7 @@ int dns_resource_record_source(DnsResourceRecord *rr, const char **ret) {
 
         /* Returns the RRset's synthesizing source, if it is known. */
 
-        if (rr->n_skip_labels_source == (unsigned) -1)
+        if (rr->n_skip_labels_source == UINT8_MAX)
                 return -ENODATA;
 
         n = dns_resource_key_name(rr->key);
@@ -1326,7 +1308,7 @@ int dns_resource_record_is_synthetic(DnsResourceRecord *rr) {
 
         /* Returns > 0 if the RR is generated from a wildcard, and is not the asterisk name itself */
 
-        if (rr->n_skip_labels_source == (unsigned) -1)
+        if (rr->n_skip_labels_source == UINT8_MAX)
                 return -ENODATA;
 
         if (rr->n_skip_labels_source == 0)
@@ -1370,8 +1352,6 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
 
         case DNS_TYPE_TXT:
         case DNS_TYPE_SPF: {
-                DnsTxtItem *j;
-
                 LIST_FOREACH(items, j, rr->txt.items) {
                         siphash24_compress_safe(j->data, j->length, state);
 
@@ -1483,14 +1463,14 @@ void dns_resource_record_hash_func(const DnsResourceRecord *rr, struct siphash *
         }
 }
 
-static int dns_resource_record_compare_func(const DnsResourceRecord *x, const DnsResourceRecord *y) {
+int dns_resource_record_compare_func(const DnsResourceRecord *x, const DnsResourceRecord *y) {
         int r;
 
         r = dns_resource_key_compare_func(x->key, y->key);
         if (r != 0)
                 return r;
 
-        if (dns_resource_record_equal(x, y))
+        if (dns_resource_record_payload_equal(x, y) > 0)
                 return 0;
 
         /* We still use CMP() here, even though don't implement proper
@@ -1626,9 +1606,11 @@ DnsResourceRecord *dns_resource_record_copy(DnsResourceRecord *rr) {
                 copy->nsec.next_domain_name = strdup(rr->nsec.next_domain_name);
                 if (!copy->nsec.next_domain_name)
                         return NULL;
-                copy->nsec.types = bitmap_copy(rr->nsec.types);
-                if (!copy->nsec.types)
-                        return NULL;
+                if (rr->nsec.types) {
+                        copy->nsec.types = bitmap_copy(rr->nsec.types);
+                        if (!copy->nsec.types)
+                                return NULL;
+                }
                 break;
 
         case DNS_TYPE_DS:
@@ -1653,9 +1635,11 @@ DnsResourceRecord *dns_resource_record_copy(DnsResourceRecord *rr) {
                 if (!copy->nsec3.next_hashed_name)
                         return NULL;
                 copy->nsec3.next_hashed_name_size = rr->nsec3.next_hashed_name_size;
-                copy->nsec3.types = bitmap_copy(rr->nsec3.types);
-                if (!copy->nsec3.types)
-                        return NULL;
+                if (rr->nsec3.types) {
+                        copy->nsec3.types = bitmap_copy(rr->nsec3.types);
+                        if (!copy->nsec3.types)
+                                return NULL;
+                }
                 break;
 
         case DNS_TYPE_TLSA:
@@ -1719,46 +1703,101 @@ int dns_resource_record_clamp_ttl(DnsResourceRecord **rr, uint32_t max_ttl) {
 
         new_rr->ttl = new_ttl;
 
-        dns_resource_record_unref(*rr);
-        *rr = new_rr;
-
+        DNS_RR_REPLACE(*rr, new_rr);
         return 1;
 }
 
-DnsTxtItem *dns_txt_item_free_all(DnsTxtItem *i) {
-        DnsTxtItem *n;
+bool dns_resource_record_is_link_local_address(DnsResourceRecord *rr) {
+        assert(rr);
 
-        if (!i)
-                return NULL;
+        if (rr->key->class != DNS_CLASS_IN)
+                return false;
 
-        n = i->items_next;
+        if (rr->key->type == DNS_TYPE_A)
+                return in4_addr_is_link_local(&rr->a.in_addr);
 
-        free(i);
-        return dns_txt_item_free_all(n);
+        if (rr->key->type == DNS_TYPE_AAAA)
+                return in6_addr_is_link_local(&rr->aaaa.in6_addr);
+
+        return false;
+}
+
+int dns_resource_record_get_cname_target(DnsResourceKey *key, DnsResourceRecord *cname, char **ret) {
+        _cleanup_free_ char *d = NULL;
+        int r;
+
+        assert(key);
+        assert(cname);
+
+        /* Checks if the RR `cname` is a CNAME/DNAME RR that matches the specified `key`. If so, returns the
+         * target domain. If not, returns -EUNATCH */
+
+        if (key->class != cname->key->class && key->class != DNS_CLASS_ANY)
+                return -EUNATCH;
+
+        if (!dns_type_may_redirect(key->type)) /* This key type is not subject to CNAME/DNAME redirection?
+                                                * Then let's refuse right-away */
+                return -EUNATCH;
+
+        if (cname->key->type == DNS_TYPE_CNAME) {
+                r = dns_name_equal(dns_resource_key_name(key),
+                                   dns_resource_key_name(cname->key));
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return -EUNATCH; /* CNAME RR key doesn't actually match the original key */
+
+                d = strdup(cname->cname.name);
+                if (!d)
+                        return -ENOMEM;
+
+        } else if (cname->key->type == DNS_TYPE_DNAME) {
+
+                r = dns_name_change_suffix(
+                                dns_resource_key_name(key),
+                                dns_resource_key_name(cname->key),
+                                cname->dname.name,
+                                &d);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return -EUNATCH; /* DNAME RR key doesn't actually match the original key */
+
+        } else
+                return -EUNATCH; /* Not a CNAME/DNAME RR, hence doesn't match the proposition either */
+
+        *ret = TAKE_PTR(d);
+        return 0;
+}
+
+DnsTxtItem *dns_txt_item_free_all(DnsTxtItem *first) {
+        LIST_FOREACH(items, i, first)
+                free(i);
+
+        return NULL;
 }
 
 bool dns_txt_item_equal(DnsTxtItem *a, DnsTxtItem *b) {
+        DnsTxtItem *bb = b;
 
         if (a == b)
                 return true;
 
-        if (!a != !b)
-                return false;
+        LIST_FOREACH(items, aa, a) {
+                if (!bb)
+                        return false;
 
-        if (!a)
-                return true;
+                if (memcmp_nn(aa->data, aa->length, bb->data, bb->length) != 0)
+                        return false;
 
-        if (a->length != b->length)
-                return false;
+                bb = bb->items_next;
+        }
 
-        if (memcmp(a->data, b->data, a->length) != 0)
-                return false;
-
-        return dns_txt_item_equal(a->items_next, b->items_next);
+        return !bb;
 }
 
 DnsTxtItem *dns_txt_item_copy(DnsTxtItem *first) {
-        DnsTxtItem *i, *copy = NULL, *end = NULL;
+        DnsTxtItem *copy = NULL, *end = NULL;
 
         LIST_FOREACH(items, i, first) {
                 DnsTxtItem *j;
@@ -1792,6 +1831,280 @@ int dns_txt_item_new_empty(DnsTxtItem **ret) {
         return 0;
 }
 
+int dns_resource_record_new_from_raw(DnsResourceRecord **ret, const void *data, size_t size) {
+        _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
+        int r;
+
+        r = dns_packet_new(&p, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX);
+        if (r < 0)
+                return r;
+
+        p->refuse_compression = true;
+
+        r = dns_packet_append_blob(p, data, size, NULL);
+        if (r < 0)
+                return r;
+
+        return dns_packet_read_rr(p, ret, NULL, NULL);
+}
+
+int dns_resource_key_to_json(DnsResourceKey *key, JsonVariant **ret) {
+        assert(key);
+        assert(ret);
+
+        return json_build(ret,
+                          JSON_BUILD_OBJECT(
+                                          JSON_BUILD_PAIR("class", JSON_BUILD_INTEGER(key->class)),
+                                          JSON_BUILD_PAIR("type", JSON_BUILD_INTEGER(key->type)),
+                                          JSON_BUILD_PAIR("name", JSON_BUILD_STRING(dns_resource_key_name(key)))));
+}
+
+static int type_bitmap_to_json(Bitmap *b, JsonVariant **ret) {
+        _cleanup_(json_variant_unrefp) JsonVariant *l = NULL;
+        unsigned t;
+        int r;
+
+        assert(ret);
+
+        BITMAP_FOREACH(t, b) {
+                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+
+                r = json_variant_new_unsigned(&v, t);
+                if (r < 0)
+                        return r;
+
+                r = json_variant_append_array(&l, v);
+                if (r < 0)
+                        return r;
+        }
+
+        if (!l)
+                return json_variant_new_array(ret, NULL, 0);
+
+        *ret = TAKE_PTR(l);
+        return 0;
+}
+
+static int txt_to_json(DnsTxtItem *items, JsonVariant **ret) {
+        JsonVariant **elements = NULL;
+        size_t n = 0;
+        int r;
+
+        assert(ret);
+
+        LIST_FOREACH(items, i, items) {
+                if (!GREEDY_REALLOC(elements, n + 1)) {
+                        r = -ENOMEM;
+                        goto finalize;
+                }
+
+                r = json_variant_new_octescape(elements + n, i->data, i->length);
+                if (r < 0)
+                        goto finalize;
+
+                n++;
+        }
+
+        r = json_variant_new_array(ret, elements, n);
+
+finalize:
+        for (size_t i = 0; i < n; i++)
+                json_variant_unref(elements[i]);
+
+        free(elements);
+        return r;
+}
+
+int dns_resource_record_to_json(DnsResourceRecord *rr, JsonVariant **ret) {
+        _cleanup_(json_variant_unrefp) JsonVariant *k = NULL;
+        int r;
+
+        assert(rr);
+        assert(ret);
+
+        r = dns_resource_key_to_json(rr->key, &k);
+        if (r < 0)
+                return r;
+
+        switch (rr->unparsable ? _DNS_TYPE_INVALID : rr->key->type) {
+
+        case DNS_TYPE_SRV:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("priority", JSON_BUILD_UNSIGNED(rr->srv.priority)),
+                                                  JSON_BUILD_PAIR("weight", JSON_BUILD_UNSIGNED(rr->srv.weight)),
+                                                  JSON_BUILD_PAIR("port", JSON_BUILD_UNSIGNED(rr->srv.port)),
+                                                  JSON_BUILD_PAIR("name", JSON_BUILD_STRING(rr->srv.name))));
+
+        case DNS_TYPE_PTR:
+        case DNS_TYPE_NS:
+        case DNS_TYPE_CNAME:
+        case DNS_TYPE_DNAME:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("name", JSON_BUILD_STRING(rr->ptr.name))));
+
+        case DNS_TYPE_HINFO:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("cpu", JSON_BUILD_STRING(rr->hinfo.cpu)),
+                                                  JSON_BUILD_PAIR("os", JSON_BUILD_STRING(rr->hinfo.os))));
+
+        case DNS_TYPE_SPF:
+        case DNS_TYPE_TXT: {
+                _cleanup_(json_variant_unrefp) JsonVariant *l = NULL;
+
+                r = txt_to_json(rr->txt.items, &l);
+                if (r < 0)
+                        return r;
+
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("items", JSON_BUILD_VARIANT(l))));
+        }
+
+        case DNS_TYPE_A:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("address", JSON_BUILD_IN4_ADDR(&rr->a.in_addr))));
+
+        case DNS_TYPE_AAAA:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("address", JSON_BUILD_IN6_ADDR(&rr->aaaa.in6_addr))));
+
+        case DNS_TYPE_SOA:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("mname", JSON_BUILD_STRING(rr->soa.mname)),
+                                                  JSON_BUILD_PAIR("rname", JSON_BUILD_STRING(rr->soa.rname)),
+                                                  JSON_BUILD_PAIR("serial", JSON_BUILD_UNSIGNED(rr->soa.serial)),
+                                                  JSON_BUILD_PAIR("refresh", JSON_BUILD_UNSIGNED(rr->soa.refresh)),
+                                                  JSON_BUILD_PAIR("expire", JSON_BUILD_UNSIGNED(rr->soa.retry)),
+                                                  JSON_BUILD_PAIR("minimum", JSON_BUILD_UNSIGNED(rr->soa.minimum))));
+
+        case DNS_TYPE_MX:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("priority", JSON_BUILD_UNSIGNED(rr->mx.priority)),
+                                                  JSON_BUILD_PAIR("exchange", JSON_BUILD_STRING(rr->mx.exchange))));
+        case DNS_TYPE_LOC:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("version", JSON_BUILD_UNSIGNED(rr->loc.version)),
+                                                  JSON_BUILD_PAIR("size", JSON_BUILD_UNSIGNED(rr->loc.size)),
+                                                  JSON_BUILD_PAIR("horiz_pre", JSON_BUILD_UNSIGNED(rr->loc.horiz_pre)),
+                                                  JSON_BUILD_PAIR("vert_pre", JSON_BUILD_UNSIGNED(rr->loc.vert_pre)),
+                                                  JSON_BUILD_PAIR("latitude", JSON_BUILD_UNSIGNED(rr->loc.latitude)),
+                                                  JSON_BUILD_PAIR("longitude", JSON_BUILD_UNSIGNED(rr->loc.longitude)),
+                                                  JSON_BUILD_PAIR("altitude", JSON_BUILD_UNSIGNED(rr->loc.altitude))));
+
+        case DNS_TYPE_DS:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("keyTag", JSON_BUILD_UNSIGNED(rr->ds.key_tag)),
+                                                  JSON_BUILD_PAIR("algorithm", JSON_BUILD_UNSIGNED(rr->ds.algorithm)),
+                                                  JSON_BUILD_PAIR("digestType", JSON_BUILD_UNSIGNED(rr->ds.digest_type)),
+                                                  JSON_BUILD_PAIR("digest", JSON_BUILD_HEX(rr->ds.digest, rr->ds.digest_size))));
+
+        case DNS_TYPE_SSHFP:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("algorithm", JSON_BUILD_UNSIGNED(rr->sshfp.algorithm)),
+                                                  JSON_BUILD_PAIR("fptype", JSON_BUILD_UNSIGNED(rr->sshfp.fptype)),
+                                                  JSON_BUILD_PAIR("fingerprint", JSON_BUILD_HEX(rr->sshfp.fingerprint, rr->sshfp.fingerprint_size))));
+
+        case DNS_TYPE_DNSKEY:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("flags", JSON_BUILD_UNSIGNED(rr->dnskey.flags)),
+                                                  JSON_BUILD_PAIR("protocol", JSON_BUILD_UNSIGNED(rr->dnskey.protocol)),
+                                                  JSON_BUILD_PAIR("algorithm", JSON_BUILD_UNSIGNED(rr->dnskey.algorithm)),
+                                                  JSON_BUILD_PAIR("dnskey", JSON_BUILD_BASE64(rr->dnskey.key, rr->dnskey.key_size))));
+
+
+        case DNS_TYPE_RRSIG:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("signer", JSON_BUILD_STRING(rr->rrsig.signer)),
+                                                  JSON_BUILD_PAIR("typeCovered", JSON_BUILD_UNSIGNED(rr->rrsig.type_covered)),
+                                                  JSON_BUILD_PAIR("algorithm", JSON_BUILD_UNSIGNED(rr->rrsig.algorithm)),
+                                                  JSON_BUILD_PAIR("labels", JSON_BUILD_UNSIGNED(rr->rrsig.labels)),
+                                                  JSON_BUILD_PAIR("originalTtl", JSON_BUILD_UNSIGNED(rr->rrsig.original_ttl)),
+                                                  JSON_BUILD_PAIR("expiration", JSON_BUILD_UNSIGNED(rr->rrsig.expiration)),
+                                                  JSON_BUILD_PAIR("inception", JSON_BUILD_UNSIGNED(rr->rrsig.inception)),
+                                                  JSON_BUILD_PAIR("keyTag", JSON_BUILD_UNSIGNED(rr->rrsig.key_tag)),
+                                                  JSON_BUILD_PAIR("signature", JSON_BUILD_BASE64(rr->rrsig.signature, rr->rrsig.signature_size))));
+
+        case DNS_TYPE_NSEC: {
+                _cleanup_(json_variant_unrefp) JsonVariant *bm = NULL;
+
+                r = type_bitmap_to_json(rr->nsec.types, &bm);
+                if (r < 0)
+                        return r;
+
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("nextDomain", JSON_BUILD_STRING(rr->nsec.next_domain_name)),
+                                                  JSON_BUILD_PAIR("types", JSON_BUILD_VARIANT(bm))));
+        }
+
+        case DNS_TYPE_NSEC3: {
+                _cleanup_(json_variant_unrefp) JsonVariant *bm = NULL;
+
+                r = type_bitmap_to_json(rr->nsec3.types, &bm);
+                if (r < 0)
+                        return r;
+
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("algorithm", JSON_BUILD_UNSIGNED(rr->nsec3.algorithm)),
+                                                  JSON_BUILD_PAIR("flags", JSON_BUILD_UNSIGNED(rr->nsec3.flags)),
+                                                  JSON_BUILD_PAIR("iterations", JSON_BUILD_UNSIGNED(rr->nsec3.iterations)),
+                                                  JSON_BUILD_PAIR("salt", JSON_BUILD_HEX(rr->nsec3.salt, rr->nsec3.salt_size)),
+                                                  JSON_BUILD_PAIR("hash", JSON_BUILD_BASE32HEX(rr->nsec3.next_hashed_name, rr->nsec3.next_hashed_name_size)),
+                                                  JSON_BUILD_PAIR("types", JSON_BUILD_VARIANT(bm))));
+        }
+
+        case DNS_TYPE_TLSA:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("certUsage", JSON_BUILD_UNSIGNED(rr->tlsa.cert_usage)),
+                                                  JSON_BUILD_PAIR("selector", JSON_BUILD_UNSIGNED(rr->tlsa.selector)),
+                                                  JSON_BUILD_PAIR("matchingType", JSON_BUILD_UNSIGNED(rr->tlsa.matching_type)),
+                                                  JSON_BUILD_PAIR("data", JSON_BUILD_HEX(rr->tlsa.data, rr->tlsa.data_size))));
+
+        case DNS_TYPE_CAA:
+                return json_build(ret,
+                                  JSON_BUILD_OBJECT(
+                                                  JSON_BUILD_PAIR("key", JSON_BUILD_VARIANT(k)),
+                                                  JSON_BUILD_PAIR("flags", JSON_BUILD_UNSIGNED(rr->caa.flags)),
+                                                  JSON_BUILD_PAIR("tag", JSON_BUILD_STRING(rr->caa.tag)),
+                                                  JSON_BUILD_PAIR("value", JSON_BUILD_OCTESCAPE(rr->caa.value, rr->caa.value_size))));
+
+        default:
+                /* Can't provide broken-down format */
+                *ret = NULL;
+                return 0;
+        }
+}
+
 static const char* const dnssec_algorithm_table[_DNSSEC_ALGORITHM_MAX_DEFINED] = {
         /* Mnemonics as listed on https://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml */
         [DNSSEC_ALGORITHM_RSAMD5]             = "RSAMD5",
@@ -1816,9 +2129,9 @@ DEFINE_STRING_TABLE_LOOKUP_WITH_FALLBACK(dnssec_algorithm, int, 255);
 
 static const char* const dnssec_digest_table[_DNSSEC_DIGEST_MAX_DEFINED] = {
         /* Names as listed on https://www.iana.org/assignments/ds-rr-types/ds-rr-types.xhtml */
-        [DNSSEC_DIGEST_SHA1] = "SHA-1",
-        [DNSSEC_DIGEST_SHA256] = "SHA-256",
+        [DNSSEC_DIGEST_SHA1]            = "SHA-1",
+        [DNSSEC_DIGEST_SHA256]          = "SHA-256",
         [DNSSEC_DIGEST_GOST_R_34_11_94] = "GOST_R_34.11-94",
-        [DNSSEC_DIGEST_SHA384] = "SHA-384",
+        [DNSSEC_DIGEST_SHA384]          = "SHA-384",
 };
 DEFINE_STRING_TABLE_LOOKUP_WITH_FALLBACK(dnssec_digest, int, 255);
