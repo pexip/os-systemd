@@ -9,6 +9,7 @@
 #include "sd-resolve.h"
 
 #include "dhcp-identifier.h"
+#include "firewall-util.h"
 #include "hashmap.h"
 #include "networkd-link.h"
 #include "networkd-network.h"
@@ -27,10 +28,14 @@ struct Manager {
         Hashmap *polkit_registry;
         int ethtool_fd;
 
-        bool enumerating:1;
-        bool dirty:1;
-        bool restarting:1;
+        KeepConfiguration keep_configuration;
+
+        bool test_mode;
+        bool enumerating;
+        bool dirty;
+        bool restarting;
         bool manage_foreign_routes;
+        bool manage_foreign_rules;
 
         Set *dirty_links;
 
@@ -38,58 +43,74 @@ struct Manager {
         LinkOperationalState operational_state;
         LinkCarrierState carrier_state;
         LinkAddressState address_state;
+        LinkAddressState ipv4_address_state;
+        LinkAddressState ipv6_address_state;
+        LinkOnlineState online_state;
 
-        Hashmap *links;
+        Hashmap *links_by_index;
+        Hashmap *links_by_name;
+        Hashmap *links_by_hw_addr;
+        Hashmap *links_by_dhcp_pd_subnet_prefix;
         Hashmap *netdevs;
         OrderedHashmap *networks;
-        Hashmap *dhcp6_prefixes;
-        Set *dhcp6_pd_prefixes;
         OrderedSet *address_pools;
+        Set *dhcp_pd_subnet_ids;
 
-        usec_t network_dirs_ts_usec;
-
-        DUID duid;
-        sd_id128_t product_uuid;
+        DUID dhcp_duid;
+        DUID dhcp6_duid;
+        DUID duid_product_uuid;
         bool has_product_uuid;
-        Set *links_requesting_uuid;
-        Set *duids_requesting_uuid;
+        bool product_uuid_requested;
 
         char* dynamic_hostname;
         char* dynamic_timezone;
 
         Set *rules;
-        Set *rules_foreign;
-        Set *rules_saved;
+
+        /* Manage nexthops by id. */
+        Hashmap *nexthops_by_id;
+
+        /* Manager stores nexthops without RTA_OIF attribute. */
+        Set *nexthops;
 
         /* Manager stores routes without RTA_OIF attribute. */
+        unsigned route_remove_messages;
         Set *routes;
         Set *routes_foreign;
 
-        /* For link speed meter*/
+        /* Route table name */
+        Hashmap *route_table_numbers_by_name;
+        Hashmap *route_table_names_by_number;
+
+        /* Wiphy */
+        Hashmap *wiphy_by_index;
+        Hashmap *wiphy_by_name;
+
+        /* For link speed meter */
         bool use_speed_meter;
         sd_event_source *speed_meter_event_source;
         usec_t speed_meter_interval_usec;
         usec_t speed_meter_usec_new;
         usec_t speed_meter_usec_old;
 
-        bool dhcp4_prefix_root_cannot_set_table:1;
-        bool bridge_mdb_on_master_not_supported:1;
+        bool bridge_mdb_on_master_not_supported;
+
+        FirewallContext *fw_ctx;
+
+        OrderedSet *request_queue;
+
+        Hashmap *tuntap_fds_by_name;
 };
 
-int manager_new(Manager **ret);
-void manager_free(Manager *m);
+int manager_new(Manager **ret, bool test_mode);
+Manager* manager_free(Manager *m);
 
-int manager_connect_bus(Manager *m);
+int manager_setup(Manager *m);
 int manager_start(Manager *m);
 
 int manager_load_config(Manager *m);
-bool manager_should_reload(Manager *m);
 
 int manager_enumerate(Manager *m);
-
-void manager_dirty(Manager *m);
-
-Link* manager_find_uplink(Manager *m, Link *exclude);
 
 int manager_set_hostname(Manager *m, const char *hostname);
 int manager_set_timezone(Manager *m, const char *timezone);

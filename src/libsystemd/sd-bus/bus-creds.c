@@ -8,7 +8,6 @@
 #include "bus-creds.h"
 #include "bus-label.h"
 #include "bus-message.h"
-#include "bus-util.h"
 #include "capability-util.h"
 #include "cgroup-util.h"
 #include "errno-util.h"
@@ -662,8 +661,8 @@ static int has_cap(sd_bus_creds *c, size_t offset, int capability) {
         if ((unsigned) capability > lc)
                 return 0;
 
-        /* If the last cap is 63, then there are 64 caps defined, and we need 2 entries á 32bit hence. *
-         * If the last cap is 64, then there are 65 caps defined, and we need 3 entries á 32bit hence. */
+        /* If the last cap is 63, then there are 64 caps defined, and we need 2 entries à 32bit hence. *
+         * If the last cap is 64, then there are 65 caps defined, and we need 3 entries à 32bit hence. */
         sz = DIV_ROUND_UP(lc+1, 32LU);
 
         return !!(c->capability[offset * sz + CAP_TO_INDEX((uint32_t) capability)] & CAP_TO_MASK_CORRECTED((uint32_t) capability));
@@ -883,8 +882,6 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                                 if (missing & SD_BUS_CREDS_SUPPLEMENTARY_GIDS) {
                                         p = startswith(line, "Groups:");
                                         if (p) {
-                                                size_t allocated = 0;
-
                                                 for (;;) {
                                                         unsigned long g;
                                                         int n = 0;
@@ -896,7 +893,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                                                         if (sscanf(p, "%lu%n", &g, &n) != 1)
                                                                 return -EIO;
 
-                                                        if (!GREEDY_REALLOC(c->supplementary_gids, allocated, c->n_supplementary_gids+1))
+                                                        if (!GREEDY_REALLOC(c->supplementary_gids, c->n_supplementary_gids+1))
                                                                 return -ENOMEM;
 
                                                         c->supplementary_gids[c->n_supplementary_gids++] = (gid_t) g;
@@ -1003,7 +1000,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, pid_t pid, pid_t tid) {
                 const char *p;
 
                 p = procfs_file_alloca(pid, "cmdline");
-                r = read_full_file(p, &c->cmdline, &c->cmdline_size);
+                r = read_full_virtual_file(p, &c->cmdline, &c->cmdline_size);
                 if (r == -ENOENT)
                         return -ESRCH;
                 if (r < 0) {

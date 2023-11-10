@@ -9,6 +9,7 @@
 #include "bus-locator.h"
 #include "bus-unit-util.h"
 #include "bus-wait-for-jobs.h"
+#include "chase-symlinks.h"
 #include "device-util.h"
 #include "dirent-util.h"
 #include "escape.h"
@@ -23,9 +24,11 @@
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "pager.h"
+#include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "pretty-print.h"
+#include "process-util.h"
 #include "sort-util.h"
 #include "spawn-polkit-agent.h"
 #include "stat-util.h"
@@ -114,11 +117,10 @@ static int help(void) {
                "     --list                       List mountable block devices\n"
                "  -u --umount                     Unmount mount points\n"
                "  -G --collect                    Unload unit after it stopped, even when failed\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , streq(program_invocation_short_name, "systemd-umount") ? "" : "--umount "
-               , link
-        );
+               "\nSee the %s for details.\n",
+               program_invocation_short_name,
+               streq(program_invocation_short_name, "systemd-umount") ? "" : "--umount ",
+               link);
 
         return 0;
 }
@@ -182,8 +184,8 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        if (strstr(program_invocation_short_name, "systemd-umount"))
-                        arg_action = ACTION_UMOUNT;
+        if (invoked_as(argv, "systemd-umount"))
+                arg_action = ACTION_UMOUNT;
 
         while ((c = getopt_long(argc, argv, "hqH:M:t:o:p:AuGl", options, NULL)) >= 0)
 
@@ -242,13 +244,15 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 't':
-                        if (free_and_strdup(&arg_mount_type, optarg) < 0)
-                                return log_oom();
+                        r = free_and_strdup_warn(&arg_mount_type, optarg);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case 'o':
-                        if (free_and_strdup(&arg_mount_options, optarg) < 0)
-                                return log_oom();
+                        r = free_and_strdup_warn(&arg_mount_options, optarg);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case ARG_OWNER: {
@@ -264,16 +268,15 @@ static int parse_argv(int argc, char *argv[]) {
                 }
 
                 case ARG_FSCK:
-                        r = parse_boolean(optarg);
+                        r = parse_boolean_argument("--fsck=", optarg, &arg_fsck);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --fsck= argument: %s", optarg);
-
-                        arg_fsck = r;
+                                return r;
                         break;
 
                 case ARG_DESCRIPTION:
-                        if (free_and_strdup(&arg_description, optarg) < 0)
-                                return log_oom();
+                        r = free_and_strdup_warn(&arg_description, optarg);
+                        if (r < 0)
+                                return r;
                         break;
 
                 case 'p':
@@ -287,9 +290,9 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_AUTOMOUNT:
-                        r = parse_boolean(optarg);
+                        r = parse_boolean_argument("--automount=", optarg, NULL);
                         if (r < 0)
-                                return log_error_errno(r, "--automount= expects a valid boolean parameter: %s", optarg);
+                                return r;
 
                         arg_action = r ? ACTION_AUTOMOUNT : ACTION_MOUNT;
                         break;
@@ -327,8 +330,11 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
+
+        if (arg_user)
+                arg_ask_password = false;
 
         if (arg_user && arg_transport != BUS_TRANSPORT_LOCAL)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -384,7 +390,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (!arg_mount_what)
                                 return log_oom();
 
-                        path_simplify(arg_mount_what, false);
+                        path_simplify(arg_mount_what);
 
                         if (!path_is_absolute(arg_mount_what))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -401,7 +407,7 @@ static int parse_argv(int argc, char *argv[]) {
                                 if (!arg_mount_where)
                                         return log_oom();
 
-                                path_simplify(arg_mount_where, false);
+                                path_simplify(arg_mount_where);
 
                                 if (!path_is_absolute(arg_mount_where))
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -595,7 +601,7 @@ static int start_transient_mount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
                 if (r < 0)
                         return r;
         }
@@ -704,7 +710,7 @@ static int start_transient_automount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
                 if (r < 0)
                         return r;
         }
@@ -721,7 +727,7 @@ static int find_mount_points(const char *what, char ***list) {
         _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
         _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
         _cleanup_strv_free_ char **l = NULL;
-        size_t bufsize = 0, n = 0;
+        size_t n = 0;
         int r;
 
         assert(what);
@@ -753,7 +759,7 @@ static int find_mount_points(const char *what, char ***list) {
                         continue;
 
                 /* one extra slot is needed for the terminating NULL */
-                if (!GREEDY_REALLOC0(l, bufsize, n + 2))
+                if (!GREEDY_REALLOC0(l, n + 2))
                         return log_oom();
 
                 l[n] = strdup(target);
@@ -762,7 +768,7 @@ static int find_mount_points(const char *what, char ***list) {
                 n++;
         }
 
-        if (!GREEDY_REALLOC0(l, bufsize, n + 1))
+        if (!GREEDY_REALLOC0(l, n + 1))
                 return log_oom();
 
         *list = TAKE_PTR(l);
@@ -771,7 +777,6 @@ static int find_mount_points(const char *what, char ***list) {
 
 static int find_loop_device(const char *backing_file, char **loop_dev) {
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
         _cleanup_free_ char *l = NULL;
 
         assert(backing_file);
@@ -784,8 +789,6 @@ static int find_loop_device(const char *backing_file, char **loop_dev) {
         FOREACH_DIRENT(de, d, return -errno) {
                 _cleanup_free_ char *sys = NULL, *fname = NULL;
                 int r;
-
-                dirent_ensure_type(d, de);
 
                 if (de->d_type != DT_DIR)
                         continue;
@@ -872,7 +875,7 @@ static int stop_mount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
                 if (r < 0)
                         return r;
         }
@@ -927,7 +930,7 @@ static int umount_by_device(sd_bus *bus, const char *what) {
                 return log_error_errno(SYNTHETIC_ERRNO(ENOTBLK),
                                        "Not a block device: %s", what);
 
-        r = sd_device_new_from_devnum(&d, 'b', st.st_rdev);
+        r = sd_device_new_from_stat_rdev(&d, &st);
         if (r < 0)
                 return log_error_errno(r, "Failed to get device from device number: %m");
 
@@ -983,7 +986,7 @@ static int action_umount(
                         if (!p)
                                 return log_oom();
 
-                        path_simplify(p, false);
+                        path_simplify(p);
 
                         r = stop_mounts(bus, p);
                         if (r < 0)
@@ -1195,7 +1198,7 @@ static int acquire_removable(sd_device *d) {
                 return 0;
 
         for (;;) {
-                if (sd_device_get_sysattr_value(d, "removable", &v) > 0)
+                if (sd_device_get_sysattr_value(d, "removable", &v) >= 0)
                         break;
 
                 if (sd_device_get_parent(d, &d) < 0)
@@ -1268,7 +1271,7 @@ static int discover_loop_backing_file(void) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Invalid file type: %s", loop_dev);
 
-        r = sd_device_new_from_devnum(&d, 'b', st.st_rdev);
+        r = sd_device_new_from_stat_rdev(&d, &st);
         if (r < 0)
                 return log_error_errno(r, "Failed to get device from device number: %m");
 
@@ -1312,7 +1315,7 @@ static int discover_device(void) {
                                        "Invalid file type: %s",
                                        arg_mount_what);
 
-        r = sd_device_new_from_devnum(&d, 'b', st.st_rdev);
+        r = sd_device_new_from_stat_rdev(&d, &st);
         if (r < 0)
                 return log_error_errno(r, "Failed to get device from device number: %m");
 
@@ -1381,7 +1384,7 @@ static int list_devices(void) {
         if (arg_full)
                 table_set_width(table, 0);
 
-        r = table_set_sort(table, (size_t) 0, (size_t) SIZE_MAX);
+        r = table_set_sort(table, (size_t) 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to set sort index: %m");
 
@@ -1428,7 +1431,7 @@ static int list_devices(void) {
                 }
         }
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         r = table_print(table, NULL);
         if (r < 0)
@@ -1454,7 +1457,7 @@ static int run(int argc, char* argv[]) {
 
         r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
         if (r < 0)
-                return bus_log_connect_error(r);
+                return bus_log_connect_error(r, arg_transport);
 
         if (arg_action == ACTION_UMOUNT)
                 return action_umount(bus, argc, argv);
@@ -1494,7 +1497,7 @@ static int run(int argc, char* argv[]) {
                 arg_fsck = false;
 
         if (arg_fsck && arg_mount_type && arg_transport == BUS_TRANSPORT_LOCAL) {
-                r = fsck_exists(arg_mount_type);
+                r = fsck_exists_for_fstype(arg_mount_type);
                 if (r < 0)
                         log_warning_errno(r, "Couldn't determine whether fsck for %s exists, proceeding anyway.", arg_mount_type);
                 else if (r == 0) {
@@ -1530,7 +1533,7 @@ static int run(int argc, char* argv[]) {
                 break;
 
         default:
-                assert_not_reached("Unexpected action.");
+                assert_not_reached();
         }
 
         return r;

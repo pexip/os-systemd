@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
+#include <unistd.h>
 
 #include "alloc-util.h"
 #include "pretty-print.h"
+#include "rlimit-util.h"
 #include "systemctl-compat-telinit.h"
 #include "systemctl-daemon-reload.h"
 #include "systemctl-start-unit.h"
@@ -31,11 +33,11 @@ static int telinit_help(void) {
                "\nOptions:\n"
                "     --help      Show this help\n"
                "     --no-wall   Don't send wall message before halt/power-off/reboot\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , ansi_highlight(), ansi_normal()
-               , link
-        );
+               "\nSee the %s for details.\n",
+               program_invocation_short_name,
+               ansi_highlight(),
+               ansi_normal(),
+               link);
 
         return 0;
 }
@@ -91,7 +93,7 @@ int telinit_parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         if (optind >= argc)
@@ -123,8 +125,11 @@ int telinit_parse_argv(int argc, char *argv[]) {
 }
 
 int start_with_fallback(void) {
+        int r;
+
         /* First, try systemd via D-Bus. */
-        if (start_unit(0, NULL, NULL) == 0)
+        r = verb_start(0, NULL, NULL);
+        if (r == 0)
                 return 0;
 
 #if HAVE_SYSV_COMPAT
@@ -133,20 +138,28 @@ int start_with_fallback(void) {
                 return 0;
 #endif
 
-        return log_error_errno(SYNTHETIC_ERRNO(EIO),
-                               "Failed to talk to init daemon.");
+        return log_error_errno(r, "Failed to talk to init daemon: %m");
 }
 
 int reload_with_fallback(void) {
-        /* First, try systemd via D-Bus. */
-        if (daemon_reload(0, NULL, NULL) >= 0)
-                return 0;
 
-        /* Nothing else worked, so let's try signals */
         assert(IN_SET(arg_action, ACTION_RELOAD, ACTION_REEXEC));
 
+        /* First, try systemd via D-Bus */
+        if (daemon_reload(arg_action, /* graceful= */ true) > 0)
+                return 0;
+
+        /* That didn't work, so let's try signals */
         if (kill(1, arg_action == ACTION_RELOAD ? SIGHUP : SIGTERM) < 0)
                 return log_error_errno(errno, "kill() failed: %m");
 
         return 0;
+}
+
+int exec_telinit(char *argv[]) {
+        (void) rlimit_nofile_safe();
+        (void) execv(TELINIT, argv);
+
+        return log_error_errno(SYNTHETIC_ERRNO(EIO),
+                               "Couldn't find an alternative telinit implementation to spawn.");
 }

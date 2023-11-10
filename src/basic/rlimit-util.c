@@ -3,6 +3,7 @@
 #include <errno.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "format-util.h"
@@ -43,20 +44,19 @@ int setrlimit_closest(int resource, const struct rlimit *rlim) {
             fixed.rlim_max == highest.rlim_max)
                 return 0;
 
-        if (setrlimit(resource, &fixed) < 0)
-                return -errno;
+        log_debug("Failed at setting rlimit " RLIM_FMT " for resource RLIMIT_%s. Will attempt setting value " RLIM_FMT " instead.", rlim->rlim_max, rlimit_to_string(resource), fixed.rlim_max);
 
-        return 0;
+        return RET_NERRNO(setrlimit(resource, &fixed));
 }
 
 int setrlimit_closest_all(const struct rlimit *const *rlim, int *which_failed) {
-        int i, r;
+        int r;
 
         assert(rlim);
 
         /* On failure returns the limit's index that failed in *which_failed, but only if non-NULL */
 
-        for (i = 0; i < _RLIMIT_MAX; i++) {
+        for (int i = 0; i < _RLIMIT_MAX; i++) {
                 if (!rlim[i])
                         continue;
 
@@ -298,26 +298,26 @@ int rlimit_parse(int resource, const char *val, struct rlimit *ret) {
 }
 
 int rlimit_format(const struct rlimit *rl, char **ret) {
-        char *s = NULL;
+        _cleanup_free_ char *s = NULL;
+        int r;
 
         assert(rl);
         assert(ret);
 
         if (rl->rlim_cur >= RLIM_INFINITY && rl->rlim_max >= RLIM_INFINITY)
-                s = strdup("infinity");
+                r = free_and_strdup(&s, "infinity");
         else if (rl->rlim_cur >= RLIM_INFINITY)
-                (void) asprintf(&s, "infinity:" RLIM_FMT, rl->rlim_max);
+                r = asprintf(&s, "infinity:" RLIM_FMT, rl->rlim_max);
         else if (rl->rlim_max >= RLIM_INFINITY)
-                (void) asprintf(&s, RLIM_FMT ":infinity", rl->rlim_cur);
+                r = asprintf(&s, RLIM_FMT ":infinity", rl->rlim_cur);
         else if (rl->rlim_cur == rl->rlim_max)
-                (void) asprintf(&s, RLIM_FMT, rl->rlim_cur);
+                r = asprintf(&s, RLIM_FMT, rl->rlim_cur);
         else
-                (void) asprintf(&s, RLIM_FMT ":" RLIM_FMT, rl->rlim_cur, rl->rlim_max);
-
-        if (!s)
+                r = asprintf(&s, RLIM_FMT ":" RLIM_FMT, rl->rlim_cur, rl->rlim_max);
+        if (r < 0)
                 return -ENOMEM;
 
-        *ret = s;
+        *ret = TAKE_PTR(s);
         return 0;
 }
 
@@ -401,7 +401,11 @@ int rlimit_nofile_safe(void) {
         if (rl.rlim_cur <= FD_SETSIZE)
                 return 0;
 
-        rl.rlim_cur = FD_SETSIZE;
+        /* So we might have inherited a hard limit that's larger than the kernel's maximum limit as stored in
+         * /proc/sys/fs/nr_open. If we pass this hard limit unmodified to setrlimit(), we'll get EPERM. To
+         * make sure that doesn't happen, let's limit our hard limit to the value from nr_open. */
+        rl.rlim_max = MIN(rl.rlim_max, (rlim_t) read_nr_open());
+        rl.rlim_cur = MIN((rlim_t) FD_SETSIZE, rl.rlim_max);
         if (setrlimit(RLIMIT_NOFILE, &rl) < 0)
                 return log_debug_errno(errno, "Failed to lower RLIMIT_NOFILE's soft limit to " RLIM_FMT ": %m", rl.rlim_cur);
 

@@ -93,7 +93,7 @@ static struct udev_enumerate *udev_enumerate_free(struct udev_enumerate *udev_en
  * udev_enumerate_ref:
  * @udev_enumerate: context
  *
- * Take a reference of a enumeration context.
+ * Take a reference of an enumeration context.
  *
  * Returns: the passed enumeration context
  **/
@@ -365,7 +365,7 @@ _public_ int udev_enumerate_add_match_is_initialized(struct udev_enumerate *udev
 
         assert_return(udev_enumerate, -EINVAL);
 
-        r = device_enumerator_add_match_is_initialized(udev_enumerate->enumerator);
+        r = device_enumerator_add_match_is_initialized(udev_enumerate->enumerator, MATCH_INITIALIZED_COMPAT);
         if (r < 0)
                 return r;
 

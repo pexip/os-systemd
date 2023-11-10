@@ -5,6 +5,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#if HAVE_LINUX_TIME_TYPES_H
+/* This header defines __kernel_timespec for us, but is only available since Linux 5.1, hence conditionally
+ * include this. */
+#include <linux/time_types.h>
+#endif
 #include <signal.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -15,33 +20,17 @@
 #include <asm/sgidefs.h>
 #endif
 
-#if defined(__x86_64__) && defined(__ILP32__)
-#  define systemd_SC_arch_bias(x) ((x) | /* __X32_SYSCALL_BIT */ 0x40000000)
-#elif defined(__ia64__)
-#  define systemd_SC_arch_bias(x) (1024 + (x))
-#elif defined __alpha__
-#  define systemd_SC_arch_bias(x) (110 + (x))
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_SC_arch_bias(x) (4000 + (x))
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_SC_arch_bias(x) (6000 + (x))
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_SC_arch_bias(x) (5000 + (x))
-#  else
-#    error "Unknown MIPS ABI"
-#  endif
-#else
-#  define systemd_SC_arch_bias(x) (x)
-#endif
-
+#include "macro.h"
 #include "missing_keyctl.h"
 #include "missing_stat.h"
+#include "missing_syscall_def.h"
 
 /* linux/kcmp.h */
 #ifndef KCMP_FILE /* 3f4994cfc15f38a3159c6e3a4b3ab2e1481a6b02 (3.19) */
 #define KCMP_FILE 0
 #endif
+
+/* ======================================================================= */
 
 #if !HAVE_PIVOT_ROOT
 static inline int missing_pivot_root(const char *new_root, const char *put_old) {
@@ -53,47 +42,25 @@ static inline int missing_pivot_root(const char *new_root, const char *put_old) 
 
 /* ======================================================================= */
 
-#if defined __x86_64__
-#  define systemd_NR_memfd_create systemd_SC_arch_bias(319)
-#elif defined __arm__
-#  define systemd_NR_memfd_create 385
-#elif defined __aarch64__
-#  define systemd_NR_memfd_create 279
-#elif defined __alpha__
-#  define systemd_NR_memfd_create 512
-#elif defined(__powerpc__)
-#  define systemd_NR_memfd_create 360
-#elif defined __s390__
-#  define systemd_NR_memfd_create 350
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_memfd_create systemd_SC_arch_bias(354)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_memfd_create systemd_SC_arch_bias(318)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_memfd_create systemd_SC_arch_bias(314)
-#  endif
-#elif defined __i386__
-#  define systemd_NR_memfd_create 356
-#elif defined __arc__
-#  define systemd_NR_memfd_create 279
-#else
-#  warning "memfd_create() syscall number unknown for your architecture"
+#if !HAVE_IOPRIO_GET
+static inline int missing_ioprio_get(int which, int who) {
+        return syscall(__NR_ioprio_get, which, who);
+}
+
+#  define ioprio_get missing_ioprio_get
 #endif
 
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_memfd_create && __NR_memfd_create >= 0
-#  if defined systemd_NR_memfd_create
-assert_cc(__NR_memfd_create == systemd_NR_memfd_create);
-#  endif
-#else
-#  if defined __NR_memfd_create
-#    undef __NR_memfd_create
-#  endif
-#  if defined systemd_NR_memfd_create
-#    define __NR_memfd_create systemd_NR_memfd_create
-#  endif
+/* ======================================================================= */
+
+#if !HAVE_IOPRIO_SET
+static inline int missing_ioprio_set(int which, int who, int ioprio) {
+        return syscall(__NR_ioprio_set, which, who, ioprio);
+}
+
+#  define ioprio_set missing_ioprio_set
 #endif
+
+/* ======================================================================= */
 
 #if !HAVE_MEMFD_CREATE
 static inline int missing_memfd_create(const char *name, unsigned int flags) {
@@ -110,54 +77,9 @@ static inline int missing_memfd_create(const char *name, unsigned int flags) {
 
 /* ======================================================================= */
 
-#if defined __x86_64__
-#  define systemd_NR_getrandom systemd_SC_arch_bias(318)
-#elif defined(__i386__)
-#  define systemd_NR_getrandom 355
-#elif defined(__arm__)
-#  define systemd_NR_getrandom 384
-#elif defined(__aarch64__)
-#  define systemd_NR_getrandom 278
-#elif defined(__alpha__)
-#  define systemd_NR_getrandom 511
-#elif defined(__ia64__)
-#  define systemd_NR_getrandom systemd_SC_arch_bias(318)
-#elif defined(__m68k__)
-#  define systemd_NR_getrandom 352
-#elif defined(__s390x__)
-#  define systemd_NR_getrandom 349
-#elif defined(__powerpc__)
-#  define systemd_NR_getrandom 359
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_getrandom systemd_SC_arch_bias(353)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_getrandom systemd_SC_arch_bias(317)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_getrandom systemd_SC_arch_bias(313)
-#  endif
-#elif defined(__arc__)
-#  define systemd_NR_getrandom 278
-#else
-#  warning "getrandom() syscall number unknown for your architecture"
-#endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_getrandom && __NR_getrandom >= 0
-#  if defined systemd_NR_getrandom
-assert_cc(__NR_getrandom == systemd_NR_getrandom);
-#  endif
-#else
-#  if defined __NR_getrandom
-#    undef __NR_getrandom
-#  endif
-#  if defined systemd_NR_getrandom
-#    define __NR_getrandom systemd_NR_getrandom
-#  endif
-#endif
-
 #if !HAVE_GETRANDOM
-static inline int missing_getrandom(void *buffer, size_t count, unsigned flags) {
+/* glibc says getrandom() returns ssize_t */
+static inline ssize_t missing_getrandom(void *buffer, size_t count, unsigned flags) {
 #  ifdef __NR_getrandom
         return syscall(__NR_getrandom, buffer, count, flags);
 #  else
@@ -186,48 +108,6 @@ static inline pid_t missing_gettid(void) {
 
 /* ======================================================================= */
 
-#if defined(__x86_64__)
-#  define systemd_NR_name_to_handle_at systemd_SC_arch_bias(303)
-#elif defined(__i386__)
-#  define systemd_NR_name_to_handle_at 341
-#elif defined(__arm__)
-#  define systemd_NR_name_to_handle_at 370
-#elif defined __aarch64__
-#  define systemd_NR_name_to_handle_at 264
-#elif defined(__alpha__)
-#  define systemd_NR_name_to_handle_at 497
-#elif defined(__powerpc__)
-#  define systemd_NR_name_to_handle_at 345
-#elif defined __s390__ || defined __s390x__
-#  define systemd_NR_name_to_handle_at 335
-#elif defined(__arc__)
-#  define systemd_NR_name_to_handle_at 264
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_name_to_handle_at systemd_SC_arch_bias(339)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_name_to_handle_at systemd_SC_arch_bias(303)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_name_to_handle_at systemd_SC_arch_bias(298)
-#  endif
-#else
-#  warning "name_to_handle_at number is not defined"
-#endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_name_to_handle_at && __NR_name_to_handle_at >= 0
-#  if defined systemd_NR_name_to_handle_at
-assert_cc(__NR_name_to_handle_at == systemd_NR_name_to_handle_at);
-#  endif
-#else
-#  if defined __NR_name_to_handle_at
-#    undef __NR_name_to_handle_at
-#  endif
-#  if defined systemd_NR_name_to_handle_at
-#    define __NR_name_to_handle_at systemd_NR_name_to_handle_at
-#  endif
-#endif
-
 #if !HAVE_NAME_TO_HANDLE_AT
 struct file_handle {
         unsigned int handle_bytes;
@@ -248,48 +128,6 @@ static inline int missing_name_to_handle_at(int fd, const char *name, struct fil
 #endif
 
 /* ======================================================================= */
-
-#if defined __aarch64__
-#  define systemd_NR_setns 268
-#elif defined __arm__
-#  define systemd_NR_setns 375
-#elif defined __alpha__
-#  define systemd_NR_setns 501
-#elif defined(__x86_64__)
-#  define systemd_NR_setns systemd_SC_arch_bias(308)
-#elif defined(__i386__)
-#  define systemd_NR_setns 346
-#elif defined(__powerpc__)
-#  define systemd_NR_setns 350
-#elif defined __s390__ || defined __s390x__
-#  define systemd_NR_setns 339
-#elif defined(__arc__)
-#  define systemd_NR_setns 268
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_setns systemd_SC_arch_bias(344)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_setns systemd_SC_arch_bias(308)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_setns systemd_SC_arch_bias(303)
-#  endif
-#else
-#  warning "setns() syscall number unknown for your architecture"
-#endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_setns && __NR_setns >= 0
-#  if defined systemd_NR_setns
-assert_cc(__NR_setns == systemd_NR_setns);
-#  endif
-#else
-#  if defined __NR_setns
-#    undef __NR_setns
-#  endif
-#  if defined systemd_NR_setns
-#    define __NR_setns systemd_NR_setns
-#  endif
-#endif
 
 #if !HAVE_SETNS
 static inline int missing_setns(int fd, int nstype) {
@@ -315,48 +153,6 @@ static inline pid_t raw_getpid(void) {
 }
 
 /* ======================================================================= */
-
-#if defined __x86_64__
-#  define systemd_NR_renameat2 systemd_SC_arch_bias(316)
-#elif defined __arm__
-#  define systemd_NR_renameat2 382
-#elif defined __aarch64__
-#  define systemd_NR_renameat2 276
-#elif defined __alpha__
-#  define systemd_NR_renameat2 510
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_renameat2 systemd_SC_arch_bias(351)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_renameat2 systemd_SC_arch_bias(315)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_renameat2 systemd_SC_arch_bias(311)
-#  endif
-#elif defined __i386__
-#  define systemd_NR_renameat2 353
-#elif defined __powerpc64__
-#  define systemd_NR_renameat2 357
-#elif defined __s390__ || defined __s390x__
-#  define systemd_NR_renameat2 347
-#elif defined __arc__
-#  define systemd_NR_renameat2 276
-#else
-#  warning "renameat2() syscall number unknown for your architecture"
-#endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_renameat2 && __NR_renameat2 >= 0
-#  if defined systemd_NR_renameat2
-assert_cc(__NR_renameat2 == systemd_NR_renameat2);
-#  endif
-#else
-#  if defined __NR_renameat2
-#    undef __NR_renameat2
-#  endif
-#  if defined systemd_NR_renameat2
-#    define __NR_renameat2 systemd_NR_renameat2
-#  endif
-#endif
 
 #if !HAVE_RENAMEAT2
 static inline int missing_renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags) {
@@ -425,48 +221,6 @@ static inline key_serial_t missing_request_key(const char *type, const char *des
 
 /* ======================================================================= */
 
-#if defined(__x86_64__)
-#  define systemd_NR_copy_file_range systemd_SC_arch_bias(326)
-#elif defined(__i386__)
-#  define systemd_NR_copy_file_range 377
-#elif defined __s390__
-#  define systemd_NR_copy_file_range 375
-#elif defined __arm__
-#  define systemd_NR_copy_file_range 391
-#elif defined __aarch64__
-#  define systemd_NR_copy_file_range 285
-#elif defined __alpha__
-#  define systemd_NR_copy_file_range 519
-#elif defined __powerpc__
-#  define systemd_NR_copy_file_range 379
-#elif defined __arc__
-#  define systemd_NR_copy_file_range 285
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_copy_file_range systemd_SC_arch_bias(360)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_copy_file_range systemd_SC_arch_bias(324)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_copy_file_range systemd_SC_arch_bias(320)
-#  endif
-#else
-#  warning "copy_file_range() syscall number unknown for your architecture"
-#endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_copy_file_range && __NR_copy_file_range >= 0
-#  if defined systemd_NR_copy_file_range
-assert_cc(__NR_copy_file_range == systemd_NR_copy_file_range);
-#  endif
-#else
-#  if defined __NR_copy_file_range
-#    undef __NR_copy_file_range
-#  endif
-#  if defined systemd_NR_copy_file_range
-#    define __NR_copy_file_range systemd_NR_copy_file_range
-#  endif
-#endif
-
 #if !HAVE_COPY_FILE_RANGE
 static inline ssize_t missing_copy_file_range(int fd_in, loff_t *off_in,
                                               int fd_out, loff_t *off_out,
@@ -485,50 +239,6 @@ static inline ssize_t missing_copy_file_range(int fd_in, loff_t *off_in,
 
 /* ======================================================================= */
 
-#if defined __i386__
-#  define systemd_NR_bpf 357
-#elif defined __x86_64__
-#  define systemd_NR_bpf systemd_SC_arch_bias(321)
-#elif defined __aarch64__
-#  define systemd_NR_bpf 280
-#elif defined __arm__
-#  define systemd_NR_bpf 386
-#elif defined __alpha__
-#  define systemd_NR_bpf 515
-#elif defined(__powerpc__)
-#  define systemd_NR_bpf 361
-#elif defined __sparc__
-#  define systemd_NR_bpf 349
-#elif defined __s390__
-#  define systemd_NR_bpf 351
-#elif defined __tilegx__
-#  define systemd_NR_bpf 280
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_bpf systemd_SC_arch_bias(355)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_bpf systemd_SC_arch_bias(319)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_bpf systemd_SC_arch_bias(315)
-#  endif
-#else
-#  warning "bpf() syscall number unknown for your architecture"
-#endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_bpf && __NR_bpf >= 0
-#  if defined systemd_NR_bpf
-assert_cc(__NR_bpf == systemd_NR_bpf);
-#  endif
-#else
-#  if defined __NR_bpf
-#    undef __NR_bpf
-#  endif
-#  if defined systemd_NR_bpf
-#    define __NR_bpf systemd_NR_bpf
-#  endif
-#endif
-
 #if !HAVE_BPF
 union bpf_attr;
 
@@ -545,90 +255,6 @@ static inline int missing_bpf(int cmd, union bpf_attr *attr, size_t size) {
 #endif
 
 /* ======================================================================= */
-
-#ifndef __IGNORE_pkey_mprotect
-#  if defined __i386__
-#    define systemd_NR_pkey_mprotect 380
-#  elif defined __x86_64__
-#    define systemd_NR_pkey_mprotect systemd_SC_arch_bias(329)
-#  elif defined __aarch64__
-#    define systemd_NR_pkey_mprotect 288
-#  elif defined __arm__
-#    define systemd_NR_pkey_mprotect 394
-#  elif defined __alpha__
-#    define systemd_NR_pkey_mprotect 524
-#  elif defined __powerpc__
-#    define systemd_NR_pkey_mprotect 386
-#  elif defined __s390__
-#    define systemd_NR_pkey_mprotect 384
-#  elif defined _MIPS_SIM
-#    if _MIPS_SIM == _MIPS_SIM_ABI32
-#      define systemd_NR_pkey_mprotect systemd_SC_arch_bias(363)
-#    elif _MIPS_SIM == _MIPS_SIM_NABI32
-#      define systemd_NR_pkey_mprotect systemd_SC_arch_bias(327)
-#    elif _MIPS_SIM == _MIPS_SIM_ABI64
-#      define systemd_NR_pkey_mprotect systemd_SC_arch_bias(323)
-#    endif
-#  else
-#    warning "pkey_mprotect() syscall number unknown for your architecture"
-#  endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#  if defined __NR_pkey_mprotect && __NR_pkey_mprotect >= 0
-#    if defined systemd_NR_pkey_mprotect
-assert_cc(__NR_pkey_mprotect == systemd_NR_pkey_mprotect);
-#    endif
-#  else
-#    if defined __NR_pkey_mprotect
-#      undef __NR_pkey_mprotect
-#    endif
-#    if defined systemd_NR_pkey_mprotect
-#      define __NR_pkey_mprotect systemd_NR_pkey_mprotect
-#    endif
-#  endif
-#endif
-
-/* ======================================================================= */
-
-#if defined __aarch64__
-#  define systemd_NR_statx 291
-#elif defined __arm__
-#  define systemd_NR_statx 397
-#elif defined __alpha__
-#  define systemd_NR_statx 522
-#elif defined __i386__ || defined __powerpc64__
-#  define systemd_NR_statx 383
-#elif defined __s390__ || defined __s390x__
-#  define systemd_NR_statx 379
-#elif defined __sparc__
-#  define systemd_NR_statx 360
-#elif defined __x86_64__
-#  define systemd_NR_statx systemd_SC_arch_bias(332)
-#elif defined _MIPS_SIM
-#  if _MIPS_SIM == _MIPS_SIM_ABI32
-#    define systemd_NR_statx systemd_SC_arch_bias(366)
-#  elif _MIPS_SIM == _MIPS_SIM_NABI32
-#    define systemd_NR_statx systemd_SC_arch_bias(330)
-#  elif _MIPS_SIM == _MIPS_SIM_ABI64
-#    define systemd_NR_statx systemd_SC_arch_bias(326)
-#  endif
-#else
-#  warning "statx() syscall number unknown for your architecture"
-#endif
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_statx && __NR_statx >= 0
-#  if defined systemd_NR_statx
-assert_cc(__NR_statx == systemd_NR_statx);
-#  endif
-#else
-#  if defined __NR_statx
-#    undef __NR_statx
-#  endif
-#  if defined systemd_NR_statx
-#    define __NR_statx systemd_NR_statx
-#  endif
-#endif
 
 #if !HAVE_STATX
 struct statx;
@@ -695,21 +321,6 @@ static inline long missing_get_mempolicy(int *mode, unsigned long *nodemask,
 
 /* ======================================================================= */
 
-/* should be always defined, see kernel 39036cd2727395c3369b1051005da74059a85317 */
-#define systemd_NR_pidfd_send_signal systemd_SC_arch_bias(424)
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_pidfd_send_signal && __NR_pidfd_send_signal >= 0
-#  if defined systemd_NR_pidfd_send_signal
-assert_cc(__NR_pidfd_send_signal == systemd_NR_pidfd_send_signal);
-#  endif
-#else
-#  if defined __NR_pidfd_send_signal
-#    undef __NR_pidfd_send_signal
-#  endif
-#  define __NR_pidfd_send_signal systemd_NR_pidfd_send_signal
-#endif
-
 #if !HAVE_PIDFD_SEND_SIGNAL
 static inline int missing_pidfd_send_signal(int fd, int sig, siginfo_t *info, unsigned flags) {
 #  ifdef __NR_pidfd_send_signal
@@ -721,21 +332,6 @@ static inline int missing_pidfd_send_signal(int fd, int sig, siginfo_t *info, un
 }
 
 #  define pidfd_send_signal missing_pidfd_send_signal
-#endif
-
-/* should be always defined, see kernel 7615d9e1780e26e0178c93c55b73309a5dc093d7 */
-#define systemd_NR_pidfd_open systemd_SC_arch_bias(434)
-
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_pidfd_open && __NR_pidfd_open >= 0
-#  if defined systemd_NR_pidfd_open
-assert_cc(__NR_pidfd_open == systemd_NR_pidfd_open);
-#  endif
-#else
-#  if defined __NR_pidfd_open
-#    undef __NR_pidfd_open
-#  endif
-#  define __NR_pidfd_open systemd_NR_pidfd_open
 #endif
 
 #if !HAVE_PIDFD_OPEN
@@ -767,21 +363,24 @@ static inline int missing_rt_sigqueueinfo(pid_t tgid, int sig, siginfo_t *info) 
 
 /* ======================================================================= */
 
-#define systemd_NR_close_range systemd_SC_arch_bias(436)
+#if !HAVE_EXECVEAT
+static inline int missing_execveat(int dirfd, const char *pathname,
+                                   char *const argv[], char *const envp[],
+                                   int flags) {
+#  if defined __NR_execveat && __NR_execveat >= 0
+        return syscall(__NR_execveat, dirfd, pathname, argv, envp, flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
 
-/* may be (invalid) negative number due to libseccomp, see PR 13319 */
-#if defined __NR_close_range && __NR_close_range >= 0
-#  if defined systemd_NR_close_range
-assert_cc(__NR_close_range == systemd_NR_close_range);
-#  endif
-#else
-#  if defined __NR_close_range
-#    undef __NR_close_range
-#  endif
-#  if defined systemd_NR_close_range
-#    define __NR_close_range systemd_NR_close_range
-#  endif
+#  undef AT_EMPTY_PATH
+#  define AT_EMPTY_PATH 0x1000
+#  define execveat missing_execveat
 #endif
+
+/* ======================================================================= */
 
 #if !HAVE_CLOSE_RANGE
 static inline int missing_close_range(int first_fd, int end_fd, unsigned flags) {
@@ -809,4 +408,241 @@ static inline int missing_close_range(int first_fd, int end_fd, unsigned flags) 
 }
 
 #  define close_range missing_close_range
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_EPOLL_PWAIT2
+
+/* Defined to be equivalent to the kernel's _NSIG_WORDS, i.e. the size of the array of longs that is
+ * encapsulated by sigset_t. */
+#define KERNEL_NSIG_WORDS (64 / (sizeof(long) * 8))
+#define KERNEL_NSIG_BYTES (KERNEL_NSIG_WORDS * sizeof(long))
+
+struct epoll_event;
+
+static inline int missing_epoll_pwait2(
+                int fd,
+                struct epoll_event *events,
+                int maxevents,
+                const struct timespec *timeout,
+                const sigset_t *sigset) {
+
+#  if defined(__NR_epoll_pwait2) && HAVE_LINUX_TIME_TYPES_H
+        if (timeout) {
+                /* Convert from userspace timespec to kernel timespec */
+                struct __kernel_timespec ts = {
+                        .tv_sec = timeout->tv_sec,
+                        .tv_nsec = timeout->tv_nsec,
+                };
+
+                return syscall(__NR_epoll_pwait2, fd, events, maxevents, &ts, sigset, sigset ? KERNEL_NSIG_BYTES : 0);
+        } else
+                return syscall(__NR_epoll_pwait2, fd, events, maxevents, NULL, sigset, sigset ? KERNEL_NSIG_BYTES : 0);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define epoll_pwait2 missing_epoll_pwait2
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_MOUNT_SETATTR
+
+#if !HAVE_STRUCT_MOUNT_ATTR
+struct mount_attr {
+        uint64_t attr_set;
+        uint64_t attr_clr;
+        uint64_t propagation;
+        uint64_t userns_fd;
+};
+#else
+struct mount_attr;
+#endif
+
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY       0x00000001 /* Mount read-only */
+#endif
+
+#ifndef MOUNT_ATTR_NOSUID
+#define MOUNT_ATTR_NOSUID       0x00000002 /* Ignore suid and sgid bits */
+#endif
+
+#ifndef MOUNT_ATTR_NODEV
+#define MOUNT_ATTR_NODEV        0x00000004 /* Disallow access to device special files */
+#endif
+
+#ifndef MOUNT_ATTR_NOEXEC
+#define MOUNT_ATTR_NOEXEC       0x00000008 /* Disallow program execution */
+#endif
+
+#ifndef MOUNT_ATTR__ATIME
+#define MOUNT_ATTR__ATIME       0x00000070 /* Setting on how atime should be updated */
+#endif
+
+#ifndef MOUNT_ATTR_RELATIME
+#define MOUNT_ATTR_RELATIME     0x00000000 /* - Update atime relative to mtime/ctime. */
+#endif
+
+#ifndef MOUNT_ATTR_NOATIME
+#define MOUNT_ATTR_NOATIME      0x00000010 /* - Do not update access times. */
+#endif
+
+#ifndef MOUNT_ATTR_STRICTATIME
+#define MOUNT_ATTR_STRICTATIME  0x00000020 /* - Always perform atime updates */
+#endif
+
+#ifndef MOUNT_ATTR_NODIRATIME
+#define MOUNT_ATTR_NODIRATIME   0x00000080 /* Do not update directory access times */
+#endif
+
+#ifndef MOUNT_ATTR_IDMAP
+#define MOUNT_ATTR_IDMAP        0x00100000 /* Idmap mount to @userns_fd in struct mount_attr. */
+#endif
+
+#ifndef MOUNT_ATTR_NOSYMFOLLOW
+#define MOUNT_ATTR_NOSYMFOLLOW  0x00200000 /* Do not follow symlinks */
+#endif
+
+#ifndef MOUNT_ATTR_SIZE_VER0
+#define MOUNT_ATTR_SIZE_VER0    32 /* sizeof first published struct */
+#endif
+
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
+#endif
+
+static inline int missing_mount_setattr(
+                int dfd,
+                const char *path,
+                unsigned flags,
+                struct mount_attr *attr,
+                size_t size) {
+
+#  if defined __NR_mount_setattr && __NR_mount_setattr >= 0
+        return syscall(__NR_mount_setattr, dfd, path, flags, attr, size);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define mount_setattr missing_mount_setattr
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_OPEN_TREE
+
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+
+#ifndef OPEN_TREE_CLOEXEC
+#define OPEN_TREE_CLOEXEC O_CLOEXEC
+#endif
+
+static inline int missing_open_tree(
+                int dfd,
+                const char *filename,
+                unsigned flags) {
+
+#  if defined __NR_open_tree && __NR_open_tree >= 0
+        return syscall(__NR_open_tree, dfd, filename, flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define open_tree missing_open_tree
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_MOVE_MOUNT
+
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004 /* Empty from path permitted */
+#endif
+
+#ifndef MOVE_MOUNT_T_EMPTY_PATH
+#define MOVE_MOUNT_T_EMPTY_PATH 0x00000040 /* Empty to path permitted */
+#endif
+
+static inline int missing_move_mount(
+                int from_dfd,
+                const char *from_pathname,
+                int to_dfd,
+                const char *to_pathname,
+                unsigned flags) {
+
+#  if defined __NR_move_mount && __NR_move_mount >= 0
+        return syscall(__NR_move_mount, from_dfd, from_pathname, to_dfd, to_pathname, flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define move_mount missing_move_mount
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_FSOPEN
+
+#ifndef FSOPEN_CLOEXEC
+#define FSOPEN_CLOEXEC 0x00000001
+#endif
+
+static inline int missing_fsopen(const char *fsname, unsigned flags) {
+#  if defined __NR_fsopen && __NR_fsopen >= 0
+        return syscall(__NR_fsopen, fsname, flags);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define fsopen missing_fsopen
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_FSCONFIG
+
+#ifndef FSCONFIG_SET_STRING
+#define FSCONFIG_SET_STRING 1 /* Set parameter, supplying a string value */
+#endif
+
+static inline int missing_fsconfig(int fd, unsigned cmd, const char *key, const void *value, int aux) {
+#  if defined __NR_fsconfig && __NR_fsconfig >= 0
+        return syscall(__NR_fsconfig, fd, cmd, key, value, aux);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define fsconfig missing_fsconfig
+#endif
+
+/* ======================================================================= */
+
+#if !HAVE_GETDENTS64
+
+static inline ssize_t missing_getdents64(int fd, void *buffer, size_t length) {
+#  if defined __NR_getdents64 && __NR_getdents64 >= 0
+        return syscall(__NR_getdents64, fd, buffer, length);
+#  else
+        errno = ENOSYS;
+        return -1;
+#  endif
+}
+
+#  define getdents64 missing_getdents64
 #endif

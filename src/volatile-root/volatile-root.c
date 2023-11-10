@@ -4,14 +4,14 @@
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
+#include "chase-symlinks.h"
+#include "devnum-util.h"
 #include "escape.h"
-#include "fs-util.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "path-util.h"
-#include "stat-util.h"
 #include "string-util.h"
 #include "volatile-util.h"
 
@@ -119,7 +119,7 @@ static int run(int argc, char *argv[]) {
         dev_t devt;
         int r;
 
-        log_setup_service();
+        log_setup();
 
         if (argc > 3)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -127,12 +127,12 @@ static int run(int argc, char *argv[]) {
 
         r = query_volatile_mode(&m);
         if (r < 0)
-                return log_error_errno(r, "Failed to determine volatile mode from kernel command line.");
+                return log_error_errno(r, "Failed to determine volatile mode from kernel command line: %m");
         if (r == 0 && argc >= 2) {
                 /* The kernel command line always wins. However if nothing was set there, the argument passed here wins instead. */
                 m = volatile_mode_from_string(argv[1]);
                 if (m < 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Couldn't parse volatile mode: %s", argv[1]);
+                        return log_error_errno(m, "Couldn't parse volatile mode: %s", argv[1]);
         }
 
         if (argc < 3)

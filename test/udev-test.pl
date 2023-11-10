@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 # udev test
 #
@@ -31,6 +32,10 @@ BEGIN {
         exit($EXIT_TEST_SKIP);
     }
 }
+
+# Relax sd-device's sysfs verification, since we want to provide a fake sysfs
+# here that actually is a tmpfs.
+$ENV{"SYSTEMD_DEVICE_VERIFY_SYSFS"}="0";
 
 my $udev_bin            = "./test-udev";
 my $valgrind            = 0;
@@ -171,7 +176,7 @@ EOF
                         {
                                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda/sda1",
                                 exp_links       => ["boot_disk1", "boot_disk1-4", "boot_disk1-5"],
-                                not_exp_links   => ["boot_disk1-1", "boot_disk1-2", "boot_disk1-3"]
+                                not_exp_links   => ["boot_disk1-1", "boot_disk1-2", "boot_disk1-3", "boot_disk1-6", "boot_disk1-7"]
                         }],
                 rules           => <<EOF
 SUBSYSTEMS=="scsi", ATTRS{vendor}=="?ATA", SYMLINK+="boot_disk%n-1"
@@ -180,6 +185,12 @@ SUBSYSTEMS=="scsi", ATTRS{vendor}=="A??", SYMLINK+="boot_disk%n"
 SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATAS", SYMLINK+="boot_disk%n-3"
 SUBSYSTEMS=="scsi", ATTRS{vendor}=="AT?", SYMLINK+="boot_disk%n-4"
 SUBSYSTEMS=="scsi", ATTRS{vendor}=="??A", SYMLINK+="boot_disk%n-5"
+SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", GOTO="skip-6"
+SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", SYMLINK+="boot_disk%n-6"
+LABEL="skip-6"
+SUBSYSTEMS=="scsi", GOTO="skip-7"
+SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", SYMLINK+="boot_disk%n-7"
+LABEL="skip-7"
 EOF
         },
         {
@@ -207,6 +218,8 @@ EOF
 SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", ATTRS{scsi_level}=="6", ATTRS{rev}=="4.06", ATTRS{type}=="0", ATTRS{queue_depth}=="32", SYMLINK+="boot_diskXX%n"
 SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", ATTRS{scsi_level}=="6", ATTRS{rev}=="4.06", ATTRS{type}=="0", ATTRS{queue_depth}=="1", SYMLINK+="boot_diskXY%n"
 SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", ATTRS{scsi_level}=="6", ATTRS{rev}=="4.06", ATTRS{type}=="0", SYMLINK+="boot_disk%n"
+SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK=="link1", SYMLINK+="match"
+SUBSYSTEMS=="scsi", ATTRS{vendor}=="ATA", ATTRS{model}=="ST910021AS", SYMLINK!="removed1", SYMLINK+="unmatch"
 EOF
         },
         {
@@ -1165,6 +1178,21 @@ SYMLINK="  first  name-\$env{WITH_WS}-end another_symlink a b c "
 EOF
         },
         {
+                desc            => "symlink with env which contain slash (see #19309)",
+                devices => [
+                        {
+                                devpath         => "/devices/pci0000:00/0000:00:1d.7/usb5/5-2/5-2:1.0/tty/ttyACM0",
+                                exp_links       => ["first", "name-aaa_bbb_ccc-end",
+                                                    "another_symlink", "a", "b", "c"],
+                                not_exp_links   => ["ame-aaa/bbb/ccc-end"],
+                        }],
+                rules           => <<EOF
+ENV{WITH_SLASH}="aaa/bbb/ccc"
+OPTIONS="string_escape=replace", ENV{REPLACED}="\$env{WITH_SLASH}"
+SYMLINK="  first  name-\$env{REPLACED}-end another_symlink a b c "
+EOF
+        },
+        {
                 desc            => "symlink creation (same directory)",
                 devices => [
                         {
@@ -1795,13 +1823,15 @@ EOF
                 devices => [
                         {
                                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",
-                                exp_links       => ["found"],
-                                not_exp_name    => "bad",
+                                exp_links       => ["found", "found2"],
+                                not_exp_name    => ["bad", "bad2"],
                         }],
                 rules           => <<EOF
 KERNEL=="sda", TAG="foo"
 TAGS=="foo|", SYMLINK+="found"
 TAGS=="aaa|", SYMLINK+="bad"
+KERNEL=="sda", TAGS!="hoge", SYMLINK+="found2"
+KERNEL=="sda", TAGS!="foo", SYMLINK+="bad2"
 EOF
         },
         {
@@ -1954,8 +1984,8 @@ EOF
                                 not_exp_links   => ["notthere"],
                         }],
                 rules           => <<EOF
-TEST=="/etc/machine-id", SYMLINK+="there"
-TEST!="/etc/machine-id", SYMLINK+="notthere"
+TEST=="/etc/passwd", SYMLINK+="there"
+TEST!="/etc/passwd", SYMLINK+="notthere"
 EOF
         },
         {
@@ -2121,7 +2151,7 @@ TAGS=="aaa", SYMLINK+="bad"
                     EOF
         },
         {
-                desc            => "continuations with white only line",
+                desc            => "continuations with space only line",
                 devices => [
                         {
                                 devpath         => "/devices/pci0000:00/0000:00:1f.2/host0/target0:0:0/0:0:0:0/block/sda",

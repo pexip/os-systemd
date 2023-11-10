@@ -10,7 +10,7 @@ extern const sd_bus_vtable bus_unit_cgroup_vtable[];
 
 void bus_unit_send_change_signal(Unit *u);
 void bus_unit_send_pending_change_signal(Unit *u, bool including_new);
-int bus_unit_send_pending_freezer_message(Unit *u);
+int bus_unit_send_pending_freezer_message(Unit *u, bool cancelled);
 void bus_unit_send_removed_signal(Unit *u);
 
 int bus_unit_method_start_generic(sd_bus_message *message, Unit *u, JobType job_type, bool reload_if_possible, sd_bus_error *error);
@@ -29,11 +29,25 @@ int bus_unit_method_freeze(sd_bus_message *message, void *userdata, sd_bus_error
 int bus_unit_method_thaw(sd_bus_message *message, void *userdata, sd_bus_error *error);
 
 typedef enum BusUnitQueueFlags {
-        BUS_UNIT_QUEUE_RELOAD_IF_POSSIBLE = 1 << 0,
-        BUS_UNIT_QUEUE_VERBOSE_REPLY      = 1 << 1,
+        BUS_UNIT_QUEUE_RELOAD_IF_POSSIBLE            = 1 << 0,
+        BUS_UNIT_QUEUE_VERBOSE_REPLY                 = 1 << 1,
 } BusUnitQueueFlags;
 
-int bus_unit_queue_job(sd_bus_message *message, Unit *u, JobType type, JobMode mode, BusUnitQueueFlags flags, sd_bus_error *error);
+int bus_unit_queue_job_one(
+                sd_bus_message *message,
+                Unit *u,
+                JobType type,
+                JobMode mode,
+                BusUnitQueueFlags flags,
+                sd_bus_message *reply,
+                sd_bus_error *error);
+int bus_unit_queue_job(
+                sd_bus_message *message,
+                Unit *u,
+                JobType type,
+                JobMode mode,
+                BusUnitQueueFlags flags,
+                sd_bus_error *error);
 int bus_unit_validate_load_state(Unit *u, sd_bus_error *error);
 
 int bus_unit_track_add_name(Unit *u, const char *name);

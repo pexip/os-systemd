@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "glyph-util.h"
 #include "in-addr-util.h"
 #include "resolved-dns-synthesize.h"
 #include "resolved-varlink.h"
@@ -57,6 +58,12 @@ static int reply_query_state(DnsQuery *q) {
         case DNS_TRANSACTION_NETWORK_DOWN:
                 return varlink_error(q->varlink_request, "io.systemd.Resolve.NetworkDown", NULL);
 
+        case DNS_TRANSACTION_NO_SOURCE:
+                return varlink_error(q->varlink_request, "io.systemd.Resolve.NoSource", NULL);
+
+        case DNS_TRANSACTION_STUB_LOOP:
+                return varlink_error(q->varlink_request, "io.systemd.Resolve.StubLoop", NULL);
+
         case DNS_TRANSACTION_NOT_FOUND:
                 /* We return this as NXDOMAIN. This is only generated when a host doesn't implement LLMNR/TCP, and we
                  * thus quickly know that we cannot resolve an in-addr.arpa or ip6.arpa address. */
@@ -72,7 +79,7 @@ static int reply_query_state(DnsQuery *q) {
         case DNS_TRANSACTION_VALIDATING:
         case DNS_TRANSACTION_SUCCESS:
         default:
-                assert_not_reached("Impossible state");
+                assert_not_reached();
         }
 }
 
@@ -93,6 +100,19 @@ static void vl_on_disconnect(VarlinkServer *s, Varlink *link, void *userdata) {
         dns_query_complete(q, DNS_TRANSACTION_ABORTED);
 }
 
+static void vl_on_notification_disconnect(VarlinkServer *s, Varlink *link, void *userdata) {
+        Manager *m = ASSERT_PTR(userdata);
+
+        assert(s);
+        assert(link);
+
+        Varlink *removed_link = set_remove(m->varlink_subscription, link);
+        if (removed_link) {
+                varlink_unref(removed_link);
+                log_debug("%u monitor clients remain active", set_size(m->varlink_subscription));
+        }
+}
+
 static bool validate_and_mangle_flags(
                 const char *name,
                 uint64_t *flags,
@@ -103,7 +123,7 @@ static bool validate_and_mangle_flags(
         /* This checks that the specified client-provided flags parameter actually makes sense, and mangles
          * it slightly. Specifically:
          *
-         * 1. We check that only the protocol flags and the NO_CNAME flag are on at most, plus the
+         * 1. We check that only the protocol flags and a bunch of NO_XYZ flags are on at most, plus the
          *    method-specific flags specified in 'ok'.
          *
          * 2. If no protocols are enabled we automatically convert that to "all protocols are enabled".
@@ -114,7 +134,15 @@ static bool validate_and_mangle_flags(
          * "everything".
          */
 
-        if (*flags & ~(SD_RESOLVED_PROTOCOLS_ALL|SD_RESOLVED_NO_CNAME|ok))
+        if (*flags & ~(SD_RESOLVED_PROTOCOLS_ALL|
+                       SD_RESOLVED_NO_CNAME|
+                       SD_RESOLVED_NO_VALIDATE|
+                       SD_RESOLVED_NO_SYNTHESIZE|
+                       SD_RESOLVED_NO_CACHE|
+                       SD_RESOLVED_NO_ZONE|
+                       SD_RESOLVED_NO_TRUST_ANCHOR|
+                       SD_RESOLVED_NO_NETWORK|
+                       ok))
                 return false;
 
         if ((*flags & SD_RESOLVED_PROTOCOLS_ALL) == 0) /* If no protocol is enabled, enable all */
@@ -129,9 +157,10 @@ static bool validate_and_mangle_flags(
         return true;
 }
 
-static void vl_method_resolve_hostname_complete(DnsQuery *q) {
+static void vl_method_resolve_hostname_complete(DnsQuery *query) {
         _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *canonical = NULL;
         _cleanup_(json_variant_unrefp) JsonVariant *array = NULL;
+        _cleanup_(dns_query_freep) DnsQuery *q = query;
         _cleanup_free_ char *normalized = NULL;
         DnsResourceRecord *rr;
         DnsQuestion *question;
@@ -144,15 +173,18 @@ static void vl_method_resolve_hostname_complete(DnsQuery *q) {
                 goto finish;
         }
 
-        r = dns_query_process_cname(q);
+        r = dns_query_process_cname_many(q);
         if (r == -ELOOP) {
                 r = varlink_error(q->varlink_request, "io.systemd.Resolve.CNAMELoop", NULL);
                 goto finish;
         }
         if (r < 0)
                 goto finish;
-        if (r == DNS_QUERY_RESTARTED) /* This was a cname, and the query was restarted. */
+        if (r == DNS_QUERY_CNAME) {
+                /* This was a cname, and the query was restarted. */
+                TAKE_PTR(q);
                 return;
+        }
 
         question = dns_query_question_for_protocol(q, q->answer_protocol);
 
@@ -180,7 +212,7 @@ static void vl_method_resolve_hostname_complete(DnsQuery *q) {
 
                 r = json_build(&entry,
                                JSON_BUILD_OBJECT(
-                                               JSON_BUILD_PAIR("ifindex", JSON_BUILD_INTEGER(ifindex)),
+                                               JSON_BUILD_PAIR_CONDITION(ifindex > 0, "ifindex", JSON_BUILD_INTEGER(ifindex)),
                                                JSON_BUILD_PAIR("family", JSON_BUILD_INTEGER(family)),
                                                JSON_BUILD_PAIR("address", JSON_BUILD_BYTE_ARRAY(p, FAMILY_ADDRESS_SIZE(family)))));
                 if (r < 0)
@@ -208,14 +240,12 @@ static void vl_method_resolve_hostname_complete(DnsQuery *q) {
                            JSON_BUILD_OBJECT(
                                            JSON_BUILD_PAIR("addresses", JSON_BUILD_VARIANT(array)),
                                            JSON_BUILD_PAIR("name", JSON_BUILD_STRING(normalized)),
-                                           JSON_BUILD_PAIR("flags", JSON_BUILD_INTEGER(SD_RESOLVED_FLAGS_MAKE(q->answer_protocol, q->answer_family, dns_query_fully_authenticated(q))))));
+                                           JSON_BUILD_PAIR("flags", JSON_BUILD_INTEGER(dns_query_reply_flags_make(q)))));
 finish:
         if (r < 0) {
-                log_error_errno(r, "Failed to send hostname reply: %m");
+                log_full_errno(ERRNO_IS_DISCONNECT(r) ? LOG_DEBUG : LOG_ERR, r, "Failed to send hostname reply: %m");
                 r = varlink_error_errno(q->varlink_request, r);
         }
-
-        dns_query_free(q);
 }
 
 static int parse_as_address(Varlink *link, LookupParameters *p) {
@@ -253,7 +283,8 @@ static int parse_as_address(Varlink *link, LookupParameters *p) {
                                                         JSON_BUILD_PAIR("family", JSON_BUILD_INTEGER(ff)),
                                                         JSON_BUILD_PAIR("address", JSON_BUILD_BYTE_ARRAY(&parsed, FAMILY_ADDRESS_SIZE(ff)))))),
                                 JSON_BUILD_PAIR("name", JSON_BUILD_STRING(canonical)),
-                                JSON_BUILD_PAIR("flags", JSON_BUILD_INTEGER(SD_RESOLVED_FLAGS_MAKE(dns_synthesize_protocol(p->flags), ff, true)))));
+                                JSON_BUILD_PAIR("flags", JSON_BUILD_INTEGER(SD_RESOLVED_FLAGS_MAKE(dns_synthesize_protocol(p->flags), ff, true, true)|
+                                                                            SD_RESOLVED_SYNTHETIC))));
 }
 
 static int vl_method_resolve_hostname(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
@@ -269,11 +300,13 @@ static int vl_method_resolve_hostname(Varlink *link, JsonVariant *parameters, Va
         _cleanup_(lookup_parameters_destroy) LookupParameters p = {
                 .family = AF_UNSPEC,
         };
-        Manager *m = userdata;
-        DnsQuery *q;
+        _cleanup_(dns_query_freep) DnsQuery *q = NULL;
+        Manager *m;
         int r;
 
         assert(link);
+
+        m = varlink_server_get_userdata(varlink_get_server(link));
         assert(m);
 
         if (FLAGS_SET(flags, VARLINK_METHOD_ONEWAY))
@@ -310,7 +343,7 @@ static int vl_method_resolve_hostname(Varlink *link, JsonVariant *parameters, Va
         if (r < 0 && r != -EALREADY)
                 return r;
 
-        r = dns_query_new(m, &q, question_utf8, question_idna ?: question_utf8, p.ifindex, p.flags);
+        r = dns_query_new(m, &q, question_utf8, question_idna ?: question_utf8, NULL, p.ifindex, p.flags);
         if (r < 0)
                 return r;
 
@@ -321,23 +354,19 @@ static int vl_method_resolve_hostname(Varlink *link, JsonVariant *parameters, Va
 
         r = dns_query_go(q);
         if (r < 0)
-                goto fail;
+                return r;
 
+        TAKE_PTR(q);
         return 1;
-
-fail:
-        dns_query_free(q);
-        return r;
 }
 
 static int json_dispatch_address(const char *name, JsonVariant *variant, JsonDispatchFlags flags, void *userdata) {
-        LookupParameters *p = userdata;
+        LookupParameters *p = ASSERT_PTR(userdata);
         union in_addr_union buf = {};
         JsonVariant *i;
         size_t n, k = 0;
 
         assert(variant);
-        assert(p);
 
         if (!json_variant_is_array(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an array.", strna(name));
@@ -347,14 +376,16 @@ static int json_dispatch_address(const char *name, JsonVariant *variant, JsonDis
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is array of unexpected size.", strna(name));
 
         JSON_VARIANT_ARRAY_FOREACH(i, variant) {
-                intmax_t b;
+                int64_t b;
 
                 if (!json_variant_is_integer(i))
                         return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Element %zu of JSON field '%s' is not an integer.", k, strna(name));
 
                 b = json_variant_integer(i);
                 if (b < 0 || b > 0xff)
-                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Element %zu of JSON field '%s' is out of range 0…255.", k, strna(name));
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                        "Element %zu of JSON field '%s' is out of range 0%s255.",
+                                        k, strna(name), special_glyph(SPECIAL_GLYPH_ELLIPSIS));
 
                 buf.bytes[k++] = (uint8_t) b;
         }
@@ -365,8 +396,9 @@ static int json_dispatch_address(const char *name, JsonVariant *variant, JsonDis
         return 0;
 }
 
-static void vl_method_resolve_address_complete(DnsQuery *q) {
+static void vl_method_resolve_address_complete(DnsQuery *query) {
         _cleanup_(json_variant_unrefp) JsonVariant *array = NULL;
+        _cleanup_(dns_query_freep) DnsQuery *q = query;
         DnsQuestion *question;
         DnsResourceRecord *rr;
         int ifindex, r;
@@ -378,15 +410,18 @@ static void vl_method_resolve_address_complete(DnsQuery *q) {
                 goto finish;
         }
 
-        r = dns_query_process_cname(q);
+        r = dns_query_process_cname_many(q);
         if (r == -ELOOP) {
                 r = varlink_error(q->varlink_request, "io.systemd.Resolve.CNAMELoop", NULL);
                 goto finish;
         }
         if (r < 0)
                 goto finish;
-        if (r == DNS_QUERY_RESTARTED) /* This was a cname, and the query was restarted. */
+        if (r == DNS_QUERY_CNAME) {
+                /* This was a cname, and the query was restarted. */
+                TAKE_PTR(q);
                 return;
+        }
 
         question = dns_query_question_for_protocol(q, q->answer_protocol);
 
@@ -406,7 +441,7 @@ static void vl_method_resolve_address_complete(DnsQuery *q) {
 
                 r = json_build(&entry,
                                JSON_BUILD_OBJECT(
-                                               JSON_BUILD_PAIR("ifindex", JSON_BUILD_INTEGER(ifindex)),
+                                               JSON_BUILD_PAIR_CONDITION(ifindex > 0, "ifindex", JSON_BUILD_INTEGER(ifindex)),
                                                JSON_BUILD_PAIR("name", JSON_BUILD_STRING(normalized))));
                 if (r < 0)
                         goto finish;
@@ -424,14 +459,12 @@ static void vl_method_resolve_address_complete(DnsQuery *q) {
         r = varlink_replyb(q->varlink_request,
                            JSON_BUILD_OBJECT(
                                            JSON_BUILD_PAIR("names", JSON_BUILD_VARIANT(array)),
-                                           JSON_BUILD_PAIR("flags", JSON_BUILD_INTEGER(SD_RESOLVED_FLAGS_MAKE(q->answer_protocol, q->answer_family, dns_query_fully_authenticated(q))))));
+                                           JSON_BUILD_PAIR("flags", JSON_BUILD_INTEGER(dns_query_reply_flags_make(q)))));
 finish:
         if (r < 0) {
-                log_error_errno(r, "Failed to send address reply: %m");
+                log_full_errno(ERRNO_IS_DISCONNECT(r) ? LOG_DEBUG : LOG_ERR, r, "Failed to send address reply: %m");
                 r = varlink_error_errno(q->varlink_request, r);
         }
-
-        dns_query_free(q);
 }
 
 static int vl_method_resolve_address(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
@@ -447,11 +480,13 @@ static int vl_method_resolve_address(Varlink *link, JsonVariant *parameters, Var
         _cleanup_(lookup_parameters_destroy) LookupParameters p = {
                 .family = AF_UNSPEC,
         };
-        Manager *m = userdata;
-        DnsQuery *q;
+        _cleanup_(dns_query_freep) DnsQuery *q = NULL;
+        Manager *m;
         int r;
 
         assert(link);
+
+        m = varlink_server_get_userdata(varlink_get_server(link));
         assert(m);
 
         if (FLAGS_SET(flags, VARLINK_METHOD_ONEWAY))
@@ -464,11 +499,11 @@ static int vl_method_resolve_address(Varlink *link, JsonVariant *parameters, Var
         if (p.ifindex < 0)
                 return varlink_error_invalid_parameter(link, JSON_VARIANT_STRING_CONST("ifindex"));
 
-        if (!IN_SET(p.family, AF_UNSPEC, AF_INET, AF_INET6))
+        if (!IN_SET(p.family, AF_INET, AF_INET6))
                 return varlink_error_invalid_parameter(link, JSON_VARIANT_STRING_CONST("family"));
 
         if (FAMILY_ADDRESS_SIZE(p.family) != p.address_size)
-                return varlink_error(link, "io.systemd.UserDatabase.BadAddressSize", NULL);
+                return varlink_error(link, "io.systemd.Resolve.BadAddressSize", NULL);
 
         if (!validate_and_mangle_flags(NULL, &p.flags, 0))
                 return varlink_error_invalid_parameter(link, JSON_VARIANT_STRING_CONST("flags"));
@@ -477,7 +512,7 @@ static int vl_method_resolve_address(Varlink *link, JsonVariant *parameters, Var
         if (r < 0)
                 return r;
 
-        r = dns_query_new(m, &q, question, question, p.ifindex, p.flags|SD_RESOLVED_NO_SEARCH);
+        r = dns_query_new(m, &q, question, question, NULL, p.ifindex, p.flags|SD_RESOLVED_NO_SEARCH);
         if (r < 0)
                 return r;
 
@@ -490,16 +525,84 @@ static int vl_method_resolve_address(Varlink *link, JsonVariant *parameters, Var
 
         r = dns_query_go(q);
         if (r < 0)
-                goto fail;
+                return r;
 
+        TAKE_PTR(q);
         return 1;
-
-fail:
-        dns_query_free(q);
-        return r;
 }
 
-int manager_varlink_init(Manager *m) {
+static int vl_method_subscribe_dns_resolves(Varlink *link, JsonVariant *parameters, VarlinkMethodFlags flags, void *userdata) {
+        Manager *m;
+        int r;
+
+        assert(link);
+
+        m = ASSERT_PTR(varlink_server_get_userdata(varlink_get_server(link)));
+
+        /* if the client didn't set the more flag, it is using us incorrectly */
+        if (!FLAGS_SET(flags, VARLINK_METHOD_MORE))
+                return varlink_error_invalid_parameter(link, NULL);
+
+        if (json_variant_elements(parameters) > 0)
+                return varlink_error_invalid_parameter(link, parameters);
+
+        /* Send a ready message to the connecting client, to indicate that we are now listinening, and all
+         * queries issued after the point the client sees this will also be reported to the client. */
+        r = varlink_notifyb(link,
+                            JSON_BUILD_OBJECT(JSON_BUILD_PAIR("ready", JSON_BUILD_BOOLEAN(true))));
+        if (r < 0)
+                return log_error_errno(r, "Failed to report monitor to be established: %m");
+
+        r = set_ensure_put(&m->varlink_subscription, NULL, link);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add subscription to set: %m");
+        varlink_ref(link);
+
+        log_debug("%u clients now attached for varlink notifications", set_size(m->varlink_subscription));
+
+        return 1;
+}
+
+static int varlink_monitor_server_init(Manager *m) {
+        _cleanup_(varlink_server_unrefp) VarlinkServer *server = NULL;
+        int r;
+
+        assert(m);
+
+        if (m->varlink_monitor_server)
+                return 0;
+
+        r = varlink_server_new(&server, VARLINK_SERVER_ROOT_ONLY);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate varlink server object: %m");
+
+        varlink_server_set_userdata(server, m);
+
+        r = varlink_server_bind_method(
+                        server,
+                        "io.systemd.Resolve.Monitor.SubscribeQueryResults",
+                        vl_method_subscribe_dns_resolves);
+        if (r < 0)
+                return log_error_errno(r, "Failed to register varlink methods: %m");
+
+        r = varlink_server_bind_disconnect(server, vl_on_notification_disconnect);
+        if (r < 0)
+                return log_error_errno(r, "Failed to register varlink disconnect handler: %m");
+
+        r = varlink_server_listen_address(server, "/run/systemd/resolve/io.systemd.Resolve.Monitor", 0600);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind to varlink socket: %m");
+
+        r = varlink_server_attach_event(server, m->event, SD_EVENT_PRIORITY_NORMAL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to attach varlink connection to event loop: %m");
+
+        m->varlink_monitor_server = TAKE_PTR(server);
+
+        return 0;
+}
+
+static int varlink_main_server_init(Manager *m) {
         _cleanup_(varlink_server_unrefp) VarlinkServer *s = NULL;
         int r;
 
@@ -537,8 +640,23 @@ int manager_varlink_init(Manager *m) {
         return 0;
 }
 
+int manager_varlink_init(Manager *m) {
+        int r;
+
+        r = varlink_main_server_init(m);
+        if (r < 0)
+                return r;
+
+        r = varlink_monitor_server_init(m);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
 void manager_varlink_done(Manager *m) {
         assert(m);
 
         m->varlink_server = varlink_server_unref(m->varlink_server);
+        m->varlink_monitor_server = varlink_server_unref(m->varlink_monitor_server);
 }

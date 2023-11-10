@@ -58,14 +58,13 @@ struct job_info {
 
 static int output_jobs_list(sd_bus *bus, const struct job_info* jobs, unsigned n, bool skipped) {
         _cleanup_(table_unrefp) Table *table = NULL;
-        const struct job_info *j;
         const char *on, *off;
         int r;
 
         assert(n == 0 || jobs);
 
         if (n == 0) {
-                if (!arg_no_legend) {
+                if (arg_legend != 0) {
                         on = ansi_highlight_green();
                         off = ansi_normal();
 
@@ -74,19 +73,19 @@ static int output_jobs_list(sd_bus *bus, const struct job_info* jobs, unsigned n
                 return 0;
         }
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         table = table_new("job", "unit", "type", "state");
         if (!table)
                 return log_oom();
 
-        table_set_header(table, !arg_no_legend);
+        table_set_header(table, arg_legend != 0);
         if (arg_full)
                 table_set_width(table, 0);
 
-        (void) table_set_empty_string(table, "-");
+        table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
-        for (j = jobs; j < jobs + n; j++) {
+        for (const struct job_info *j = jobs; j < jobs + n; j++) {
                 if (streq(j->state, "running"))
                         on = ansi_highlight();
                 else
@@ -112,7 +111,7 @@ static int output_jobs_list(sd_bus *bus, const struct job_info* jobs, unsigned n
         if (r < 0)
                 return log_error_errno(r, "Failed to print the table: %m");
 
-        if (!arg_no_legend) {
+        if (arg_legend != 0) {
                 on = ansi_highlight();
                 off = ansi_normal();
 
@@ -126,13 +125,12 @@ static bool output_show_job(struct job_info *job, char **patterns) {
         return strv_fnmatch_or_empty(patterns, job->name, FNM_NOESCAPE);
 }
 
-int list_jobs(int argc, char *argv[], void *userdata) {
+int verb_list_jobs(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_free_ struct job_info *jobs = NULL;
         const char *name, *type, *state;
         bool skipped = false;
-        size_t size = 0;
         unsigned c = 0;
         sd_bus *bus;
         uint32_t id;
@@ -158,7 +156,7 @@ int list_jobs(int argc, char *argv[], void *userdata) {
                         continue;
                 }
 
-                if (!GREEDY_REALLOC(jobs, size, c + 1))
+                if (!GREEDY_REALLOC(jobs, c + 1))
                         return log_oom();
 
                 jobs[c++] = job;
@@ -170,7 +168,7 @@ int list_jobs(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         return output_jobs_list(bus, jobs, c, skipped);
 }

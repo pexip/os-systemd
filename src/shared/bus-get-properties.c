@@ -55,23 +55,6 @@ int bus_property_get_id128(
                 return sd_bus_message_append_array(reply, 'y', id->bytes, 16);
 }
 
-int bus_property_get_percent(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        char pstr[DECIMAL_STR_MAX(int) + 2];
-        int p = *(int*) userdata;
-
-        xsprintf(pstr, "%d%%", p);
-
-        return sd_bus_message_append_basic(reply, 's', pstr);
-}
-
 #if __SIZEOF_SIZE_T__ != 8
 int bus_property_get_size(
                 sd_bus *bus,
@@ -147,21 +130,21 @@ int bus_property_get_rlimit(
                 int z;
 
                 /* Chop off "Soft" suffix */
-                s = is_soft ? strndupa(property, is_soft - property) : property;
+                s = is_soft ? strndupa_safe(property, is_soft - property) : property;
 
                 /* Skip over any prefix, such as "Default" */
-                assert_se(p = strstr(s, "Limit"));
+                assert_se(p = strstrafter(s, "Limit"));
 
-                z = rlimit_from_string(p + 5);
+                z = rlimit_from_string(p);
                 assert(z >= 0);
 
                 (void) getrlimit(z, &buf);
                 x = is_soft ? buf.rlim_cur : buf.rlim_max;
         }
 
-        /* rlim_t might have different sizes, let's map RLIMIT_INFINITY to (uint64_t) -1, so that it is the same on all
+        /* rlim_t might have different sizes, let's map RLIMIT_INFINITY to UINT64_MAX, so that it is the same on all
          * archs */
-        u = x == RLIM_INFINITY ? (uint64_t) -1 : (uint64_t) x;
+        u = x == RLIM_INFINITY ? UINT64_MAX : (uint64_t) x;
 
         return sd_bus_message_append(reply, "t", u);
 }

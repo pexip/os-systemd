@@ -1,9 +1,10 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
 # -*- coding: utf-8 -*-
 
 # Copyright 2017 The Chromium OS Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file.
+# found in the LICENSES/BSD-3-Clause.txt file.
 
 """Autosuspend udev rule generator
 
@@ -11,8 +12,6 @@ This script is executed at build time to generate udev rules. The
 resulting rules file is installed on the device, the script itself
 is not.
 """
-
-from __future__ import print_function
 
 # List of USB devices (vendorid:productid) for which it is safe to enable
 # autosuspend.

@@ -23,8 +23,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "device-nodes.h"
 #include "fd-util.h"
-#include "libudev-util.h"
 #include "log.h"
 #include "memory-util.h"
 #include "udev-util.h"
@@ -162,8 +162,8 @@ static int disk_identify_command(
                         return ret;
         }
 
-        if (!(sense[0] == 0x72 && desc[0] == 0x9 && desc[1] == 0x0c) &&
-                !(sense[0] == 0x70 && sense[12] == 0x00 && sense[13] == 0x1d)) {
+        if (!((sense[0] & 0x7f) == 0x72 && desc[0] == 0x9 && desc[1] == 0x0c) &&
+                !((sense[0] & 0x7f) == 0x70 && sense[12] == 0x00 && sense[13] == 0x1d)) {
                 errno = EIO;
                 return -1;
         }
@@ -240,7 +240,7 @@ static int disk_identify_packet_device_command(
                         return ret;
         }
 
-        if (!(sense[0] == 0x72 && desc[0] == 0x9 && desc[1] == 0x0c)) {
+        if (!((sense[0] & 0x7f) == 0x72 && desc[0] == 0x9 && desc[1] == 0x0c)) {
                 errno = EIO;
                 return -1;
         }
@@ -297,7 +297,7 @@ static void disk_identify_fixup_uint16 (uint8_t identify[512], unsigned offset_w
  * disk_identify:
  * @fd: File descriptor for the block device.
  * @out_identify: Return location for IDENTIFY data.
- * @out_is_packet_device: Return location for whether returned data is from a IDENTIFY PACKET DEVICE.
+ * @out_is_packet_device: Return location for whether returned data is from an IDENTIFY PACKET DEVICE.
  *
  * Sends the IDENTIFY DEVICE or IDENTIFY PACKET DEVICE command to the
  * device represented by @fd. If successful, then the result will be
@@ -439,7 +439,7 @@ int main(int argc, char *argv[]) {
                 return 1;
         }
 
-        fd = open(node, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
+        fd = open(node, O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOCTTY);
         if (fd < 0) {
                 log_error("unable to open '%s'", node);
                 return 1;
@@ -483,13 +483,13 @@ int main(int argc, char *argv[]) {
 
         memcpy(model, id.model, 40);
         model[40] = '\0';
-        udev_util_encode_string(model, model_enc, sizeof(model_enc));
-        util_replace_whitespace((char *) id.model, model, 40);
-        util_replace_chars(model, NULL);
-        util_replace_whitespace((char *) id.serial_no, serial, 20);
-        util_replace_chars(serial, NULL);
-        util_replace_whitespace((char *) id.fw_rev, revision, 8);
-        util_replace_chars(revision, NULL);
+        encode_devnode_name(model, model_enc, sizeof(model_enc));
+        udev_replace_whitespace((char *) id.model, model, 40);
+        udev_replace_chars(model, NULL);
+        udev_replace_whitespace((char *) id.serial_no, serial, 20);
+        udev_replace_chars(serial, NULL);
+        udev_replace_whitespace((char *) id.fw_rev, revision, 8);
+        udev_replace_chars(revision, NULL);
 
         if (export) {
                 /* Set this to convey the disk speaks the ATA protocol */

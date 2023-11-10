@@ -7,6 +7,7 @@
 
 #include "json.h"
 #include "macro.h"
+#include "pager.h"
 
 typedef enum TableDataType {
         TABLE_EMPTY,
@@ -15,6 +16,7 @@ typedef enum TableDataType {
         TABLE_STRV_WRAPPED,
         TABLE_PATH,
         TABLE_BOOLEAN,
+        TABLE_BOOLEAN_CHECKMARK,
         TABLE_TIMESTAMP,
         TABLE_TIMESTAMP_UTC,
         TABLE_TIMESTAMP_RELATIVE,
@@ -32,12 +34,18 @@ typedef enum TableDataType {
         TABLE_UINT16,
         TABLE_UINT32,
         TABLE_UINT64,
+        TABLE_UINT64_HEX,
         TABLE_PERCENT,
         TABLE_IFINDEX,
         TABLE_IN_ADDR,  /* Takes a union in_addr_union (or a struct in_addr) */
         TABLE_IN6_ADDR, /* Takes a union in_addr_union (or a struct in6_addr) */
         TABLE_ID128,
         TABLE_UUID,
+        TABLE_UID,
+        TABLE_GID,
+        TABLE_PID,
+        TABLE_SIGNAL,
+        TABLE_MODE,     /* as in UNIX file mode (mode_t), in typical octal output */
         _TABLE_DATA_TYPE_MAX,
 
         /* The following are not really data types, but commands for table_add_cell_many() to make changes to
@@ -53,18 +61,16 @@ typedef enum TableDataType {
         TABLE_SET_URL,
         TABLE_SET_UPPERCASE,
 
-        _TABLE_DATA_TYPE_INVALID = -1,
+        _TABLE_DATA_TYPE_INVALID = -EINVAL,
 } TableDataType;
 
-/* PIDs are just 32bit signed integers on Linux */
-#define TABLE_PID TABLE_INT32
-assert_cc(sizeof(pid_t) == sizeof(int32_t));
-
-/* UIDs/GIDs are just 32bit unsigned integers on Linux */
-#define TABLE_UID TABLE_UINT32
-#define TABLE_GID TABLE_UINT32
-assert_cc(sizeof(uid_t) == sizeof(uint32_t));
-assert_cc(sizeof(gid_t) == sizeof(uint32_t));
+typedef enum TableErsatz {
+        TABLE_ERSATZ_EMPTY,
+        TABLE_ERSATZ_DASH,
+        TABLE_ERSATZ_UNSET,
+        TABLE_ERSATZ_NA,
+        _TABLE_ERSATZ_MAX,
+} TableErsatz;
 
 typedef struct Table Table;
 typedef struct TableCell TableCell;
@@ -78,7 +84,7 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Table*, table_unref);
 
 int table_add_cell_full(Table *t, TableCell **ret_cell, TableDataType type, const void *data, size_t minimum_width, size_t maximum_width, unsigned weight, unsigned align_percent, unsigned ellipsize_percent);
 static inline int table_add_cell(Table *t, TableCell **ret_cell, TableDataType type, const void *data) {
-        return table_add_cell_full(t, ret_cell, type, data, (size_t) -1, (size_t) -1, (unsigned) -1, (unsigned) -1, (unsigned) -1);
+        return table_add_cell_full(t, ret_cell, type, data, SIZE_MAX, SIZE_MAX, UINT_MAX, UINT_MAX, UINT_MAX);
 }
 int table_add_cell_stringf(Table *t, TableCell **ret_cell, const char *format, ...) _printf_(3, 4);
 
@@ -104,12 +110,14 @@ int table_add_many_internal(Table *t, TableDataType first_type, ...);
 void table_set_header(Table *table, bool b);
 void table_set_width(Table *t, size_t width);
 void table_set_cell_height_max(Table *t, size_t height);
-int table_set_empty_string(Table *t, const char *empty);
-int table_set_display_all(Table *t);
-int table_set_display(Table *t, size_t first_column, ...);
-int table_set_sort(Table *t, size_t first_column, ...);
+void table_set_ersatz_string(Table *t, TableErsatz ersatz);
+int table_set_display_internal(Table *t, size_t first_column, ...);
+#define table_set_display(...) table_set_display_internal(__VA_ARGS__, SIZE_MAX)
+int table_set_sort_internal(Table *t, size_t first_column, ...);
+#define table_set_sort(...) table_set_sort_internal(__VA_ARGS__, SIZE_MAX)
 int table_set_reverse(Table *t, size_t column, bool b);
-int table_hide_column_from_display(Table *t, size_t column);
+int table_hide_column_from_display_internal(Table *t, ...);
+#define table_hide_column_from_display(t, ...) table_hide_column_from_display_internal(t, __VA_ARGS__, (size_t) -1)
 
 int table_print(Table *t, FILE *f);
 int table_format(Table *t, char **ret);
@@ -129,8 +137,12 @@ const void *table_get_at(Table *t, size_t row, size_t column);
 int table_to_json(Table *t, JsonVariant **ret);
 int table_print_json(Table *t, FILE *f, JsonFormatFlags json_flags);
 
+int table_print_with_pager(Table *t, JsonFormatFlags json_format_flags, PagerFlags pager_flags, bool show_header);
+
+int table_set_json_field_name(Table *t, size_t column, const char *name);
+
 #define table_log_add_error(r) \
-        log_error_errno(r, "Failed to add cell(s) to table: %m")
+        log_error_errno(r, "Failed to add cells to table: %m")
 
 #define table_log_print_error(r) \
         log_error_errno(r, "Failed to print table: %m")

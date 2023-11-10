@@ -161,6 +161,56 @@ static int link_set_ipv6_hop_limit(Link *link) {
         return sysctl_write_ip_property_int(AF_INET6, link->ifname, "hop_limit", link->network->ipv6_hop_limit);
 }
 
+static int link_set_ipv6_proxy_ndp(Link *link) {
+        bool v;
+
+        assert(link);
+
+        if (!socket_ipv6_is_supported())
+                return 0;
+
+        if (link->flags & IFF_LOOPBACK)
+                return 0;
+
+        if (!link->network)
+                return 0;
+
+        if (link->network->ipv6_proxy_ndp >= 0)
+                v = link->network->ipv6_proxy_ndp;
+        else
+                v = !set_isempty(link->network->ipv6_proxy_ndp_addresses);
+
+        return sysctl_write_ip_property_boolean(AF_INET6, link->ifname, "proxy_ndp", v);
+}
+
+int link_set_ipv6_mtu(Link *link) {
+        uint32_t mtu;
+
+        assert(link);
+
+        /* Make this a NOP if IPv6 is not available */
+        if (!socket_ipv6_is_supported())
+                return 0;
+
+        if (link->flags & IFF_LOOPBACK)
+                return 0;
+
+        if (!link->network)
+                return 0;
+
+        if (link->network->ipv6_mtu == 0)
+                return 0;
+
+        mtu = link->network->ipv6_mtu;
+        if (mtu > link->max_mtu) {
+                log_link_warning(link, "Reducing requested IPv6 MTU %"PRIu32" to the interface's maximum MTU %"PRIu32".",
+                                 mtu, link->max_mtu);
+                mtu = link->max_mtu;
+        }
+
+        return sysctl_write_ip_property_uint32(AF_INET6, link->ifname, "mtu", mtu);
+}
+
 static int link_set_ipv4_accept_local(Link *link) {
         assert(link);
 
@@ -171,6 +221,18 @@ static int link_set_ipv4_accept_local(Link *link) {
                 return 0;
 
         return sysctl_write_ip_property_boolean(AF_INET, link->ifname, "accept_local", link->network->ipv4_accept_local > 0);
+}
+
+static int link_set_ipv4_route_localnet(Link *link) {
+        assert(link);
+
+        if (link->flags & IFF_LOOPBACK)
+                return 0;
+
+        if (link->network->ipv4_route_localnet < 0)
+                return 0;
+
+        return sysctl_write_ip_property_boolean(AF_INET, link->ifname, "route_localnet", link->network->ipv4_route_localnet > 0);
 }
 
 int link_set_sysctl(Link *link) {
@@ -194,7 +256,7 @@ int link_set_sysctl(Link *link) {
 
         r = link_set_ipv6_forward(link);
         if (r < 0)
-                log_link_warning_errno(link, r, "Cannot configure IPv6 packet forwarding, ignoring: %m");;
+                log_link_warning_errno(link, r, "Cannot configure IPv6 packet forwarding, ignoring: %m");
 
         r = link_set_ipv6_privacy_extensions(link);
         if (r < 0)
@@ -212,33 +274,34 @@ int link_set_sysctl(Link *link) {
         if (r < 0)
                 log_link_warning_errno(link, r, "Cannot set IPv6 hop limit for interface, ignoring: %m");
 
+        r = link_set_ipv6_proxy_ndp(link);
+        if (r < 0)
+                log_link_warning_errno(link, r, "Cannot set IPv6 proxy NDP, ignoring: %m");
+
+        r = link_set_ipv6_mtu(link);
+        if (r < 0)
+                log_link_warning_errno(link, r, "Cannot set IPv6 MTU, ignoring: %m");
+
+        r = link_set_ipv6ll_stable_secret(link);
+        if (r < 0)
+                log_link_warning_errno(link, r, "Cannot set stable secret address for IPv6 link-local address: %m");
+
         r = link_set_ipv4_accept_local(link);
         if (r < 0)
                 log_link_warning_errno(link, r, "Cannot set IPv4 accept_local flag for interface, ignoring: %m");
 
-        return 0;
-}
-
-int link_set_ipv6_mtu(Link *link) {
-        int r;
-
-        assert(link);
-
-        /* Make this a NOP if IPv6 is not available */
-        if (!socket_ipv6_is_supported())
-                return 0;
-
-        if (link->flags & IFF_LOOPBACK)
-                return 0;
-
-        if (link->network->ipv6_mtu == 0)
-                return 0;
-
-        r = sysctl_write_ip_property_uint32(AF_INET6, link->ifname, "mtu", link->network->ipv6_mtu);
+        r = link_set_ipv4_route_localnet(link);
         if (r < 0)
-                return r;
+                log_link_warning_errno(link, r, "Cannot set IPv4 route_localnet flag for interface, ignoring: %m");
 
-        link->ipv6_mtu_set = true;
+        /* If promote_secondaries is not set, DHCP will work only as long as the IP address does not
+         * changes between leases. The kernel will remove all secondary IP addresses of an interface
+         * otherwise. The way systemd-networkd works is that the new IP of a lease is added as a
+         * secondary IP and when the primary one expires it relies on the kernel to promote the
+         * secondary IP. See also https://github.com/systemd/systemd/issues/7163 */
+        r = sysctl_write_ip_property_boolean(AF_INET, link->ifname, "promote_secondaries", true);
+        if (r < 0)
+                log_link_warning_errno(link, r, "Cannot enable promote_secondaries for interface, ignoring: %m");
 
         return 0;
 }
@@ -264,12 +327,11 @@ int config_parse_ipv6_privacy_extensions(
                 void *data,
                 void *userdata) {
 
-        IPv6PrivacyExtensions s, *ipv6_privacy_extensions = data;
+        IPv6PrivacyExtensions s, *ipv6_privacy_extensions = ASSERT_PTR(data);
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(ipv6_privacy_extensions);
 
         s = ipv6_privacy_extensions_from_string(rvalue);
         if (s < 0) {

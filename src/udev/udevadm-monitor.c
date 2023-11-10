@@ -27,7 +27,7 @@ static Set *arg_tag_filter = NULL;
 static Hashmap *arg_subsystem_filter = NULL;
 
 static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device, void *userdata) {
-        DeviceAction action = _DEVICE_ACTION_INVALID;
+        sd_device_action_t action = _SD_DEVICE_ACTION_INVALID;
         const char *devpath = NULL, *subsystem = NULL;
         MonitorNetlinkGroup group = PTR_TO_INT(userdata);
         struct timespec ts;
@@ -35,7 +35,7 @@ static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device,
         assert(device);
         assert(IN_SET(group, MONITOR_GROUP_UDEV, MONITOR_GROUP_KERNEL));
 
-        (void) device_get_action(device, &action);
+        (void) sd_device_get_action(device, &action);
         (void) sd_device_get_devpath(device, &devpath);
         (void) sd_device_get_subsystem(device, &subsystem);
 
@@ -91,8 +91,7 @@ static int setup_monitor(MonitorNetlinkGroup sender, sd_event *event, sd_device_
         if (r < 0)
                 return log_error_errno(r, "Failed to start device monitor: %m");
 
-        (void) sd_event_source_set_description(sd_device_monitor_get_event_source(monitor),
-                                               sender == MONITOR_GROUP_UDEV ? "device-monitor-udev" : "device-monitor-kernel");
+        (void) sd_device_monitor_set_description(monitor, sender == MONITOR_GROUP_UDEV ? "udev" : "kernel");
 
         *ret = TAKE_PTR(monitor);
         return 0;
@@ -107,8 +106,8 @@ static int help(void) {
                "  -k --kernel                              Print kernel uevents\n"
                "  -u --udev                                Print udev events\n"
                "  -s --subsystem-match=SUBSYSTEM[/DEVTYPE] Filter events by subsystem\n"
-               "  -t --tag-match=TAG                       Filter events by tag\n"
-               , program_invocation_short_name);
+               "  -t --tag-match=TAG                       Filter events by tag\n",
+               program_invocation_short_name);
 
         return 0;
 }
@@ -157,15 +156,12 @@ static int parse_argv(int argc, char *argv[]) {
                         if (!subsystem)
                                 return -ENOMEM;
 
-                        r = hashmap_ensure_allocated(&arg_subsystem_filter, NULL);
+                        r = hashmap_ensure_put(&arg_subsystem_filter, NULL, subsystem, devtype);
                         if (r < 0)
                                 return r;
 
-                        r = hashmap_put(arg_subsystem_filter, subsystem, devtype);
-                        if (r < 0)
-                                return r;
-
-                        subsystem = devtype = NULL;
+                        TAKE_PTR(subsystem);
+                        TAKE_PTR(devtype);
                         break;
                 }
                 case 't':
@@ -182,7 +178,7 @@ static int parse_argv(int argc, char *argv[]) {
                 case '?':
                         return -EINVAL;
                 default:
-                        assert_not_reached("Unknown option.");
+                        assert_not_reached();
                 }
 
         if (!arg_print_kernel && !arg_print_udev) {

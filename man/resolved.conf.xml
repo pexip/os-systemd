@@ -1,6 +1,9 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd" [
+<!ENTITY % entities SYSTEM "custom-entities.ent" >
+%entities;
+]>
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
 <refentry id="resolved.conf" conditional='ENABLE_RESOLVE'
@@ -72,7 +75,7 @@
 
       <varlistentry>
         <term><varname>Domains=</varname></term>
-        <listitem><para>A space-separated list of domains optionally prefixed with <literal>~</literal>,
+        <listitem><para>A space-separated list of domains, optionally prefixed with <literal>~</literal>,
         used for two distinct purposes described below. Defaults to the empty list.</para>
 
         <para>Any domains <emphasis>not</emphasis> prefixed with <literal>~</literal> are used as search
@@ -83,17 +86,23 @@
         <filename>/etc/resolv.conf</filename> with the <varname>search</varname> keyword are used instead, if
         that file exists and any domains are configured in it.</para>
 
-        <para>The domains prefixed with <literal>~</literal> are called "routing domains". All domains listed
-        here (both search domains and routing domains after removing the <literal>~</literal> prefix) define
-        a search path that preferably directs DNS queries to this interface. This search path has an effect
-        only when suitable per-link DNS servers are known. Such servers may be defined through the
-        <varname>DNS=</varname> setting (see above) and dynamically at run time, for example from DHCP
-        leases. If no per-link DNS servers are known, routing domains have no effect.</para>
+        <para>The domains prefixed with <literal>~</literal> are called "route-only domains". All domains
+        listed here (<emphasis>both search domains and route-only domains</emphasis> after removing the
+        <literal>~</literal> prefix) define a search path that preferably directs DNS queries to this
+        interface. This search path has an effect only when suitable per-link DNS servers are known. Such
+        servers may be defined through the <varname>DNS=</varname> setting (see above) and dynamically at run
+        time, for example from DHCP leases. If no per-link DNS servers are known, route-only domains have no
+        effect.</para>
 
         <para>Use the construct <literal>~.</literal> (which is composed from <literal>~</literal> to
-        indicate a routing domain and <literal>.</literal> to indicate the DNS root domain that is the
+        indicate a route-only domain and <literal>.</literal> to indicate the DNS root domain that is the
         implied suffix of all DNS domains) to use the DNS servers defined for this link preferably for all
-        domains.</para></listitem>
+        domains.</para>
+
+        <para>See "Protocols and Routing" in
+        <citerefentry><refentrytitle>systemd-resolved.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        for details of how search and route-only domains are used.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -199,7 +208,7 @@
         domains (TLDs) that are not known by the DNS root server. This
         logic does not work in all private zone setups.</para>
 
-        <para>Defaults to <literal>allow-downgrade</literal>.</para>
+        <para>Defaults to <literal>&DEFAULT_DNSSEC_MODE;</literal>.</para>
         </listitem>
       </varlistentry>
 
@@ -210,7 +219,7 @@
         true all connections to the server will be encrypted. Note that this
         mode requires a DNS server that supports DNS-over-TLS and has a valid
         certificate. If the hostname was specified in <varname>DNS=</varname>
-        by using the format format <literal>address#server_name</literal> it
+        by using the format <literal>address#server_name</literal> it
         is used to validate its certificate and also to enable Server Name
         Indication (SNI) when opening a TLS connection. Otherwise
         the certificate is checked against the server's IP.
@@ -239,7 +248,7 @@
         <varname>DNSOverTLS=</varname> setting is in effect. For per-link DNS servers the per-link setting is in effect, unless
         it is unset in which case the global setting is used instead.</para>
 
-        <para>Defaults to off.</para>
+        <para>Defaults to <literal>&DEFAULT_DNS_OVER_TLS_MODE;</literal>.</para>
         </listitem>
       </varlistentry>
 
@@ -251,17 +260,27 @@
         request. Be aware that turning off caching comes at a performance penalty, which is particularly high
         when DNSSEC is used. If <literal>no-negative</literal>, only positive answers are cached.</para>
 
-        <para>Note that caching is turned off implicitly if the configured DNS server is on a host-local IP address
-        (such as 127.0.0.1 or ::1), in order to avoid duplicate local caching.</para></listitem>
+        <para>Note that caching is turned off by default for host-local DNS servers.
+        See <varname>CacheFromLocalhost=</varname> for details.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>CacheFromLocalhost=</varname></term>
+        <listitem><para>Takes a boolean as argument. If <literal>no</literal> (the default), and response cames from
+        host-local IP address (such as 127.0.0.1 or ::1), the result wouldn't be cached in order to avoid
+        potential duplicate local caching.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
         <term><varname>DNSStubListener=</varname></term>
-        <listitem><para>Takes a boolean argument or one of <literal>udp</literal> and <literal>tcp</literal>. If
-        <literal>udp</literal>, a DNS stub resolver will listen for UDP requests on address 127.0.0.53
-        port 53. If <literal>tcp</literal>, the stub will listen for TCP requests on the same address and port. If
-        <literal>yes</literal> (the default), the stub listens for both UDP and TCP requests.  If <literal>no</literal>, the stub
-        listener is disabled.</para>
+        <listitem><para>Takes a boolean argument or one of <literal>udp</literal> and
+        <literal>tcp</literal>. If <literal>udp</literal>, a DNS stub resolver will listen for UDP requests
+        on addresses 127.0.0.53 and 127.0.0.54, port 53. If <literal>tcp</literal>, the stub will listen for
+        TCP requests on the same addresses and port. If <literal>yes</literal> (the default), the stub listens
+        for both UDP and TCP requests. If <literal>no</literal>, the stub listener is disabled.</para>
+
+        <xi:include href="systemd-resolved.service.xml" xpointer="proxy-stub" />
 
         <para>Note that the DNS stub listener is turned off implicitly when its listening address and port are already
         in use.</para></listitem>
@@ -326,7 +345,7 @@ DNSStubListenerExtra=udp:[2001:db8:0:f102::13]:9953</programlisting>
       <citerefentry><refentrytitle>systemd-resolved.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>systemd-networkd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
       <citerefentry><refentrytitle>dnssec-trust-anchors.d</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>resolv.conf</refentrytitle><manvolnum>4</manvolnum></citerefentry>
+      <citerefentry project='man-pages'><refentrytitle>resolv.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
       </para>
   </refsect1>
 

@@ -1,56 +1,56 @@
-#! /bin/bash
-set -e
-set -x
+#!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
+set -eux
+set -o pipefail
 
-_clear_service () {
-    systemctl stop $1.service 2>/dev/null || :
-    rm -f  /{etc,run,usr/lib}/systemd/system/$1.service
-    rm -fr /{etc,run,usr/lib}/systemd/system/$1.service.d
-    rm -fr /{etc,run,usr/lib}/systemd/system/$1.service.{wants,requires}
-    if [[ $1 == *@ ]]; then
-        systemctl stop $1*.service 2>/dev/null || :
-        rm -f  /{etc,run,usr/lib}/systemd/system/$1*.service
-        rm -fr /{etc,run,usr/lib}/systemd/system/$1*.service.d
-        rm -fr /{etc,run,usr/lib}/systemd/system/$1*.service.{wants,requires}
+clear_unit () {
+    local UNIT_NAME="${1:?}"
+    systemctl stop "$UNIT_NAME" 2>/dev/null || :
+    rm -f  /{etc,run,usr/lib}/systemd/system/"$UNIT_NAME"
+    rm -fr /{etc,run,usr/lib}/systemd/system/"$UNIT_NAME".d
+    rm -fr /{etc,run,usr/lib}/systemd/system/"$UNIT_NAME".{wants,requires}
+    if [[ $UNIT_NAME == *@ ]]; then
+        local base="${UNIT_NAME%@*}"
+        local suffix="${UNIT_NAME##*.}"
+        systemctl stop "$base@"*."$suffix" 2>/dev/null || :
+        rm -f  /{etc,run,usr/lib}/systemd/system/"$base@"*."$suffix"
+        rm -fr /{etc,run,usr/lib}/systemd/system/"$base@"*."$suffix".d
+        rm -fr /{etc,run,usr/lib}/systemd/system/"$base@"*."$suffix".{wants,requires}
     fi
 }
 
-clear_services () {
-    for u in $*; do
-        _clear_service $u
+clear_units () {
+    for u in "$@"; do
+        clear_unit "$u"
     done
     systemctl daemon-reload
 }
 
 create_service () {
-    clear_services $1
+    local SERVICE_NAME="${1:?}"
+    clear_units "${SERVICE_NAME}".service
 
-    cat >/etc/systemd/system/$1.service<<EOF
+    cat >/etc/systemd/system/"$SERVICE_NAME".service <<EOF
 [Unit]
-Description=$1 unit
+Description=$SERVICE_NAME unit
 
 [Service]
-ExecStart=/bin/sleep 100000
+ExecStart=sleep 100000
 EOF
-    mkdir -p /{etc,run,usr/lib}/systemd/system/$1.service.d
-    mkdir -p /etc/systemd/system/$1.service.{wants,requires}
-    mkdir -p /run/systemd/system/$1.service.{wants,requires}
-    mkdir -p /usr/lib/systemd/system/$1.service.{wants,requires}
+    mkdir -p /{etc,run,usr/lib}/systemd/system/"$SERVICE_NAME".service.{d,wants,requires}
 }
 
 create_services () {
-    for u in $*; do
-        create_service $u
+    for u in "$@"; do
+        create_service "$u"
     done
 }
 
 check_ok () {
-    [ $# -eq 3 ] || return
-
-    x="$(systemctl show --value -p $2 $1)"
+    x="$(systemctl show --value -p "${2:?}" "${1:?}")"
     case "$x" in
-        *$3*) return 0 ;;
-        *)    return 1 ;;
+        *${3:?}*) return 0 ;;
+        *)        return 1 ;;
     esac
 }
 
@@ -121,32 +121,250 @@ EOF
     check_ok test15-b ExecCondition "/bin/echo test15-b"
     rm -rf /usr/lib/systemd/system/service.d
 
-    clear_services test15-a test15-b test15-c
+    clear_units test15-{a,b,c,c1}.service
 }
 
-test_hierarchical_dropins () {
-    echo "Testing hierarchical dropins..."
+test_linked_units () {
+    echo "Testing linked units..."
+    echo "*** test linked unit (same basename)"
+
+    create_service test15-a
+    mv /etc/systemd/system/test15-a.service /
+    ln -s /test15-a.service /etc/systemd/system/
+    ln -s test15-a.service /etc/systemd/system/test15-b.service
+
+    check_ok test15-a Names test15-a.service
+    check_ok test15-a Names test15-b.service
+
+    echo "*** test linked unit (cross basename)"
+
+    mv /test15-a.service /test15-a@.scope
+    ln -fs /test15-a@.scope /etc/systemd/system/test15-a.service
+    systemctl daemon-reload
+
+    check_ok test15-a Names test15-a.service
+    check_ok test15-a Names test15-b.service
+    check_ko test15-a Names test15-a@     # test15-a@.scope is the symlink target.
+                                          # Make sure it is completely ignored.
+
+    rm /test15-a@.scope
+    clear_units test15-{a,b}.service
+}
+
+test_template_alias() {
+    echo "Testing instance alias..."
+    echo "*** forward"
+
+    create_service test15-a@
+    ln -s test15-a@inst.service /etc/systemd/system/test15-b@inst.service  # alias
+
+    check_ok test15-a@inst Names test15-a@inst.service
+    check_ok test15-a@inst Names test15-b@inst.service
+
+    check_ok test15-a@other Names test15-a@other.service
+    check_ko test15-a@other Names test15-b@other.service
+
+    echo "*** reverse"
+
+    systemctl daemon-reload
+
+    check_ok test15-b@inst Names test15-a@inst.service
+    check_ok test15-b@inst Names test15-b@inst.service
+
+    check_ko test15-b@other Names test15-a@other.service
+    check_ok test15-b@other Names test15-b@other.service
+
+    clear_units test15-{a,b}@.service
+}
+
+test_hierarchical_service_dropins () {
+    echo "Testing hierarchical service dropins..."
     echo "*** test service.d/ top level drop-in"
     create_services a-b-c
-    check_ko a-b-c ExecCondition "/bin/echo service.d"
-    check_ko a-b-c ExecCondition "/bin/echo a-.service.d"
-    check_ko a-b-c ExecCondition "/bin/echo a-b-.service.d"
-    check_ko a-b-c ExecCondition "/bin/echo a-b-c.service.d"
+    check_ko a-b-c ExecCondition "echo service.d"
+    check_ko a-b-c ExecCondition "echo a-.service.d"
+    check_ko a-b-c ExecCondition "echo a-b-.service.d"
+    check_ko a-b-c ExecCondition "echo a-b-c.service.d"
 
     for dropin in service.d a-.service.d a-b-.service.d a-b-c.service.d; do
         mkdir -p /usr/lib/systemd/system/$dropin
         echo "
 [Service]
-ExecCondition=/bin/echo $dropin
-        " > /usr/lib/systemd/system/$dropin/override.conf
+ExecCondition=echo $dropin
+        " >/usr/lib/systemd/system/$dropin/override.conf
         systemctl daemon-reload
-        check_ok a-b-c ExecCondition "/bin/echo $dropin"
+        check_ok a-b-c ExecCondition "echo $dropin"
+
+        # Check that we can start a transient service in presence of the drop-ins
+        systemd-run -u a-b-c2.service -p Description='sleepy' sleep infinity
+
+        # The transient setting replaces the default
+        check_ok a-b-c2.service Description "sleepy"
+
+        # The override takes precedence for ExecCondition
+        # (except the last iteration when it only applies to the other service)
+        if [ "$dropin" != "a-b-c.service.d" ]; then
+            check_ok a-b-c2.service ExecCondition "echo $dropin"
+        fi
+
+        # Check that things are the same after a reload
+        systemctl daemon-reload
+        check_ok a-b-c2.service Description "sleepy"
+        if [ "$dropin" != "a-b-c.service.d" ]; then
+            check_ok a-b-c2.service ExecCondition "echo $dropin"
+        fi
+
+        systemctl stop a-b-c2.service
     done
     for dropin in service.d a-.service.d a-b-.service.d a-b-c.service.d; do
         rm -rf /usr/lib/systemd/system/$dropin
     done
 
-    clear_services a-b-c
+    clear_units a-b-c.service
+}
+
+test_hierarchical_slice_dropins () {
+    echo "Testing hierarchical slice dropins..."
+    echo "*** test slice.d/ top level drop-in"
+    # Slice units don't even need a fragment, so we test the defaults here
+    check_ok a-b-c.slice Description "Slice /a/b/c"
+    check_ok a-b-c.slice MemoryMax "infinity"
+
+    # Test drop-ins
+    for dropin in slice.d a-.slice.d a-b-.slice.d a-b-c.slice.d; do
+        mkdir -p /usr/lib/systemd/system/$dropin
+        echo "
+[Slice]
+MemoryMax=1000000000
+        " >/usr/lib/systemd/system/$dropin/override.conf
+        systemctl daemon-reload
+        check_ok a-b-c.slice MemoryMax "1000000000"
+
+        busctl call \
+               org.freedesktop.systemd1 \
+               /org/freedesktop/systemd1 \
+               org.freedesktop.systemd1.Manager \
+               StartTransientUnit 'ssa(sv)a(sa(sv))' \
+               'a-b-c.slice' 'replace' \
+               2 \
+               'Description' s 'slice too' \
+               'MemoryMax' t 1000000002 \
+               0
+
+        # The override takes precedence for MemoryMax
+        check_ok a-b-c.slice MemoryMax "1000000000"
+        # The transient setting replaces the default
+        check_ok a-b-c.slice Description "slice too"
+
+        # Check that things are the same after a reload
+        systemctl daemon-reload
+        check_ok a-b-c.slice MemoryMax "1000000000"
+        check_ok a-b-c.slice Description "slice too"
+
+        busctl call \
+               org.freedesktop.systemd1 \
+               /org/freedesktop/systemd1 \
+               org.freedesktop.systemd1.Manager \
+               StopUnit 'ss' \
+               'a-b-c.slice' 'replace'
+
+        rm /usr/lib/systemd/system/$dropin/override.conf
+    done
+
+    # Test unit with a fragment
+    echo "
+[Slice]
+MemoryMax=1000000001
+        " >/usr/lib/systemd/system/a-b-c.slice
+    systemctl daemon-reload
+    check_ok a-b-c.slice MemoryMax "1000000001"
+
+    clear_units a-b-c.slice
+}
+
+test_transient_service_dropins () {
+    echo "Testing dropins for a transient service..."
+    echo "*** test transient service drop-ins"
+
+    mkdir -p /etc/systemd/system/service.d
+    mkdir -p /etc/systemd/system/a-.service.d
+    mkdir -p /etc/systemd/system/a-b-.service.d
+    mkdir -p /etc/systemd/system/a-b-c.service.d
+
+    echo -e '[Service]\nStandardInputText=aaa' >/etc/systemd/system/service.d/drop1.conf
+    echo -e '[Service]\nStandardInputText=bbb' >/etc/systemd/system/a-.service.d/drop2.conf
+    echo -e '[Service]\nStandardInputText=ccc' >/etc/systemd/system/a-b-.service.d/drop3.conf
+    echo -e '[Service]\nStandardInputText=ddd' >/etc/systemd/system/a-b-c.service.d/drop4.conf
+
+    # There's no fragment yet, so this fails
+    systemctl cat a-b-c.service && exit 1
+
+    # xxx → eHh4Cg==
+    systemd-run -u a-b-c.service -p StandardInputData=eHh4Cg== sleep infinity
+
+    data=$(systemctl show -P StandardInputData a-b-c.service)
+    # xxx\naaa\n\bbb\nccc\nddd\n → eHh4…
+    test "$data" = "eHh4CmFhYQpiYmIKY2NjCmRkZAo="
+
+    # Do a reload and check again
+    systemctl daemon-reload
+    data=$(systemctl show -P StandardInputData a-b-c.service)
+    test "$data" = "eHh4CmFhYQpiYmIKY2NjCmRkZAo="
+
+    clear_units a-b-c.service
+    rm /etc/systemd/system/service.d/drop1.conf \
+       /etc/systemd/system/a-.service.d/drop2.conf \
+       /etc/systemd/system/a-b-.service.d/drop3.conf
+}
+
+test_transient_slice_dropins () {
+    echo "Testing dropins for a transient slice..."
+    echo "*** test transient slice drop-ins"
+
+    # FIXME: implement reloading of individual units.
+    #
+    # The settings here are loaded twice. For most settings it doesn't matter,
+    # but Documentation is not deduplicated, so we current get repeated entried
+    # which is a bug.
+
+    mkdir -p /etc/systemd/system/slice.d
+    mkdir -p /etc/systemd/system/a-.slice.d
+    mkdir -p /etc/systemd/system/a-b-.slice.d
+    mkdir -p /etc/systemd/system/a-b-c.slice.d
+
+    echo -e '[Unit]\nDocumentation=man:drop1' >/etc/systemd/system/slice.d/drop1.conf
+    echo -e '[Unit]\nDocumentation=man:drop2' >/etc/systemd/system/a-.slice.d/drop2.conf
+    echo -e '[Unit]\nDocumentation=man:drop3' >/etc/systemd/system/a-b-.slice.d/drop3.conf
+    echo -e '[Unit]\nDocumentation=man:drop4' >/etc/systemd/system/a-b-c.slice.d/drop4.conf
+
+    # Invoke daemon-reload to make sure that the call below doesn't fail
+    systemctl daemon-reload
+
+    # No fragment is required, so this works
+    systemctl cat a-b-c.slice
+
+    busctl call \
+           org.freedesktop.systemd1 \
+           /org/freedesktop/systemd1 \
+           org.freedesktop.systemd1.Manager \
+           StartTransientUnit 'ssa(sv)a(sa(sv))' \
+           'a-b-c.slice' 'replace' \
+           1 \
+           'Documentation' as 1 'man:drop5' \
+           0
+
+    data=$(systemctl show -P Documentation a-b-c.slice)
+    test "$data" = "man:drop1 man:drop2 man:drop3 man:drop4 man:drop5 man:drop1 man:drop2 man:drop3 man:drop4"
+
+    # Do a reload and check again
+    systemctl daemon-reload
+    data=$(systemctl show -P Documentation a-b-c.slice)
+    test "$data" = "man:drop5 man:drop1 man:drop2 man:drop3 man:drop4"
+
+    clear_units a-b-c.slice
+    rm /etc/systemd/system/slice.d/drop1.conf \
+       /etc/systemd/system/a-.slice.d/drop2.conf \
+       /etc/systemd/system/a-b-.slice.d/drop3.conf
 }
 
 test_template_dropins () {
@@ -295,7 +513,7 @@ EOF
     check_ok bar-alias@3 Requires yup-template-requires.device
     check_ok bar-alias@3 Requires yup-3-requires.device
 
-    clear_services foo {bar,yup,bar-alias}@{,1,2,3}
+    clear_units foo.service {bar,yup,bar-alias}@{,1,2,3}.service
 }
 
 test_alias_dropins () {
@@ -310,7 +528,7 @@ test_alias_dropins () {
     systemctl --quiet is-active test15-b
     systemctl stop test15-a test15-b
     rm /etc/systemd/system/test15-b1.service
-    clear_services test15-a test15-b
+    clear_units test15-{a,b}.service
 
     # Check that dependencies don't vary.
     echo "*** test 2"
@@ -327,7 +545,7 @@ test_alias_dropins () {
     systemctl stop test15-a test15-x test15-y
     rm /etc/systemd/system/test15-a1.service
 
-    clear_services test15-a test15-x test15-y
+    clear_units test15-{a,x,y}.service
 }
 
 test_masked_dropins () {
@@ -448,7 +666,7 @@ EOF
     ln -sf /dev/null /etc/systemd/system/test15-a.service.requires/test15-b.service
     check_ok test15-a Requires test15-b
 
-    clear_services test15-a test15-b
+    clear_units test15-{a,b}.service
 }
 
 test_invalid_dropins () {
@@ -460,15 +678,40 @@ test_invalid_dropins () {
     # Assertion failed on earlier versions, command exits unsuccessfully on later versions
     systemctl cat a@.service || true
     systemctl stop a
-    clear_services a
+    clear_units a.service
     return 0
 }
 
+test_symlink_dropin_directory () {
+    # For issue #21920.
+    echo "Testing symlink drop-in directory..."
+    create_services test15-a
+    rmdir /{etc,run,usr/lib}/systemd/system/test15-a.service.d
+    mkdir -p /tmp/testsuite-15-test15-a-dropin-directory
+    ln -s /tmp/testsuite-15-test15-a-dropin-directory /etc/systemd/system/test15-a.service.d
+    cat >/tmp/testsuite-15-test15-a-dropin-directory/override.conf <<EOF
+[Unit]
+Description=hogehoge
+EOF
+    ln -s /tmp/testsuite-15-test15-a-dropin-directory-nonexistent /run/systemd/system/test15-a.service.d
+    touch /tmp/testsuite-15-test15-a-dropin-directory-regular
+    ln -s /tmp/testsuite-15-test15-a-dropin-directory-regular /usr/lib/systemd/system/test15-a.service.d
+    check_ok test15-a Description hogehoge
+
+    clear_units test15-a.service
+}
+
 test_basic_dropins
-test_hierarchical_dropins
+test_linked_units
+test_template_alias
+test_hierarchical_service_dropins
+test_hierarchical_slice_dropins
+test_transient_service_dropins
+test_transient_slice_dropins
 test_template_dropins
 test_alias_dropins
 test_masked_dropins
 test_invalid_dropins
+test_symlink_dropin_directory
 
 touch /testok

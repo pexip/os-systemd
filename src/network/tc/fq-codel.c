@@ -33,63 +33,63 @@ static int fair_queueing_controlled_delay_fill_message(Link *link, QDisc *qdisc,
         assert(qdisc);
         assert(req);
 
-        fqcd = FQ_CODEL(qdisc);
+        assert_se(fqcd = FQ_CODEL(qdisc));
 
         r = sd_netlink_message_open_container_union(req, TCA_OPTIONS, "fq_codel");
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not open container TCA_OPTIONS: %m");
+                return r;
 
         if (fqcd->packet_limit > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_LIMIT, fqcd->packet_limit);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_LIMIT attribute: %m");
+                        return r;
         }
 
         if (fqcd->flows > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_FLOWS, fqcd->flows);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_FLOWS attribute: %m");
+                        return r;
         }
 
         if (fqcd->quantum > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_QUANTUM, fqcd->quantum);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_QUANTUM attribute: %m");
+                        return r;
         }
 
         if (fqcd->interval_usec > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_INTERVAL, fqcd->interval_usec);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_INTERVAL attribute: %m");
+                        return r;
         }
 
         if (fqcd->target_usec > 0) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_TARGET, fqcd->target_usec);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_TARGET attribute: %m");
+                        return r;
         }
 
         if (fqcd->ecn >= 0) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_ECN, fqcd->ecn);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_ECN attribute: %m");
+                        return r;
         }
 
         if (fqcd->ce_threshold_usec != USEC_INFINITY) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_CE_THRESHOLD, fqcd->ce_threshold_usec);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_CE_THRESHOLD attribute: %m");
+                        return r;
         }
 
         if (fqcd->memory_limit != UINT32_MAX) {
                 r = sd_netlink_message_append_u32(req, TCA_FQ_CODEL_MEMORY_LIMIT, fqcd->memory_limit);
                 if (r < 0)
-                        return log_link_error_errno(link, r, "Could not append TCA_FQ_CODEL_MEMORY_LIMIT attribute: %m");
+                        return r;
         }
 
         r = sd_netlink_message_close_container(req);
         if (r < 0)
-                return log_link_error_errno(link, r, "Could not close container TCA_OPTIONS: %m");
+                return r;
 
         return 0;
 }
@@ -108,14 +108,13 @@ int config_parse_fair_queueing_controlled_delay_u32(
 
         _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueingControlledDelay *fqcd;
-        Network *network = data;
+        Network *network = ASSERT_PTR(data);
         uint32_t *p;
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_FQ_CODEL, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -133,12 +132,12 @@ int config_parse_fair_queueing_controlled_delay_u32(
         else if (streq(lvalue, "Flows"))
                 p = &fqcd->flows;
         else
-                assert_not_reached("Invalid lvalue.");
+                assert_not_reached();
 
         if (isempty(rvalue)) {
                 *p = 0;
 
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
@@ -150,7 +149,7 @@ int config_parse_fair_queueing_controlled_delay_u32(
                 return 0;
         }
 
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }
@@ -169,14 +168,13 @@ int config_parse_fair_queueing_controlled_delay_usec(
 
         _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueingControlledDelay *fqcd;
-        Network *network = data;
+        Network *network = ASSERT_PTR(data);
         usec_t *p;
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_FQ_CODEL, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -196,7 +194,7 @@ int config_parse_fair_queueing_controlled_delay_usec(
         else if (streq(lvalue, "CEThresholdSec"))
                 p = &fqcd->ce_threshold_usec;
         else
-                assert_not_reached("Invalid lvalue.");
+                assert_not_reached();
 
         if (isempty(rvalue)) {
                 if (streq(lvalue, "CEThresholdSec"))
@@ -204,7 +202,7 @@ int config_parse_fair_queueing_controlled_delay_usec(
                 else
                         *p = 0;
 
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
@@ -216,7 +214,7 @@ int config_parse_fair_queueing_controlled_delay_usec(
                 return 0;
         }
 
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }
@@ -235,13 +233,12 @@ int config_parse_fair_queueing_controlled_delay_bool(
 
         _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueingControlledDelay *fqcd;
-        Network *network = data;
+        Network *network = ASSERT_PTR(data);
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_FQ_CODEL, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -257,7 +254,7 @@ int config_parse_fair_queueing_controlled_delay_bool(
         if (isempty(rvalue)) {
                 fqcd->ecn = -1;
 
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
@@ -270,7 +267,7 @@ int config_parse_fair_queueing_controlled_delay_bool(
         }
 
         fqcd->ecn = r;
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }
@@ -289,7 +286,7 @@ int config_parse_fair_queueing_controlled_delay_size(
 
         _cleanup_(qdisc_free_or_set_invalidp) QDisc *qdisc = NULL;
         FairQueueingControlledDelay *fqcd;
-        Network *network = data;
+        Network *network = ASSERT_PTR(data);
         uint64_t sz;
         uint32_t *p;
         int r;
@@ -297,7 +294,6 @@ int config_parse_fair_queueing_controlled_delay_size(
         assert(filename);
         assert(lvalue);
         assert(rvalue);
-        assert(data);
 
         r = qdisc_new_static(QDISC_KIND_FQ_CODEL, network, filename, section_line, &qdisc);
         if (r == -ENOMEM)
@@ -315,7 +311,7 @@ int config_parse_fair_queueing_controlled_delay_size(
         else if (STR_IN_SET(lvalue, "QuantumBytes", "Quantum"))
                 p = &fqcd->quantum;
         else
-                assert_not_reached("Invalid lvalue.");
+                assert_not_reached();
 
         if (isempty(rvalue)) {
                 if (STR_IN_SET(lvalue, "MemoryLimitBytes", "MemoryLimit"))
@@ -323,7 +319,7 @@ int config_parse_fair_queueing_controlled_delay_size(
                 else
                         *p = 0;
 
-                qdisc = NULL;
+                TAKE_PTR(qdisc);
                 return 0;
         }
 
@@ -342,7 +338,7 @@ int config_parse_fair_queueing_controlled_delay_size(
         }
 
         *p = sz;
-        qdisc = NULL;
+        TAKE_PTR(qdisc);
 
         return 0;
 }

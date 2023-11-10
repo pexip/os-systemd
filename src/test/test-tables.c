@@ -8,6 +8,7 @@
 #include "condition.h"
 #include "device-private.h"
 #include "device.h"
+#include "discover-image.h"
 #include "execute.h"
 #include "import-util.h"
 #include "install.h"
@@ -18,7 +19,6 @@
 #include "locale-util.h"
 #include "log.h"
 #include "logs-show.h"
-#include "machine-image.h"
 #include "mount.h"
 #include "path.h"
 #include "process-util.h"
@@ -50,7 +50,7 @@ int main(int argc, char **argv) {
         test_table(collect_mode, COLLECT_MODE);
         test_table(condition_result, CONDITION_RESULT);
         test_table(condition_type, CONDITION_TYPE);
-        test_table(device_action, DEVICE_ACTION);
+        test_table(device_action, SD_DEVICE_ACTION);
         test_table(device_state, DEVICE_STATE);
         test_table(dns_over_tls_mode, DNS_OVER_TLS_MODE);
         test_table(dnssec_mode, DNSSEC_MODE);
@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
         test_table(log_target, LOG_TARGET);
         test_table(mac_address_policy, MAC_ADDRESS_POLICY);
         test_table(managed_oom_mode, MANAGED_OOM_MODE);
+        test_table(managed_oom_preference, MANAGED_OOM_PREFERENCE);
         test_table(manager_state, MANAGER_STATE);
         test_table(manager_timestamp, MANAGER_TIMESTAMP);
         test_table(mount_exec_command, MOUNT_EXEC_COMMAND);
@@ -115,14 +116,15 @@ int main(int argc, char **argv) {
         test_table(timer_state, TIMER_STATE);
         test_table(unit_active_state, UNIT_ACTIVE_STATE);
         test_table(unit_dependency, UNIT_DEPENDENCY);
-        test_table(unit_file_change_type, UNIT_FILE_CHANGE_TYPE);
-        test_table(unit_file_preset_mode, UNIT_FILE_PRESET);
+        test_table(install_change_type, INSTALL_CHANGE_TYPE);
+        test_table(unit_file_preset_mode, UNIT_FILE_PRESET_MODE);
         test_table(unit_file_state, UNIT_FILE_STATE);
         test_table(unit_load_state, UNIT_LOAD_STATE);
         test_table(unit_type, UNIT_TYPE);
         test_table(virtualization, VIRTUALIZATION);
+        test_table(compression, COMPRESSION);
 
-        test_table_sparse(object_compressed, OBJECT_COMPRESSED);
+        assert_cc(sizeof(sd_device_action_t) == sizeof(int64_t));
 
         return EXIT_SUCCESS;
 }

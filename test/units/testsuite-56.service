@@ -1,7 +1,6 @@
 [Unit]
-Description=TESTSUITE-56-OOMD
+Description=TEST-56-EXIT-TYPE
 
 [Service]
-ExecStartPre=rm -f /failed /skipped /testok
 ExecStart=/usr/lib/systemd/tests/testdata/units/%N.sh
 Type=oneshot

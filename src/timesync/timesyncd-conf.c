@@ -24,7 +24,6 @@ int manager_parse_server_string(Manager *m, ServerType type, const char *string)
         for (;;) {
                 _cleanup_free_ char *word = NULL;
                 bool found = false;
-                ServerName *n;
 
                 r = extract_first_word(&string, &word, NULL, 0);
                 if (r < 0)
@@ -122,6 +121,11 @@ int manager_parse_config_file(Manager *m) {
         if (m->poll_interval_max_usec < m->poll_interval_min_usec) {
                 log_warning("PollIntervalMaxSec= is smaller than PollIntervalMinSec=. Using default value.");
                 m->poll_interval_max_usec = MAX(NTP_POLL_INTERVAL_MAX_USEC, m->poll_interval_min_usec * 32);
+        }
+
+        if (m->connection_retry_usec < 1 * USEC_PER_SEC) {
+                log_warning("Invalid ConnectionRetrySec=. Using default value.");
+                m->connection_retry_usec = DEFAULT_CONNECTION_RETRY_USEC;
         }
 
         return r;

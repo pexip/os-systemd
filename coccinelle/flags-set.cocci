@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
 @@
 /* Disable this transformation in cases where it doesn't make sense or
  * where it makes the resulting expression more confusing
@@ -8,7 +9,8 @@ position p : script:python() {
                  p[0].current_element == "log_set_max_level_realm" or
                  p[0].current_element == "unichar_is_valid")
         };
-expression x, y;
+expression x;
+constant y;
 @@
 (
 - ((x@p) & (y)) == (y)

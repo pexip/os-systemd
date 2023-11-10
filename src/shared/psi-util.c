@@ -4,9 +4,11 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "missing_threads.h"
 #include "parse-util.h"
 #include "psi-util.h"
 #include "string-util.h"
@@ -34,8 +36,8 @@ int read_resource_pressure(const char *path, PressureType type, ResourcePressure
                 return -EINVAL;
 
         r = fopen_unlocked(path, "re", &f);
-         if (r < 0)
-                 return r;
+        if (r < 0)
+                return r;
 
         for (;;) {
                 _cleanup_free_ char *l = NULL;
@@ -105,14 +107,24 @@ int read_resource_pressure(const char *path, PressureType type, ResourcePressure
 }
 
 int is_pressure_supported(void) {
-        const char *p;
+        static thread_local int cached = -1;
+        int r;
 
-        FOREACH_STRING(p, "/proc/pressure/cpu", "/proc/pressure/io", "/proc/pressure/memory")
-                if (access(p, F_OK) < 0) {
-                        if (errno == ENOENT)
-                                return 0;
-                        return -errno;
+        /* The pressure files, both under /proc/ and in cgroups, will exist even if the kernel has PSI
+         * support disabled; we have to read the file to make sure it doesn't return -EOPNOTSUPP */
+
+        if (cached >= 0)
+                return cached;
+
+        FOREACH_STRING(p, "/proc/pressure/cpu", "/proc/pressure/io", "/proc/pressure/memory") {
+                r = read_virtual_file(p, 0, NULL, NULL);
+                if (r < 0) {
+                        if (r == -ENOENT || ERRNO_IS_NOT_SUPPORTED(r))
+                                return (cached = false);
+
+                        return r;
                 }
+        }
 
-        return 1;
+        return (cached = true);
 }

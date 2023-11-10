@@ -28,6 +28,9 @@
     <para><filename>/run/systemd/journald.conf.d/*.conf</filename></para>
     <para><filename>/usr/lib/systemd/journald.conf.d/*.conf</filename></para>
     <para><filename>/etc/systemd/journald@<replaceable>NAMESPACE</replaceable>.conf</filename></para>
+    <para><filename>/etc/systemd/journald@<replaceable>NAMESPACE</replaceable>.conf.d/*.conf</filename></para>
+    <para><filename>/run/systemd/journald@<replaceable>NAMESPACE</replaceable>.conf.d/*.conf</filename></para>
+    <para><filename>/usr/lib/systemd/journald@<replaceable>NAMESPACE</replaceable>.conf.d/*.conf</filename></para>
   </refsynopsisdiv>
 
   <refsect1>
@@ -41,8 +44,9 @@
 
     <para>The <command>systemd-journald</command> instance managing the default namespace is configured by
     <filename>/etc/systemd/journald.conf</filename> and associated drop-ins. Instances managing other
-    namespaces read <filename>/etc/systemd/journald@<replaceable>NAMESPACE</replaceable>.conf</filename> with
-    the namespace identifier filled in. This allows each namespace to carry a distinct configuration. See
+    namespaces read <filename>/etc/systemd/journald@<replaceable>NAMESPACE</replaceable>.conf</filename>
+    and associated drop-ins with the namespace identifier filled in. This allows each namespace to carry
+    a distinct configuration. See
     <citerefentry><refentrytitle>systemd-journald.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
     for details about journal namespaces.</para>
   </refsect1>
@@ -74,10 +78,23 @@
         the kernel log buffer, or a syslog socket will still work). Defaults to <literal>auto</literal> in
         the default journal namespace, and <literal>persistent</literal> in all others.</para>
 
+        <para>Note that journald will initially use volatile storage, until a call to
+        <command>journalctl --flush</command> (or sending <constant>SIGUSR1</constant> to journald) will cause
+        it to switch to persistent logging (under the conditions mentioned above). This is done automatically
+        on boot via <literal>systemd-journal-flush.service</literal>.</para>
+
         <para>Note that when this option is changed to <literal>volatile</literal>, existing persistent data
         is not removed. In the other direction,
         <citerefentry><refentrytitle>journalctl</refentrytitle><manvolnum>1</manvolnum></citerefentry> with
         the <option>--flush</option> option may be used to move volatile data to persistent storage.</para>
+
+        <para>When journal namespacing (see <varname>LogNamespace=</varname> in
+        <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>) is
+        used, setting <varname>Storage=</varname> to <literal>volatile</literal> or <literal>auto</literal>
+        will not have an effect on the creation of the per-namespace logs directory in
+        <filename>/var/log/journal/</filename>, as the <filename>systemd-journald@.service</filename> service
+        file by default carries <varname>LogsDirectory=</varname>. To turn that off, add a unit file drop-in
+        file that sets <varname>LogsDirectory=</varname> to an empty string.</para>
         </listitem>
       </varlistentry>
 
@@ -256,21 +273,16 @@
         <varname>RuntimeMaxUse=</varname> limit after a vacuuming operation is
         complete.</para>
 
-        <para><varname>SystemMaxFileSize=</varname> and
-        <varname>RuntimeMaxFileSize=</varname> control how large
-        individual journal files may grow at most. This influences
-        the granularity in which disk space is made available through
-        rotation, i.e. deletion of historic data. Defaults to one
-        eighth of the values configured with
-        <varname>SystemMaxUse=</varname> and
-        <varname>RuntimeMaxUse=</varname>, so that usually seven
-        rotated journal files are kept as history.</para>
+        <para><varname>SystemMaxFileSize=</varname> and <varname>RuntimeMaxFileSize=</varname> control how
+        large individual journal files may grow at most. This influences the granularity in which disk space
+        is made available through rotation, i.e. deletion of historic data. Defaults to one eighth of the
+        values configured with <varname>SystemMaxUse=</varname> and <varname>RuntimeMaxUse=</varname>, so
+        that usually seven rotated journal files are kept as history. If the journal compact mode is enabled
+        (enabled by default), the maximum file size is capped to 4G.</para>
 
-        <para>Specify values in bytes or use K, M, G, T, P, E as
-        units for the specified sizes (equal to 1024, 1024², … bytes).
-        Note that size limits are enforced synchronously when journal
-        files are extended, and no explicit rotation step triggered by
-        time is needed.</para>
+        <para>Specify values in bytes or use K, M, G, T, P, E as units for the specified sizes (equal to
+        1024, 1024², … bytes). Note that size limits are enforced synchronously when journal files are
+        extended, and no explicit rotation step triggered by time is needed.</para>
 
         <para><varname>SystemMaxFiles=</varname> and
         <varname>RuntimeMaxFiles=</varname> control how many

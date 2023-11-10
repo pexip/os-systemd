@@ -49,14 +49,14 @@ static void test_netdev_one(const char *ifname, const char *key, const char *val
         assert_se(streq(output, expected));
 }
 
-static void test_link_one(const char *ifname, const char *key, const char *value, const char *expected) {
+static void test_link_one(const char *filename, const char *key, const char *value, const char *expected) {
         _cleanup_(context_clear) Context context = {};
         _cleanup_free_ char *output = NULL;
         Link *link;
 
         printf("# %s=%s\n", key, value);
         assert_se(parse_cmdline_item(key, value, &context) >= 0);
-        assert_se(link = link_get(&context, ifname));
+        assert_se(link = link_get(&context, filename));
         assert_se(link_format(link, &output) >= 0);
         puts(output);
         assert_se(streq(output, expected));
@@ -65,7 +65,8 @@ static void test_link_one(const char *ifname, const char *key, const char *value
 int main(int argc, char *argv[]) {
         test_network_one("", "ip", "dhcp6",
                          "[Match]\n"
-                         "Name=*\n"
+                         "Kind=!*\n"
+                         "Type=!loopback\n"
                          "\n[Link]\n"
                          "\n[Network]\n"
                          "DHCP=ipv6\n"
@@ -228,7 +229,8 @@ int main(int argc, char *argv[]) {
 
         test_network_one("", "rd.route", "10.1.2.3/16:10.0.2.3",
                          "[Match]\n"
-                         "Name=*\n"
+                         "Kind=!*\n"
+                         "Type=!loopback\n"
                          "\n[Link]\n"
                          "\n[Network]\n"
                          "\n[DHCP]\n"
@@ -250,7 +252,8 @@ int main(int argc, char *argv[]) {
 
         test_network_one("", "nameserver", "10.1.2.3",
                          "[Match]\n"
-                         "Name=*\n"
+                         "Kind=!*\n"
+                         "Type=!loopback\n"
                          "\n[Link]\n"
                          "\n[Network]\n"
                          "DNS=10.1.2.3\n"
@@ -259,7 +262,8 @@ int main(int argc, char *argv[]) {
 
         test_network_one("", "rd.peerdns", "0",
                          "[Match]\n"
-                         "Name=*\n"
+                         "Kind=!*\n"
+                         "Type=!loopback\n"
                          "\n[Link]\n"
                          "\n[Network]\n"
                          "\n[DHCP]\n"
@@ -268,7 +272,8 @@ int main(int argc, char *argv[]) {
 
         test_network_one("", "rd.peerdns", "1",
                          "[Match]\n"
-                         "Name=*\n"
+                         "Kind=!*\n"
+                         "Type=!loopback\n"
                          "\n[Link]\n"
                          "\n[Network]\n"
                          "\n[DHCP]\n"
@@ -332,6 +337,22 @@ int main(int argc, char *argv[]) {
                       "MACAddress=00:11:22:33:44:55\n"
                       "\n[Link]\n"
                       "Name=hogehoge\n"
+                      );
+
+        test_link_one("001122334455", "net.ifname-policy", "keep,kernel,database,onboard,slot,path,mac,00:11:22:33:44:55",
+                      "[Match]\n"
+                      "MACAddress=00:11:22:33:44:55\n"
+                      "\n[Link]\n"
+                      "NamePolicy=keep kernel database onboard slot path mac\n"
+                      "AlternativeNamesPolicy=database onboard slot path mac\n"
+                      );
+
+        test_link_one("default", "net.ifname-policy", "keep,kernel,database,onboard,slot,path,mac",
+                      "[Match]\n"
+                      "OriginalName=*\n"
+                      "\n[Link]\n"
+                      "NamePolicy=keep kernel database onboard slot path mac\n"
+                      "AlternativeNamesPolicy=database onboard slot path mac\n"
                       );
 
         test_network_two("eth0",

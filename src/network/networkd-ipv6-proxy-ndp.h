@@ -4,7 +4,10 @@
 #include "conf-parser.h"
 
 typedef struct Link Link;
+typedef struct Network Network;
 
-int link_set_ipv6_proxy_ndp_addresses(Link *link);
+void network_adjust_ipv6_proxy_ndp(Network *network);
+
+int link_request_static_ipv6_proxy_ndp_addresses(Link *link);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_ipv6_proxy_ndp_address);
