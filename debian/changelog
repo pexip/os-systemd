@@ -1,3 +1,17 @@
+systemd (252.19-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.19
+  * Refresh patches
+
+ -- Luca Boccassi <bluca@debian.org>  Fri, 10 Nov 2023 00:25:41 +0000
+
+systemd (252.18-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.18
+  * Refresh patches
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 08 Oct 2023 16:14:12 +0100
+
 systemd (252.17-1~deb12u1) bookworm; urgency=medium
 
   * New upstream version 252.17. Fixes minor security issue in arm64
