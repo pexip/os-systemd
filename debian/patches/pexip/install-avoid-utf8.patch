@@ -1,13 +1,26 @@
---- a/src/shared/install.c
-+++ b/src/shared/install.c
-@@ -320,9 +320,8 @@
-                 switch(changes[i].type) {
-                 case UNIT_FILE_SYMLINK:
+Index: os-systemd/src/shared/install.c
+===================================================================
+--- os-systemd.orig/src/shared/install.c
++++ os-systemd/src/shared/install.c
+@@ -351,9 +351,8 @@ void install_changes_dump(int r, const c
+                 switch (changes[i].type) {
+                 case INSTALL_CHANGE_SYMLINK:
                          if (!quiet)
 -                                log_info("Created symlink %s %s %s.",
 +                                log_info("Created symlink %s -> %s.",
                                           changes[i].path,
--                                         special_glyph(SPECIAL_GLYPH_ARROW),
+-                                         special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
                                           changes[i].source);
                          break;
-                 case UNIT_FILE_UNLINK:
+                 case INSTALL_CHANGE_UNLINK:
+@@ -548,8 +547,8 @@ static int create_symlink(
+         }
+ 
+         if (chroot_unit_symlinks_equivalent(lp, new_path, dest, old_path)) {
+-                log_debug("Symlink %s %s %s already exists",
+-                          new_path, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), dest);
++                log_debug("Symlink %s -> %s already exists",
++                          new_path, dest);
+                 return 1;
+         }
+ 
