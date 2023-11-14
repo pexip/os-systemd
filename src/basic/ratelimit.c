@@ -19,7 +19,7 @@ bool ratelimit_below(RateLimit *r) {
         ts = now(CLOCK_MONOTONIC);
 
         if (r->begin <= 0 ||
-            ts - r->begin > r->interval) {
+            usec_sub_unsigned(ts, r->begin) > r->interval) {
                 r->begin = ts;
 
                 /* Reset counter */
@@ -30,9 +30,34 @@ bool ratelimit_below(RateLimit *r) {
         if (r->num < r->burst)
                 goto good;
 
+        r->num++;
         return false;
 
 good:
         r->num++;
         return true;
+}
+
+unsigned ratelimit_num_dropped(RateLimit *r) {
+        assert(r);
+
+        return r->num > r->burst ? r->num - r->burst : 0;
+}
+
+usec_t ratelimit_end(const RateLimit *rl) {
+        assert(rl);
+
+        if (rl->begin == 0)
+                return 0;
+
+        return usec_add(rl->begin, rl->interval);
+}
+
+usec_t ratelimit_left(const RateLimit *rl) {
+        assert(rl);
+
+        if (rl->begin == 0)
+                return 0;
+
+        return usec_sub_unsigned(ratelimit_end(rl), now(CLOCK_MONOTONIC));
 }

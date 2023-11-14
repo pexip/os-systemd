@@ -21,6 +21,7 @@
 #include "fd-util.h"
 #include "format-util.h"
 #include "main-func.h"
+#include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "pretty-print.h"
@@ -110,7 +111,7 @@ static int help(void) {
                "     --nice=NICE                  Nice level\n"
                "     --working-directory=PATH     Set working directory\n"
                "  -d --same-dir                   Inherit working directory from caller\n"
-               "  -E --setenv=NAME=VALUE          Set environment\n"
+               "  -E --setenv=NAME[=VALUE]        Set environment variable\n"
                "  -t --pty                        Run service on pseudo TTY as STDIN/STDOUT/\n"
                "                                  STDERR\n"
                "  -P --pipe                       Pass STDIN/STDOUT/STDERR directly to service\n"
@@ -131,11 +132,11 @@ static int help(void) {
                "     --on-timezone-change         Run when the timezone changes\n"
                "     --on-clock-change            Run when the realtime clock jumps\n"
                "     --timer-property=NAME=VALUE  Set timer unit property\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , ansi_highlight(), ansi_normal()
-               , link
-        );
+               "\nSee the %s for details.\n",
+               program_invocation_short_name,
+               ansi_highlight(),
+               ansi_normal(),
+               link);
 
         return 0;
 }
@@ -240,6 +241,9 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
+        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
+         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
+        optind = 0;
         while ((c = getopt_long(argc, argv, "+hrH:M:E:p:tPqGdSu:", options, NULL)) >= 0)
 
                 switch (c) {
@@ -321,8 +325,9 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'E':
-                        if (strv_extend(&arg_environment, optarg) < 0)
-                                return log_oom();
+                        r = strv_env_replace_strdup_passthrough(&arg_environment, optarg);
+                        if (r < 0)
+                                return log_error_errno(r, "Cannot assign environment variable %s: %m", optarg);
 
                         break;
 
@@ -470,7 +475,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_WORKING_DIRECTORY:
-                        r = parse_path_argument_and_warn(optarg, true, &arg_working_directory);
+                        r = parse_path_argument(optarg, true, &arg_working_directory);
                         if (r < 0)
                                 return r;
 
@@ -502,8 +507,12 @@ static int parse_argv(int argc, char *argv[]) {
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
+
+        /* If we are talking to the per-user instance PolicyKit isn't going to help */
+        if (arg_user)
+                arg_ask_password = false;
 
         with_trigger = !!arg_path_property || !!arg_socket_property || arg_with_timer;
 
@@ -575,13 +584,13 @@ static int parse_argv(int argc, char *argv[]) {
         } else if (!arg_unit || !with_trigger)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Command line to execute required.");
 
-        if (arg_user && arg_transport != BUS_TRANSPORT_LOCAL)
+        if (arg_user && arg_transport == BUS_TRANSPORT_REMOTE)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Execution in user context is not supported on non-local systems.");
+                                       "Execution in user context is not supported on remote systems.");
 
-        if (arg_scope && arg_transport != BUS_TRANSPORT_LOCAL)
+        if (arg_scope && arg_transport == BUS_TRANSPORT_REMOTE)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Scope execution is not supported on non-local systems.");
+                                       "Scope execution is not supported on remote systems.");
 
         if (arg_scope && (arg_remain_after_exit || arg_service_type))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -637,11 +646,7 @@ static int transient_unit_set_properties(sd_bus_message *m, UnitType t, char **p
                         return bus_log_create_error(r);
         }
 
-        r = bus_append_unit_property_assignment_many(m, t, properties);
-        if (r < 0)
-                return r;
-
-        return 0;
+        return bus_append_unit_property_assignment_many(m, t, properties);
 }
 
 static int transient_cgroup_set_properties(sd_bus_message *m) {
@@ -666,15 +671,8 @@ static int transient_cgroup_set_properties(sd_bus_message *m) {
                 *end = 0;
         }
 
-        if (!isempty(arg_slice)) {
-                if (name) {
-                        char *j = strjoin(name, "-", arg_slice);
-                        free_and_replace(name, j);
-                } else
-                        name = strdup(arg_slice);
-                if (!name)
-                        return log_oom();
-        }
+        if (!isempty(arg_slice) && !strextend_with_separator(&name, "-", arg_slice))
+                return log_oom();
 
         if (!name)
                 return 0;
@@ -795,9 +793,12 @@ static int transient_service_set_properties(sd_bus_message *m, const char *pty_p
 
                 e = getenv("TERM");
                 if (e) {
-                        char *n;
+                        _cleanup_free_ char *n = NULL;
 
-                        n = strjoina("TERM=", e);
+                        n = strjoin("TERM=", e);
+                        if (!n)
+                                return log_oom();
+
                         r = sd_bus_message_append(m,
                                                   "(sv)",
                                                   "Environment", "as", 1, n);
@@ -955,10 +956,12 @@ static int make_unit_name(sd_bus *bus, UnitType t, char **ret) {
                 return 0;
         }
 
-        /* We managed to get the unique name, then let's use that to
-         * name our transient units. */
+        /* We managed to get the unique name, then let's use that to name our transient units. */
 
-        id = startswith(unique, ":1.");
+        id = startswith(unique, ":1."); /* let' strip the usual prefix */
+        if (!id)
+                id = startswith(unique, ":"); /* the spec only requires things to start with a colon, hence
+                                               * let's add a generic fallback for that. */
         if (!id)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Unique name %s has unexpected format.",
@@ -1077,10 +1080,9 @@ static int run_context_update(RunContext *c, const char *path) {
 }
 
 static int on_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error *error) {
-        RunContext *c = userdata;
+        RunContext *c = ASSERT_PTR(userdata);
 
         assert(m);
-        assert(c);
 
         return run_context_update(c, sd_bus_message_get_path(m));
 }
@@ -1159,7 +1161,7 @@ static int start_transient_service(
                         if (!pty_path)
                                 return log_oom();
                 } else
-                        assert_not_reached("Can't allocate tty via ssh");
+                        assert_not_reached();
         }
 
         /* Optionally, wait for the start job to complete. If we are supposed to read the service's stdin
@@ -1228,7 +1230,7 @@ static int start_transient_service(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet, arg_user ? STRV_MAKE_CONST("--user") : NULL);
                 if (r < 0)
                         return r;
         }
@@ -1318,7 +1320,7 @@ static int start_transient_service(
                                 log_info("Finished with result: %s", strna(c.result));
 
                         if (c.exit_code == CLD_EXITED)
-                                log_info("Main processes terminated with: code=%s/status=%i",
+                                log_info("Main processes terminated with: code=%s/status=%u",
                                          sigchld_code_to_string(c.exit_code), c.exit_status);
                         else if (c.exit_code > 0)
                                 log_info("Main processes terminated with: code=%s/status=%s",
@@ -1326,34 +1328,25 @@ static int start_transient_service(
 
                         if (timestamp_is_set(c.inactive_enter_usec) &&
                             timestamp_is_set(c.inactive_exit_usec) &&
-                            c.inactive_enter_usec > c.inactive_exit_usec) {
-                                char ts[FORMAT_TIMESPAN_MAX];
+                            c.inactive_enter_usec > c.inactive_exit_usec)
                                 log_info("Service runtime: %s",
-                                         format_timespan(ts, sizeof ts, c.inactive_enter_usec - c.inactive_exit_usec, USEC_PER_MSEC));
-                        }
+                                         FORMAT_TIMESPAN(c.inactive_enter_usec - c.inactive_exit_usec, USEC_PER_MSEC));
 
-                        if (c.cpu_usage_nsec != NSEC_INFINITY) {
-                                char ts[FORMAT_TIMESPAN_MAX];
+                        if (c.cpu_usage_nsec != NSEC_INFINITY)
                                 log_info("CPU time consumed: %s",
-                                         format_timespan(ts, sizeof ts, DIV_ROUND_UP(c.cpu_usage_nsec, NSEC_PER_USEC), USEC_PER_MSEC));
-                        }
+                                         FORMAT_TIMESPAN(DIV_ROUND_UP(c.cpu_usage_nsec, NSEC_PER_USEC), USEC_PER_MSEC));
 
-                        if (c.ip_ingress_bytes != UINT64_MAX) {
-                                char bytes[FORMAT_BYTES_MAX];
-                                log_info("IP traffic received: %s", format_bytes(bytes, sizeof bytes, c.ip_ingress_bytes));
-                        }
-                        if (c.ip_egress_bytes != UINT64_MAX) {
-                                char bytes[FORMAT_BYTES_MAX];
-                                log_info("IP traffic sent: %s", format_bytes(bytes, sizeof bytes, c.ip_egress_bytes));
-                        }
-                        if (c.io_read_bytes != UINT64_MAX) {
-                                char bytes[FORMAT_BYTES_MAX];
-                                log_info("IO bytes read: %s", format_bytes(bytes, sizeof bytes, c.io_read_bytes));
-                        }
-                        if (c.io_write_bytes != UINT64_MAX) {
-                                char bytes[FORMAT_BYTES_MAX];
-                                log_info("IO bytes written: %s", format_bytes(bytes, sizeof bytes, c.io_write_bytes));
-                        }
+                        if (c.ip_ingress_bytes != UINT64_MAX)
+                                log_info("IP traffic received: %s", FORMAT_BYTES(c.ip_ingress_bytes));
+
+                        if (c.ip_egress_bytes != UINT64_MAX)
+                                log_info("IP traffic sent: %s", FORMAT_BYTES(c.ip_egress_bytes));
+
+                        if (c.io_read_bytes != UINT64_MAX)
+                                log_info("IO bytes read: %s", FORMAT_BYTES(c.io_read_bytes));
+
+                        if (c.io_write_bytes != UINT64_MAX)
+                                log_info("IO bytes written: %s", FORMAT_BYTES(c.io_write_bytes));
                 }
 
                 /* Try to propagate the service's return value. But if the service defines
@@ -1473,7 +1466,7 @@ static int start_transient_scope(sd_bus *bus) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = bus_wait_for_jobs_one(w, object, arg_quiet);
+        r = bus_wait_for_jobs_one(w, object, arg_quiet, arg_user ? STRV_MAKE_CONST("--user") : NULL);
         if (r < 0)
                 return r;
 
@@ -1539,7 +1532,10 @@ static int start_transient_scope(sd_bus *bus) {
                         return log_error_errno(errno, "Failed to change UID to " UID_FMT ": %m", uid);
         }
 
-        env = strv_env_merge(3, environ, user_env, arg_environment);
+        if (arg_working_directory && chdir(arg_working_directory) < 0)
+                return log_error_errno(errno, "Failed to change directory to '%s': %m", arg_working_directory);
+
+        env = strv_env_merge(environ, user_env, arg_environment);
         if (!env)
                 return log_oom();
 
@@ -1641,7 +1637,7 @@ static int start_transient_trigger(
         else if (streq(suffix, ".timer"))
                 r = transient_timer_set_properties(m);
         else
-                assert_not_reached("Invalid suffix");
+                assert_not_reached();
         if (r < 0)
                 return r;
 
@@ -1693,7 +1689,7 @@ static int start_transient_trigger(
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = bus_wait_for_jobs_one(w, object, arg_quiet);
+        r = bus_wait_for_jobs_one(w, object, arg_quiet, arg_user ? STRV_MAKE_CONST("--user") : NULL);
         if (r < 0)
                 return r;
 
@@ -1704,6 +1700,19 @@ static int start_transient_trigger(
         }
 
         return 0;
+}
+
+static bool shall_make_executable_absolute(void) {
+        if (strv_isempty(arg_cmdline))
+                return false;
+        if (arg_transport != BUS_TRANSPORT_LOCAL)
+                return false;
+
+        FOREACH_STRING(f, "RootDirectory=", "RootImage=", "ExecSearchPath=", "MountImages=", "ExtensionImages=")
+                if (strv_find_startswith(arg_property, f))
+                        return false;
+
+        return true;
 }
 
 static int run(int argc, char* argv[]) {
@@ -1719,10 +1728,7 @@ static int run(int argc, char* argv[]) {
         if (r <= 0)
                 return r;
 
-        if (!strv_isempty(arg_cmdline) &&
-            arg_transport == BUS_TRANSPORT_LOCAL &&
-            !strv_find_startswith(arg_property, "RootDirectory=") &&
-            !strv_find_startswith(arg_property, "RootImage=")) {
+        if (shall_make_executable_absolute()) {
                 /* Patch in an absolute path to fail early for user convenience, but only when we can do it
                  * (i.e. we will be running from the same file system). This also uses the user's $PATH,
                  * while we use a fixed search path in the manager. */
@@ -1751,12 +1757,12 @@ static int run(int argc, char* argv[]) {
 
         /* If --wait is used connect via the bus, unconditionally, as ref/unref is not supported via the limited direct
          * connection */
-        if (arg_wait || arg_stdio != ARG_STDIO_NONE)
+        if (arg_wait || arg_stdio != ARG_STDIO_NONE || (arg_user && arg_transport != BUS_TRANSPORT_LOCAL))
                 r = bus_connect_transport(arg_transport, arg_host, arg_user, &bus);
         else
                 r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
         if (r < 0)
-                return bus_log_connect_error(r);
+                return bus_log_connect_error(r, arg_transport);
 
         if (arg_scope)
                 r = start_transient_scope(bus);

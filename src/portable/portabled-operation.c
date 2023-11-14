@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "portabled-operation.h"
@@ -7,27 +9,26 @@
 
 static int operation_done(sd_event_source *s, const siginfo_t *si, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        Operation *o = userdata;
+        Operation *o = ASSERT_PTR(userdata);
         int r;
 
-        assert(o);
         assert(si);
 
-        log_debug("Operating " PID_FMT " is now complete with code=%s status=%i",
+        log_debug("Operation " PID_FMT " is now complete with code=%s status=%i",
                   o->pid,
                   sigchld_code_to_string(si->si_code), si->si_status);
 
         o->pid = 0;
 
         if (si->si_code != CLD_EXITED) {
-                r = sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED, "Child died abnormally.");
+                r = sd_bus_error_set(&error, SD_BUS_ERROR_FAILED, "Child died abnormally.");
                 goto fail;
         }
 
         if (si->si_status == EXIT_SUCCESS)
                 r = 0;
         else if (read(o->errno_fd, &r, sizeof(r)) != sizeof(r)) { /* Try to acquire error code for failed operation */
-                r = sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED, "Child failed.");
+                r = sd_bus_error_set(&error, SD_BUS_ERROR_FAILED, "Child failed.");
                 goto fail;
         }
 

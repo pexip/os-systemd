@@ -38,12 +38,12 @@ static bool output_show_unit_file(const UnitFileList *u, char **states, char **p
                 if (!dot)
                         return false;
 
-                if (!strv_find(arg_types, dot+1))
+                if (!strv_contains(arg_types, dot+1))
                         return false;
         }
 
         if (!strv_isempty(states) &&
-            !strv_find(states, unit_file_state_to_string(u->state)))
+            !strv_contains(states, unit_file_state_to_string(u->state)))
                 return false;
 
         return true;
@@ -54,15 +54,15 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
         _cleanup_(unit_file_presets_freep) UnitFilePresets presets = {};
         int r;
 
-        table = table_new("unit file", "state", "vendor preset");
+        table = table_new("unit file", "state", "preset");
         if (!table)
                 return log_oom();
 
-        table_set_header(table, !arg_no_legend);
+        table_set_header(table, arg_legend != 0);
         if (arg_full)
                 table_set_width(table, 0);
 
-        (void) table_set_empty_string(table, "-");
+        table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         for (const UnitFileList *u = units; u < units + c; u++) {
                 const char *on_underline = NULL, *on_unit_color = NULL, *id;
@@ -127,17 +127,15 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
         if (r < 0)
                 return r;
 
-        if (!arg_no_legend)
+        if (arg_legend != 0)
                 printf("\n%u unit files listed.\n", c);
 
         return 0;
 }
 
-int list_unit_files(int argc, char *argv[], void *userdata) {
+int verb_list_unit_files(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_free_ UnitFileList *units = NULL;
-        UnitFileList *unit;
-        size_t size = 0;
         unsigned c = 0;
         const char *state;
         char *path;
@@ -235,7 +233,7 @@ int list_unit_files(int argc, char *argv[], void *userdata) {
 
                 while ((r = sd_bus_message_read(reply, "(ss)", &path, &state)) > 0) {
 
-                        if (!GREEDY_REALLOC(units, size, c + 1))
+                        if (!GREEDY_REALLOC(units, c + 1))
                                 return log_oom();
 
                         units[c] = (struct UnitFileList) {
@@ -257,7 +255,7 @@ int list_unit_files(int argc, char *argv[], void *userdata) {
                         return bus_log_parse_error(r);
         }
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         typesafe_qsort(units, c, compare_unit_file_list);
         r = output_unit_file_list(units, c);
@@ -265,7 +263,7 @@ int list_unit_files(int argc, char *argv[], void *userdata) {
                 return r;
 
         if (install_client_side())
-                for (unit = units; unit < units + c; unit++)
+                for (UnitFileList *unit = units; unit < units + c; unit++)
                         free(unit->path);
 
         if (c == 0)

@@ -36,7 +36,6 @@ static int bus_message_append_strv_key_value(
                 sd_bus_message *m,
                 const char **l) {
 
-        const char **k, **v;
         int r;
 
         assert(m);
@@ -198,11 +197,10 @@ static int async_polkit_defer(sd_event_source *s, void *userdata) {
 }
 
 static int async_polkit_callback(sd_bus_message *reply, void *userdata, sd_bus_error *error) {
-        AsyncPolkitQuery *q = userdata;
+        AsyncPolkitQuery *q = ASSERT_PTR(userdata);
         int r;
 
         assert(reply);
-        assert(q);
 
         assert(q->slot);
         q->slot = sd_bus_slot_unref(q->slot);
@@ -259,24 +257,20 @@ int bus_verify_polkit_async(
                 Hashmap **registry,
                 sd_bus_error *ret_error) {
 
-#if ENABLE_POLKIT
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *pk = NULL;
-        AsyncPolkitQuery *q;
-        int c;
-#endif
         const char *sender;
         int r;
 
         assert(call);
         assert(action);
         assert(registry);
+        assert(ret_error);
 
         r = check_good_user(call, good_user);
         if (r != 0)
                 return r;
 
 #if ENABLE_POLKIT
-        q = hashmap_get(*registry, call);
+        AsyncPolkitQuery *q = hashmap_get(*registry, call);
         if (q) {
                 int authorized, challenge;
 
@@ -332,7 +326,9 @@ int bus_verify_polkit_async(
                 return -EBADMSG;
 
 #if ENABLE_POLKIT
-        c = sd_bus_message_get_allow_interactive_authorization(call);
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *pk = NULL;
+
+        int c = sd_bus_message_get_allow_interactive_authorization(call);
         if (c < 0)
                 return c;
         if (c > 0)
@@ -408,8 +404,11 @@ int bus_verify_polkit_async(
         return -EACCES;
 }
 
-void bus_verify_polkit_async_registry_free(Hashmap *registry) {
+Hashmap *bus_verify_polkit_async_registry_free(Hashmap *registry) {
 #if ENABLE_POLKIT
-        hashmap_free_with_destructor(registry, async_polkit_query_free);
+        return hashmap_free_with_destructor(registry, async_polkit_query_free);
+#else
+        assert(hashmap_isempty(registry));
+        return hashmap_free(registry);
 #endif
 }

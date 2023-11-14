@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <sys/stat.h>
+
 #include "sd-netlink.h"
 
 #include "in-addr-util.h"
+#include "network-util.h"
 #include "ratelimit.h"
 #include "resolve-util.h"
 
@@ -23,6 +26,7 @@ struct LinkAddress {
 
         int family;
         union in_addr_union in_addr;
+        unsigned char prefixlen;
 
         unsigned char flags, scope;
 
@@ -64,6 +68,8 @@ struct Link {
         DnsScope *mdns_ipv4_scope;
         DnsScope *mdns_ipv6_scope;
 
+        struct stat networkd_state_file_stat;
+        LinkOperationalState networkd_operstate;
         bool is_managed;
 
         char *ifname;
@@ -91,7 +97,7 @@ void link_allocate_scopes(Link *l);
 
 DnsServer* link_set_dns_server(Link *l, DnsServer *s);
 DnsServer* link_get_dns_server(Link *l);
-void link_next_dns_server(Link *l);
+void link_next_dns_server(Link *l, DnsServer *if_current);
 
 DnssecMode link_get_dnssec_mode(Link *l);
 bool link_dnssec_supported(Link *l);

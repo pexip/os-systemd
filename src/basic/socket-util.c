@@ -23,10 +23,7 @@
 #include "format-util.h"
 #include "io-util.h"
 #include "log.h"
-#include "macro.h"
 #include "memory-util.h"
-#include "missing_socket.h"
-#include "missing_network.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -34,6 +31,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "sysctl-util.h"
 #include "user-util.h"
 #include "utf8.h"
 
@@ -109,7 +107,7 @@ int socket_address_verify(const SocketAddress *a, bool strict) {
                                 /* If there's no embedded NUL byte, then the size needs to match the whole
                                  * structure or the structure with one extra NUL byte suffixed. (Yeah, Linux is awful,
                                  * and considers both equivalent: getsockname() even extends sockaddr_un beyond its
-                                 * size if the path is non NUL terminated.)*/
+                                 * size if the path is non NUL terminated.) */
                                 if (!IN_SET(a->size, sizeof(a->sockaddr.un.sun_path), sizeof(a->sockaddr.un.sun_path)+1))
                                         return -EINVAL;
                         }
@@ -280,10 +278,48 @@ const char* socket_address_get_path(const SocketAddress *a) {
 }
 
 bool socket_ipv6_is_supported(void) {
-        if (access("/proc/net/if_inet6", F_OK) != 0)
+        static int cached = -1;
+
+        if (cached < 0) {
+
+                if (access("/proc/net/if_inet6", F_OK) < 0) {
+
+                        if (errno != ENOENT) {
+                                log_debug_errno(errno, "Unexpected error when checking whether /proc/net/if_inet6 exists: %m");
+                                return false;
+                        }
+
+                        cached = false;
+                } else
+                        cached = true;
+        }
+
+        return cached;
+}
+
+bool socket_ipv6_is_enabled(void) {
+        _cleanup_free_ char *v = NULL;
+        int r;
+
+        /* Much like socket_ipv6_is_supported(), but also checks that the sysctl that disables IPv6 on all
+         * interfaces isn't turned on */
+
+        if (!socket_ipv6_is_supported())
                 return false;
 
-        return true;
+        r = sysctl_read_ip_property(AF_INET6, "all", "disable_ipv6", &v);
+        if (r < 0) {
+                log_debug_errno(r, "Unexpected error reading 'net.ipv6.conf.all.disable_ipv6' sysctl: %m");
+                return true;
+        }
+
+        r = parse_boolean(v);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to pare 'net.ipv6.conf.all.disable_ipv6' sysctl: %m");
+                return true;
+        }
+
+        return !r;
 }
 
 bool socket_address_matches_fd(const SocketAddress *a, int fd) {
@@ -320,7 +356,7 @@ bool socket_address_matches_fd(const SocketAddress *a, int fd) {
 }
 
 int sockaddr_port(const struct sockaddr *_sa, unsigned *ret_port) {
-        union sockaddr_union *sa = (union sockaddr_union*) _sa;
+        const union sockaddr_union *sa = (const union sockaddr_union*) _sa;
 
         /* Note, this returns the port as 'unsigned' rather than 'uint16_t', as AF_VSOCK knows larger ports */
 
@@ -342,6 +378,60 @@ int sockaddr_port(const struct sockaddr *_sa, unsigned *ret_port) {
 
         default:
                 return -EAFNOSUPPORT;
+        }
+}
+
+const union in_addr_union *sockaddr_in_addr(const struct sockaddr *_sa) {
+        const union sockaddr_union *sa = (const union sockaddr_union*) _sa;
+
+        if (!sa)
+                return NULL;
+
+        switch (sa->sa.sa_family) {
+
+        case AF_INET:
+                return (const union in_addr_union*) &sa->in.sin_addr;
+
+        case AF_INET6:
+                return (const union in_addr_union*) &sa->in6.sin6_addr;
+
+        default:
+                return NULL;
+        }
+}
+
+int sockaddr_set_in_addr(
+                union sockaddr_union *u,
+                int family,
+                const union in_addr_union *a,
+                uint16_t port) {
+
+        assert(u);
+        assert(a);
+
+        switch (family) {
+
+        case AF_INET:
+                u->in = (struct sockaddr_in) {
+                        .sin_family = AF_INET,
+                        .sin_addr = a->in,
+                        .sin_port = htobe16(port),
+                };
+
+                return 0;
+
+        case AF_INET6:
+                u->in6 = (struct sockaddr_in6) {
+                        .sin6_family = AF_INET6,
+                        .sin6_addr = a->in6,
+                        .sin6_port = htobe16(port),
+                };
+
+                return 0;
+
+        default:
+                return -EAFNOSUPPORT;
+
         }
 }
 
@@ -400,23 +490,21 @@ int sockaddr_pretty(
                         if (r < 0)
                                 return -ENOMEM;
                 } else {
-                        char a[INET6_ADDRSTRLEN], ifname[IF_NAMESIZE + 1];
-
-                        inet_ntop(AF_INET6, &sa->in6.sin6_addr, a, sizeof(a));
-                        if (sa->in6.sin6_scope_id != 0)
-                                format_ifname_full(sa->in6.sin6_scope_id, ifname, FORMAT_IFNAME_IFINDEX);
+                        const char *a = IN6_ADDR_TO_STRING(&sa->in6.sin6_addr);
 
                         if (include_port) {
-                                r = asprintf(&p,
+                                if (asprintf(&p,
                                              "[%s]:%u%s%s",
                                              a,
                                              be16toh(sa->in6.sin6_port),
                                              sa->in6.sin6_scope_id != 0 ? "%" : "",
-                                             sa->in6.sin6_scope_id != 0 ? ifname : "");
-                                if (r < 0)
+                                             FORMAT_IFNAME_FULL(sa->in6.sin6_scope_id, FORMAT_IFNAME_IFINDEX)) < 0)
                                         return -ENOMEM;
                         } else {
-                                p = sa->in6.sin6_scope_id != 0 ? strjoin(a, "%", ifname) : strdup(a);
+                                if (sa->in6.sin6_scope_id != 0)
+                                        p = strjoin(a, "%", FORMAT_IFNAME_FULL(sa->in6.sin6_scope_id, FORMAT_IFNAME_IFINDEX));
+                                else
+                                        p = strdup(a);
                                 if (!p)
                                         return -ENOMEM;
                         }
@@ -496,7 +584,7 @@ int getpeername_pretty(int fd, bool include_port, char **ret) {
                 return -errno;
 
         if (sa.sa.sa_family == AF_UNIX) {
-                struct ucred ucred = {};
+                struct ucred ucred = UCRED_INVALID;
 
                 /* UNIX connection sockets are anonymous, so let's use
                  * PID/UID as pretty credentials instead */
@@ -561,24 +649,24 @@ int socknameinfo_pretty(union sockaddr_union *sa, socklen_t salen, char **_ret) 
 }
 
 static const char* const netlink_family_table[] = {
-        [NETLINK_ROUTE] = "route",
-        [NETLINK_FIREWALL] = "firewall",
-        [NETLINK_INET_DIAG] = "inet-diag",
-        [NETLINK_NFLOG] = "nflog",
-        [NETLINK_XFRM] = "xfrm",
-        [NETLINK_SELINUX] = "selinux",
-        [NETLINK_ISCSI] = "iscsi",
-        [NETLINK_AUDIT] = "audit",
-        [NETLINK_FIB_LOOKUP] = "fib-lookup",
-        [NETLINK_CONNECTOR] = "connector",
-        [NETLINK_NETFILTER] = "netfilter",
-        [NETLINK_IP6_FW] = "ip6-fw",
-        [NETLINK_DNRTMSG] = "dnrtmsg",
+        [NETLINK_ROUTE]          = "route",
+        [NETLINK_FIREWALL]       = "firewall",
+        [NETLINK_INET_DIAG]      = "inet-diag",
+        [NETLINK_NFLOG]          = "nflog",
+        [NETLINK_XFRM]           = "xfrm",
+        [NETLINK_SELINUX]        = "selinux",
+        [NETLINK_ISCSI]          = "iscsi",
+        [NETLINK_AUDIT]          = "audit",
+        [NETLINK_FIB_LOOKUP]     = "fib-lookup",
+        [NETLINK_CONNECTOR]      = "connector",
+        [NETLINK_NETFILTER]      = "netfilter",
+        [NETLINK_IP6_FW]         = "ip6-fw",
+        [NETLINK_DNRTMSG]        = "dnrtmsg",
         [NETLINK_KOBJECT_UEVENT] = "kobject-uevent",
-        [NETLINK_GENERIC] = "generic",
-        [NETLINK_SCSITRANSPORT] = "scsitransport",
-        [NETLINK_ECRYPTFS] = "ecryptfs",
-        [NETLINK_RDMA] = "rdma",
+        [NETLINK_GENERIC]        = "generic",
+        [NETLINK_SCSITRANSPORT]  = "scsitransport",
+        [NETLINK_ECRYPTFS]       = "ecryptfs",
+        [NETLINK_RDMA]           = "rdma",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_FALLBACK(netlink_family, int, INT_MAX);
@@ -685,13 +773,29 @@ int fd_set_rcvbuf(int fd, size_t n, bool increase) {
 }
 
 static const char* const ip_tos_table[] = {
-        [IPTOS_LOWDELAY] = "low-delay",
-        [IPTOS_THROUGHPUT] = "throughput",
+        [IPTOS_LOWDELAY]    = "low-delay",
+        [IPTOS_THROUGHPUT]  = "throughput",
         [IPTOS_RELIABILITY] = "reliability",
-        [IPTOS_LOWCOST] = "low-cost",
+        [IPTOS_LOWCOST]     = "low-cost",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_FALLBACK(ip_tos, int, 0xff);
+
+bool ifname_valid_char(char a) {
+        if ((unsigned char) a >= 127U)
+                return false;
+
+        if ((unsigned char) a <= 32U)
+                return false;
+
+        if (IN_SET(a,
+                   ':',  /* colons are used by the legacy "alias" interface logic */
+                   '/',  /* slashes cannot work, since we need to use network interfaces in sysfs paths, and in paths slashes are separators */
+                   '%')) /* %d is used in the kernel's weird foo%d format string naming feature which we really really don't want to ever run into by accident */
+                return false;
+
+        return true;
+}
 
 bool ifname_valid_full(const char *p, IfnameValidFlags flags) {
         bool numeric = true;
@@ -705,6 +809,10 @@ bool ifname_valid_full(const char *p, IfnameValidFlags flags) {
         if (isempty(p))
                 return false;
 
+        /* A valid ifindex? If so, it's valid iff IFNAME_VALID_NUMERIC is set */
+        if (parse_ifindex(p) >= 0)
+                return flags & IFNAME_VALID_NUMERIC;
+
         if (flags & IFNAME_VALID_ALTERNATIVE) {
                 if (strlen(p) >= ALTIFNAMSIZ)
                         return false;
@@ -716,27 +824,22 @@ bool ifname_valid_full(const char *p, IfnameValidFlags flags) {
         if (dot_or_dot_dot(p))
                 return false;
 
+        /* Let's refuse "all" and "default" as interface name, to avoid collisions with the special sysctl
+         * directories /proc/sys/net/{ipv4,ipv6}/conf/{all,default} */
+        if (!FLAGS_SET(flags, IFNAME_VALID_SPECIAL) && STR_IN_SET(p, "all", "default"))
+                return false;
+
         for (const char *t = p; *t; t++) {
-                if ((unsigned char) *t >= 127U)
+                if (!ifname_valid_char(*t))
                         return false;
 
-                if ((unsigned char) *t <= 32U)
-                        return false;
-
-                if (IN_SET(*t, ':', '/'))
-                        return false;
-
-                numeric = numeric && (*t >= '0' && *t <= '9');
+                numeric = numeric && ascii_isdigit(*t);
         }
 
-        if (numeric) {
-                if (!(flags & IFNAME_VALID_NUMERIC))
-                        return false;
-
-                /* Verify that the number is well-formatted and in range. */
-                if (parse_ifindex(p) < 0)
-                        return false;
-        }
+        /* It's fully numeric but didn't parse as valid ifindex above? if so, it must be too large or zero or
+         * so, let's refuse that. */
+        if (numeric)
+                return false;
 
         return true;
 }
@@ -851,7 +954,7 @@ int getpeergroups(int fd, gid_t **ret) {
 ssize_t send_one_fd_iov_sa(
                 int transport_fd,
                 int fd,
-                struct iovec *iov, size_t iovlen,
+                const struct iovec *iov, size_t iovlen,
                 const struct sockaddr *sa, socklen_t len,
                 int flags) {
 
@@ -859,7 +962,7 @@ ssize_t send_one_fd_iov_sa(
         struct msghdr mh = {
                 .msg_name = (struct sockaddr*) sa,
                 .msg_namelen = len,
-                .msg_iov = iov,
+                .msg_iov = (struct iovec *)iov,
                 .msg_iovlen = iovlen,
         };
         ssize_t k;
@@ -1129,9 +1232,12 @@ int sockaddr_un_set_path(struct sockaddr_un *ret, const char *path) {
         /* Don't allow paths larger than the space in sockaddr_un. Note that we are a tiny bit more restrictive than
          * the kernel is: we insist on NUL termination (both for abstract namespace and regular file system socket
          * addresses!), which the kernel doesn't. We do this to reduce chance of incompatibility with other apps that
-         * do not expect non-NUL terminated file system path*/
+         * do not expect non-NUL terminated file system path. */
         if (l+1 > sizeof(ret->sun_path))
-                return -EINVAL;
+                return path[0] == '@' ? -EINVAL : -ENAMETOOLONG; /* return a recognizable error if this is
+                                                                  * too long to fit into a sockaddr_un, but
+                                                                  * is a file system path, and thus might be
+                                                                  * connectible via O_PATH indirection. */
 
         *ret = (struct sockaddr_un) {
                 .sun_family = AF_UNIX,
@@ -1156,33 +1262,27 @@ int socket_bind_to_ifname(int fd, const char *ifname) {
 
         /* Call with NULL to drop binding */
 
-        if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen_ptr(ifname)) < 0)
-                return -errno;
-
-        return 0;
+        return RET_NERRNO(setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen_ptr(ifname)));
 }
 
 int socket_bind_to_ifindex(int fd, int ifindex) {
-        char ifname[IF_NAMESIZE + 1];
+        char ifname[IF_NAMESIZE];
         int r;
 
         assert(fd >= 0);
 
-        if (ifindex <= 0) {
+        if (ifindex <= 0)
                 /* Drop binding */
-                if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, NULL, 0) < 0)
-                        return -errno;
-
-                return 0;
-        }
+                return RET_NERRNO(setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, NULL, 0));
 
         r = setsockopt_int(fd, SOL_SOCKET, SO_BINDTOIFINDEX, ifindex);
         if (r != -ENOPROTOOPT)
                 return r;
 
         /* Fall back to SO_BINDTODEVICE on kernels < 5.0 which didn't have SO_BINDTOIFINDEX */
-        if (!format_ifname(ifindex, ifname))
-                return -errno;
+        r = format_ifname(ifindex, ifname);
+        if (r < 0)
+                return r;
 
         return socket_bind_to_ifname(fd, ifname);
 }
@@ -1207,7 +1307,7 @@ ssize_t recvmsg_safe(int sockfd, struct msghdr *msg, int flags) {
         return n;
 }
 
-int socket_get_family(int fd, int *ret) {
+int socket_get_family(int fd) {
         int af;
         socklen_t sl = sizeof(af);
 
@@ -1221,12 +1321,11 @@ int socket_get_family(int fd, int *ret) {
 }
 
 int socket_set_recvpktinfo(int fd, int af, bool b) {
-        int r;
 
         if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
+                af = socket_get_family(fd);
+                if (af < 0)
+                        return af;
         }
 
         switch (af) {
@@ -1248,141 +1347,124 @@ int socket_set_recvpktinfo(int fd, int af, bool b) {
         }
 }
 
-int socket_set_recverr(int fd, int af, bool b) {
-        int r;
-
-        if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
-        }
-
-        switch (af) {
-
-        case AF_INET:
-                return setsockopt_int(fd, IPPROTO_IP, IP_RECVERR, b);
-
-        case AF_INET6:
-                return setsockopt_int(fd, IPPROTO_IPV6, IPV6_RECVERR, b);
-
-        default:
-                return -EAFNOSUPPORT;
-        }
-}
-
-int socket_set_recvttl(int fd, int af, bool b) {
-        int r;
-
-        if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
-        }
-
-        switch (af) {
-
-        case AF_INET:
-                return setsockopt_int(fd, IPPROTO_IP, IP_RECVTTL, b);
-
-        case AF_INET6:
-                return setsockopt_int(fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, b);
-
-        default:
-                return -EAFNOSUPPORT;
-        }
-}
-
-int socket_set_ttl(int fd, int af, int ttl) {
-        int r;
-
-        if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
-        }
-
-        switch (af) {
-
-        case AF_INET:
-                return setsockopt_int(fd, IPPROTO_IP, IP_TTL, ttl);
-
-        case AF_INET6:
-                return setsockopt_int(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, ttl);
-
-        default:
-                return -EAFNOSUPPORT;
-        }
-}
-
 int socket_set_unicast_if(int fd, int af, int ifi) {
         be32_t ifindex_be = htobe32(ifi);
-        int r;
 
         if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
+                af = socket_get_family(fd);
+                if (af < 0)
+                        return af;
         }
 
         switch (af) {
 
         case AF_INET:
-                if (setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifindex_be, sizeof(ifindex_be)) < 0)
-                        return -errno;
-
-                return 0;
+                return RET_NERRNO(setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifindex_be, sizeof(ifindex_be)));
 
         case AF_INET6:
-                if (setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &ifindex_be, sizeof(ifindex_be)) < 0)
-                        return -errno;
-
-                return 0;
+                return RET_NERRNO(setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &ifindex_be, sizeof(ifindex_be)));
 
         default:
                 return -EAFNOSUPPORT;
         }
 }
 
-int socket_set_freebind(int fd, int af, bool b) {
-        int r;
-
+int socket_set_option(int fd, int af, int opt_ipv4, int opt_ipv6, int val) {
         if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
+                af = socket_get_family(fd);
+                if (af < 0)
+                        return af;
         }
 
         switch (af) {
 
         case AF_INET:
-                return setsockopt_int(fd, IPPROTO_IP, IP_FREEBIND, b);
+                return setsockopt_int(fd, IPPROTO_IP, opt_ipv4, val);
 
         case AF_INET6:
-                return setsockopt_int(fd, IPPROTO_IPV6, IPV6_FREEBIND, b);
+                return setsockopt_int(fd, IPPROTO_IPV6, opt_ipv6, val);
 
         default:
                 return -EAFNOSUPPORT;
         }
 }
 
-int socket_set_transparent(int fd, int af, bool b) {
-        int r;
+int socket_get_mtu(int fd, int af, size_t *ret) {
+        int mtu, r;
 
         if (af == AF_UNSPEC) {
-                r = socket_get_family(fd, &af);
-                if (r < 0)
-                        return r;
+                af = socket_get_family(fd);
+                if (af < 0)
+                        return af;
         }
 
         switch (af) {
 
         case AF_INET:
-                return setsockopt_int(fd, IPPROTO_IP, IP_TRANSPARENT, b);
+                r = getsockopt_int(fd, IPPROTO_IP, IP_MTU, &mtu);
+                break;
 
         case AF_INET6:
-                return setsockopt_int(fd, IPPROTO_IPV6, IPV6_TRANSPARENT, b);
+                r = getsockopt_int(fd, IPPROTO_IPV6, IPV6_MTU, &mtu);
+                break;
 
         default:
                 return -EAFNOSUPPORT;
         }
+
+        if (r < 0)
+                return r;
+        if (mtu <= 0)
+                return -EINVAL;
+
+        *ret = (size_t) mtu;
+        return 0;
+}
+
+int connect_unix_path(int fd, int dir_fd, const char *path) {
+        _cleanup_close_ int inode_fd = -1;
+        union sockaddr_union sa = {
+                .un.sun_family = AF_UNIX,
+        };
+        size_t path_len;
+        socklen_t salen;
+
+        assert(fd >= 0);
+        assert(dir_fd == AT_FDCWD || dir_fd >= 0);
+        assert(path);
+
+        /* Connects to the specified AF_UNIX socket in the file system. Works around the 108 byte size limit
+         * in sockaddr_un, by going via O_PATH if needed. This hence works for any kind of path. */
+
+        path_len = strlen(path);
+
+        /* Refuse zero length path early, to make sure AF_UNIX stack won't mistake this for an abstract
+         * namespace path, since first char is NUL */
+        if (path_len <= 0)
+                return -EINVAL;
+
+        if (dir_fd == AT_FDCWD && path_len < sizeof(sa.un.sun_path)) {
+                memcpy(sa.un.sun_path, path, path_len + 1);
+                salen = offsetof(struct sockaddr_un, sun_path) + path_len + 1;
+        } else {
+                const char *proc;
+                size_t proc_len;
+
+                /* If dir_fd is specified, then we need to go the indirect O_PATH route, because connectat()
+                 * does not exist. If the path is too long, we also need to take the indirect route, since we
+                 * can't fit this into a sockaddr_un directly. */
+
+                inode_fd = openat(dir_fd, path, O_PATH|O_CLOEXEC);
+                if (inode_fd < 0)
+                        return -errno;
+
+                proc = FORMAT_PROC_FD_PATH(inode_fd);
+                proc_len = strlen(proc);
+
+                assert(proc_len < sizeof(sa.un.sun_path));
+                memcpy(sa.un.sun_path, proc, proc_len + 1);
+                salen = offsetof(struct sockaddr_un, sun_path) + proc_len + 1;
+        }
+
+        return RET_NERRNO(connect(fd, &sa.sa, salen));
 }

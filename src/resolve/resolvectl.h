@@ -18,7 +18,7 @@ typedef enum ExecutionMode {
         MODE_STATUS,
         MODE_SET_LINK,
         MODE_REVERT_LINK,
-        _MODE_INVALID = -1,
+        _MODE_INVALID = -EINVAL,
 } ExecutionMode;
 
 extern ExecutionMode arg_mode;
@@ -26,4 +26,10 @@ extern char **arg_set_dns;
 extern char **arg_set_domain;
 extern bool arg_ifindex_permissive;
 
-int ifname_mangle(const char *s);
+int ifname_mangle_full(const char *s, bool drop_protocol_specifier);
+static inline int ifname_mangle(const char *s) {
+        return ifname_mangle_full(s, false);
+}
+static inline int ifname_resolvconf_mangle(const char *s) {
+        return ifname_mangle_full(s, true);
+}

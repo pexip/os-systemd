@@ -6,15 +6,17 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "chase-symlinks.h"
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
+#include "glyph-util.h"
 #include "hashmap.h"
-#include "locale-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "nulstr-util.h"
 #include "pager.h"
+#include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "pretty-print.h"
@@ -89,7 +91,7 @@ static int notify_override_masked(const char *top, const char *bottom) {
 
         printf("%s%s%s     %s %s %s\n",
                ansi_highlight_red(), "[MASKED]", ansi_normal(),
-               top, special_glyph(SPECIAL_GLYPH_ARROW), bottom);
+               top, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), bottom);
         return 1;
 }
 
@@ -99,7 +101,7 @@ static int notify_override_equivalent(const char *top, const char *bottom) {
 
         printf("%s%s%s %s %s %s\n",
                ansi_highlight_green(), "[EQUIVALENT]", ansi_normal(),
-               top, special_glyph(SPECIAL_GLYPH_ARROW), bottom);
+               top, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), bottom);
         return 1;
 }
 
@@ -109,7 +111,7 @@ static int notify_override_redirected(const char *top, const char *bottom) {
 
         printf("%s%s%s %s %s %s\n",
                ansi_highlight(), "[REDIRECTED]", ansi_normal(),
-               top, special_glyph(SPECIAL_GLYPH_ARROW), bottom);
+               top, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), bottom);
         return 1;
 }
 
@@ -119,7 +121,7 @@ static int notify_override_overridden(const char *top, const char *bottom) {
 
         printf("%s%s%s %s %s %s\n",
                ansi_highlight(), "[OVERRIDDEN]", ansi_normal(),
-               top, special_glyph(SPECIAL_GLYPH_ARROW), bottom);
+               top, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), bottom);
         return 1;
 }
 
@@ -129,7 +131,7 @@ static int notify_override_extended(const char *top, const char *bottom) {
 
         printf("%s%s%s   %s %s %s\n",
                ansi_highlight(), "[EXTENDED]", ansi_normal(),
-               top, special_glyph(SPECIAL_GLYPH_ARROW), bottom);
+               top, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), bottom);
         return 1;
 }
 
@@ -193,7 +195,6 @@ static int enumerate_dir_d(
         _cleanup_free_ char *unit = NULL;
         _cleanup_free_ char *path = NULL;
         _cleanup_strv_free_ char **list = NULL;
-        char **file;
         char *c;
         int r;
 
@@ -234,7 +235,7 @@ static int enumerate_dir_d(
                         return -ENOMEM;
                 d = p + strlen(toppath) + 1;
 
-                log_debug("Adding at top: %s %s %s", d, special_glyph(SPECIAL_GLYPH_ARROW), p);
+                log_debug("Adding at top: %s %s %s", d, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), p);
                 k = ordered_hashmap_put(top, d, p);
                 if (k >= 0) {
                         p = strdup(p);
@@ -246,7 +247,7 @@ static int enumerate_dir_d(
                         return k;
                 }
 
-                log_debug("Adding at bottom: %s %s %s", d, special_glyph(SPECIAL_GLYPH_ARROW), p);
+                log_debug("Adding at bottom: %s %s %s", d, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), p);
                 free(ordered_hashmap_remove(bottom, d));
                 k = ordered_hashmap_put(bottom, d, p);
                 if (k < 0) {
@@ -270,7 +271,7 @@ static int enumerate_dir_d(
                         return -ENOMEM;
 
                 log_debug("Adding to drops: %s %s %s %s %s",
-                          unit, special_glyph(SPECIAL_GLYPH_ARROW), basename(p), special_glyph(SPECIAL_GLYPH_ARROW), p);
+                          unit, special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), basename(p), special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), p);
                 k = ordered_hashmap_put(h, basename(p), p);
                 if (k < 0) {
                         free(p);
@@ -288,10 +289,8 @@ static int enumerate_dir(
                 const char *path, bool dropins) {
 
         _cleanup_closedir_ DIR *d = NULL;
-        struct dirent *de;
         _cleanup_strv_free_ char **files = NULL, **dirs = NULL;
-        size_t n_files = 0, allocated_files = 0, n_dirs = 0, allocated_dirs = 0;
-        char **t;
+        size_t n_files = 0, n_dirs = 0;
         int r;
 
         assert(top);
@@ -310,10 +309,8 @@ static int enumerate_dir(
         }
 
         FOREACH_DIRENT_ALL(de, d, return -errno) {
-                dirent_ensure_type(d, de);
-
                 if (dropins && de->d_type == DT_DIR && endswith(de->d_name, ".d")) {
-                        if (!GREEDY_REALLOC0(dirs, allocated_dirs, n_dirs + 2))
+                        if (!GREEDY_REALLOC0(dirs, n_dirs + 2))
                                 return -ENOMEM;
 
                         dirs[n_dirs] = strdup(de->d_name);
@@ -325,7 +322,7 @@ static int enumerate_dir(
                 if (!dirent_is_file(de))
                         continue;
 
-                if (!GREEDY_REALLOC0(files, allocated_files, n_files + 2))
+                if (!GREEDY_REALLOC0(files, n_files + 2))
                         return -ENOMEM;
 
                 files[n_files] = strdup(de->d_name);
@@ -350,7 +347,7 @@ static int enumerate_dir(
                 if (!p)
                         return -ENOMEM;
 
-                log_debug("Adding at top: %s %s %s", basename(p), special_glyph(SPECIAL_GLYPH_ARROW), p);
+                log_debug("Adding at top: %s %s %s", basename(p), special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), p);
                 r = ordered_hashmap_put(top, basename(p), p);
                 if (r >= 0) {
                         p = strdup(p);
@@ -359,7 +356,7 @@ static int enumerate_dir(
                 } else if (r != -EEXIST)
                         return r;
 
-                log_debug("Adding at bottom: %s %s %s", basename(p), special_glyph(SPECIAL_GLYPH_ARROW), p);
+                log_debug("Adding at bottom: %s %s %s", basename(p), special_glyph(SPECIAL_GLYPH_ARROW_RIGHT), p);
                 free(ordered_hashmap_remove(bottom, basename(p)));
                 r = ordered_hashmap_put(bottom, basename(p), p);
                 if (r < 0)
@@ -372,10 +369,12 @@ static int enumerate_dir(
 
 static int should_skip_path(const char *prefix, const char *suffix) {
 #if HAVE_SPLIT_USR
-        _cleanup_free_ char *target = NULL;
-        const char *dirname, *p;
+        _cleanup_free_ char *target = NULL, *dirname = NULL;
+        const char *p;
 
-        dirname = prefix_roota(prefix, suffix);
+        dirname = path_join(prefix, suffix);
+        if (!dirname)
+                return -ENOMEM;
 
         if (chase_symlinks(dirname, NULL, 0, &target, NULL) < 0)
                 return false;
@@ -532,10 +531,9 @@ static int help(void) {
                "     --no-pager       Do not pipe output into a pager\n"
                "     --diff[=1|0]     Show a diff when overridden files differ\n"
                "  -t --type=LIST...   Only display a selected set of override types\n"
-               "\nSee the %s for details.\n"
-               , program_invocation_short_name
-               , link
-        );
+               "\nSee the %s for details.\n",
+               program_invocation_short_name,
+               link);
 
         return 0;
 }
@@ -587,7 +585,7 @@ static int parse_argv(int argc, char *argv[]) {
                 {}
         };
 
-        int c;
+        int c, r;
 
         assert(argc >= 1);
         assert(argv);
@@ -617,25 +615,17 @@ static int parse_argv(int argc, char *argv[]) {
                 }
 
                 case ARG_DIFF:
-                        if (!optarg)
-                                arg_diff = 1;
-                        else {
-                                int b;
-
-                                b = parse_boolean(optarg);
-                                if (b < 0)
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                               "Failed to parse diff boolean.");
-
-                                arg_diff = b;
-                        }
+                        r = parse_boolean_argument("--diff", optarg, NULL);
+                        if (r < 0)
+                                return r;
+                        arg_diff = r;
                         break;
 
                 case '?':
                         return -EINVAL;
 
                 default:
-                        assert_not_reached("Unhandled option");
+                        assert_not_reached();
                 }
 
         return 1;
@@ -644,7 +634,7 @@ static int parse_argv(int argc, char *argv[]) {
 static int run(int argc, char *argv[]) {
         int r, k, n_found = 0;
 
-        log_setup_cli();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -658,13 +648,13 @@ static int run(int argc, char *argv[]) {
         else if (arg_diff)
                 arg_flags |= SHOW_OVERRIDDEN;
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         if (optind < argc) {
                 int i;
 
                 for (i = optind; i < argc; i++) {
-                        path_simplify(argv[i], false);
+                        path_simplify(argv[i]);
 
                         k = process_suffix_chop(argv[i]);
                         if (k < 0)

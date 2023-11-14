@@ -1,42 +1,78 @@
 #!/usr/bin/env bash
-set -ex
-set -o pipefail
+set -eux
 
 systemd-analyze log-level debug
-systemd-analyze log-target console
 
-# Loose checks to ensure the environment has the necessary features for systemd-oomd
-[[ "$( awk '/SwapTotal/ { print $2 }' /proc/meminfo )" != "0" ]] || echo "no swap" >> /skipped
-[[ -e /proc/pressure ]] || echo "no PSI" >> /skipped
-cgroup_type=$(stat -fc %T /sys/fs/cgroup/)
-if [[ "$cgroup_type" != *"cgroup2"* ]] && [[ "$cgroup_type" != *"0x63677270"* ]]; then
-    echo "no cgroup2" >> /skipped
-fi
-[[ -e /skipped ]] && exit 0 || true
+# Multiple level process tree, parent process stays up
+cat >/tmp/test56-exit-cgroup.sh <<EOF
+#!/usr/bin/env bash
+set -eux
 
-systemctl start testsuite-56-testbloat.service
-systemctl start testsuite-56-testchill.service
+# process tree: systemd -> sleep
+sleep infinity &
+disown
 
-# Verify systemd-oomd is monitoring the expected units
-oomctl | grep "/testsuite-56-workload.slice"
-oomctl | grep "50%"
+# process tree: systemd -> bash -> bash -> sleep
+((sleep infinity); true) &
 
-# systemd-oomd watches for elevated pressure for 30 seconds before acting.
-# It can take time to build up pressure so either wait 5 minutes or for the service to fail.
-timeout=$(date -ud "5 minutes" +%s)
-while [[ $(date -u +%s) -le $timeout ]]; do
-    if ! systemctl status testsuite-56-testbloat.service; then
-        break
-    fi
-    sleep 15
-done
+systemd-notify --ready
 
-# testbloat should be killed and testchill should be fine
-if systemctl status testsuite-56-testbloat.service; then exit 42; fi
-if ! systemctl status testsuite-56-testchill.service; then exit 24; fi
+# Run the stop/kill command
+\$1 &
+
+# process tree: systemd -> bash -> sleep
+sleep infinity
+EOF
+chmod +x /tmp/test56-exit-cgroup.sh
+
+# service should be stopped cleanly
+systemd-run --wait --unit=one -p Type=notify -p ExitType=cgroup \
+    /tmp/test56-exit-cgroup.sh 'systemctl stop one'
+
+# same thing with a truthy exec condition
+systemd-run --wait --unit=two -p Type=notify -p ExitType=cgroup \
+    -p ExecCondition=true \
+    /tmp/test56-exit-cgroup.sh 'systemctl stop two'
+
+# false exec condition: systemd-run should exit immediately with status code: 1
+(! systemd-run --wait --unit=three -p Type=notify -p ExitType=cgroup \
+    -p ExecCondition=false \
+    /tmp/test56-exit-cgroup.sh)
+
+# service should exit uncleanly (main process exits with SIGKILL)
+(! systemd-run --wait --unit=four -p Type=notify -p ExitType=cgroup \
+    /tmp/test56-exit-cgroup.sh 'systemctl kill --signal 9 four')
+
+
+# Multiple level process tree, parent process exits quickly
+cat >/tmp/test56-exit-cgroup-parentless.sh <<EOF
+#!/usr/bin/env bash
+set -eux
+
+# process tree: systemd -> sleep
+sleep infinity &
+
+# process tree: systemd -> bash -> sleep
+((sleep infinity); true) &
+
+systemd-notify --ready
+
+# Run the stop/kill command after this bash process exits
+(sleep 1; \$1) &
+EOF
+chmod +x /tmp/test56-exit-cgroup-parentless.sh
+
+# service should be stopped cleanly
+systemd-run --wait --unit=five -p Type=notify -p ExitType=cgroup \
+    /tmp/test56-exit-cgroup-parentless.sh 'systemctl stop five'
+
+# service should still exit cleanly despite SIGKILL (the main process already exited cleanly)
+systemd-run --wait --unit=six -p Type=notify -p ExitType=cgroup \
+    /tmp/test56-exit-cgroup-parentless.sh 'systemctl kill --signal 9 six'
+
 
 systemd-analyze log-level info
 
-echo OK > /testok
+echo OK >/testok
 
 exit 0

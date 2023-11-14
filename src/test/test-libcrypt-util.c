@@ -10,13 +10,35 @@
 #include "tests.h"
 #include "libcrypt-util.h"
 
+static void test_crypt_preferred_method(void) {
+        log_info("/* %s */", __func__);
+
+        log_info("crypt_preferred_method: %s",
+#if HAVE_CRYPT_PREFERRED_METHOD
+                 crypt_preferred_method()
+#else
+                 "(not available)"
+#endif
+        );
+}
+
+static void test_make_salt(void) {
+        log_info("/* %s */", __func__);
+
+        for (int i = 0; i < 10; i++) {
+                _cleanup_free_ char *t;
+
+                assert_se(make_salt(&t) == 0);
+                log_info("%s", t);
+        }
+}
+
 static int test_hash_password(void) {
         log_info("/* %s */", __func__);
 
-        /* As a warmup exercise, check if we can hash passwords. */
+        /* As a warm-up exercise, check if we can hash passwords. */
 
         bool have_sane_hash = false;
-        const char *hash;
 
         FOREACH_STRING(hash,
                        "ew3bU1.hoKk4o",
@@ -45,7 +67,6 @@ static void test_hash_password_full(void) {
         log_info("/* %s */", __func__);
 
         _cleanup_free_ void *cd_data = NULL;
-        const char *i;
         int cd_size = 0;
 
         log_info("sizeof(struct crypt_data): %zu bytes", sizeof(struct crypt_data));
@@ -92,6 +113,9 @@ int main(int argc, char *argv[]) {
 #if defined(__powerpc__) && !defined(XCRYPT_VERSION_MAJOR)
         return log_tests_skipped("crypt_r() causes a buffer overflow on ppc64el, see https://github.com/systemd/systemd/pull/16981#issuecomment-691203787");
 #endif
+
+        test_crypt_preferred_method();
+        test_make_salt();
 
         if (!test_hash_password())
                 return log_tests_skipped("crypt doesn't support yescrypt or sha512crypt");

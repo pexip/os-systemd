@@ -16,7 +16,7 @@ static int help(int argc, char *argv[], void *userdata) {
         _cleanup_free_ char *link = NULL;
         int r;
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         r = terminal_urlify_man("oomctl", "1", &link);
         if (r < 0)
@@ -30,12 +30,13 @@ static int help(int argc, char *argv[], void *userdata) {
                "  -h --help                   Show this help\n"
                "     --version                Show package version\n"
                "     --no-pager               Do not pipe output into a pager\n"
-               "\nSee the %6$s for details.\n"
-               , program_invocation_short_name
-               , ansi_highlight(), ansi_normal()
-               , ansi_underline(), ansi_normal()
-               , link
-        );
+               "\nSee the %6$s for details.\n",
+               program_invocation_short_name,
+               ansi_highlight(),
+               ansi_normal(),
+               ansi_underline(),
+               ansi_normal(),
+               link);
 
         return 0;
 }
@@ -51,7 +52,7 @@ static int dump_state(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_error_errno(r, "Failed to connect system bus: %m");
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         r = sd_bus_call_method(
                         bus,
@@ -70,7 +71,7 @@ static int dump_state(int argc, char *argv[], void *userdata) {
                 return bus_log_parse_error(r);
 
         fflush(stdout);
-        return copy_bytes(fd, STDOUT_FILENO, (uint64_t) -1, 0);
+        return copy_bytes(fd, STDOUT_FILENO, UINT64_MAX, 0);
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -109,7 +110,7 @@ static int parse_argv(int argc, char *argv[]) {
                                 return -EINVAL;
 
                         default:
-                                assert_not_reached("Invalid option passed.");
+                                assert_not_reached();
                 }
 
         return 1;

@@ -8,6 +8,7 @@
 
 #include "alloc-util.h"
 #include "bus-error.h"
+#include "bus-locator.h"
 #include "bus-util.h"
 #include "env-file.h"
 #include "errno-util.h"
@@ -19,7 +20,7 @@
 #include "hashmap.h"
 #include "machine-dbus.h"
 #include "machine.h"
-#include "mkdir.h"
+#include "mkdir-label.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -134,7 +135,7 @@ int machine_save(Machine *m) {
                 m->name);
 
         if (m->unit) {
-                _cleanup_free_ char *escaped;
+                _cleanup_free_ char *escaped = NULL;
 
                 escaped = cescape(m->unit);
                 if (!escaped) {
@@ -149,7 +150,7 @@ int machine_save(Machine *m) {
                 fprintf(f, "SCOPE_JOB=%s\n", m->scope_job);
 
         if (m->service) {
-                _cleanup_free_ char *escaped;
+                _cleanup_free_ char *escaped = NULL;
 
                 escaped = cescape(m->service);
                 if (!escaped) {
@@ -160,7 +161,7 @@ int machine_save(Machine *m) {
         }
 
         if (m->root_directory) {
-                _cleanup_free_ char *escaped;
+                _cleanup_free_ char *escaped = NULL;
 
                 escaped = cescape(m->root_directory);
                 if (!escaped) {
@@ -265,12 +266,10 @@ int machine_load(Machine *m) {
                            "REALTIME",  &realtime,
                            "MONOTONIC", &monotonic,
                            "NETIF",     &netif);
-        if (r < 0) {
-                if (r == -ENOENT)
-                        return 0;
-
+        if (r == -ENOENT)
+                return 0;
+        if (r < 0)
                 return log_error_errno(r, "Failed to read %s: %m", m->state_file);
-        }
 
         if (id)
                 sd_id128_from_string(id, &m->id);
@@ -292,9 +291,9 @@ int machine_load(Machine *m) {
                 (void) deserialize_usec(monotonic, &m->timestamp.monotonic);
 
         if (netif) {
-                size_t allocated = 0, nr = 0;
-                const char *p;
                 _cleanup_free_ int *ni = NULL;
+                size_t nr = 0;
+                const char *p;
 
                 p = netif;
                 for (;;) {
@@ -314,14 +313,13 @@ int machine_load(Machine *m) {
                         if (r < 0)
                                 continue;
 
-                        if (!GREEDY_REALLOC(ni, allocated, nr + 1))
+                        if (!GREEDY_REALLOC(ni, nr + 1))
                                 return log_oom();
 
                         ni[nr++] = r;
                 }
 
-                free(m->netif);
-                m->netif = TAKE_PTR(ni);
+                free_and_replace(m->netif, ni);
                 m->n_netif = nr;
         }
 
@@ -350,12 +348,10 @@ static int machine_start_scope(
         if (!unit)
                 return log_oom();
 
-        r = sd_bus_message_new_method_call(
+        r = bus_message_new_method_call(
                         machine->manager->bus,
                         &m,
-                        "org.freedesktop.systemd1",
-                        "/org/freedesktop/systemd1",
-                        "org.freedesktop.systemd1.Manager",
+                        bus_systemd_mgr,
                         "StartTransientUnit");
         if (r < 0)
                 return r;
@@ -576,14 +572,8 @@ int machine_kill(Machine *m, KillWho who, int signo) {
         if (!m->unit)
                 return -ESRCH;
 
-        if (who == KILL_LEADER) {
-                /* If we shall simply kill the leader, do so directly */
-
-                if (kill(m->leader, signo) < 0)
-                        return -errno;
-
-                return 0;
-        }
+        if (who == KILL_LEADER) /* If we shall simply kill the leader, do so directly */
+                return RET_NERRNO(kill(m->leader, signo));
 
         /* Otherwise, make PID 1 do it for us, for the entire cgroup */
         return manager_kill_unit(m->manager, m->unit, signo, NULL);

@@ -9,13 +9,14 @@ typedef struct EtcHostsItem {
         struct in_addr_data address;
 
         char **names;
+        size_t n_names;
 } EtcHostsItem;
 
 typedef struct EtcHostsItemByName {
         char *name;
 
         struct in_addr_data **addresses;
-        size_t n_addresses, n_allocated;
+        size_t n_addresses;
 } EtcHostsItemByName;
 
 int etc_hosts_parse(EtcHosts *hosts, FILE *f);

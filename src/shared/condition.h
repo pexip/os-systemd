@@ -9,16 +9,23 @@
 
 typedef enum ConditionType {
         CONDITION_ARCHITECTURE,
+        CONDITION_FIRMWARE,
         CONDITION_VIRTUALIZATION,
         CONDITION_HOST,
         CONDITION_KERNEL_COMMAND_LINE,
         CONDITION_KERNEL_VERSION,
+        CONDITION_CREDENTIAL,
         CONDITION_SECURITY,
         CONDITION_CAPABILITY,
         CONDITION_AC_POWER,
         CONDITION_MEMORY,
         CONDITION_CPUS,
         CONDITION_ENVIRONMENT,
+        CONDITION_CPU_FEATURE,
+        CONDITION_OS_RELEASE,
+        CONDITION_MEMORY_PRESSURE,
+        CONDITION_CPU_PRESSURE,
+        CONDITION_IO_PRESSURE,
 
         CONDITION_NEEDS_UPDATE,
         CONDITION_FIRST_BOOT,
@@ -40,7 +47,7 @@ typedef enum ConditionType {
         CONDITION_CONTROL_GROUP_CONTROLLER,
 
         _CONDITION_TYPE_MAX,
-        _CONDITION_TYPE_INVALID = -1
+        _CONDITION_TYPE_INVALID = -EINVAL,
 } ConditionType;
 
 typedef enum ConditionResult {
@@ -49,7 +56,7 @@ typedef enum ConditionResult {
         CONDITION_FAILED,
         CONDITION_ERROR,
         _CONDITION_RESULT_MAX,
-        _CONDITION_RESULT_INVALID = -1
+        _CONDITION_RESULT_INVALID = -EINVAL,
 } ConditionResult;
 
 typedef struct Condition {

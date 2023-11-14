@@ -9,11 +9,11 @@
 #include <unistd.h>
 
 #include "base-filesystem.h"
+#include "chase-symlinks.h"
 #include "fd-util.h"
-#include "fs-util.h"
 #include "log.h"
 #include "missing_syscall.h"
-#include "mkdir.h"
+#include "mkdir-label.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "path-util.h"
@@ -32,8 +32,6 @@ int switch_root(const char *new_root,
 
         _cleanup_free_ char *resolved_old_root_after = NULL;
         _cleanup_close_ int old_root_fd = -1;
-        bool old_root_remove;
-        const char *i;
         int r;
 
         assert(new_root);
@@ -43,12 +41,16 @@ int switch_root(const char *new_root,
                 return 0;
 
         /* Check if we shall remove the contents of the old root */
-        old_root_remove = in_initrd();
-        if (old_root_remove) {
-                old_root_fd = open("/", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOCTTY|O_DIRECTORY);
-                if (old_root_fd < 0)
-                        return log_error_errno(errno, "Failed to open root directory: %m");
-        }
+        old_root_fd = open("/", O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+        if (old_root_fd < 0)
+                return log_error_errno(errno, "Failed to open root directory: %m");
+        r = fd_is_temporary_fs(old_root_fd);
+        if (r < 0)
+                return log_error_errno(r, "Failed to stat root directory: %m");
+        if (r > 0)
+                log_debug("Root directory is on tmpfs, will do cleanup later.");
+        else
+                old_root_fd = safe_close(old_root_fd);
 
         /* Determine where we shall place the old root after the transition */
         r = chase_symlinks(old_root_after, new_root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &resolved_old_root_after, NULL);
@@ -64,12 +66,12 @@ int switch_root(const char *new_root,
         if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0)
                 return log_error_errno(errno, "Failed to set \"/\" mount propagation to private: %m");
 
-        FOREACH_STRING(i, "/sys", "/dev", "/run", "/proc") {
+        FOREACH_STRING(path, "/sys", "/dev", "/run", "/proc") {
                 _cleanup_free_ char *chased = NULL;
 
-                r = chase_symlinks(i, new_root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &chased, NULL);
+                r = chase_symlinks(path, new_root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &chased, NULL);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to resolve %s/%s: %m", new_root, i);
+                        return log_error_errno(r, "Failed to resolve %s/%s: %m", new_root, path);
                 if (r > 0) {
                         /* Already exists. Let's see if it is a mount point already. */
                         r = path_is_mount_point(chased, NULL, 0);
@@ -81,8 +83,8 @@ int switch_root(const char *new_root,
                          /* Doesn't exist yet? */
                         (void) mkdir_p_label(chased, 0755);
 
-                if (mount(i, chased, NULL, mount_flags, NULL) < 0)
-                        return log_error_errno(errno, "Failed to mount %s to %s: %m", i, chased);
+                if (mount(path, chased, NULL, mount_flags, NULL) < 0)
+                        return log_error_errno(errno, "Failed to mount %s to %s: %m", path, chased);
         }
 
         /* Do not fail if base_filesystem_create() fails. Not all switch roots are like base_filesystem_create() wants
@@ -118,9 +120,8 @@ int switch_root(const char *new_root,
                 struct stat rb;
 
                 if (fstat(old_root_fd, &rb) < 0)
-                        log_warning_errno(errno, "Failed to stat old root directory, leaving: %m");
-                else
-                        (void) rm_rf_children(TAKE_FD(old_root_fd), 0, &rb); /* takes possession of the dir fd, even on failure */
+                        return log_error_errno(errno, "Failed to stat old root directory: %m");
+                (void) rm_rf_children(TAKE_FD(old_root_fd), 0, &rb); /* takes possession of the dir fd, even on failure */
         }
 
         return 0;

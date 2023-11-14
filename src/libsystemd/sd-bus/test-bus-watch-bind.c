@@ -53,8 +53,7 @@ static void* thread_server(void *p) {
         assert_se(mkdir_parents(path, 0755) >= 0);
         (void) usleep(100 * USEC_PER_MSEC);
 
-        d = dirname_malloc(path);
-        assert_se(d);
+        assert_se(path_extract_directory(path, &d) >= 0);
         assert_se(asprintf(&suffixed, "%s.%" PRIx64, d, random_u64()) >= 0);
         assert_se(rename(d, suffixed) >= 0);
         (void) usleep(100 * USEC_PER_MSEC);
@@ -77,7 +76,7 @@ static void* thread_server(void *p) {
         assert_se(bind(fd, &u.sa, sa_len) >= 0);
         usleep(100 * USEC_PER_MSEC);
 
-        assert_se(listen(fd, SOMAXCONN) >= 0);
+        assert_se(listen(fd, SOMAXCONN_DELUXE) >= 0);
         usleep(100 * USEC_PER_MSEC);
 
         assert_se(touch(path) >= 0);

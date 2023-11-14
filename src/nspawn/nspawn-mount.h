@@ -29,7 +29,7 @@ typedef enum CustomMountType {
         CUSTOM_MOUNT_INACCESSIBLE,
         CUSTOM_MOUNT_ARBITRARY,
         _CUSTOM_MOUNT_TYPE_MAX,
-        _CUSTOM_MOUNT_TYPE_INVALID = -1
+        _CUSTOM_MOUNT_TYPE_INVALID = -EINVAL,
 } CustomMountType;
 
 typedef struct CustomMount {
@@ -58,7 +58,7 @@ int inaccessible_mount_parse(CustomMount **l, size_t *n, const char *s);
 int mount_all(const char *dest, MountSettingsMask mount_settings, uid_t uid_shift, const char *selinux_apifs_context);
 int mount_sysfs(const char *dest, MountSettingsMask mount_settings);
 
-int mount_custom(const char *dest, CustomMount *mounts, size_t n, uid_t uid_shift, const char *selinux_apifs_context, MountSettingsMask mount_settings);
+int mount_custom(const char *dest, CustomMount *mounts, size_t n, uid_t uid_shift, uid_t uid_range, const char *selinux_apifs_context, MountSettingsMask mount_settings);
 bool has_custom_root_mount(const CustomMount *mounts, size_t n);
 
 int setup_volatile_mode(const char *directory, VolatileMode mode, uid_t uid_shift, const char *selinux_apifs_context);

@@ -44,9 +44,9 @@ typedef struct BrightnessWriter {
         sd_event_source* child_event_source;
 } BrightnessWriter;
 
-static void brightness_writer_free(BrightnessWriter *w) {
+static BrightnessWriter* brightness_writer_free(BrightnessWriter *w) {
         if (!w)
-                return;
+                return NULL;
 
         if (w->manager && w->path)
                 (void) hashmap_remove_value(w->manager->brightness_writers, w->path, w);
@@ -59,7 +59,7 @@ static void brightness_writer_free(BrightnessWriter *w) {
 
         w->child_event_source = sd_event_source_unref(w->child_event_source);
 
-        free(w);
+        return mfree(w);
 }
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(BrightnessWriter*, brightness_writer_free);
@@ -96,12 +96,11 @@ static void brightness_writer_reply(BrightnessWriter *w, int error) {
 static int brightness_writer_fork(BrightnessWriter *w);
 
 static int on_brightness_writer_exit(sd_event_source *s, const siginfo_t *si, void *userdata) {
-        BrightnessWriter *w = userdata;
+        BrightnessWriter *w = ASSERT_PTR(userdata);
         int r;
 
         assert(s);
         assert(si);
-        assert(w);
 
         assert(si->si_pid == w->child);
         w->child = 0;
@@ -137,7 +136,7 @@ static int brightness_writer_fork(BrightnessWriter *w) {
         assert(w->child == 0);
         assert(!w->child_event_source);
 
-        r = safe_fork("(sd-bright)", FORK_DEATHSIG|FORK_NULL_STDIO|FORK_CLOSE_ALL_FDS|FORK_LOG, &w->child);
+        r = safe_fork("(sd-bright)", FORK_DEATHSIG|FORK_NULL_STDIO|FORK_CLOSE_ALL_FDS|FORK_LOG|FORK_REOPEN_LOG, &w->child);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -217,10 +216,6 @@ int manager_write_brightness(
                 return 0;
         }
 
-        r = hashmap_ensure_allocated(&m->brightness_writers, &brightness_writer_hash_ops);
-        if (r < 0)
-                return log_oom();
-
         w = new(BrightnessWriter, 1);
         if (!w)
                 return log_oom();
@@ -234,9 +229,12 @@ int manager_write_brightness(
         if (!w->path)
                 return log_oom();
 
-        r = hashmap_put(m->brightness_writers, w->path, w);
+        r = hashmap_ensure_put(&m->brightness_writers, &brightness_writer_hash_ops, w->path, w);
+        if (r == -ENOMEM)
+                return log_oom();
         if (r < 0)
                 return log_error_errno(r, "Failed to add brightness writer to hashmap: %m");
+
         w->manager = m;
 
         r = set_add_message(&w->current_messages, message);

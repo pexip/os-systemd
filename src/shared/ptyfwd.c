@@ -338,9 +338,8 @@ static int shovel(PTYForward *f) {
 }
 
 static int on_master_event(sd_event_source *e, int fd, uint32_t revents, void *userdata) {
-        PTYForward *f = userdata;
+        PTYForward *f = ASSERT_PTR(userdata);
 
-        assert(f);
         assert(e);
         assert(e == f->master_event_source);
         assert(fd >= 0);
@@ -356,9 +355,8 @@ static int on_master_event(sd_event_source *e, int fd, uint32_t revents, void *u
 }
 
 static int on_stdin_event(sd_event_source *e, int fd, uint32_t revents, void *userdata) {
-        PTYForward *f = userdata;
+        PTYForward *f = ASSERT_PTR(userdata);
 
-        assert(f);
         assert(e);
         assert(e == f->stdin_event_source);
         assert(fd >= 0);
@@ -371,9 +369,8 @@ static int on_stdin_event(sd_event_source *e, int fd, uint32_t revents, void *us
 }
 
 static int on_stdout_event(sd_event_source *e, int fd, uint32_t revents, void *userdata) {
-        PTYForward *f = userdata;
+        PTYForward *f = ASSERT_PTR(userdata);
 
-        assert(f);
         assert(e);
         assert(e == f->stdout_event_source);
         assert(fd >= 0);
@@ -386,10 +383,9 @@ static int on_stdout_event(sd_event_source *e, int fd, uint32_t revents, void *u
 }
 
 static int on_sigwinch_event(sd_event_source *e, const struct signalfd_siginfo *si, void *userdata) {
-        PTYForward *f = userdata;
+        PTYForward *f = ASSERT_PTR(userdata);
         struct winsize ws;
 
-        assert(f);
         assert(e);
         assert(e == f->sigwinch_event_source);
 
@@ -646,24 +642,24 @@ int pty_forward_set_width_height(PTYForward *f, unsigned width, unsigned height)
 
         assert(f);
 
-        if (width == (unsigned) -1 && height == (unsigned) -1)
+        if (width == UINT_MAX && height == UINT_MAX)
                 return 0; /* noop */
 
-        if (width != (unsigned) -1 &&
+        if (width != UINT_MAX &&
             (width == 0 || width > USHRT_MAX))
                 return -ERANGE;
 
-        if (height != (unsigned) -1 &&
+        if (height != UINT_MAX &&
             (height == 0 || height > USHRT_MAX))
                 return -ERANGE;
 
-        if (width == (unsigned) -1 || height == (unsigned) -1) {
+        if (width == UINT_MAX || height == UINT_MAX) {
                 if (ioctl(f->master, TIOCGWINSZ, &ws) < 0)
                         return -errno;
 
-                if (width != (unsigned) -1)
+                if (width != UINT_MAX)
                         ws.ws_col = width;
-                if (height != (unsigned) -1)
+                if (height != UINT_MAX)
                         ws.ws_row = height;
         } else
                 ws = (struct winsize) {

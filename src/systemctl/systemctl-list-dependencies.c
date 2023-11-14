@@ -12,11 +12,10 @@ static int list_dependencies_print(const char *name, int level, unsigned branche
         _cleanup_free_ char *n = NULL;
         size_t max_len = MAX(columns(),20u);
         size_t len = 0;
-        int i;
 
         if (!arg_plain) {
 
-                for (i = level - 1; i >= 0; i--) {
+                for (int i = level - 1; i >= 0; i--) {
                         len += 2;
                         if (len > max_len - 3 && !arg_full) {
                                 printf("%s...\n",max_len % 2 ? "" : " ");
@@ -64,8 +63,8 @@ static int list_dependencies_one(
                 unsigned branches) {
 
         _cleanup_strv_free_ char **deps = NULL;
-        char **c;
         int r;
+        bool circular = false;
 
         assert(bus);
         assert(name);
@@ -83,12 +82,7 @@ static int list_dependencies_one(
 
         STRV_FOREACH(c, deps) {
                 if (strv_contains(*units, *c)) {
-                        if (!arg_plain) {
-                                printf("  ");
-                                r = list_dependencies_print("...", level + 1, (branches << 1) | (c[1] == NULL ? 0 : 1), 1);
-                                if (r < 0)
-                                        return r;
-                        }
+                        circular = true;
                         continue;
                 }
 
@@ -117,10 +111,10 @@ static int list_dependencies_one(
                                 break;
                         }
 
-                        printf("%s%s%s ", on, special_glyph(SPECIAL_GLYPH_BLACK_CIRCLE), ansi_normal());
+                        printf("%s%s%s ", on, special_glyph(unit_active_state_to_glyph(active_state)), ansi_normal());
                 }
 
-                r = list_dependencies_print(*c, level, branches, c[1] == NULL);
+                r = list_dependencies_print(*c, level, branches, /* last = */ c[1] == NULL && !circular);
                 if (r < 0)
                         return r;
 
@@ -131,15 +125,22 @@ static int list_dependencies_one(
                 }
         }
 
+        if (circular && !arg_plain) {
+                printf("  ");
+                r = list_dependencies_print("...", level, branches, /* last = */ true);
+                if (r < 0)
+                        return r;
+        }
+
         if (!arg_plain)
                 strv_remove(*units, name);
 
         return 0;
 }
 
-int list_dependencies(int argc, char *argv[], void *userdata) {
+int verb_list_dependencies(int argc, char *argv[], void *userdata) {
         _cleanup_strv_free_ char **units = NULL, **done = NULL;
-        char **u, **patterns;
+        char **patterns;
         sd_bus *bus;
         int r;
 
@@ -158,7 +159,7 @@ int list_dependencies(int argc, char *argv[], void *userdata) {
                         return log_error_errno(r, "Failed to expand names: %m");
         }
 
-        (void) pager_open(arg_pager_flags);
+        pager_open(arg_pager_flags);
 
         STRV_FOREACH(u, units) {
                 if (u != units)

@@ -4,6 +4,7 @@
 #include "conf-parser.h"
 
 typedef struct Link Link;
+typedef struct Network Network;
 
 typedef enum DHCPClientIdentifier {
         DHCP_CLIENT_ID_MAC,
@@ -14,17 +15,20 @@ typedef enum DHCPClientIdentifier {
          * https://github.com/systemd/systemd/issues/7828 */
         DHCP_CLIENT_ID_DUID_ONLY,
         _DHCP_CLIENT_ID_MAX,
-        _DHCP_CLIENT_ID_INVALID = -1,
+        _DHCP_CLIENT_ID_INVALID = -EINVAL,
 } DHCPClientIdentifier;
 
-int dhcp4_configure(Link *link);
+void network_adjust_dhcp4(Network *network);
 int dhcp4_update_mac(Link *link);
+int dhcp4_start(Link *link);
+int dhcp4_lease_lost(Link *link);
+int dhcp4_check_ready(Link *link);
 
-int link_deserialize_dhcp4(Link *link, const char *dhcp4_address);
+int link_request_dhcp4_client(Link *link);
 
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_client_identifier);
-CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_acl_ip_address);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_max_attempts);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_ip_service_type);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_mud_url);
 CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_fallback_lease_lifetime);
+CONFIG_PARSER_PROTOTYPE(config_parse_dhcp_label);

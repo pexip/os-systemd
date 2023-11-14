@@ -15,10 +15,12 @@ ConditionVirtualization=!container
 DefaultDependencies=no
 Conflicts=shutdown.target
 Before=sysinit.target shutdown.target
+After=modprobe@efi_pstore.service
+Wants=modprobe@efi_pstore.service
 
 [Service]
 Type=oneshot
-ExecStart=@rootlibexecdir@/systemd-pstore
+ExecStart={{ROOTLIBEXECDIR}}/systemd-pstore
 RemainAfterExit=yes
 StateDirectory=systemd/pstore
 

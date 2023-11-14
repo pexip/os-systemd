@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-set -ex
+# SPDX-License-Identifier: LGPL-2.1-or-later
+set -eux
 set -o pipefail
 
 systemd-analyze log-level debug
-systemd-analyze log-target console
 
 systemctl start testsuite-47-repro
 sleep 4
@@ -20,6 +20,6 @@ ps -p "$leaked_pid" && exit 42
 
 systemd-analyze log-level info
 
-echo OK > /testok
+echo OK >/testok
 
 exit 0

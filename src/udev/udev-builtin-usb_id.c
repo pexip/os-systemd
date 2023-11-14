@@ -11,16 +11,17 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "device-nodes.h"
 #include "device-util.h"
 #include "fd-util.h"
-#include "libudev-util.h"
+#include "parse-util.h"
 #include "string-util.h"
 #include "strxcpyx.h"
 #include "udev-builtin.h"
+#include "udev-util.h"
 
 static void set_usb_iftype(char *to, int if_class_num, size_t len) {
         const char *type = "generic";
@@ -74,11 +75,9 @@ static void set_usb_iftype(char *to, int if_class_num, size_t len) {
 
 static int set_usb_mass_storage_ifsubtype(char *to, const char *from, size_t len) {
         int type_num = 0;
-        char *eptr;
         const char *type = "generic";
 
-        type_num = strtoul(from, &eptr, 0);
-        if (eptr != from) {
+        if (safe_atoi(from, &type_num) >= 0) {
                 switch (type_num) {
                 case 1: /* RBC devices */
                         type = "rbc";
@@ -104,12 +103,10 @@ static int set_usb_mass_storage_ifsubtype(char *to, const char *from, size_t len
 }
 
 static void set_scsi_type(char *to, const char *from, size_t len) {
-        int type_num;
-        char *eptr;
+        unsigned type_num;
         const char *type = "generic";
 
-        type_num = strtoul(from, &eptr, 0);
-        if (eptr != from) {
+        if (safe_atou(from, &type_num) >= 0) {
                 switch (type_num) {
                 case 0:
                 case 0xe:
@@ -161,7 +158,7 @@ static int dev_if_packed_info(sd_device *dev, char *ifs_str, size_t len) {
                 return r;
 
         filename = strjoina(syspath, "/descriptors");
-        fd = open(filename, O_RDONLY|O_CLOEXEC);
+        fd = open(filename, O_RDONLY|O_CLOEXEC|O_NOCTTY);
         if (fd < 0)
                 return log_device_debug_errno(dev, errno, "Failed to open \"%s\": %m", filename);
 
@@ -227,15 +224,15 @@ static int dev_if_packed_info(sd_device *dev, char *ifs_str, size_t len) {
  * 6.) If the device supplies a serial number, this number
  *     is concatenated with the identification with an underscore '_'.
  */
-static int builtin_usb_id(sd_device *dev, int argc, char *argv[], bool test) {
+static int builtin_usb_id(sd_device *dev, sd_netlink **rtnl, int argc, char *argv[], bool test) {
         char vendor_str[64] = "";
         char vendor_str_enc[256];
         const char *vendor_id;
         char model_str[64] = "";
         char model_str_enc[256];
         const char *product_id;
-        char serial_str[UTIL_NAME_SIZE] = "";
-        char packed_if_str[UTIL_NAME_SIZE] = "";
+        char serial_str[UDEV_NAME_SIZE] = "";
+        char packed_if_str[UDEV_NAME_SIZE] = "";
         char revision_str[64] = "";
         char type_str[64] = "";
         char instance_str[64] = "";
@@ -245,7 +242,7 @@ static int builtin_usb_id(sd_device *dev, int argc, char *argv[], bool test) {
 
         sd_device *dev_interface, *dev_usb;
         const char *if_class, *if_subclass;
-        int if_class_num;
+        unsigned if_class_num;
         int protocol = 0;
         size_t l;
         char *s;
@@ -285,7 +282,9 @@ static int builtin_usb_id(sd_device *dev, int argc, char *argv[], bool test) {
         if (r < 0)
                 return log_device_debug_errno(dev_interface, r, "Failed to get bInterfaceClass attribute: %m");
 
-        if_class_num = strtoul(if_class, NULL, 16);
+        r = safe_atou_full(if_class, 16, &if_class_num);
+        if (r < 0)
+                return log_device_debug_errno(dev_interface, r, "Failed to parse if_class: %m");
         if (if_class_num == 8) {
                 /* mass storage */
                 if (sd_device_get_sysattr_value(dev_interface, "bInterfaceSubClass", &if_subclass) >= 0)
@@ -293,7 +292,7 @@ static int builtin_usb_id(sd_device *dev, int argc, char *argv[], bool test) {
         } else
                 set_usb_iftype(type_str, if_class_num, sizeof(type_str)-1);
 
-        log_device_debug(dev_interface, "if_class:%d protocol:%d", if_class_num, protocol);
+        log_device_debug(dev_interface, "if_class:%u protocol:%i", if_class_num, protocol);
 
         /* usb device directory */
         r = sd_device_get_parent_with_subsystem_devtype(dev_interface, "usb", "usb_device", &dev_usb);
@@ -328,18 +327,18 @@ static int builtin_usb_id(sd_device *dev, int argc, char *argv[], bool test) {
                         log_device_debug_errno(dev_scsi, r, "Failed to get SCSI vendor attribute: %m");
                         goto fallback;
                 }
-                udev_util_encode_string(scsi_vendor, vendor_str_enc, sizeof(vendor_str_enc));
-                util_replace_whitespace(scsi_vendor, vendor_str, sizeof(vendor_str)-1);
-                util_replace_chars(vendor_str, NULL);
+                encode_devnode_name(scsi_vendor, vendor_str_enc, sizeof(vendor_str_enc));
+                udev_replace_whitespace(scsi_vendor, vendor_str, sizeof(vendor_str)-1);
+                udev_replace_chars(vendor_str, NULL);
 
                 r = sd_device_get_sysattr_value(dev_scsi, "model", &scsi_model);
                 if (r < 0) {
                         log_device_debug_errno(dev_scsi, r, "Failed to get SCSI model attribute: %m");
                         goto fallback;
                 }
-                udev_util_encode_string(scsi_model, model_str_enc, sizeof(model_str_enc));
-                util_replace_whitespace(scsi_model, model_str, sizeof(model_str)-1);
-                util_replace_chars(model_str, NULL);
+                encode_devnode_name(scsi_model, model_str_enc, sizeof(model_str_enc));
+                udev_replace_whitespace(scsi_model, model_str, sizeof(model_str)-1);
+                udev_replace_chars(model_str, NULL);
 
                 r = sd_device_get_sysattr_value(dev_scsi, "type", &scsi_type);
                 if (r < 0) {
@@ -353,8 +352,8 @@ static int builtin_usb_id(sd_device *dev, int argc, char *argv[], bool test) {
                         log_device_debug_errno(dev_scsi, r, "Failed to get SCSI revision attribute: %m");
                         goto fallback;
                 }
-                util_replace_whitespace(scsi_rev, revision_str, sizeof(revision_str)-1);
-                util_replace_chars(revision_str, NULL);
+                udev_replace_whitespace(scsi_rev, revision_str, sizeof(revision_str)-1);
+                udev_replace_chars(revision_str, NULL);
 
                 /*
                  * some broken devices have the same identifiers
@@ -378,9 +377,9 @@ fallback:
 
                 if (sd_device_get_sysattr_value(dev_usb, "manufacturer", &usb_vendor) < 0)
                         usb_vendor = vendor_id;
-                udev_util_encode_string(usb_vendor, vendor_str_enc, sizeof(vendor_str_enc));
-                util_replace_whitespace(usb_vendor, vendor_str, sizeof(vendor_str)-1);
-                util_replace_chars(vendor_str, NULL);
+                encode_devnode_name(usb_vendor, vendor_str_enc, sizeof(vendor_str_enc));
+                udev_replace_whitespace(usb_vendor, vendor_str, sizeof(vendor_str)-1);
+                udev_replace_chars(vendor_str, NULL);
         }
 
         if (model_str[0] == '\0') {
@@ -388,17 +387,17 @@ fallback:
 
                 if (sd_device_get_sysattr_value(dev_usb, "product", &usb_model) < 0)
                         usb_model = product_id;
-                udev_util_encode_string(usb_model, model_str_enc, sizeof(model_str_enc));
-                util_replace_whitespace(usb_model, model_str, sizeof(model_str)-1);
-                util_replace_chars(model_str, NULL);
+                encode_devnode_name(usb_model, model_str_enc, sizeof(model_str_enc));
+                udev_replace_whitespace(usb_model, model_str, sizeof(model_str)-1);
+                udev_replace_chars(model_str, NULL);
         }
 
         if (revision_str[0] == '\0') {
                 const char *usb_rev;
 
                 if (sd_device_get_sysattr_value(dev_usb, "bcdDevice", &usb_rev) >= 0) {
-                        util_replace_whitespace(usb_rev, revision_str, sizeof(revision_str)-1);
-                        util_replace_chars(revision_str, NULL);
+                        udev_replace_whitespace(usb_rev, revision_str, sizeof(revision_str)-1);
+                        udev_replace_chars(revision_str, NULL);
                 }
         }
 
@@ -406,18 +405,16 @@ fallback:
                 const char *usb_serial;
 
                 if (sd_device_get_sysattr_value(dev_usb, "serial", &usb_serial) >= 0) {
-                        const unsigned char *p;
-
                         /* http://msdn.microsoft.com/en-us/library/windows/hardware/gg487321.aspx */
-                        for (p = (unsigned char *) usb_serial; *p != '\0'; p++)
+                        for (const unsigned char *p = (unsigned char*) usb_serial; *p != '\0'; p++)
                                 if (*p < 0x20 || *p > 0x7f || *p == ',') {
                                         usb_serial = NULL;
                                         break;
                                 }
 
                         if (usb_serial) {
-                                util_replace_whitespace(usb_serial, serial_str, sizeof(serial_str)-1);
-                                util_replace_chars(serial_str, NULL);
+                                udev_replace_whitespace(usb_serial, serial_str, sizeof(serial_str)-1);
+                                udev_replace_chars(serial_str, NULL);
                         }
                 }
         }
@@ -430,21 +427,52 @@ fallback:
         if (!isempty(instance_str))
                 strpcpyl(&s, l, "-", instance_str, NULL);
 
-        udev_builtin_add_property(dev, test, "ID_VENDOR", vendor_str);
-        udev_builtin_add_property(dev, test, "ID_VENDOR_ENC", vendor_str_enc);
-        udev_builtin_add_property(dev, test, "ID_VENDOR_ID", vendor_id);
-        udev_builtin_add_property(dev, test, "ID_MODEL", model_str);
-        udev_builtin_add_property(dev, test, "ID_MODEL_ENC", model_str_enc);
-        udev_builtin_add_property(dev, test, "ID_MODEL_ID", product_id);
-        udev_builtin_add_property(dev, test, "ID_REVISION", revision_str);
-        udev_builtin_add_property(dev, test, "ID_SERIAL", serial);
+        if (sd_device_get_property_value(dev, "ID_BUS", NULL) >= 0)
+                log_device_debug(dev, "ID_BUS property is already set, setting only properties prefixed with \"ID_USB_\".");
+        else {
+                udev_builtin_add_property(dev, test, "ID_BUS", "usb");
+
+                udev_builtin_add_property(dev, test, "ID_MODEL", model_str);
+                udev_builtin_add_property(dev, test, "ID_MODEL_ENC", model_str_enc);
+                udev_builtin_add_property(dev, test, "ID_MODEL_ID", product_id);
+
+                udev_builtin_add_property(dev, test, "ID_SERIAL", serial);
+                if (!isempty(serial_str))
+                        udev_builtin_add_property(dev, test, "ID_SERIAL_SHORT", serial_str);
+
+                udev_builtin_add_property(dev, test, "ID_VENDOR", vendor_str);
+                udev_builtin_add_property(dev, test, "ID_VENDOR_ENC", vendor_str_enc);
+                udev_builtin_add_property(dev, test, "ID_VENDOR_ID", vendor_id);
+
+                udev_builtin_add_property(dev, test, "ID_REVISION", revision_str);
+
+                if (!isempty(type_str))
+                        udev_builtin_add_property(dev, test, "ID_TYPE", type_str);
+
+                if (!isempty(instance_str))
+                        udev_builtin_add_property(dev, test, "ID_INSTANCE", instance_str);
+        }
+
+        /* Also export the same values in the above by prefixing ID_USB_. */
+        udev_builtin_add_property(dev, test, "ID_USB_MODEL", model_str);
+        udev_builtin_add_property(dev, test, "ID_USB_MODEL_ENC", model_str_enc);
+        udev_builtin_add_property(dev, test, "ID_USB_MODEL_ID", product_id);
+        udev_builtin_add_property(dev, test, "ID_USB_SERIAL", serial);
         if (!isempty(serial_str))
-                udev_builtin_add_property(dev, test, "ID_SERIAL_SHORT", serial_str);
+                udev_builtin_add_property(dev, test, "ID_USB_SERIAL_SHORT", serial_str);
+
+        udev_builtin_add_property(dev, test, "ID_USB_VENDOR", vendor_str);
+        udev_builtin_add_property(dev, test, "ID_USB_VENDOR_ENC", vendor_str_enc);
+        udev_builtin_add_property(dev, test, "ID_USB_VENDOR_ID", vendor_id);
+
+        udev_builtin_add_property(dev, test, "ID_USB_REVISION", revision_str);
+
         if (!isempty(type_str))
-                udev_builtin_add_property(dev, test, "ID_TYPE", type_str);
+                udev_builtin_add_property(dev, test, "ID_USB_TYPE", type_str);
+
         if (!isempty(instance_str))
-                udev_builtin_add_property(dev, test, "ID_INSTANCE", instance_str);
-        udev_builtin_add_property(dev, test, "ID_BUS", "usb");
+                udev_builtin_add_property(dev, test, "ID_USB_INSTANCE", instance_str);
+
         if (!isempty(packed_if_str))
                 udev_builtin_add_property(dev, test, "ID_USB_INTERFACES", packed_if_str);
         if (ifnum)

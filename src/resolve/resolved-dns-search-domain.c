@@ -52,13 +52,13 @@ int dns_search_domain_new(
                 l->n_search_domains++;
                 break;
 
-        case DNS_SERVER_SYSTEM:
+        case DNS_SEARCH_DOMAIN_SYSTEM:
                 LIST_APPEND(domains, m->search_domains, d);
                 m->n_search_domains++;
                 break;
 
         default:
-                assert_not_reached("Unknown search domain type");
+                assert_not_reached();
         }
 
         d->linked = true;
@@ -135,7 +135,7 @@ void dns_search_domain_move_back_and_unmark(DnsSearchDomain *d) {
                 break;
 
         default:
-                assert_not_reached("Unknown search domain type");
+                assert_not_reached();
         }
 }
 
@@ -151,18 +151,22 @@ void dns_search_domain_unlink_all(DnsSearchDomain *first) {
         dns_search_domain_unlink_all(next);
 }
 
-void dns_search_domain_unlink_marked(DnsSearchDomain *first) {
+bool dns_search_domain_unlink_marked(DnsSearchDomain *first) {
         DnsSearchDomain *next;
+        bool changed;
 
         if (!first)
-                return;
+                return false;
 
         next = first->domains_next;
 
-        if (first->marked)
+        if (first->marked) {
                 dns_search_domain_unlink(first);
+                changed = true;
+        } else
+                changed = false;
 
-        dns_search_domain_unlink_marked(next);
+        return dns_search_domain_unlink_marked(next) || changed;
 }
 
 void dns_search_domain_mark_all(DnsSearchDomain *first) {
@@ -174,7 +178,6 @@ void dns_search_domain_mark_all(DnsSearchDomain *first) {
 }
 
 int dns_search_domain_find(DnsSearchDomain *first, const char *name, DnsSearchDomain **ret) {
-        DnsSearchDomain *d;
         int r;
 
         assert(name);

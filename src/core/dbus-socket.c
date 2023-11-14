@@ -32,7 +32,6 @@ static int property_get_listen(
                 sd_bus_error *error) {
 
         Socket *s = SOCKET(userdata);
-        SocketPort *p;
         int r;
 
         assert(bus);
@@ -65,7 +64,7 @@ static int property_get_listen(
                                 break;
 
                         default:
-                                assert_not_reached("Unknown socket type");
+                                assert_not_reached();
                 }
 
                 r = sd_bus_message_append(reply, "(ss)", socket_port_type_to_string(p), a);
@@ -326,16 +325,14 @@ static int bus_socket_set_transient_property(
 
         if (streq(name, "Symlinks")) {
                 _cleanup_strv_free_ char **l = NULL;
-                char **p;
 
                 r = sd_bus_message_read_strv(message, &l);
                 if (r < 0)
                         return r;
 
-                STRV_FOREACH(p, l) {
+                STRV_FOREACH(p, l)
                         if (!path_is_absolute(*p))
                                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Symlink path is not absolute: %s", *p);
-                }
 
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         if (strv_isempty(l)) {
@@ -367,7 +364,7 @@ static int bus_socket_set_transient_property(
                         return r;
 
                 while ((r = sd_bus_message_read(message, "(ss)", &t, &a)) > 0) {
-                        _cleanup_free_ SocketPort *p = NULL;
+                        _cleanup_(socket_port_freep) SocketPort *p = NULL;
 
                         p = new(SocketPort, 1);
                         if (!p)
@@ -383,14 +380,14 @@ static int bus_socket_set_transient_property(
                                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Unknown Socket type: %s", t);
 
                         if (p->type != SOCKET_SOCKET) {
-                                if (!path_is_valid(p->path))
-                                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid socket path: %s", t);
+                                if (!path_is_absolute(a) || !path_is_valid(a))
+                                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid socket path: %s", a);
 
                                 p->path = strdup(a);
                                 if (!p->path)
                                         return log_oom();
 
-                                path_simplify(p->path, false);
+                                path_simplify(p->path);
 
                         } else if (streq(t, "Netlink")) {
                                 r = socket_address_parse_netlink(&p->address, a);
@@ -406,7 +403,7 @@ static int bus_socket_set_transient_property(
                                 if (p->address.type < 0)
                                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid address type: %s", t);
 
-                                if (socket_address_family(&p->address) != AF_LOCAL && p->address.type == SOCK_SEQPACKET)
+                                if (socket_address_family(&p->address) != AF_UNIX && p->address.type == SOCK_SEQPACKET)
                                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Address family not supported: %s", a);
                         }
 

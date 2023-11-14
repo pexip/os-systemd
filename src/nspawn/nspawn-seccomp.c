@@ -88,6 +88,7 @@ static int add_syscall_filters(
                 { 0,                  "sched_getparam"         },
                 { 0,                  "sched_getscheduler"     },
                 { 0,                  "sched_rr_get_interval"  },
+                { 0,                  "sched_rr_get_interval_time64" },
                 { 0,                  "sched_yield"            },
                 { 0,                  "seccomp"                },
                 { 0,                  "sendfile"               },
@@ -126,7 +127,7 @@ static int add_syscall_filters(
                  * @pkey
                  * @swap
                  *
-                 * bpf                (NB: bpffs is not namespaced!)
+                 * bpf
                  * fanotify_init
                  * fanotify_mark
                  * kexec_file_load
@@ -140,7 +141,6 @@ static int add_syscall_filters(
         };
 
         _cleanup_strv_free_ char **added = NULL;
-        char **p;
         int r;
 
         for (size_t i = 0; i < ELEMENTSOF(allow_list); i++) {
