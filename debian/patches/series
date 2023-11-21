@@ -21,7 +21,6 @@ debian/Skip-flaky-test_resolved_domain_restricted_dns-in-network.patch
 pexip/disable-journald-audit.patch
 pexip/install-avoid-utf8.patch
 pexip/path-coldplug-event-race.patch
-pexip/log_inotify_errors.patch
 pexip/path_debug.patch
 pexip/log_inotify_overflow.patch
 pexip/openssl3-deprecations.patch
