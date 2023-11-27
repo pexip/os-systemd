@@ -13,57 +13,27 @@ Index: os-systemd/src/resolve/resolved-dnstls-openssl.c
  
          manager->dnstls_data.ctx = SSL_CTX_new(TLS_client_method());
          if (!manager->dnstls_data.ctx)
-Index: os-systemd/src/shared/openssl-util.c
-===================================================================
---- os-systemd.orig/src/shared/openssl-util.c
-+++ os-systemd/src/shared/openssl-util.c
-@@ -53,16 +53,17 @@ int rsa_encrypt_bytes(
-         _cleanup_free_ void *b = NULL;
-         size_t l;
- 
-+        int padding = RSA_PKCS1_PADDING;
-+        OSSL_PARAM params[1];
-+        params[0] = OSSL_PARAM_construct_int(OSSL_SIGNATURE_PARAM_PAD_MODE, &padding);
-+
-         ctx = EVP_PKEY_CTX_new(pkey, NULL);
-         if (!ctx)
-                 return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to allocate public key context");
- 
--        if (EVP_PKEY_encrypt_init(ctx) <= 0)
-+        if (EVP_PKEY_encrypt_init_ex(ctx, params) <= 0)
-                 return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to initialize public key context");
- 
--        if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0)
--                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to configure PKCS#1 padding");
--
-         if (EVP_PKEY_encrypt(ctx, NULL, &l, decrypted_key, decrypted_key_size) <= 0)
-                 return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to determine encrypted key size");
- 
 Index: os-systemd/src/resolve/resolved-dns-dnssec.c
 ===================================================================
 --- os-systemd.orig/src/resolve/resolved-dns-dnssec.c
 +++ os-systemd/src/resolve/resolved-dns-dnssec.c
-@@ -101,6 +101,11 @@ static int dnssec_rsa_verify_raw(
+@@ -14,6 +14,7 @@
+ #include "string-table.h"
+ 
  #if PREFER_OPENSSL
++#include "openssl/rsa.h"
  #  pragma GCC diagnostic push
  #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-+
-+        int padding = RSA_PKCS1_PADDING;
-+        OSSL_PARAM params[1];
-+        params[0] = OSSL_PARAM_construct_int(OSSL_SIGNATURE_PARAM_PAD_MODE, &padding);
-+
-         _cleanup_(RSA_freep) RSA *rpubkey = NULL;
-         _cleanup_(EVP_PKEY_freep) EVP_PKEY *epubkey = NULL;
-         _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = NULL;
-@@ -137,10 +142,7 @@ static int dnssec_rsa_verify_raw(
-         if (!ctx)
-                 return -ENOMEM;
+ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(RSA*, RSA_free, NULL);
+Index: os-systemd/src/shared/openssl-util.c
+===================================================================
+--- os-systemd.orig/src/shared/openssl-util.c
++++ os-systemd/src/shared/openssl-util.c
+@@ -3,6 +3,7 @@
+ #include "openssl-util.h"
+ #include "alloc-util.h"
+ #include "hexdecoct.h"
++#include "openssl/rsa.h"
  
--        if (EVP_PKEY_verify_init(ctx) <= 0)
--                return -EIO;
--
--        if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0)
-+        if (EVP_PKEY_verify_init_ex(ctx, params) <= 0)
-                 return -EIO;
- 
-         if (EVP_PKEY_CTX_set_signature_md(ctx, hash_algorithm) <= 0)
+ #if HAVE_OPENSSL
+ int openssl_hash(const EVP_MD *alg,
