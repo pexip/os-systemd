@@ -2,6 +2,7 @@ systemd (252.17-1~deb12u1pexip1) pexip-bookworm; urgency=medium
 
   * Initial bookworm version
   * Remove unnecessary upstart migration patches
+  * Disable p11kit support.
 
  -- Mark Hymers <mark.hymers@pexip.com>  Mon, 27 Nov 2023 10:25:58 +0000
 
