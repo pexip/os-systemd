@@ -28,7 +28,7 @@ index 4a0132a..357808d 100644
          manager->dnstls_data.ctx = SSL_CTX_new(TLS_client_method());
          if (!manager->dnstls_data.ctx)
 diff --git a/src/resolve/resolved-dns-dnssec.c b/src/resolve/resolved-dns-dnssec.c
-index f63cd9b..83c25ad 100644
+index f63cd9b..acd3523 100644
 --- a/src/resolve/resolved-dns-dnssec.c
 +++ b/src/resolve/resolved-dns-dnssec.c
 @@ -14,11 +14,18 @@
@@ -40,12 +40,12 @@ index f63cd9b..83c25ad 100644
 -DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(RSA*, RSA_free, NULL);
 -DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(EC_KEY*, EC_KEY_free, NULL);
 -#  pragma GCC diagnostic pop
-+#include "openssl/rsa.h"
-+#include "openssl/param_build.h"
-+typedef unsigned char OSSL_BUF;
++#  include "openssl/rsa.h"
++#  include "openssl/param_build.h"
 +DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(OSSL_PARAM*, OSSL_PARAM_free, NULL);
 +DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(OSSL_PARAM_BLD*, OSSL_PARAM_BLD_free, NULL);
 +/* The macro gets very confused, so spell this one out longhand */
++typedef unsigned char OSSL_BUF;
 +static inline void OSSL_BUF_freep(OSSL_BUF* *p) {
 +        if (*p != NULL) {
 +                OPENSSL_free(*p);
@@ -55,66 +55,72 @@ index f63cd9b..83c25ad 100644
  #endif
  
  #define VERIFY_RRS_MAX 256
-@@ -99,11 +105,11 @@ static int dnssec_rsa_verify_raw(
-         int r;
- 
+@@ -101,9 +108,11 @@ static int dnssec_rsa_verify_raw(
  #if PREFER_OPENSSL
--#  pragma GCC diagnostic push
--#    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+ #  pragma GCC diagnostic push
+ #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 -        _cleanup_(RSA_freep) RSA *rpubkey = NULL;
--        _cleanup_(EVP_PKEY_freep) EVP_PKEY *epubkey = NULL;
-+
+         _cleanup_(EVP_PKEY_freep) EVP_PKEY *epubkey = NULL;
          _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = NULL;
-+        _cleanup_(EVP_PKEY_freep) EVP_PKEY *rsa = NULL;
++        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *vctx = NULL;
 +        _cleanup_(OSSL_PARAM_freep) OSSL_PARAM *params = NULL;
 +        _cleanup_(OSSL_PARAM_BLD_freep) OSSL_PARAM_BLD *bld = NULL;
          _cleanup_(BN_freep) BIGNUM *e = NULL, *m = NULL;
  
          assert(hash_algorithm);
-@@ -116,26 +122,22 @@ static int dnssec_rsa_verify_raw(
+@@ -116,42 +125,44 @@ static int dnssec_rsa_verify_raw(
          if (!m)
                  return -EIO;
  
 -        rpubkey = RSA_new();
 -        if (!rpubkey)
--                return -ENOMEM;
--
--        if (RSA_set0_key(rpubkey, m, e, NULL) <= 0)
 +        bld = OSSL_PARAM_BLD_new();
-+        if (bld == NULL)
++        if (!bld)
+                 return -ENOMEM;
+ 
+-        if (RSA_set0_key(rpubkey, m, e, NULL) <= 0)
++        if (OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e) == 0 ||
++            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, m) == 0)
                  return -EIO;
 -        e = m = NULL;
--
+ 
 -        assert((size_t) RSA_size(rpubkey) == signature_size);
++        params = OSSL_PARAM_BLD_to_param(bld);
++        if (!params)
++                return -EIO;
  
 -        epubkey = EVP_PKEY_new();
 -        if (!epubkey)
--                return -ENOMEM;
-+        if (OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e) == 0 ||
-+            OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, m) == 0)
-+                return -EIO;
++        ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
++        if (!ctx)
+                 return -ENOMEM;
  
 -        if (EVP_PKEY_assign_RSA(epubkey, RSAPublicKey_dup(rpubkey)) <= 0)
-+        params = OSSL_PARAM_BLD_to_param(bld);
-+        if (params == NULL)
++        if (EVP_PKEY_fromdata_init(ctx) <= 0 ||
++            EVP_PKEY_fromdata(ctx, &epubkey, EVP_PKEY_PUBLIC_KEY, params) <= 0)
                  return -EIO;
  
 -        ctx = EVP_PKEY_CTX_new(epubkey, NULL);
 -        if (!ctx)
--                return -ENOMEM;
-+        ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
-+        if (ctx == NULL || EVP_PKEY_fromdata_init(ctx) <= 0 ||
-+            EVP_PKEY_fromdata(ctx, &rsa, EVP_PKEY_PUBLIC_KEY, params) <= 0)
-+                return -EIO;
++        vctx = EVP_PKEY_CTX_new(epubkey, NULL);
++        if (!vctx)
+                 return -ENOMEM;
  
-         if (EVP_PKEY_verify_init(ctx) <= 0)
-                 return -EIO;
-@@ -147,11 +149,10 @@ static int dnssec_rsa_verify_raw(
+-        if (EVP_PKEY_verify_init(ctx) <= 0)
++        if (EVP_PKEY_verify_init(vctx) <= 0)
                  return -EIO;
  
-         r = EVP_PKEY_verify(ctx, signature, signature_size, data, data_size);
--        if (r < 0)
-+        if (r != 1)
+-        if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0)
++        if (EVP_PKEY_CTX_set_rsa_padding(vctx, RSA_PKCS1_PADDING) <= 0)
+                 return -EIO;
+ 
+-        if (EVP_PKEY_CTX_set_signature_md(ctx, hash_algorithm) <= 0)
++        if (EVP_PKEY_CTX_set_signature_md(vctx, hash_algorithm) <= 0)
+                 return -EIO;
+ 
+-        r = EVP_PKEY_verify(ctx, signature, signature_size, data, data_size);
++        r = EVP_PKEY_verify(vctx, signature, signature_size, data, data_size);
+         if (r < 0)
                  return log_debug_errno(SYNTHETIC_ERRNO(EIO),
                                         "Signature verification failed: 0x%lx", ERR_get_error());
  
@@ -122,60 +128,79 @@ index f63cd9b..83c25ad 100644
  #else
          gcry_sexp_t public_key_sexp = NULL, data_sexp = NULL, signature_sexp = NULL;
          gcry_mpi_t n = NULL, e = NULL, s = NULL;
-@@ -301,14 +302,16 @@ static int dnssec_ecdsa_verify_raw(
+@@ -301,44 +312,44 @@ static int dnssec_ecdsa_verify_raw(
          int k;
  
  #if PREFER_OPENSSL
 -#  pragma GCC diagnostic push
 -#    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-+        size_t signaturelen;
-+
-         _cleanup_(EC_GROUP_freep) EC_GROUP *ec_group = NULL;
-         _cleanup_(EC_POINT_freep) EC_POINT *p = NULL;
+-        _cleanup_(EC_GROUP_freep) EC_GROUP *ec_group = NULL;
+-        _cleanup_(EC_POINT_freep) EC_POINT *p = NULL;
 -        _cleanup_(EC_KEY_freep) EC_KEY *eckey = NULL;
-+        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = NULL;
+-        _cleanup_(BN_CTX_freep) BN_CTX *bctx = NULL;
 +        _cleanup_(EVP_PKEY_freep) EVP_PKEY *eckey = NULL;
-         _cleanup_(BN_CTX_freep) BN_CTX *bctx = NULL;
++        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = NULL;
++        _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *vctx = NULL;
++        _cleanup_(OSSL_PARAM_BLD_freep) OSSL_PARAM_BLD *bld = NULL;
++        _cleanup_(OSSL_PARAM_freep) OSSL_PARAM *params = NULL;
          _cleanup_(BN_freep) BIGNUM *r = NULL, *s = NULL;
          _cleanup_(ECDSA_SIG_freep) ECDSA_SIG *sig = NULL;
 +        _cleanup_(OSSL_BUF_freep) OSSL_BUF *signature = NULL;
++        size_t signaturelen;
  
          assert(hash_algorithm);
  
-@@ -327,18 +330,12 @@ static int dnssec_ecdsa_verify_raw(
-         if (EC_POINT_oct2point(ec_group, p, key, key_size, bctx) <= 0)
+-        ec_group = EC_GROUP_new_by_curve_name(curve);
+-        if (!ec_group)
+-                return -ENOMEM;
+-
+-        p = EC_POINT_new(ec_group);
+-        if (!p)
++        bld = OSSL_PARAM_BLD_new();
++        if (!bld)
+                 return -ENOMEM;
+ 
+-        bctx = BN_CTX_new();
+-        if (!bctx)
+-                return -ENOMEM;
++        if (OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, OBJ_nid2sn(curve), 0) <= 0 ||
++            OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, key, key_size) <= 0)
++                return -EIO;
+ 
+-        if (EC_POINT_oct2point(ec_group, p, key, key_size, bctx) <= 0)
++        params = OSSL_PARAM_BLD_to_param(bld);
++        if (!params)
                  return -EIO;
  
 -        eckey = EC_KEY_new();
-+        eckey = EVP_PKEY_new_raw_public_key(EVP_PKEY_EC, NULL, key, key_size);
-         if (!eckey)
--                return -ENOMEM;
--
+-        if (!eckey)
++        ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
++        if (!ctx)
+                 return -ENOMEM;
+ 
 -        if (EC_KEY_set_group(eckey, ec_group) <= 0)
--                return -EIO;
--
++        if (EVP_PKEY_fromdata_init(ctx) != 1 ||
++            EVP_PKEY_fromdata(ctx, &eckey, EVP_PKEY_PUBLIC_KEY, params) != 1)
+                 return -EIO;
+ 
 -        if (EC_KEY_set_public_key(eckey, p) <= 0)
-                 return log_debug_errno(SYNTHETIC_ERRNO(EIO),
+-                return log_debug_errno(SYNTHETIC_ERRNO(EIO),
 -                                       "EC_POINT_bn2point failed: 0x%lx", ERR_get_error());
-+                                       "EVP_PKEY_new_raw_public_key failed: 0x%lx", ERR_get_error());
++        vctx = EVP_PKEY_CTX_new(eckey, NULL);
++        if (!vctx)
++                return -ENOMEM;
  
 -        assert(EC_KEY_check_key(eckey) == 1);
-+        ctx = EVP_PKEY_CTX_new(eckey, NULL);
++        if (EVP_PKEY_public_check(vctx) != 1)
++                return -EIO;
  
          r = BN_bin2bn(signature_r, signature_r_size, NULL);
          if (!r)
-@@ -348,22 +345,28 @@ static int dnssec_ecdsa_verify_raw(
-         if (!s)
-                 return -EIO;
- 
--        /* TODO: We should eventually use use the EVP API once it supports ECDSA signature verification */
--
-         sig = ECDSA_SIG_new();
-         if (!sig)
-                 return -ENOMEM;
+@@ -356,14 +367,23 @@ static int dnssec_ecdsa_verify_raw(
  
          if (ECDSA_SIG_set0(sig, r, s) <= 0)
                  return -EIO;
++
 +        /* Set these to NULL since they are now owned by the "sig" obj */
          r = s = NULL;
  
@@ -186,10 +211,10 @@ index f63cd9b..83c25ad 100644
 +        if (signaturelen <= 0)
 +                return -EIO;
 +
-+        if (EVP_PKEY_verify_init(ctx) != 1)
++        if (EVP_PKEY_verify_init(vctx) <= 0)
 +                return -EIO;
 +
-+        k = EVP_PKEY_verify(ctx, signature, signaturelen, data, data_size);
++        k = EVP_PKEY_verify(vctx, signature, signaturelen, data, data_size);
 +        if (k != 1)
                  return log_debug_errno(SYNTHETIC_ERRNO(EIO),
                                         "Signature verification failed: 0x%lx", ERR_get_error());
