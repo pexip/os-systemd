@@ -1,3 +1,9 @@
+systemd (252.19-1~deb12u1pexip1) pexip-bookworm; urgency=medium
+
+  * New upstream release.
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Sat, 09 Dec 2023 11:20:28 +0000
+
 systemd (252.19-1~deb12u1) bookworm; urgency=medium
 
   * New upstream version 252.19
