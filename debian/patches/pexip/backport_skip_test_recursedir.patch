@@ -7,7 +7,7 @@ Index: os-systemd/src/test/test-recurse-dir.c
 +++ os-systemd/src/test/test-recurse-dir.c
 @@ -123,6 +123,10 @@ int main(int argc, char *argv[]) {
          usec_t t1, t2, t3, t4;
-         int r;
+         _cleanup_close_ int fd = -EBADF;
  
 +        /* Pexip temporary fix; upstream in 31cfcf50088b69c973b9335a2383fa6502d90419 */
 +        log_tests_skipped("nftw mountpoint detection produces false-positives on overlayfs");
