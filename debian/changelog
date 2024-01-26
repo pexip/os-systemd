@@ -1,3 +1,27 @@
+systemd (252.22-1~deb12u1) bookworm; urgency=medium
+
+  * d/t/control: add dependency on stress for upstream suite. Needed by
+    TEST-55-OOMD
+  * New upstream version 252.22
+  * Refresh patches
+
+ -- Luca Boccassi <bluca@debian.org>  Fri, 26 Jan 2024 21:48:36 +0000
+
+systemd (252.21-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.21
+    CVE-2023-7008 (Closes: #1059278)
+  * Refresh patches
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 24 Dec 2023 15:29:22 +0100
+
+systemd (252.20-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.20
+  * Refresh patches
+
+ -- Luca Boccassi <bluca@debian.org>  Wed, 06 Dec 2023 23:13:24 +0000
+
 systemd (252.19-1~deb12u1) bookworm; urgency=medium
 
   * New upstream version 252.19
