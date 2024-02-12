@@ -2,17 +2,21 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 set -ex
 
-test_rule="/run/udev/rules.d/49-test.rules"
+TEST_RULE="/run/udev/rules.d/49-test.rules"
 KILL_PID=
 
 setup() {
-    mkdir -p "${test_rule%/*}"
-    cp -f /etc/udev/udev.conf /etc/udev/udev.conf.bckp
-    cat >"${test_rule}" <<EOF
+    mkdir -p "${TEST_RULE%/*}"
+    [[ -e /etc/udev/udev.conf ]] && cp -f /etc/udev/udev.conf /etc/udev/udev.conf.bak
+    # Don't bother storing the coredumps in journal for this particular test
+    mkdir -p /run/systemd/coredump.conf.d/
+    echo -ne "[Coredump]\nStorage=external\n" >/run/systemd/coredump.conf.d/99-storage-journal.conf
+
+    cat >"${TEST_RULE}" <<EOF
 ACTION=="add", SUBSYSTEM=="mem", KERNEL=="null", OPTIONS="log_level=debug"
 ACTION=="add", SUBSYSTEM=="mem", KERNEL=="null", PROGRAM=="/bin/sleep 60"
 EOF
-    cat >>/etc/udev/udev.conf <<EOF
+    cat >/etc/udev/udev.conf <<EOF
 event_timeout=10
 timeout_signal=SIGABRT
 EOF
@@ -28,9 +32,9 @@ teardown() {
     fi
 
     rm -rf "$TMPDIR"
-
-    mv -f /etc/udev/udev.conf.bckp /etc/udev/udev.conf
-    rm -f "$test_rule"
+    rm -f "$TEST_RULE"
+    [[ -e /etc/udev/udev.conf.bak ]] && mv -f /etc/udev/udev.conf.bak /etc/udev/udev.conf
+    rm /run/systemd/coredump.conf.d/99-storage-journal.conf
     systemctl restart systemd-udevd.service
 }
 

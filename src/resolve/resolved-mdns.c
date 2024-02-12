@@ -36,7 +36,7 @@ int manager_mdns_start(Manager *m) {
         if (r < 0)
                 return r;
 
-        if (socket_ipv6_is_supported()) {
+        if (socket_ipv6_is_enabled()) {
                 r = manager_mdns_ipv6_fd(m);
                 if (r == -EADDRINUSE)
                         goto eaddrinuse;
@@ -254,8 +254,9 @@ static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to extract resource records from incoming packet: %m");
 
+        /* TODO: Support Known-Answers only packets gracefully. */
         if (dns_question_size(p->question) <= 0)
-                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Received mDNS query without question, ignoring.");
+                return 0;
 
         unicast_reply = mdns_should_reply_using_unicast(p);
         if (unicast_reply && !sender_on_local_subnet(s, p)) {
