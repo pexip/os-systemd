@@ -1,3 +1,9 @@
+systemd (252.22-1~deb12u1+pexip24u1) pexip; urgency=medium
+
+  * New upstream release
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Mon, 12 Feb 2024 09:39:48 +0000
+
 systemd (252.22-1~deb12u1) bookworm; urgency=medium
 
   * d/t/control: add dependency on stress for upstream suite. Needed by
