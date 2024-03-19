@@ -8,4 +8,11 @@ if [ "$1" = configure ] && [ -z "$2" ] && [ -e /boot/grub/grub.cfg ] && command 
     update-grub || true
 fi
 
+# Pexip specific migration from upstart
+# file removed in commit 0244ae33b21f71966de0c58bc7de35faad58000c
+# Can be removed after v35 gatepost release
+if [ "$1" = configure ]; then
+    rm -f /etc/init/rc.conf
+fi
+
 #DEBHELPER#
