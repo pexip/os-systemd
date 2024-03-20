@@ -1,6 +1,12 @@
+systemd (252.22-1~deb12u1+pexip24u3) pexip; urgency=medium
+
+  * Remove stupid tmpfiles.d /var/log/README symlink
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Wed, 20 Mar 2024 14:42:24 +0000
+
 systemd (252.22-1~deb12u1+pexip24u2) pexip; urgency=medium
 
-  * Remove leftover upsatart compatability file rc.conf
+  * Remove leftover upstart compatibility file rc.conf
 
  -- Vincent Sanders <vince@pexip.com>  Tue, 19 Mar 2024 14:46:48 +0000
 

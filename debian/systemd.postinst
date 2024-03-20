@@ -85,3 +85,9 @@ if [ -n "$2" ]; then
     _systemctl try-restart systemd-networkd.service || true
     _systemctl try-restart systemd-journald.service || true
 fi
+
+# Pexip-specific change: remove the tmpfiles.d /var/log/README symlink that we
+# don't want.
+if [ "$1" = configure ]; then
+    rm -f /var/log/README
+fi

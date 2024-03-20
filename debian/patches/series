@@ -25,3 +25,4 @@ pexip/path_debug.patch
 pexip/log_inotify_overflow.patch
 pexip/openssl3-deprecations.patch
 pexip/backport_skip_test_recursedir.patch
+pexip/remove-log-README.patch
