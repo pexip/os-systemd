@@ -1,3 +1,9 @@
+systemd (252.22-1~deb12u1+pexip24u4) pexip; urgency=medium
+
+  * Clean up /etc/init/rc.conf fully
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Thu, 28 Mar 2024 16:41:03 +0000
+
 systemd (252.22-1~deb12u1+pexip24u3) pexip; urgency=medium
 
   * Remove stupid tmpfiles.d /var/log/README symlink
