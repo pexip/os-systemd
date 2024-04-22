@@ -1,3 +1,9 @@
+systemd (252.22-1~deb12u1+pexip24u5) pexip; urgency=medium
+
+  * Force configuration of systemd in /etc/nsswitch.conf
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Mon, 22 Apr 2024 17:43:39 +0100
+
 systemd (252.22-1~deb12u1+pexip24u4) pexip; urgency=medium
 
   * Clean up /etc/init/rc.conf fully

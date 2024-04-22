@@ -1,0 +1,14 @@
+#!/bin/sh
+
+#DEBHELPER#
+
+# The default dh_installnss behaviour does not do what we want for PexOS; force
+# the addition of systemd to the end of each of these databases, for
+# consistency.
+if [ "$1" = "configure" ]; then
+    for db in passwd group shadow gshadow; do
+        if ! grep -q -E "^$db:[^#]*\s(systemd)$" "${DPKG_ROOT}/etc/nsswitch.conf"; then
+            sed -i -E "s/^($db:.*$)/\1 systemd/" "${DPKG_ROOT}/etc/nsswitch.conf"
+        fi
+    done
+fi
