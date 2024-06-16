@@ -2305,9 +2305,9 @@ static EFI_STATUS initrd_prepare(
         assert(ret_initrd_size);
 
         if (entry->type != LOADER_LINUX || !entry->initrd) {
-                ret_options = NULL;
-                ret_initrd = NULL;
-                ret_initrd_size = 0;
+                *ret_options = NULL;
+                *ret_initrd = NULL;
+                *ret_initrd_size = 0;
                 return EFI_SUCCESS;
         }
 
@@ -2517,7 +2517,7 @@ static EFI_STATUS secure_boot_discover_keys(Config *config, EFI_FILE *root_dir) 
         EFI_STATUS err;
         _cleanup_(file_closep) EFI_FILE *keys_basedir = NULL;
 
-        if (secure_boot_mode() != SECURE_BOOT_SETUP)
+        if (!IN_SET(secure_boot_mode(), SECURE_BOOT_SETUP, SECURE_BOOT_AUDIT))
                 return EFI_SUCCESS;
 
         /* the lack of a 'keys' directory is not fatal and is silently ignored */

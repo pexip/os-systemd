@@ -594,8 +594,7 @@ static int service_verify(Service *s) {
         if (s->type != SERVICE_ONESHOT && s->exec_command[SERVICE_EXEC_START]->command_next)
                 return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Service has more than one ExecStart= setting, which is only allowed for Type=oneshot services. Refusing.");
 
-        if (s->type == SERVICE_ONESHOT &&
-            !IN_SET(s->restart, SERVICE_RESTART_NO, SERVICE_RESTART_ON_FAILURE, SERVICE_RESTART_ON_ABNORMAL, SERVICE_RESTART_ON_WATCHDOG, SERVICE_RESTART_ON_ABORT))
+        if (s->type == SERVICE_ONESHOT && IN_SET(s->restart, SERVICE_RESTART_ALWAYS, SERVICE_RESTART_ON_SUCCESS))
                 return log_unit_error_errno(UNIT(s), SYNTHETIC_ERRNO(ENOEXEC), "Service has Restart= set to either always or on-success, which isn't allowed for Type=oneshot services. Refusing.");
 
         if (s->type == SERVICE_ONESHOT && !exit_status_set_is_empty(&s->restart_force_status))
@@ -3379,8 +3378,10 @@ static void service_notify_cgroup_empty_event(Unit *u) {
                         break;
                 }
 
-                if (s->exit_type == SERVICE_EXIT_CGROUP && main_pid_good(s) <= 0)
-                        service_enter_start_post(s);
+                if (s->exit_type == SERVICE_EXIT_CGROUP && main_pid_good(s) <= 0) {
+                        service_enter_stop_post(s, SERVICE_SUCCESS);
+                        break;
+                }
 
                 _fallthrough_;
         case SERVICE_START_POST:
@@ -3649,11 +3650,13 @@ static void service_sigchld_event(Unit *u, pid_t pid, int code, int status) {
                                 default:
                                         assert_not_reached();
                                 }
-                        } else if (s->exit_type == SERVICE_EXIT_CGROUP && s->state == SERVICE_START)
+                        } else if (s->exit_type == SERVICE_EXIT_CGROUP && s->state == SERVICE_START &&
+                                   !IN_SET(s->type, SERVICE_NOTIFY, SERVICE_DBUS))
                                 /* If a main process exits very quickly, this function might be executed
                                  * before service_dispatch_exec_io(). Since this function disabled IO events
                                  * to monitor the main process above, we need to update the state here too.
-                                 * Let's consider the process is successfully launched and exited. */
+                                 * Let's consider the process is successfully launched and exited, but
+                                 * only when we're not expecting a readiness notification or dbus name. */
                                 service_enter_start_post(s);
                 }
 

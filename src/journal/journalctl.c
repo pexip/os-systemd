@@ -336,7 +336,7 @@ static int help(void) {
                "  -u --unit=UNIT             Show logs from the specified unit\n"
                "     --user-unit=UNIT        Show logs from the specified user unit\n"
                "  -t --identifier=STRING     Show entries with the specified syslog identifier\n"
-               "  -p --priority=RANGE        Show entries with the specified priority\n"
+               "  -p --priority=RANGE        Show entries within the specified priority range\n"
                "     --facility=FACILITY...  Show entries with the specified facilities\n"
                "  -g --grep=PATTERN          Show entries with MESSAGE matching PATTERN\n"
                "     --case-sensitive[=BOOL] Force case sensitive or insensitive matching\n"
@@ -1048,7 +1048,7 @@ static int parse_argv(int argc, char *argv[]) {
                 arg_boot_offset = 0;
         }
 
-        if (!!arg_directory + !!arg_file + !!arg_machine + !!arg_root + !!arg_image > 1)
+        if (!!arg_directory + !!arg_file + arg_file_stdin + !!arg_machine + !!arg_root + !!arg_image > 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Please specify at most one of -D/--directory=, --file=, -M/--machine=, --root=, --image=.");
 

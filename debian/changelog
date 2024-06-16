@@ -1,3 +1,48 @@
+systemd (252.26-1~deb12u2) bookworm; urgency=medium
+
+  [ Gioele Barabucci ]
+  * d/libnss-myhostname.nss: Install after `files` (Closes: #1072380)
+  * d/libnss-mymachines.nss: Install before `resolve` and `dns` Installing
+    `mymachines` before `dns` and `resolve` (whatever comes first) is
+    suggested in the manpage. It also avoids leaking information about
+    local machines to the DNS resolver. (Closes: #825438, #851314)
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 16 Jun 2024 10:44:31 +0100
+
+systemd (252.26-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.26
+  * autopkgtest: reboot before logind test. If the testbed hasn't rebooted
+    the test session will be running in a logind session created by the
+    existing logind instead of the one under test, so reboot before
+    running.
+  * d/t/boot-and-services: drop tmp check. LXC now sets up a tmpfs on /tmp
+    as per upstream recommendation, so we cannot detect it via fstab
+    anymore.
+
+ -- Luca Boccassi <bluca@debian.org>  Tue, 28 May 2024 13:50:58 +0100
+
+systemd (252.25-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.25
+  * Refresh patches for v252.25
+
+ -- Luca Boccassi <bluca@debian.org>  Thu, 09 May 2024 18:11:06 +0100
+
+systemd (252.24-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.24
+  * Refresh patches
+
+ -- Luca Boccassi <bluca@debian.org>  Fri, 26 Apr 2024 01:34:18 +0100
+
+systemd (252.23-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.23 (CVE-2023-50387, CVE-2023-50868)
+  * Refresh patches
+
+ -- Luca Boccassi <bluca@debian.org>  Wed, 28 Feb 2024 17:00:53 +0000
+
 systemd (252.22-1~deb12u1) bookworm; urgency=medium
 
   * d/t/control: add dependency on stress for upstream suite. Needed by
