@@ -4512,6 +4512,16 @@ static int exec_child(
         }
 
         if (context->utmp_id) {
+                _cleanup_free_ char *username_alloc = NULL;
+
+                if (!username && context->utmp_mode == EXEC_UTMP_USER) {
+                        username_alloc = uid_to_name(uid_is_valid(uid) ? uid : saved_uid);
+                        if (!username_alloc) {
+                                *exit_status = EXIT_USER;
+                                return log_oom();
+                        }
+                }
+
                 const char *line = context->tty_path ?
                         (path_startswith(context->tty_path, "/dev/") ?: context->tty_path) :
                         NULL;
@@ -4520,7 +4530,7 @@ static int exec_child(
                                       context->utmp_mode == EXEC_UTMP_INIT  ? INIT_PROCESS :
                                       context->utmp_mode == EXEC_UTMP_LOGIN ? LOGIN_PROCESS :
                                       USER_PROCESS,
-                                      username);
+                                      username ?: username_alloc);
         }
 
         if (uid_is_valid(uid)) {
@@ -4700,12 +4710,14 @@ static int exec_child(
 
                 if (ns_type_supported(NAMESPACE_NET)) {
                         r = setup_shareable_ns(runtime->netns_storage_socket, CLONE_NEWNET);
-                        if (r == -EPERM)
-                                log_unit_warning_errno(unit, r,
-                                                       "PrivateNetwork=yes is configured, but network namespace setup failed, ignoring: %m");
-                        else if (r < 0) {
-                                *exit_status = EXIT_NETWORK;
-                                return log_unit_error_errno(unit, r, "Failed to set up network namespacing: %m");
+                        if (r < 0) {
+                                if (ERRNO_IS_PRIVILEGE(r))
+                                        log_unit_warning_errno(unit, r,
+                                                               "PrivateNetwork=yes is configured, but network namespace setup failed, ignoring: %m");
+                                else {
+                                        *exit_status = EXIT_NETWORK;
+                                        return log_unit_error_errno(unit, r, "Failed to set up network namespacing: %m");
+                                }
                         }
                 } else if (context->network_namespace_path) {
                         *exit_status = EXIT_NETWORK;
@@ -4719,12 +4731,14 @@ static int exec_child(
 
                 if (ns_type_supported(NAMESPACE_IPC)) {
                         r = setup_shareable_ns(runtime->ipcns_storage_socket, CLONE_NEWIPC);
-                        if (r == -EPERM)
-                                log_unit_warning_errno(unit, r,
-                                                       "PrivateIPC=yes is configured, but IPC namespace setup failed, ignoring: %m");
-                        else if (r < 0) {
-                                *exit_status = EXIT_NAMESPACE;
-                                return log_unit_error_errno(unit, r, "Failed to set up IPC namespacing: %m");
+                        if (r < 0) {
+                                if (ERRNO_IS_PRIVILEGE(r))
+                                        log_unit_warning_errno(unit, r,
+                                                               "PrivateIPC=yes is configured, but IPC namespace setup failed, ignoring: %m");
+                                else {
+                                        *exit_status = EXIT_NAMESPACE;
+                                        return log_unit_error_errno(unit, r, "Failed to set up IPC namespacing: %m");
+                                }
                         }
                 } else if (context->ipc_namespace_path) {
                         *exit_status = EXIT_NAMESPACE;

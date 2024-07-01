@@ -1593,7 +1593,7 @@ static void directory_watch(sd_journal *j, Directory *m, int fd, uint32_t mask) 
 
         m->wd = inotify_add_watch_fd(j->inotify_fd, fd, mask);
         if (m->wd < 0) {
-                log_debug_errno(errno, "Failed to watch journal directory '%s', ignoring: %m", m->path);
+                log_debug_errno(m->wd, "Failed to watch journal directory '%s', ignoring: %m", m->path);
                 return;
         }
 
@@ -2215,9 +2215,7 @@ _public_ int sd_journal_get_monotonic_usec(sd_journal *j, uint64_t *ret, sd_id12
         if (r < 0)
                 return r;
 
-        if (ret_boot_id)
-                *ret_boot_id = o->entry.boot_id;
-        else {
+        if (!ret_boot_id) {
                 sd_id128_t id;
 
                 r = sd_id128_get_boot(&id);
@@ -2230,6 +2228,8 @@ _public_ int sd_journal_get_monotonic_usec(sd_journal *j, uint64_t *ret, sd_id12
 
         if (ret)
                 *ret = le64toh(o->entry.monotonic);
+        if (ret_boot_id)
+                *ret_boot_id = o->entry.boot_id;
 
         return 0;
 }
