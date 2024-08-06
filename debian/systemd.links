@@ -27,6 +27,3 @@
 
 # Compat symlink
 /lib/systemd/systemd /bin/systemd
-
-# Create a compat symlink as systemd-sysctl no longer reads /etc/sysctl.conf
-/etc/sysctl.conf /etc/sysctl.d/99-sysctl.conf

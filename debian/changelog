@@ -1,3 +1,10 @@
+systemd (252.26-1~deb12u2+pexip24u2) pexip; urgency=medium
+
+  * Remove /etc/sysctl.d/99-sysctl.conf as newer procps packages
+    do not ship it.
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Tue, 06 Aug 2024 10:13:50 +0100
+
 systemd (252.26-1~deb12u2+pexip24u1) pexip; urgency=medium
 
   * New upstream release
