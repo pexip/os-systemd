@@ -66,9 +66,8 @@ SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:0701??:
 
 SUBSYSTEM=="udc", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-gadget.target"
 
-# Don't apply sysctl config to network devices as they appear.
-# We manage them via tenet instead.
-# ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="{{ROOTLIBEXECDIR}}/systemd-sysctl --prefix=/net/ipv4/conf/$name --prefix=/net/ipv4/neigh/$name --prefix=/net/ipv6/conf/$name --prefix=/net/ipv6/neigh/$name"
+# Apply sysctl variables to network devices (and only to those) as they appear.
+ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="{{ROOTLIBEXECDIR}}/systemd-sysctl --prefix=/net/ipv4/conf/$name --prefix=/net/ipv4/neigh/$name --prefix=/net/ipv6/conf/$name --prefix=/net/ipv6/neigh/$name"
 
 {% if ENABLE_BACKLIGHT %}
 # Pull in backlight save/restore for all backlight devices and
