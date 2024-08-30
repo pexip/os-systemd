@@ -1,3 +1,10 @@
+systemd (252.26-1~deb12u2+pexip24u5) pexip; urgency=medium
+
+  * Change tack on the sysctl thing - just call sysctl rather than
+    systemd-sysctl.
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Fri, 30 Aug 2024 11:37:03 +0100
+
 systemd (252.26-1~deb12u2+pexip24u4) pexip; urgency=medium
 
   * Fix: move that last change to patch.
