@@ -10,7 +10,7 @@ index 7b50409..d1d1dd8 100644
 -ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="{{ROOTLIBEXECDIR}}/systemd-sysctl --prefix=/net/ipv4/conf/$name --prefix=/net/ipv4/neigh/$name --prefix=/net/ipv6/conf/$name --prefix=/net/ipv6/neigh/$name"
 +# Apply sysctl config to network devices as they appear, using sysctl rather than systemd-sysctl. Let's not break if we don't have enough entropy!
 +# This will (re)set all the sysctl settings each time it's called, meh.
-+# ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="sysctl -q --system"
++ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="sysctl -q --system"
  
  {% if ENABLE_BACKLIGHT %}
  # Pull in backlight save/restore for all backlight devices and
