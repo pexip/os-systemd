@@ -1,3 +1,9 @@
+systemd (252.26-1~deb12u2+pexip24u7) pexip; urgency=medium
+
+  * Disable udev patch
+
+ -- John-Mark Bell <jmb@pexip.com>  Sun, 01 Sep 2022 11:49:46 +0100
+
 systemd (252.26-1~deb12u2+pexip24u6) pexip; urgency=medium
 
   * Try again, without commenting things
