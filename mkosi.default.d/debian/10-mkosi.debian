@@ -7,6 +7,10 @@
 Distribution=debian
 Release=testing
 
+# Booting with UEFI does not work on Debian in this branch
+[Host]
+QemuBoot=linux
+
 [Content]
 Packages=
         cryptsetup-bin
@@ -26,7 +30,7 @@ Packages=
         libip4tc2
         libtss2-dev # Use the -dev package to avoid churn in updating version numbers
         netcat-openbsd
-        policykit-1
+        polkitd
         procps
         quota
         xxd

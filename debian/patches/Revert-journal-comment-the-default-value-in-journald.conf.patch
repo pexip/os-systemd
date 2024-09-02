@@ -1,0 +1,17 @@
+Author: Luca Boccassi <bluca@debian.org>
+Bug-Debian: http://bugs.debian.org/1079086
+Description: Revert "journal: comment the default value in journald.conf"
+ Because of how dpkg handles config files, this will cause a prompt to
+ users on upgrade, which is undesirable for stable updates, so revert it
+ in v252-stable.
+--- a/src/journal/journald.conf
++++ b/src/journal/journald.conf
+@@ -30,7 +30,7 @@
+ #RuntimeKeepFree=
+ #RuntimeMaxFileSize=
+ #RuntimeMaxFiles=100
+-#MaxRetentionSec=0
++#MaxRetentionSec=
+ #MaxFileSec=1month
+ #ForwardToSyslog=yes
+ #ForwardToKMsg=no

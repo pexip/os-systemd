@@ -47,7 +47,7 @@ index 5a60a9d..64f4d4b 100644
 +++ b/src/journal/journald.conf
 @@ -32,7 +32,7 @@
  #RuntimeMaxFiles=100
- #MaxRetentionSec=
+ #MaxRetentionSec=0
  #MaxFileSec=1month
 -#ForwardToSyslog=no
 +#ForwardToSyslog=yes

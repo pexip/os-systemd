@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sched.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
@@ -73,6 +74,7 @@
 #include "memory-util.h"
 #include "missing_fs.h"
 #include "missing_ioprio.h"
+#include "missing_sched.h"
 #include "mkdir-label.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
@@ -4436,27 +4438,26 @@ static int exec_child(
                 }
         }
 
+        if (context->cpu_sched_set) {
+                struct sched_attr attr = {
+                        .size = sizeof(attr),
+                        .sched_policy = context->cpu_sched_policy,
+                        .sched_priority = context->cpu_sched_priority,
+                        .sched_flags = context->cpu_sched_reset_on_fork ? SCHED_FLAG_RESET_ON_FORK : 0,
+                };
+
+                r = sched_setattr(/* pid= */ 0, &attr, /* flags= */ 0);
+                if (r < 0) {
+                        *exit_status = EXIT_SETSCHEDULER;
+                        return log_unit_error_errno(unit, errno, "Failed to set up CPU scheduling: %m");
+                }
+        }
+
         if (context->nice_set) {
                 r = setpriority_closest(context->nice);
                 if (r < 0) {
                         *exit_status = EXIT_NICE;
                         return log_unit_error_errno(unit, r, "Failed to set up process scheduling priority (nice level): %m");
-                }
-        }
-
-        if (context->cpu_sched_set) {
-                struct sched_param param = {
-                        .sched_priority = context->cpu_sched_priority,
-                };
-
-                r = sched_setscheduler(0,
-                                       context->cpu_sched_policy |
-                                       (context->cpu_sched_reset_on_fork ?
-                                        SCHED_RESET_ON_FORK : 0),
-                                       &param);
-                if (r < 0) {
-                        *exit_status = EXIT_SETSCHEDULER;
-                        return log_unit_error_errno(unit, errno, "Failed to set up CPU scheduling: %m");
                 }
         }
 
