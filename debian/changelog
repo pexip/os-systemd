@@ -1,3 +1,9 @@
+systemd (252.26-1~deb12u2+pexip24u8) pexip; urgency=medium
+
+  * Re-enable the udev patch and add a path to sysctl.
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Mon, 02 Sep 2024 10:58:49 +0100
+
 systemd (252.26-1~deb12u2+pexip24u7) pexip; urgency=medium
 
   * Disable udev patch
