@@ -1,3 +1,11 @@
+systemd (252.31-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.31
+  * Drop journald.conf patch merged upstream
+  * Refresh patches to remove fuzz from update
+
+ -- Luca Boccassi <bluca@debian.org>  Thu, 10 Oct 2024 18:40:53 +0100
+
 systemd (252.30-1~deb12u2) bookworm; urgency=medium
 
   * Backport patch to revert new comment in /etc/systemd/journald.conf.
