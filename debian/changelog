@@ -1,8 +1,14 @@
+systemd (252.31-1~deb12u1+pexip24u2) pexip; urgency=medium
+
+  * Rebuild to fix libssl build failure
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Fri, 15 Nov 2024 12:15:58 +0000
+
 systemd (252.31-1~deb12u1+pexip24u1) pexip; urgency=medium
 
-  * No-change rebuild to ensure we pick up the new libssl3
+  * New upstream release
 
- -- Steve McIntyre <steve.mcintyre@pexip.com>  Fri, 15 Nov 2024 18:40:53 +0000
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Fri, 15 Nov 2024 11:43:07 +0000
 
 systemd (252.31-1~deb12u1) bookworm; urgency=medium
 
