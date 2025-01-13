@@ -1,3 +1,21 @@
+systemd (252.33-1~deb12u1+pexip24u1) pexip; urgency=medium
+
+  * New upstream release
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Mon, 13 Jan 2025 17:41:07 +0000
+
+systemd (252.33-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.33
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 01 Dec 2024 13:28:27 +0000
+
+systemd (252.32-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.32
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 16 Nov 2024 18:35:32 +0000
+
 systemd (252.31-1~deb12u1+pexip24u2) pexip; urgency=medium
 
   * Rebuild to fix libssl build failure
