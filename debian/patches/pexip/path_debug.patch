@@ -72,7 +72,7 @@ Index: os-systemd/src/core/path.c
  
 +        log_unit_debug(UNIT(p), "%d: source %u", __LINE__, source);
          if (path_check_good(p, source, &trigger_path)) {
-                 log_unit_debug(UNIT(p), "Got triggered.");
+                 log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                  path_enter_running(p, trigger_path);
 @@ -617,6 +632,7 @@ static void path_enter_waiting(Path *p,
          if (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY)
@@ -80,7 +80,7 @@ Index: os-systemd/src/core/path.c
  
 +        log_unit_debug(UNIT(p), "%d: source %u", __LINE__, source);
          if (path_check_good(p, source, &trigger_path)) {
-                 log_unit_debug(UNIT(p), "Got triggered.");
+                 log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                  path_enter_running(p, trigger_path);
 @@ -659,6 +675,7 @@ static int path_start(Unit *u) {
          path_mkdir(p);
