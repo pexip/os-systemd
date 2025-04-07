@@ -5,7 +5,6 @@
 #include "alloc-util.h"
 #include "logind-device.h"
 #include "logind-seat-dbus.h"
-#include "util.h"
 
 Device* device_new(Manager *m, const char *sysfs, bool master) {
         Device *d;
@@ -28,7 +27,7 @@ Device* device_new(Manager *m, const char *sysfs, bool master) {
 
         d->manager = m;
         d->master = master;
-        dual_timestamp_get(&d->timestamp);
+        dual_timestamp_now(&d->timestamp);
 
         return d;
 }

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "ansi-color.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "sort-util.h"
@@ -49,9 +50,24 @@ static bool output_show_unit_file(const UnitFileList *u, char **states, char **p
         return true;
 }
 
+static const char* preset_action_to_color(PresetAction action, bool underline) {
+        assert(action >= 0);
+
+        switch (action) {
+        case PRESET_ENABLE:
+                return underline ? ansi_highlight_green_underline() : ansi_highlight_green();
+        case PRESET_DISABLE:
+                return underline ? ansi_highlight_red_underline() : ansi_highlight_red();
+        case PRESET_IGNORE:
+                return underline ? ansi_highlight_yellow_underline() : ansi_highlight_yellow();
+        default:
+                return NULL;
+        }
+}
+
 static int output_unit_file_list(const UnitFileList *units, unsigned c) {
         _cleanup_(table_unrefp) Table *table = NULL;
-        _cleanup_(unit_file_presets_freep) UnitFilePresets presets = {};
+        _cleanup_(unit_file_presets_done) UnitFilePresets presets = {};
         int r;
 
         table = table_new("unit file", "state", "preset");
@@ -64,7 +80,7 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
 
         table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
-        for (const UnitFileList *u = units; u < units + c; u++) {
+        FOREACH_ARRAY(u, units, c) {
                 const char *on_underline = NULL, *on_unit_color = NULL, *id;
                 bool underline;
 
@@ -98,22 +114,14 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
                         return table_log_add_error(r);
 
                 if (show_preset_for_state(u->state)) {
-                        const char *unit_preset_str, *on_preset_color;
+                        const char *on_preset_color = underline ? on_underline : ansi_normal();
 
-                        r = unit_file_query_preset(arg_scope, arg_root, id, &presets);
-                        if (r < 0) {
-                                unit_preset_str = "n/a";
-                                on_preset_color = underline ? on_underline : ansi_normal();
-                        } else if (r == 0) {
-                                unit_preset_str = "disabled";
-                                on_preset_color = underline ? ansi_highlight_red_underline() : ansi_highlight_red();
-                        } else {
-                                unit_preset_str = "enabled";
-                                on_preset_color = underline ? ansi_highlight_green_underline() : ansi_highlight_green();
-                        }
+                        r = unit_file_query_preset(arg_runtime_scope, arg_root, id, &presets);
+                        if (r >= 0)
+                                on_preset_color = preset_action_to_color(r, underline);
 
                         r = table_add_many(table,
-                                           TABLE_STRING, unit_preset_str,
+                                           TABLE_STRING, strna(preset_action_past_tense_to_string(r)),
                                            TABLE_SET_BOTH_COLORS, strempty(on_preset_color));
                 } else
                         r = table_add_many(table,
@@ -135,51 +143,38 @@ static int output_unit_file_list(const UnitFileList *units, unsigned c) {
 
 int verb_list_unit_files(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+        _cleanup_hashmap_free_ Hashmap *h = NULL;
         _cleanup_free_ UnitFileList *units = NULL;
         unsigned c = 0;
-        const char *state;
-        char *path;
         int r;
-        bool fallback = false;
 
         if (install_client_side()) {
-                Hashmap *h;
-                UnitFileList *u;
                 unsigned n_units;
 
-                h = hashmap_new(&string_hash_ops);
-                if (!h)
-                        return log_oom();
-
-                r = unit_file_get_list(arg_scope, arg_root, h, arg_states, strv_skip(argv, 1));
-                if (r < 0) {
-                        unit_file_list_free(h);
+                r = unit_file_get_list(arg_runtime_scope, arg_root, arg_states, strv_skip(argv, 1), &h);
+                if (r < 0)
                         return log_error_errno(r, "Failed to get unit file list: %m");
-                }
 
                 n_units = hashmap_size(h);
 
-                units = new(UnitFileList, n_units ?: 1); /* avoid malloc(0) */
-                if (!units) {
-                        unit_file_list_free(h);
+                units = new(UnitFileList, n_units);
+                if (!units)
                         return log_oom();
-                }
 
+                UnitFileList *u;
                 HASHMAP_FOREACH(u, h) {
                         if (!output_show_unit_file(u, NULL, NULL))
                                 continue;
 
                         units[c++] = *u;
-                        free(u);
                 }
 
                 assert(c <= n_units);
-                hashmap_free(h);
-
-                r = 0;
         } else {
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                const char *path, *state;
+                bool fallback = false;
                 sd_bus *bus;
 
                 r = acquire_bus(BUS_MANAGER, &bus);
@@ -202,19 +197,17 @@ int verb_list_unit_files(int argc, char *argv[], void *userdata) {
                                 return log_error_errno(r, "Failed to append unit dependencies: %m");
 
                         r = sd_bus_message_append_strv(m, names_with_deps);
-                        if (r < 0)
-                                return bus_log_create_error(r);
-                } else {
+                } else
                         r = sd_bus_message_append_strv(m, strv_skip(argv, 1));
-                        if (r < 0)
-                                return bus_log_create_error(r);
-                }
+                if (r < 0)
+                        return bus_log_create_error(r);
 
                 r = sd_bus_call(bus, m, 0, &error, &reply);
                 if (r < 0 && sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD)) {
                         /* Fallback to legacy ListUnitFiles method */
+                        log_debug_errno(r, "Unable to list unit files through ListUnitFilesByPatterns, falling back to ListUnitsFiles method.");
+
                         fallback = true;
-                        log_debug_errno(r, "Failed to list unit files: %s Falling back to ListUnitsFiles method.", bus_error_message(&error, r));
                         m = sd_bus_message_unref(m);
                         sd_bus_error_free(&error);
 
@@ -236,16 +229,15 @@ int verb_list_unit_files(int argc, char *argv[], void *userdata) {
                         if (!GREEDY_REALLOC(units, c + 1))
                                 return log_oom();
 
-                        units[c] = (struct UnitFileList) {
-                                path,
-                                unit_file_state_from_string(state)
+                        units[c] = (UnitFileList) {
+                                .path = (char*) path,
+                                .state = unit_file_state_from_string(state),
                         };
 
                         if (output_show_unit_file(&units[c],
                             fallback ? arg_states : NULL,
                             fallback ? strv_skip(argv, 1) : NULL))
                                 c++;
-
                 }
                 if (r < 0)
                         return bus_log_parse_error(r);
@@ -261,10 +253,6 @@ int verb_list_unit_files(int argc, char *argv[], void *userdata) {
         r = output_unit_file_list(units, c);
         if (r < 0)
                 return r;
-
-        if (install_client_side())
-                for (UnitFileList *unit = units; unit < units + c; unit++)
-                        free(unit->path);
 
         if (c == 0)
                 return -ENOENT;

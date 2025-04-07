@@ -40,20 +40,18 @@ bool memeqbyte(uint8_t byte, const void *data, size_t length) {
         return memcmp(data, p + 16, length) == 0;
 }
 
-#if !HAVE_EXPLICIT_BZERO
-/*
- * The pointer to memset() is volatile so that compiler must de-reference the pointer and can't assume that
- * it points to any function in particular (such as memset(), which it then might further "optimize"). This
- * approach is inspired by openssl's crypto/mem_clr.c.
- */
-typedef void *(*memset_t)(void *,int,size_t);
+void *memdup_reverse(const void *mem, size_t size) {
+        assert(mem);
+        assert(size != 0);
 
-static volatile memset_t memset_func = memset;
+        void *p = malloc(size);
+        if (!p)
+                return NULL;
 
-void* explicit_bzero_safe(void *p, size_t l) {
-        if (l > 0)
-                memset_func(p, '\0', l);
+        uint8_t *p_dst = p;
+        const uint8_t *p_src = mem;
+        for (size_t i = 0, k = size; i < size; i++, k--)
+                p_dst[i] = p_src[k-1];
 
         return p;
 }
-#endif

@@ -41,7 +41,7 @@ static int property_get_pool_usage(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         uint64_t usage = UINT64_MAX;
 
         assert(bus);
@@ -67,7 +67,7 @@ static int property_get_pool_limit(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         uint64_t size = UINT64_MAX;
 
         assert(bus);
@@ -281,6 +281,8 @@ static int method_detach_image(sd_bus_message *message, void *userdata, sd_bus_e
 
         assert(message);
 
+        CLEANUP_ARRAY(changes, n_changes, portable_changes_free);
+
         /* Note that we do not redirect detaching to the image object here, because we want to allow that users can
          * detach already deleted images too, in case the user already deleted an image before properly detaching
          * it. */
@@ -318,11 +320,8 @@ static int method_detach_image(sd_bus_message *message, void *userdata, sd_bus_e
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.portable1.attach-images",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        /* details= */ NULL,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -339,13 +338,9 @@ static int method_detach_image(sd_bus_message *message, void *userdata, sd_bus_e
                         &n_changes,
                         error);
         if (r < 0)
-                goto finish;
+                return r;
 
-        r = reply_portable_changes(message, changes, n_changes);
-
-finish:
-        portable_changes_free(changes, n_changes);
-        return r;
+        return reply_portable_changes(message, changes, n_changes);
 }
 
 static int method_reattach_image(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -379,11 +374,8 @@ static int method_set_pool_limit(sd_bus_message *message, void *userdata, sd_bus
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.portable1.manage-images",
-                        NULL,
-                        false,
-                        UID_INVALID,
+                        /* details= */ NULL,
                         &m->polkit_registry,
                         error);
         if (r < 0)

@@ -16,10 +16,11 @@
 #include "path-util.h"
 #include "rm-rf.h"
 #include "strv.h"
+#include "tests.h"
 #include "tmpfile-util.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-        _cleanup_close_ int fdin_close = -1, fdout = -1;
+        _cleanup_close_ int fdin_close = -EBADF, fdout = -EBADF;
         _cleanup_(rm_rf_physical_and_freep) char *tmp = NULL;
         _cleanup_(unlink_and_freep) char *name = NULL;
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
@@ -30,8 +31,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (outside_size_range(size, 3, 65536))
                 return 0;
 
-        if (!getenv("SYSTEMD_LOG_LEVEL"))
-                log_set_max_level(LOG_ERR);
+        fuzz_setup_logging();
 
         assert_se(mkdtemp_malloc("/tmp/fuzz-journal-remote-XXXXXX", &tmp) >= 0);
         assert_se(name = path_join(tmp, "fuzz-journal-remote.XXXXXX.journal"));
@@ -55,20 +55,17 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 return r;
         }
 
-        r = journal_remote_add_source(&s, fdin, (char*) "fuzz-data", false);
-        if (r < 0)
-                return r;
+        ASSERT_OK_POSITIVE(journal_remote_add_source(&s, fdin, (char*) "fuzz-data", false));
         TAKE_FD(fdin_close);
-        assert(r > 0);
 
         while (s.active)
-                assert_se(journal_remote_handle_raw_source(NULL, fdin, 0, &s) >= 0);
+                ASSERT_OK(journal_remote_handle_raw_source(NULL, fdin, 0, &s));
 
         assert_se(close(fdin) < 0 && errno == EBADF); /* Check that the fd is closed already */
 
         /* Out */
 
-        r = sd_journal_open_files(&j, (const char**) STRV_MAKE(name), 0);
+        r = sd_journal_open_files(&j, (const char**) STRV_MAKE(name), SD_JOURNAL_ASSUME_IMMUTABLE);
         if (r < 0) {
                 log_error_errno(r, "sd_journal_open_files([\"%s\"]) failed: %m", name);
                 assert_se(IN_SET(r, -ENOMEM, -EMFILE, -ENFILE, -ENODATA));
@@ -85,11 +82,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         for (OutputMode mode = 0; mode < _OUTPUT_MODE_MAX; mode++) {
                 if (!dev_null)
                         log_info("/* %s */", output_mode_to_string(mode));
-                r = show_journal(dev_null ?: stdout, j, mode, 0, 0, -1, 0, NULL);
-                assert_se(r >= 0);
-
-                r = sd_journal_seek_head(j);
-                assert_se(r >= 0);
+                ASSERT_OK(show_journal(dev_null ?: stdout, j, mode, 0, 0, -1, 0, NULL));
+                ASSERT_OK(sd_journal_seek_head(j));
         }
 
         return 0;

@@ -59,7 +59,6 @@ static int load_kernel_syscalls(Set **ret) {
 }
 
 static int syscall_set_add(Set **s, const SyscallFilterSet *set) {
-        const char *sc;
         int r;
 
         assert(s);
@@ -80,8 +79,6 @@ static int syscall_set_add(Set **s, const SyscallFilterSet *set) {
 }
 
 static void syscall_set_remove(Set *s, const SyscallFilterSet *set) {
-        const char *sc;
-
         if (!set)
                 return;
 
@@ -94,8 +91,6 @@ static void syscall_set_remove(Set *s, const SyscallFilterSet *set) {
 }
 
 static void dump_syscall_filter(const SyscallFilterSet *set) {
-        const char *syscall;
-
         printf("%s%s%s\n"
                "    # %s\n",
                ansi_highlight(),

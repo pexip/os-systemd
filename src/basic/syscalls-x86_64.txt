@@ -19,6 +19,7 @@ bpf	321
 brk	12
 cachectl
 cacheflush
+cachestat	451
 capget	125
 capset	126
 chdir	80
@@ -148,6 +149,7 @@ gettimeofday	96
 getuid	102
 getuid32
 getxattr	191
+getxattrat	464
 getxgid
 getxpid
 getxuid
@@ -187,12 +189,18 @@ lgetxattr	192
 link	86
 linkat	265
 listen	50
+listmount	458
 listxattr	194
+listxattrat	465
 llistxattr	195
+llseek
 lookup_dcookie	212
 lremovexattr	198
 lseek	8
 lsetxattr	189
+lsm_get_self_attr	459
+lsm_list_modules	461
+lsm_set_self_attr	460
 lstat	6
 lstat64
 madvise	28
@@ -228,6 +236,7 @@ mq_timedsend	242
 mq_timedsend_time64
 mq_unlink	241
 mremap	25
+mseal	462
 msgctl	71
 msgget	68
 msgrcv	70
@@ -334,6 +343,7 @@ recvmmsg_time64
 recvmsg	47
 remap_file_pages	216
 removexattr	197
+removexattrat	466
 rename	82
 renameat	264
 renameat2	316
@@ -422,6 +432,7 @@ settimeofday	164
 setuid	105
 setuid32
 setxattr	188
+setxattrat	463
 sgetmask
 shmat	30
 shmctl	31
@@ -448,6 +459,7 @@ stat	4
 stat64
 statfs	137
 statfs64
+statmount	457
 statx	332
 stime
 subpage_prot
@@ -495,6 +507,7 @@ uname	63
 unlink	87
 unlinkat	263
 unshare	272
+uretprobe	335
 userfaultfd	323
 ustat	136
 utime	132

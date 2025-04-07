@@ -20,6 +20,7 @@
 #include "namespace-util.h"
 #include "path-util.h"
 #include "string-util.h"
+#include "uid-classification.h"
 #include "user-util.h"
 
 static const char *mount_options_for_fstype(const char *fstype) {
@@ -184,9 +185,9 @@ static int append_identity_range(char **text, uid_t start, uid_t next_start, uid
                           exclude + 1, exclude + 1, next_start - exclude - 1);
 }
 
-static int make_userns(uid_t stored_uid, uid_t exposed_uid) {
+static int make_home_userns(uid_t stored_uid, uid_t exposed_uid) {
         _cleanup_free_ char *text = NULL;
-        _cleanup_close_ int userns_fd = -1;
+        _cleanup_close_ int userns_fd = -EBADF;
         int r;
 
         assert(uid_is_valid(stored_uid));
@@ -215,7 +216,7 @@ static int make_userns(uid_t stored_uid, uid_t exposed_uid) {
         /* Also map the container range. People can use that to place containers owned by high UIDs in their
          * home directories if they really want. We won't manage this UID range for them but pass it through
          * 1:1, and it will lose its meaning once migrated between hosts. */
-        r = append_identity_range(&text, CONTAINER_UID_BASE_MIN, CONTAINER_UID_BASE_MAX+1, stored_uid);
+        r = append_identity_range(&text, CONTAINER_UID_MIN, CONTAINER_UID_MAX+1, stored_uid);
         if (r < 0)
                 return log_oom();
 
@@ -226,7 +227,7 @@ static int make_userns(uid_t stored_uid, uid_t exposed_uid) {
                 return log_oom();
 
         /* Leave everything else unmapped, starting from UID_NOBODY itself. Specifically, this means the
-         * whole space outside of 16bit remains unmapped */
+         * whole space outside of 16-bit remains unmapped */
 
         log_debug("Creating userns with mapping:\n%s", text);
 
@@ -238,7 +239,7 @@ static int make_userns(uid_t stored_uid, uid_t exposed_uid) {
 }
 
 int home_shift_uid(int dir_fd, const char *target, uid_t stored_uid, uid_t exposed_uid, int *ret_mount_fd) {
-        _cleanup_close_ int mount_fd = -1, userns_fd = -1;
+        _cleanup_close_ int mount_fd = -EBADF, userns_fd = -EBADF;
         int r;
 
         assert(dir_fd >= 0);
@@ -261,7 +262,7 @@ int home_shift_uid(int dir_fd, const char *target, uid_t stored_uid, uid_t expos
                         log_debug_errno(errno, "The open_tree() syscall is not supported, not setting up UID shift mount: %m");
 
                         if (ret_mount_fd)
-                                *ret_mount_fd = -1;
+                                *ret_mount_fd = -EBADF;
 
                         return 0;
                 }
@@ -269,7 +270,7 @@ int home_shift_uid(int dir_fd, const char *target, uid_t stored_uid, uid_t expos
                 return log_error_errno(errno, "Failed to open tree of home directory: %m");
         }
 
-        userns_fd = make_userns(stored_uid, exposed_uid);
+        userns_fd = make_home_userns(stored_uid, exposed_uid);
         if (userns_fd < 0)
                 return userns_fd;
 
@@ -284,7 +285,7 @@ int home_shift_uid(int dir_fd, const char *target, uid_t stored_uid, uid_t expos
                         log_debug_errno(errno, "UID/GID mapping for shifted mount not available, not setting it up: %m");
 
                         if (ret_mount_fd)
-                                *ret_mount_fd = -1;
+                                *ret_mount_fd = -EBADF;
 
                         return 0;
                 }

@@ -49,15 +49,15 @@ run_network_generator() {
 
     rm -rf "${WORK_DIR:?}"/*
     stderr="$WORK_DIR/stderr"
-    if ! "$GENERATOR_BIN" --root "$WORK_DIR" 2>"$stderr"; then
+    if ! SYSTEMD_LOG_LEVEL="info" "$GENERATOR_BIN" --root "$WORK_DIR" 2>"$stderr"; then
         echo >&2 "Generator failed when parsing $SYSTEMD_PROC_CMDLINE"
-        cat "$stderr"
+        cat >&2 "$stderr"
         return 1
     fi
 
     if [[ -s "$stderr" ]]; then
         echo >&2 "Generator generated unexpected messages on stderr"
-        cat "$stderr"
+        cat >&2 "$stderr"
         return 1
     fi
 
@@ -83,6 +83,8 @@ check_dhcp() {
             ;;
         none|off)
             grep -q "^DHCP=no$" "$network_file"
+            grep -q "^LinkLocalAddressing=no$" "$network_file"
+            grep -q "^IPv6AcceptRA=no$" "$network_file"
             ;;
         auto6|ibft)
             grep -q "^DHCP=no$" "$network_file"
@@ -92,6 +94,13 @@ check_dhcp() {
             ;;
         link6)
             grep -q "^DHCP=no$" "$network_file"
+            grep -q "^LinkLocalAddressing=ipv6$" "$network_file"
+            grep -q "^IPv6AcceptRA=no$" "$network_file"
+            ;;
+        link-local)
+            grep -q "^DHCP=no$" "$network_file"
+            grep -q "^LinkLocalAddressing=yes$" "$network_file"
+            grep -q "^IPv6AcceptRA=no$" "$network_file"
             ;;
         *)
             echo >&2 "Invalid assignment $cmdline"
@@ -102,17 +111,18 @@ check_dhcp() {
 }
 
 # Check the shortest ip= variant, i.e.:
-#   ip={dhcp|on|any|dhcp6|auto6|either6|link6}
+#   ip={dhcp|on|any|dhcp6|auto6|either6|link6|link-local}
 #
 # Note:
 #   - dracut also supports single-dhcp
+#   - link-local is supported only by systemd-network-generator
 check_one_dhcp() {
     local cmdline="${1:?}"
     local dhcp="${cmdline#ip=}"
     local network_file
 
     SYSTEMD_LOG_LEVEL=debug SYSTEMD_PROC_CMDLINE="$cmdline" run_network_generator
-    network_file="${WORK_DIR:?}/run/systemd/network/91-default.network"
+    network_file="${WORK_DIR:?}/run/systemd/network/71-default.network"
     cat "$network_file"
 
     check_dhcp "$dhcp" "$network_file"
@@ -121,7 +131,7 @@ check_one_dhcp() {
 }
 
 # Similar to the previous one, but with slightly more fields:
-#   ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6}[:[<mtu>][:<macaddr>]]
+#   ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6|link-local}[:[<mtu>][:<macaddr>]]
 #
 # Same notes apply as well.
 check_one_interface_dhcp() {
@@ -131,7 +141,7 @@ check_one_interface_dhcp() {
     IFS=":" read -r ifname dhcp mtu mac <<< "${cmdline#ip=}"
 
     SYSTEMD_LOG_LEVEL=debug SYSTEMD_PROC_CMDLINE="$cmdline" run_network_generator
-    network_file="${WORK_DIR:?}/run/systemd/network/90-$ifname.network"
+    network_file="${WORK_DIR:?}/run/systemd/network/70-$ifname.network"
     cat "$network_file"
 
     grep -q "^Name=$ifname$" "$network_file"
@@ -163,10 +173,10 @@ check_one_long() {
     SYSTEMD_LOG_LEVEL=debug SYSTEMD_PROC_CMDLINE="$cmdline" run_network_generator
 
     if [[ -n "$ifname" ]]; then
-        network_file="${WORK_DIR:?}/run/systemd/network/90-$ifname.network"
+        network_file="${WORK_DIR:?}/run/systemd/network/70-$ifname.network"
         grep -q "^Name=$ifname$" "$network_file"
     else
-        network_file="${WORK_DIR:?}/run/systemd/network/91-default.network"
+        network_file="${WORK_DIR:?}/run/systemd/network/71-default.network"
         grep -q "^Kind=!\*$" "$network_file"
     fi
 
@@ -216,7 +226,7 @@ for f in "$TEST_DATA"/test-*.input; do
     "$GENERATOR_BIN" --root "$out" -- $(cat "$f")
 
     if ! diff -u "$out/run/systemd/network" "${f%.input}.expected"; then
-        echo "**** Unexpected output for $f"
+        echo >&2 "**** Unexpected output for $f"
         exit 1
     fi
 
@@ -226,15 +236,16 @@ done
 # Now generate bunch of .network units on the fly and check if they contain expected
 # directives & values
 
-# ip={dhcp|on|any|dhcp6|auto6|either6|link6}
-for dhcp in dhcp on any dhcp6 auto6 either6 link6 off none ibft; do
+# ip={dhcp|on|any|dhcp6|auto6|either6|link6|link-local}
+for dhcp in dhcp on any dhcp6 auto6 either6 link6 link-local off none ibft; do
     check_one_dhcp "ip=$dhcp"
 done
 
-# ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6}[:[<mtu>][:<macaddr>]]
+# ip=<interface>:{dhcp|on|any|dhcp6|auto6|link6|link-local}[:[<mtu>][:<macaddr>]]
 COMMAND_LINES=(
     "ip=foo:dhcp"
     "ip=bar:dhcp6"
+    "ip=linklocal99:link-local"
     "ip=baz1:any:666"
     "ip=baz1:any:128:52:54:00:a7:8f:ac"
 )
@@ -250,7 +261,6 @@ COMMAND_LINES=(
     "ip=1.2.3.4:2.3.4.5:1.2.3.1:255.255.255.0:hello-world.local:dummy99:off:123"
     "ip=1.2.3.4:2.3.4.5:1.2.3.1:255.255.255.0:hello-world.local:dummy99:off:123:52:54:00:a7:8f:ac"
     "ip=1.2.3.4:2.3.4.5:1.2.3.1:255.255.255.0:hello-world.local:dummy99:off::52:54:00:a7:8f:ac"
-    "ip=1.2.3.4:2.3.4.5:1.2.3.1:255.255.255.0:hello-world.local:dummy99:off::"
     "ip=1.2.3.4:2.3.4.5:1.2.3.1:255.255.255.0:hello-world.local:dummy99:off:1.2.3.2"
     "ip=1.2.3.4:2.3.4.5:1.2.3.1:255.255.255.0:hello-world.local:dummy99:off:1.2.3.2:1.2.3.3"
     "ip=192.168.0.2::192.168.0.1:255.255.128.0::foo1:off"
@@ -261,7 +271,6 @@ COMMAND_LINES=(
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off:666"
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off:666:52:54:00:a7:8f:ac"
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off::52:54:00:a7:8f:ac"
-    "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off::"
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off:[fdef:c400:bd01:1096::aaaa]"
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off:[fdef:c400:bd01:1096::aaaa]:[fdef:c400:bd01:1096::bbbb]"
     "ip=:::::dhcp99:any"
@@ -288,7 +297,9 @@ INVALID_COMMAND_LINES=(
     "ip=:::::dhcp99:dhcp6:4294967296"
     "ip=:::::dhcp99:dhcp6:-1"
     "ip=:::::dhcp99:dhcp6:666:52:54:00"
+    "ip=1.2.3.4:2.3.4.5:1.2.3.1:255.255.255.0:hello-world.local:dummy99:off::"
     "ip=fdef:c400:bd01:1096::2::[fdef:c400:bd01:1096::1]:64::ipv6:off:[fdef:c400:bd01:1096::aaaa]"
+    "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off::"
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off:foo"
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off:[fdef:c400:bd01:1096::aaaa]:foo"
     "ip=[fdef:c400:bd01:1096::2]::[fdef:c400:bd01:1096::1]:64::ipv6:off:[fdef:c400:bd01:1096::aaaa]:[fdef:c400:bd01:1096::bbbb]:"

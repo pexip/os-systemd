@@ -35,6 +35,7 @@ typedef enum TimestampStyle {
         TIMESTAMP_UTC,
         TIMESTAMP_US_UTC,
         TIMESTAMP_UNIX,
+        TIMESTAMP_DATE,
         _TIMESTAMP_STYLE_MAX,
         _TIMESTAMP_STYLE_INVALID = -EINVAL,
 } TimestampStyle;
@@ -65,27 +66,31 @@ typedef enum TimestampStyle {
 /* We assume a maximum timezone length of 6. TZNAME_MAX is not defined on Linux, but glibc internally initializes this
  * to 6. Let's rely on that. */
 #define FORMAT_TIMESTAMP_MAX (3U+1U+10U+1U+8U+1U+6U+1U+6U+1U)
-#define FORMAT_TIMESTAMP_WIDTH 28U /* when outputting, assume this width */
 #define FORMAT_TIMESTAMP_RELATIVE_MAX 256U
 #define FORMAT_TIMESPAN_MAX 64U
 
 #define TIME_T_MAX (time_t)((UINTMAX_C(1) << ((sizeof(time_t) << 3) - 1)) - 1)
 
-#define DUAL_TIMESTAMP_NULL ((struct dual_timestamp) {})
-#define TRIPLE_TIMESTAMP_NULL ((struct triple_timestamp) {})
+#define DUAL_TIMESTAMP_NULL ((dual_timestamp) {})
+#define DUAL_TIMESTAMP_INFINITY ((dual_timestamp) { USEC_INFINITY, USEC_INFINITY })
+#define TRIPLE_TIMESTAMP_NULL ((triple_timestamp) {})
+
+#define TIMESPEC_OMIT ((const struct timespec) { .tv_nsec = UTIME_OMIT })
 
 usec_t now(clockid_t clock);
 nsec_t now_nsec(clockid_t clock);
 
+usec_t map_clock_usec_raw(usec_t from, usec_t from_base, usec_t to_base);
 usec_t map_clock_usec(usec_t from, clockid_t from_clock, clockid_t to_clock);
 
-dual_timestamp* dual_timestamp_get(dual_timestamp *ts);
+dual_timestamp* dual_timestamp_now(dual_timestamp *ts);
 dual_timestamp* dual_timestamp_from_realtime(dual_timestamp *ts, usec_t u);
 dual_timestamp* dual_timestamp_from_monotonic(dual_timestamp *ts, usec_t u);
 dual_timestamp* dual_timestamp_from_boottime(dual_timestamp *ts, usec_t u);
 
-triple_timestamp* triple_timestamp_get(triple_timestamp *ts);
+triple_timestamp* triple_timestamp_now(triple_timestamp *ts);
 triple_timestamp* triple_timestamp_from_realtime(triple_timestamp *ts, usec_t u);
+triple_timestamp* triple_timestamp_from_boottime(triple_timestamp *ts, usec_t u);
 
 #define DUAL_TIMESTAMP_HAS_CLOCK(clock)                               \
         IN_SET(clock, CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_MONOTONIC)
@@ -123,8 +128,17 @@ struct timeval* timeval_store(struct timeval *tv, usec_t u);
 #define TIMEVAL_STORE(u) timeval_store(&(struct timeval) {}, (u))
 
 char* format_timestamp_style(char *buf, size_t l, usec_t t, TimestampStyle style) _warn_unused_result_;
-char* format_timestamp_relative(char *buf, size_t l, usec_t t) _warn_unused_result_;
+char* format_timestamp_relative_full(char *buf, size_t l, usec_t t, clockid_t clock, bool implicit_left) _warn_unused_result_;
 char* format_timespan(char *buf, size_t l, usec_t t, usec_t accuracy) _warn_unused_result_;
+
+_warn_unused_result_
+static inline char* format_timestamp_relative(char *buf, size_t l, usec_t t) {
+        return format_timestamp_relative_full(buf, l, t, CLOCK_REALTIME, /* implicit_left = */ false);
+}
+_warn_unused_result_
+static inline char* format_timestamp_relative_monotonic(char *buf, size_t l, usec_t t) {
+        return format_timestamp_relative_full(buf, l, t, CLOCK_MONOTONIC, /* implicit_left = */ false);
+}
 
 _warn_unused_result_
 static inline char* format_timestamp(char *buf, size_t l, usec_t t) {
@@ -137,19 +151,21 @@ static inline char* format_timestamp(char *buf, size_t l, usec_t t) {
 #define FORMAT_TIMESTAMP(t) format_timestamp((char[FORMAT_TIMESTAMP_MAX]){}, FORMAT_TIMESTAMP_MAX, t)
 #define FORMAT_TIMESTAMP_RELATIVE(t)                                    \
         format_timestamp_relative((char[FORMAT_TIMESTAMP_RELATIVE_MAX]){}, FORMAT_TIMESTAMP_RELATIVE_MAX, t)
+#define FORMAT_TIMESTAMP_RELATIVE_MONOTONIC(t)                          \
+        format_timestamp_relative_monotonic((char[FORMAT_TIMESTAMP_RELATIVE_MAX]){}, FORMAT_TIMESTAMP_RELATIVE_MAX, t)
 #define FORMAT_TIMESPAN(t, accuracy) format_timespan((char[FORMAT_TIMESPAN_MAX]){}, FORMAT_TIMESPAN_MAX, t, accuracy)
 #define FORMAT_TIMESTAMP_STYLE(t, style) \
         format_timestamp_style((char[FORMAT_TIMESTAMP_MAX]){}, FORMAT_TIMESTAMP_MAX, t, style)
 
-int parse_timestamp(const char *t, usec_t *usec);
+int parse_timestamp(const char *t, usec_t *ret);
 
-int parse_sec(const char *t, usec_t *usec);
-int parse_sec_fix_0(const char *t, usec_t *usec);
-int parse_sec_def_infinity(const char *t, usec_t *usec);
-int parse_time(const char *t, usec_t *usec, usec_t default_unit);
-int parse_nsec(const char *t, nsec_t *nsec);
+int parse_sec(const char *t, usec_t *ret);
+int parse_sec_fix_0(const char *t, usec_t *ret);
+int parse_sec_def_infinity(const char *t, usec_t *ret);
+int parse_time(const char *t, usec_t *ret, usec_t default_unit);
+int parse_nsec(const char *t, nsec_t *ret);
 
-int get_timezones(char ***l);
+int get_timezones(char ***ret);
 int verify_timezone(const char *name, int log_level);
 static inline bool timezone_is_valid(const char *name, int log_level) {
         return verify_timezone(name, log_level) >= 0;
@@ -159,10 +175,10 @@ bool clock_supported(clockid_t clock);
 
 usec_t usec_shift_clock(usec_t, clockid_t from, clockid_t to);
 
-int get_timezone(char **timezone);
+int get_timezone(char **ret);
 
-time_t mktime_or_timegm(struct tm *tm, bool utc);
-struct tm *localtime_or_gmtime_r(const time_t *t, struct tm *tm, bool utc);
+int mktime_or_timegm_usec(struct tm *tm, bool utc, usec_t *ret);
+int localtime_or_gmtime_usec(usec_t t, bool utc, struct tm *ret);
 
 uint32_t usec_to_jiffies(usec_t usec);
 usec_t jiffies_to_usec(uint32_t jiffies);
@@ -172,11 +188,7 @@ bool in_utc_timezone(void);
 static inline usec_t usec_add(usec_t a, usec_t b) {
         /* Adds two time values, and makes sure USEC_INFINITY as input results as USEC_INFINITY in output,
          * and doesn't overflow. */
-
-        if (a > USEC_INFINITY - b) /* overflow check */
-                return USEC_INFINITY;
-
-        return a + b;
+        return saturate_add(a, b, USEC_INFINITY);
 }
 
 static inline usec_t usec_sub_unsigned(usec_t timestamp, usec_t delta) {
@@ -200,13 +212,31 @@ static inline usec_t usec_sub_signed(usec_t timestamp, int64_t delta) {
         return usec_sub_unsigned(timestamp, (usec_t) delta);
 }
 
+static inline int usleep_safe(usec_t usec) {
+        /* usleep() takes useconds_t that is (typically?) uint32_t. Also, usleep() may only support the
+         * range [0, 1000000]. See usleep(3). Let's override usleep() with clock_nanosleep().
+         *
+         * ⚠️ Note we are not using plain nanosleep() here, since that operates on CLOCK_REALTIME, not
+         *    CLOCK_MONOTONIC! */
+
+        if (usec == 0)
+                return 0;
+
+        // FIXME: use RET_NERRNO() macro here. Currently, this header cannot include errno-util.h.
+        return clock_nanosleep(CLOCK_MONOTONIC, 0, TIMESPEC_STORE(usec), NULL) < 0 ? -errno : 0;
+}
+
+/* The last second we can format is 31. Dec 9999, 1s before midnight, because otherwise we'd enter 5 digit
+ * year territory. However, since we want to stay away from this in all timezones we take one day off. */
+#define USEC_TIMESTAMP_FORMATTABLE_MAX_64BIT ((usec_t) 253402214399000000) /* Thu 9999-12-30 23:59:59 UTC */
+/* With a 32-bit time_t we can't go beyond 2038...
+ * We parse timestamp with RFC-822/ISO 8601 (e.g. +06, or -03:00) as UTC, hence the upper bound must be off
+ * by USEC_PER_DAY. See parse_timestamp() for more details. */
+#define USEC_TIMESTAMP_FORMATTABLE_MAX_32BIT (((usec_t) INT32_MAX) * USEC_PER_SEC - USEC_PER_DAY)
 #if SIZEOF_TIME_T == 8
-  /* The last second we can format is 31. Dec 9999, 1s before midnight, because otherwise we'd enter 5 digit
-   * year territory. However, since we want to stay away from this in all timezones we take one day off. */
-#  define USEC_TIMESTAMP_FORMATTABLE_MAX ((usec_t) 253402214399000000)
+#  define USEC_TIMESTAMP_FORMATTABLE_MAX USEC_TIMESTAMP_FORMATTABLE_MAX_64BIT
 #elif SIZEOF_TIME_T == 4
-/* With a 32bit time_t we can't go beyond 2038... */
-#  define USEC_TIMESTAMP_FORMATTABLE_MAX ((usec_t) 2147483647000000)
+#  define USEC_TIMESTAMP_FORMATTABLE_MAX USEC_TIMESTAMP_FORMATTABLE_MAX_32BIT
 #else
 #  error "Yuck, time_t is neither 4 nor 8 bytes wide?"
 #endif

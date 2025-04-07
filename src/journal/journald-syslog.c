@@ -9,7 +9,9 @@
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "format-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
+#include "journal-internal.h"
+#include "journald-client.h"
 #include "journald-console.h"
 #include "journald-kmsg.h"
 #include "journald-server.h"
@@ -125,7 +127,6 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
         char header_priority[DECIMAL_STR_MAX(priority) + 3], header_time[64],
              header_pid[STRLEN("[]: ") + DECIMAL_STR_MAX(pid_t) + 1];
         int n = 0;
-        time_t t;
         struct tm tm;
         _cleanup_free_ char *ident_buf = NULL;
 
@@ -142,8 +143,7 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
         iovec[n++] = IOVEC_MAKE_STRING(header_priority);
 
         /* Second: timestamp */
-        t = tv ? tv->tv_sec : ((time_t) (now(CLOCK_REALTIME) / USEC_PER_SEC));
-        if (!localtime_r(&t, &tm))
+        if (localtime_or_gmtime_usec(tv ? tv->tv_sec * USEC_PER_SEC : now(CLOCK_REALTIME), /* utc= */ false, &tm) < 0)
                 return;
         if (strftime(header_time, sizeof(header_time), "%h %e %T ", &tm) <= 0)
                 return;
@@ -152,7 +152,7 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
         /* Third: identifier and PID */
         if (ucred) {
                 if (!identifier) {
-                        (void) get_process_comm(ucred->pid, &ident_buf);
+                        (void) pid_get_comm(ucred->pid, &ident_buf);
                         identifier = ident_buf;
                 }
 
@@ -175,8 +175,8 @@ void server_forward_syslog(Server *s, int priority, const char *identifier, cons
 
 int syslog_fixup_facility(int priority) {
 
-        if ((priority & LOG_FACMASK) == 0)
-                return (priority & LOG_PRIMASK) | LOG_USER;
+        if (LOG_FAC(priority) == 0)
+                return LOG_PRI(priority) | LOG_USER;
 
         return priority;
 }
@@ -312,8 +312,8 @@ void server_process_syslog_message(
                 const char *label,
                 size_t label_len) {
 
-        char *t, syslog_priority[sizeof("PRIORITY=") + DECIMAL_STR_MAX(int)],
-                 syslog_facility[sizeof("SYSLOG_FACILITY=") + DECIMAL_STR_MAX(int)];
+        char *t, syslog_priority[STRLEN("PRIORITY=") + DECIMAL_STR_MAX(int)],
+                 syslog_facility[STRLEN("SYSLOG_FACILITY=") + DECIMAL_STR_MAX(int)];
         const char *msg, *syslog_ts, *a;
         _cleanup_free_ char *identifier = NULL, *pid = NULL,
                 *dummy = NULL, *msg_msg = NULL, *msg_raw = NULL;
@@ -334,7 +334,9 @@ void server_process_syslog_message(
         if (ucred && pid_is_valid(ucred->pid)) {
                 r = client_context_get(s, ucred->pid, ucred, label, label_len, NULL, &context);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to retrieve credentials for PID " PID_FMT ", ignoring: %m", ucred->pid);
+                        log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
+                                                    "Failed to retrieve credentials for PID " PID_FMT ", ignoring: %m",
+                                                    ucred->pid);
         }
 
         /* We are creating a copy of the message because we want to forward the original message
@@ -371,6 +373,9 @@ void server_process_syslog_message(
         if (!client_context_test_priority(context, priority))
                 return;
 
+        if (client_context_check_keep_log(context, msg, strlen(msg)) <= 0)
+                return;
+
         syslog_ts = msg;
         syslog_ts_len = syslog_skip_timestamp(&msg);
         if (syslog_ts_len == 0)
@@ -396,10 +401,10 @@ void server_process_syslog_message(
 
         iovec[n++] = IOVEC_MAKE_STRING("_TRANSPORT=syslog");
 
-        xsprintf(syslog_priority, "PRIORITY=%i", priority & LOG_PRIMASK);
+        xsprintf(syslog_priority, "PRIORITY=%i", LOG_PRI(priority));
         iovec[n++] = IOVEC_MAKE_STRING(syslog_priority);
 
-        if (priority & LOG_FACMASK) {
+        if (LOG_FAC(priority) != 0) {
                 xsprintf(syslog_facility, "SYSLOG_FACILITY=%i", LOG_FAC(priority));
                 iovec[n++] = IOVEC_MAKE_STRING(syslog_facility);
         }

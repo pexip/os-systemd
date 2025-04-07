@@ -5,8 +5,6 @@
 #include "strv.h"
 #include "tests.h"
 
-const bool mempool_use_allowed = VALGRIND;
-
 TEST(set_steal_first) {
         _cleanup_set_free_ Set *m = NULL;
         int seen[3] = {};
@@ -37,11 +35,10 @@ static void item_seen(Item *item) {
 TEST(set_free_with_destructor) {
         Set *m;
         struct Item items[4] = {};
-        unsigned i;
 
         assert_se(m = set_new(NULL));
-        for (i = 0; i < ELEMENTSOF(items) - 1; i++)
-                assert_se(set_put(m, items + i) == 1);
+        FOREACH_ARRAY(item, items, ELEMENTSOF(items) - 1)
+                assert_se(set_put(m, item) == 1);
 
         m = set_free_with_destructor(m, item_seen);
         assert_se(items[0].seen == 1);
@@ -55,11 +52,10 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(item_hash_ops, void, trivial_hash_
 TEST(set_free_with_hash_ops) {
         Set *m;
         struct Item items[4] = {};
-        unsigned i;
 
         assert_se(m = set_new(&item_hash_ops));
-        for (i = 0; i < ELEMENTSOF(items) - 1; i++)
-                assert_se(set_put(m, items + i) == 1);
+        FOREACH_ARRAY(item, items, ELEMENTSOF(items) - 1)
+                assert_se(set_put(m, item) == 1);
 
         m = set_free(m);
         assert_se(items[0].seen == 1);
@@ -145,11 +141,12 @@ TEST(set_ensure_allocated) {
         assert_se(set_ensure_allocated(&m, &string_hash_ops) == 1);
         assert_se(set_ensure_allocated(&m, &string_hash_ops) == 0);
         assert_se(set_ensure_allocated(&m, NULL) == 0);
-        assert_se(set_size(m) == 0);
+        assert_se(set_isempty(m));
 }
 
 TEST(set_copy) {
-        Set *s, *copy;
+        _cleanup_set_free_ Set *s = NULL;
+        _cleanup_set_free_free_ Set *copy = NULL;
         char *key1, *key2, *key3, *key4;
 
         key1 = strdup("key1");
@@ -173,9 +170,6 @@ TEST(set_copy) {
         assert_se(copy);
 
         assert_se(set_equal(s, copy));
-
-        set_free(s);
-        set_free_free(copy);
 }
 
 TEST(set_ensure_put) {
@@ -237,28 +231,28 @@ TEST(set_strjoin) {
         /* Single entry */
         assert_se(set_put_strdup(&m, "aaa") == 1);
         assert_se(set_strjoin(m, NULL, false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "", false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, " ", false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "xxx", false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, NULL, true, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "", true, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, " ", true, &joined) >= 0);
-        assert_se(streq(joined, " aaa "));
+        ASSERT_STREQ(joined, " aaa ");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "xxx", true, &joined) >= 0);
-        assert_se(streq(joined, "xxxaaaxxx"));
+        ASSERT_STREQ(joined, "xxxaaaxxx");
 
         /* Two entries */
         assert_se(set_put_strdup(&m, "bbb") == 1);

@@ -6,12 +6,12 @@
 #include "sd-bus.h"
 #include "sd-device.h"
 #include "sd-event.h"
+#include "sd-varlink.h"
 
 typedef struct Manager Manager;
 
 #include "hashmap.h"
 #include "homed-home.h"
-#include "varlink.h"
 
 /* The LUKS free disk space rebalancing logic goes through this state machine */
 typedef enum RebalanceState {
@@ -55,11 +55,11 @@ struct Manager {
 
         Home *gc_focus;
 
-        VarlinkServer *varlink_server;
+        sd_varlink_server *varlink_server;
         char *userdb_service;
 
         EVP_PKEY *private_key; /* actually a pair of private and public key */
-        Hashmap *public_keys; /* key name [char*] → publick key [EVP_PKEY*] */
+        Hashmap *public_keys; /* key name [char*] → public key [EVP_PKEY*] */
 
         RebalanceState rebalance_state;
         usec_t rebalance_interval_usec;

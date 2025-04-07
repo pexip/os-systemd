@@ -34,7 +34,7 @@ int bus_property_get_triggered_unit(
 BUS_DEFINE_SET_TRANSIENT(mode_t, "u", uint32_t, mode_t, "%04o");
 BUS_DEFINE_SET_TRANSIENT(unsigned, "u", uint32_t, unsigned, "%" PRIu32);
 
-static inline bool valid_user_group_name_or_id_relaxed(const char *u) {
+static bool valid_user_group_name_or_id_relaxed(const char *u) {
         return valid_user_group_name(u, VALID_USER_ALLOW_NUMERIC|VALID_USER_RELAX);
 }
 
@@ -95,6 +95,30 @@ int bus_set_transient_bool(
         return 1;
 }
 
+int bus_set_transient_tristate(
+                Unit *u,
+                const char *name,
+                int *p,
+                sd_bus_message *message,
+                UnitWriteFlags flags,
+                sd_bus_error *error) {
+
+        int v, r;
+
+        assert(p);
+
+        r = sd_bus_message_read(message, "b", &v);
+        if (r < 0)
+                return r;
+
+        if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                *p = v;
+                unit_write_settingf(u, flags, name, "%s=%s", name, yes_no(v));
+        }
+
+        return 1;
+}
+
 int bus_set_transient_usec_internal(
                 Unit *u,
                 const char *name,
@@ -126,35 +150,92 @@ int bus_set_transient_usec_internal(
         return 1;
 }
 
-int bus_verify_manage_units_async_full(
-                Unit *u,
+int bus_verify_manage_units_async_impl(
+                Manager *manager,
+                const char *id,
                 const char *verb,
-                int capability,
                 const char *polkit_message,
-                bool interactive,
                 sd_bus_message *call,
                 sd_bus_error *error) {
 
-        const char *details[9] = {
-                "unit", u->id,
-                "verb", verb,
+        const char *details[9];
+        size_t n_details = 0;
+
+        assert(manager);
+        assert(call);
+
+        if (id) {
+                details[n_details++] = "unit";
+                details[n_details++] = id;
+        }
+
+        if (verb) {
+                details[n_details++] = "verb";
+                details[n_details++] = verb;
         };
 
         if (polkit_message) {
-                details[4] = "polkit.message";
-                details[5] = polkit_message;
-                details[6] = "polkit.gettext_domain";
-                details[7] = GETTEXT_PACKAGE;
+                details[n_details++] = "polkit.message";
+                details[n_details++] = polkit_message;
+                details[n_details++] = "polkit.gettext_domain";
+                details[n_details++] = GETTEXT_PACKAGE;
         }
+
+        assert(n_details < ELEMENTSOF(details));
+        details[n_details] = NULL;
 
         return bus_verify_polkit_async(
                         call,
-                        capability,
                         "org.freedesktop.systemd1.manage-units",
-                        details,
-                        interactive,
-                        UID_INVALID,
-                        &u->manager->polkit_registry,
+                        n_details > 0 ? details : NULL,
+                        &manager->polkit_registry,
+                        error);
+}
+
+int bus_verify_manage_unit_files_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+        assert(m);
+        assert(call);
+
+        return bus_verify_polkit_async(
+                        call,
+                        "org.freedesktop.systemd1.manage-unit-files",
+                        /* details= */ NULL,
+                        &m->polkit_registry,
+                        error);
+}
+
+int bus_verify_reload_daemon_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+        assert(m);
+        assert(call);
+
+        return bus_verify_polkit_async(
+                        call,
+                        "org.freedesktop.systemd1.reload-daemon",
+                        /* details= */ NULL,
+                        &m->polkit_registry, error);
+}
+
+int bus_verify_set_environment_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+        assert(m);
+        assert(call);
+
+        return bus_verify_polkit_async(
+                        call,
+                        "org.freedesktop.systemd1.set-environment",
+                        /* details= */ NULL,
+                        &m->polkit_registry,
+                        error);
+}
+
+int bus_verify_bypass_dump_ratelimit_async(Manager *m, sd_bus_message *call, sd_bus_error *error) {
+        assert(m);
+        assert(call);
+
+        return bus_verify_polkit_async(
+                        call,
+                        "org.freedesktop.systemd1.bypass-dump-ratelimit",
+                        /* details= */ NULL,
+                        &m->polkit_registry,
                         error);
 }
 

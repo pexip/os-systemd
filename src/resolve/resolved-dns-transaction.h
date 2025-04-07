@@ -61,6 +61,8 @@ struct DnsTransaction {
 
         DnsAnswer *answer;
         int answer_rcode;
+        int answer_ede_rcode;
+        char *answer_ede_msg;
         DnssecResult answer_dnssec_result;
         DnsTransactionSource answer_source;
         uint32_t answer_nsec_ttl;
@@ -97,11 +99,8 @@ struct DnsTransaction {
         /* The features of the DNS server at time of transaction start */
         DnsServerFeatureLevel current_feature_level;
 
-        /* If we got SERVFAIL back, we retry the lookup, using a lower feature level than we used
-         * before. Similar, if we get NXDOMAIN in pure EDNS0 mode, we check in EDNS0-less mode before giving
-         * up (as mitigation for DVE-2018-0001). */
+        /* If we got SERVFAIL back, we retry the lookup, using a lower feature level than we used before. */
         DnsServerFeatureLevel clamp_feature_level_servfail;
-        DnsServerFeatureLevel clamp_feature_level_nxdomain;
 
         uint16_t id;
 
@@ -111,6 +110,8 @@ struct DnsTransaction {
         bool initial_jitter_elapsed:1;
 
         bool probing:1;
+
+        bool seen_timeout:1;
 
         /* Query candidates this transaction is referenced by and that
          * shall be notified about this specific transaction

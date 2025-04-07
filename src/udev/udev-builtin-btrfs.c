@@ -11,11 +11,11 @@
 #include "string-util.h"
 #include "strxcpyx.h"
 #include "udev-builtin.h"
-#include "util.h"
 
-static int builtin_btrfs(sd_device *dev, sd_netlink **rtnl, int argc, char *argv[], bool test) {
+static int builtin_btrfs(UdevEvent *event, int argc, char *argv[]) {
+        sd_device *dev = ASSERT_PTR(ASSERT_PTR(event)->dev);
         struct btrfs_ioctl_vol_args args = {};
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
         if (argc != 3 || !streq(argv[1], "ready"))
@@ -27,7 +27,7 @@ static int builtin_btrfs(sd_device *dev, sd_netlink **rtnl, int argc, char *argv
                         /* Driver not installed? Then we aren't ready. This is useful in initrds that lack
                          * btrfs.ko. After the host transition (where btrfs.ko will hopefully become
                          * available) the device can be retriggered and will then be considered ready. */
-                        udev_builtin_add_property(dev, test, "ID_BTRFS_READY", "0");
+                        udev_builtin_add_property(dev, event->event_mode, "ID_BTRFS_READY", "0");
                         return 0;
                 }
 
@@ -39,7 +39,7 @@ static int builtin_btrfs(sd_device *dev, sd_netlink **rtnl, int argc, char *argv
         if (r < 0)
                 return log_device_debug_errno(dev, errno, "Failed to call BTRFS_IOC_DEVICES_READY: %m");
 
-        udev_builtin_add_property(dev, test, "ID_BTRFS_READY", one_zero(r == 0));
+        udev_builtin_add_property(dev, event->event_mode, "ID_BTRFS_READY", one_zero(r == 0));
         return 0;
 }
 

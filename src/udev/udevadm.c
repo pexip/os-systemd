@@ -14,7 +14,6 @@
 #include "udev-util.h"
 #include "udevadm.h"
 #include "udevd.h"
-#include "util.h"
 #include "verbs.h"
 
 static int help(void) {
@@ -26,12 +25,12 @@ static int help(void) {
                 { "monitor",      "Listen to kernel and udev events"  },
                 { "test",         "Test an event run"                 },
                 { "test-builtin", "Test a built-in command"           },
+                { "verify",       "Verify udev rules files"           },
                 { "wait",         "Wait for device or device symlink" },
                 { "lock",         "Lock a block device"               },
         };
 
         _cleanup_free_ char *link = NULL;
-        size_t i;
         int r;
 
         r = terminal_urlify_man("udevadm", "8", &link);
@@ -43,8 +42,8 @@ static int help(void) {
                "Commands:\n",
                program_invocation_short_name);
 
-        for (i = 0; i < ELEMENTSOF(short_descriptions); i++)
-                printf("  %-12s  %s\n", short_descriptions[i][0], short_descriptions[i][1]);
+        FOREACH_ELEMENT(desc, short_descriptions)
+                printf("  %-12s  %s\n", (*desc)[0], (*desc)[1]);
 
         printf("\nSee the %s for details.\n", link);
         return 0;
@@ -108,6 +107,7 @@ static int udevadm_main(int argc, char *argv[]) {
                 { "test-builtin", VERB_ANY, VERB_ANY, 0, builtin_main },
                 { "wait",         VERB_ANY, VERB_ANY, 0, wait_main    },
                 { "lock",         VERB_ANY, VERB_ANY, 0, lock_main    },
+                { "verify",       VERB_ANY, VERB_ANY, 0, verify_main  },
                 { "version",      VERB_ANY, VERB_ANY, 0, version_main },
                 { "help",         VERB_ANY, VERB_ANY, 0, help_main    },
                 {}
@@ -122,19 +122,18 @@ static int run(int argc, char *argv[]) {
         if (invoked_as(argv, "udevd"))
                 return run_udevd(argc, argv);
 
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
-        r = mac_selinux_init();
+        r = mac_init();
         if (r < 0)
                 return r;
 
         return udevadm_main(argc, argv);
 }
 
-DEFINE_MAIN_FUNCTION(run);
+DEFINE_MAIN_FUNCTION_WITH_POSITIVE_FAILURE(run);

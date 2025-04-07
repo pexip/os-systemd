@@ -32,9 +32,6 @@ typedef struct Manager Manager;
 
 #define DEFAULT_SAVE_TIME_INTERVAL_USEC (60 * USEC_PER_SEC)
 
-#define STATE_DIR   "/var/lib/systemd/timesync"
-#define CLOCK_FILE  STATE_DIR "/clock"
-
 struct Manager {
         sd_bus *bus;
         sd_event *event;
@@ -45,10 +42,9 @@ struct Manager {
         LIST_HEAD(ServerName, runtime_servers);
         LIST_HEAD(ServerName, fallback_servers);
 
-        bool have_fallbacks:1;
-
         RateLimit ratelimit;
         bool exhausted_servers;
+        bool have_fallbacks;
 
         /* network */
         sd_event_source *network_event_source;
@@ -117,6 +113,10 @@ struct Manager {
         sd_event_source *event_save_time;
         usec_t save_time_interval_usec;
         bool save_on_exit;
+
+        /* Used to coalesce bus PropertiesChanged events */
+        sd_event_source *deferred_ntp_server_event_source;
+        unsigned ntp_server_change_mask;
 };
 
 int manager_new(Manager **ret);
@@ -131,6 +131,7 @@ void manager_flush_runtime_servers(Manager *m);
 
 int manager_connect(Manager *m);
 void manager_disconnect(Manager *m);
-bool manager_is_connected(Manager *m);
 
 int manager_setup_save_time_event(Manager *m);
+
+int bus_manager_emit_ntp_server_changed(Manager *m);

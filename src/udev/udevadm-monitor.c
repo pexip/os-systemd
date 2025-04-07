@@ -48,8 +48,6 @@ static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device,
                devpath, subsystem);
 
         if (arg_show_property) {
-                const char *key, *value;
-
                 FOREACH_DEVICE_PROPERTY(device, key, value)
                         printf("%s=%s\n", key, value);
 
@@ -210,9 +208,11 @@ int monitor_main(int argc, char *argv[], void *userdata) {
                 goto finalize;
         }
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
-        (void) sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
+        if (r < 0) {
+                log_error_errno(r, "Failed to install SIGINT/SIGTERM handling: %m");
+                goto finalize;
+        }
 
         printf("monitor will print the received events for:\n");
         if (arg_print_udev) {

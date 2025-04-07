@@ -98,7 +98,7 @@ int bpf_program_new(uint32_t prog_type, const char *prog_name, BPFProgram **ret)
 
         *p = (BPFProgram) {
                 .prog_type = prog_type,
-                .kernel_fd = -1,
+                .kernel_fd = -EBADF,
                 .prog_name = TAKE_PTR(name),
         };
 
@@ -121,7 +121,7 @@ int bpf_program_new_from_bpffs_path(const char *path, BPFProgram **ret) {
 
         *p = (BPFProgram) {
                 .prog_type = BPF_PROG_TYPE_UNSPEC,
-                .kernel_fd = -1,
+                .kernel_fd = -EBADF,
         };
 
         r = bpf_program_load_from_bpf_fs(p, path);
@@ -137,7 +137,6 @@ int bpf_program_new_from_bpffs_path(const char *path, BPFProgram **ret) {
 
         return 0;
 }
-
 
 int bpf_program_add_instructions(BPFProgram *p, const struct bpf_insn *instructions, size_t count) {
 
@@ -207,7 +206,7 @@ int bpf_program_load_from_bpf_fs(BPFProgram *p, const char *path) {
 
 int bpf_program_cgroup_attach(BPFProgram *p, int type, const char *path, uint32_t flags) {
         _cleanup_free_ char *copy = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         union bpf_attr attr;
         int r;
 
@@ -268,7 +267,7 @@ int bpf_program_cgroup_attach(BPFProgram *p, int type, const char *path, uint32_
 }
 
 int bpf_program_cgroup_detach(BPFProgram *p) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         assert(p);
 
@@ -300,8 +299,16 @@ int bpf_program_cgroup_detach(BPFProgram *p) {
         return 0;
 }
 
-int bpf_map_new(enum bpf_map_type type, size_t key_size, size_t value_size, size_t max_entries, uint32_t flags) {
+int bpf_map_new(
+                const char *name,
+                enum bpf_map_type type,
+                size_t key_size,
+                size_t value_size,
+                size_t max_entries,
+                uint32_t flags) {
+
         union bpf_attr attr;
+        const char *n = name;
 
         zero(attr);
         attr.map_type = type;
@@ -309,6 +316,13 @@ int bpf_map_new(enum bpf_map_type type, size_t key_size, size_t value_size, size
         attr.value_size = value_size;
         attr.max_entries = max_entries;
         attr.map_flags = flags;
+
+        /* The map name is primarily informational for debugging purposes, and typically too short
+         * to carry the full unit name, hence we employ a trivial lossy escaping to make it fit
+         * (truncation + only alphanumerical, "." and "_" are allowed as per
+         * https://docs.kernel.org/bpf/maps.html#usage-notes) */
+        for (size_t i = 0; i < sizeof(attr.map_name) - 1 && *n; i++, n++)
+                attr.map_name[i] = strchr(ALPHANUMERICAL ".", *n) ? *n : '_';
 
         return RET_NERRNO(bpf(BPF_MAP_CREATE, &attr, sizeof(attr)));
 }
@@ -420,7 +434,7 @@ int bpf_program_serialize_attachment_set(FILE *f, FDSet *fds, const char *key, S
 int bpf_program_deserialize_attachment(const char *v, FDSet *fds, BPFProgram **bpfp) {
         _cleanup_free_ char *sfd = NULL, *sat = NULL, *unescaped = NULL;
         _cleanup_(bpf_program_freep) BPFProgram *p = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         ssize_t l;
         int ifd, at, r;
 
@@ -434,11 +448,9 @@ int bpf_program_deserialize_attachment(const char *v, FDSet *fds, BPFProgram **b
         if (r == 0)
                 return -EINVAL;
 
-        r = safe_atoi(sfd, &ifd);
-        if (r < 0)
-                return r;
+        ifd = parse_fd(sfd);
         if (ifd < 0)
-                return -EBADF;
+                return r;
 
         /* Extract second word: the attach type */
         r = extract_first_word(&v, &sat, NULL, 0);

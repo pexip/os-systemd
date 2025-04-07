@@ -4,6 +4,7 @@
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
 
+#include "sd-json.h"
 #include "sd-lldp-rx.h"
 
 #include "alloc-util.h"
@@ -198,10 +199,9 @@ static int lldp_rx_receive_datagram(sd_event_source *s, int fd, uint32_t revents
         assert(fd >= 0);
 
         space = next_datagram_size_fd(fd);
+        if (ERRNO_IS_NEG_TRANSIENT(space) || ERRNO_IS_NEG_DISCONNECT(space))
+                return 0;
         if (space < 0) {
-                if (ERRNO_IS_TRANSIENT(space) || ERRNO_IS_DISCONNECT(space))
-                        return 0;
-
                 log_lldp_rx_errno(lldp_rx, space, "Failed to determine datagram size to read, ignoring: %m");
                 return 0;
         }
@@ -230,7 +230,7 @@ static int lldp_rx_receive_datagram(sd_event_source *s, int fd, uint32_t revents
         if (ioctl(fd, SIOCGSTAMPNS, &ts) >= 0)
                 triple_timestamp_from_realtime(&n->timestamp, timespec_load(&ts));
         else
-                triple_timestamp_get(&n->timestamp);
+                triple_timestamp_now(&n->timestamp);
 
         (void) lldp_rx_handle_datagram(lldp_rx, n);
         return 0;
@@ -405,7 +405,7 @@ int sd_lldp_rx_new(sd_lldp_rx **ret) {
 
         *lldp_rx = (sd_lldp_rx) {
                 .n_ref = 1,
-                .fd = -1,
+                .fd = -EBADF,
                 .neighbors_max = LLDP_DEFAULT_NEIGHBORS_MAX,
                 .capability_mask = UINT16_MAX,
         };
@@ -453,7 +453,7 @@ static int lldp_rx_start_timer(sd_lldp_rx *lldp_rx, sd_lldp_neighbor *neighbor) 
                                 lldp_rx->event_priority, "lldp-rx-timer", true);
 }
 
-static inline int neighbor_compare_func(sd_lldp_neighbor * const *a, sd_lldp_neighbor * const *b) {
+static int neighbor_compare_func(sd_lldp_neighbor * const *a, sd_lldp_neighbor * const *b) {
         assert(a);
         assert(b);
         assert(*a);
@@ -489,6 +489,30 @@ int sd_lldp_rx_get_neighbors(sd_lldp_rx *lldp_rx, sd_lldp_neighbor ***ret) {
         *ret = TAKE_PTR(l);
 
         return k;
+}
+
+int lldp_rx_build_neighbors_json(sd_lldp_rx *lldp_rx, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        int r;
+
+        assert(lldp_rx);
+        assert(ret);
+
+        sd_lldp_neighbor *n;
+        HASHMAP_FOREACH(n, lldp_rx->neighbor_by_id) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *w = NULL;
+
+                r = lldp_neighbor_build_json(n, &w);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&v, w);
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(v);
+        return 0;
 }
 
 int sd_lldp_rx_set_neighbors_max(sd_lldp_rx *lldp_rx, uint64_t m) {

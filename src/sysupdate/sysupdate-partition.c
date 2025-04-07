@@ -10,94 +10,12 @@
 #include "stdio-util.h"
 #include "string-util.h"
 #include "sysupdate-partition.h"
-#include "util.h"
 
 void partition_info_destroy(PartitionInfo *p) {
         assert(p);
 
         p->label = mfree(p->label);
         p->device = mfree(p->device);
-}
-
-static int fdisk_partition_get_attrs_as_uint64(
-                struct fdisk_partition *pa,
-                uint64_t *ret) {
-
-        uint64_t flags = 0;
-        const char *a;
-        int r;
-
-        assert(pa);
-        assert(ret);
-
-        /* Retrieve current flags as uint64_t mask */
-
-        a = fdisk_partition_get_attrs(pa);
-        if (!a) {
-                *ret = 0;
-                return 0;
-        }
-
-        for (;;) {
-                _cleanup_free_ char *word = NULL;
-
-                r = extract_first_word(&a, &word, ",", EXTRACT_DONT_COALESCE_SEPARATORS);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                if (streq(word, "RequiredPartition"))
-                        flags |= SD_GPT_FLAG_REQUIRED_PARTITION;
-                else if (streq(word, "NoBlockIOProtocol"))
-                        flags |= SD_GPT_FLAG_NO_BLOCK_IO_PROTOCOL;
-                else if (streq(word, "LegacyBIOSBootable"))
-                        flags |= SD_GPT_FLAG_LEGACY_BIOS_BOOTABLE;
-                else {
-                        const char *e;
-                        unsigned u;
-
-                        /* Drop "GUID" prefix if specified */
-                        e = startswith(word, "GUID:") ?: word;
-
-                        if (safe_atou(e, &u) < 0) {
-                                log_debug("Unknown partition flag '%s', ignoring.", word);
-                                continue;
-                        }
-
-                        if (u >= sizeof(flags)*8) { /* partition flags on GPT are 64bit. Let's ignore any further
-                                                       bits should libfdisk report them */
-                                log_debug("Partition flag above bit 63 (%s), ignoring.", word);
-                                continue;
-                        }
-
-                        flags |= UINT64_C(1) << u;
-                }
-        }
-
-        *ret = flags;
-        return 0;
-}
-
-static int fdisk_partition_set_attrs_as_uint64(
-                struct fdisk_partition *pa,
-                uint64_t flags) {
-
-        _cleanup_free_ char *attrs = NULL;
-        int r;
-
-        assert(pa);
-
-        for (unsigned i = 0; i < sizeof(flags) * 8; i++) {
-                if (!FLAGS_SET(flags, UINT64_C(1) << i))
-                        continue;
-
-                r = strextendf_with_separator(&attrs, ",", "%u", i);
-                if (r < 0)
-                        return r;
-        }
-
-        return fdisk_partition_set_attrs(pa, strempty(attrs));
 }
 
 int read_partition_info(
@@ -107,11 +25,12 @@ int read_partition_info(
                 PartitionInfo *ret) {
 
         _cleanup_free_ char *label_copy = NULL, *device = NULL;
-        const char *pts, *ids, *label;
+        const char *label;
         struct fdisk_partition *p;
-        struct fdisk_parttype *pt;
         uint64_t start, size, flags;
+        unsigned long ssz;
         sd_id128_t ptid, id;
+        GptPartitionType type;
         size_t partno;
         int r;
 
@@ -121,7 +40,7 @@ int read_partition_info(
 
         p = fdisk_table_get_partition(t, i);
         if (!p)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read partition metadata: %m");
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read partition metadata.");
 
         if (fdisk_partition_is_used(p) <= 0) {
                 *ret = (PartitionInfo) PARTITION_INFO_NULL;
@@ -136,36 +55,25 @@ int read_partition_info(
         partno = fdisk_partition_get_partno(p);
 
         start = fdisk_partition_get_start(p);
-        assert(start <= UINT64_MAX / 512U);
-        start *= 512U;
+        ssz = fdisk_get_sector_size(c);
+        assert(start <= UINT64_MAX / ssz);
+        start *= ssz;
 
         size = fdisk_partition_get_size(p);
-        assert(size <= UINT64_MAX / 512U);
-        size *= 512U;
+        assert(size <= UINT64_MAX / ssz);
+        size *= ssz;
 
         label = fdisk_partition_get_name(p);
         if (!label)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Found a partition without a label.");
 
-        pt = fdisk_partition_get_type(p);
-        if (!pt)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to acquire type of partition: %m");
-
-        pts = fdisk_parttype_get_string(pt);
-        if (!pts)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to acquire type of partition as string: %m");
-
-        r = sd_id128_from_string(pts, &ptid);
+        r = fdisk_partition_get_type_as_id128(p, &ptid);
         if (r < 0)
-                return log_error_errno(r, "Failed to parse partition type UUID %s: %m", pts);
+                return log_error_errno(r, "Failed to read partition type UUID: %m");
 
-        ids = fdisk_partition_get_uuid(p);
-        if (!ids)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Found a partition without a UUID.");
-
-        r = sd_id128_from_string(ids, &id);
+        r = fdisk_partition_get_uuid_as_id128(p, &id);
         if (r < 0)
-                return log_error_errno(r, "Failed to parse partition UUID %s: %m", ids);
+                return log_error_errno(r, "Failed to read partition UUID: %m");
 
         r = fdisk_partition_get_attrs_as_uint64(p, &flags);
         if (r < 0)
@@ -179,6 +87,8 @@ int read_partition_info(
         if (!label_copy)
                 return log_oom();
 
+        type = gpt_partition_type_from_uuid(ptid);
+
         *ret = (PartitionInfo) {
                 .partno = partno,
                 .start = start,
@@ -188,9 +98,9 @@ int read_partition_info(
                 .uuid = id,
                 .label = TAKE_PTR(label_copy),
                 .device = TAKE_PTR(device),
-                .no_auto = FLAGS_SET(flags, SD_GPT_FLAG_NO_AUTO) && gpt_partition_type_knows_no_auto(ptid),
-                .read_only = FLAGS_SET(flags, SD_GPT_FLAG_READ_ONLY) && gpt_partition_type_knows_read_only(ptid),
-                .growfs = FLAGS_SET(flags, SD_GPT_FLAG_GROWFS) && gpt_partition_type_knows_growfs(ptid),
+                .no_auto = FLAGS_SET(flags, SD_GPT_FLAG_NO_AUTO) && gpt_partition_type_knows_no_auto(type),
+                .read_only = FLAGS_SET(flags, SD_GPT_FLAG_READ_ONLY) && gpt_partition_type_knows_read_only(type),
+                .growfs = FLAGS_SET(flags, SD_GPT_FLAG_GROWFS) && gpt_partition_type_knows_growfs(type),
         };
 
         return 1; /* found! */
@@ -211,13 +121,9 @@ int find_suitable_partition(
         assert(device);
         assert(ret);
 
-        c = fdisk_new_context();
-        if (!c)
-                return log_oom();
-
-        r = fdisk_assign_device(c, device, /* readonly= */ true);
+        r = fdisk_new_context_at(AT_FDCWD, device, /* read_only= */ true, /* sector_size= */ UINT32_MAX, &c);
         if (r < 0)
-                return log_error_errno(r, "Failed to open device '%s': %m", device);
+                return log_error_errno(r, "Failed to create fdisk context from '%s': %m", device);
 
         if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                 return log_error_errno(SYNTHETIC_ERRNO(EHWPOISON), "Disk %s has no GPT disk label, not suitable.", device);
@@ -270,6 +176,7 @@ int patch_partition(
         _cleanup_(fdisk_unref_partitionp) struct fdisk_partition *pa = NULL;
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
         bool tweak_no_auto, tweak_read_only, tweak_growfs;
+        GptPartitionType type;
         int r, fd;
 
         assert(device);
@@ -279,13 +186,9 @@ int patch_partition(
         if (change == 0) /* Nothing to do */
                 return 0;
 
-        c = fdisk_new_context();
-        if (!c)
-                return log_oom();
-
-        r = fdisk_assign_device(c, device, /* readonly= */ false);
+        r = fdisk_new_context_at(AT_FDCWD, device, /* read_only= */ false, /* sector_size= */ UINT32_MAX, &c);
         if (r < 0)
-                return log_error_errno(r, "Failed to open device '%s': %m", device);
+                return log_error_errno(r, "Failed to create fdisk context from '%s': %m", device);
 
         assert_se((fd = fdisk_get_devfd(c)) >= 0);
 
@@ -314,16 +217,18 @@ int patch_partition(
                         return log_error_errno(r, "Failed to update partition UUID: %m");
         }
 
+        type = gpt_partition_type_from_uuid(info->type);
+
         /* Tweak the read-only flag, but only if supported by the partition type */
         tweak_no_auto =
                 FLAGS_SET(change, PARTITION_NO_AUTO) &&
-                gpt_partition_type_knows_no_auto(info->type);
+                gpt_partition_type_knows_no_auto(type);
         tweak_read_only =
                 FLAGS_SET(change, PARTITION_READ_ONLY) &&
-                gpt_partition_type_knows_read_only(info->type);
+                gpt_partition_type_knows_read_only(type);
         tweak_growfs =
                 FLAGS_SET(change, PARTITION_GROWFS) &&
-                gpt_partition_type_knows_growfs(info->type);
+                gpt_partition_type_knows_growfs(type);
 
         if (change & PARTITION_FLAGS) {
                 uint64_t flags;

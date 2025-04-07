@@ -11,10 +11,12 @@
 #include "arphrd-util.h"
 #include "conf-files.h"
 #include "conf-parser.h"
+#include "constants.h"
 #include "creds-util.h"
-#include "def.h"
 #include "device-private.h"
 #include "device-util.h"
+#include "env-util.h"
+#include "escape.h"
 #include "ethtool-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -25,16 +27,25 @@
 #include "netif-sriov.h"
 #include "netif-util.h"
 #include "netlink-util.h"
+#include "network-util.h"
 #include "parse-util.h"
 #include "path-lookup.h"
 #include "path-util.h"
 #include "proc-cmdline.h"
 #include "random-util.h"
+#include "specifier.h"
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "udev-builtin.h"
 #include "utf8.h"
+
+static const Specifier link_specifier_table[] = {
+        COMMON_SYSTEM_SPECIFIERS,
+        COMMON_TMP_SPECIFIERS,
+        {}
+};
 
 struct LinkConfigContext {
         LIST_HEAD(LinkConfig, configs);
@@ -47,11 +58,15 @@ static LinkConfig* link_config_free(LinkConfig *config) {
                 return NULL;
 
         free(config->filename);
+        strv_free(config->dropins);
 
         net_match_clear(&config->match);
         condition_free_list(config->conditions);
 
         free(config->description);
+        strv_free(config->properties);
+        strv_free(config->import_properties);
+        strv_free(config->unset_properties);
         free(config->name_policy);
         free(config->name);
         strv_free(config->alternative_names);
@@ -59,6 +74,7 @@ static LinkConfig* link_config_free(LinkConfig *config) {
         free(config->alias);
         free(config->wol_password_file);
         erase_and_free(config->wol_password);
+        cpu_set_free(config->rps_cpu_mask);
 
         ordered_hashmap_free_with_destructor(config->sr_iov_by_section, sr_iov_free);
 
@@ -97,7 +113,7 @@ int link_config_ctx_new(LinkConfigContext **ret) {
                 return -ENOMEM;
 
         *ctx = (LinkConfigContext) {
-                .ethtool_fd = -1,
+                .ethtool_fd = -EBADF,
         };
 
         *ret = TAKE_PTR(ctx);
@@ -212,7 +228,6 @@ int link_load_one(LinkConfigContext *ctx, const char *filename) {
         _cleanup_hashmap_free_ Hashmap *stats_by_path = NULL;
         _cleanup_free_ char *name = NULL;
         const char *dropin_dirname;
-        size_t i;
         int r;
 
         assert(ctx);
@@ -251,20 +266,21 @@ int link_load_one(LinkConfigContext *ctx, const char *filename) {
                 .sr_iov_num_vfs = UINT32_MAX,
         };
 
-        for (i = 0; i < ELEMENTSOF(config->features); i++)
-                config->features[i] = -1;
+        FOREACH_ELEMENT(feature, config->features)
+                *feature = -1;
 
         dropin_dirname = strjoina(basename(filename), ".d");
         r = config_parse_many(
                         STRV_MAKE_CONST(filename),
                         NETWORK_DIRS,
                         dropin_dirname,
+                        /* root = */ NULL,
                         "Match\0"
                         "Link\0"
                         "SR-IOV\0",
                         config_item_perf_lookup, link_config_gperf_lookup,
                         CONFIG_PARSE_WARN, config, &stats_by_path,
-                        NULL);
+                        &config->dropins);
         if (r < 0)
                 return r; /* config_parse_many() logs internally. */
 
@@ -361,18 +377,20 @@ Link *link_free(Link *link) {
                 return NULL;
 
         sd_device_unref(link->device);
+        sd_device_unref(link->device_db_clone);
         free(link->kind);
-        free(link->driver);
+        strv_free(link->altnames);
         return mfree(link);
 }
 
-int link_new(LinkConfigContext *ctx, sd_netlink **rtnl, sd_device *device, Link **ret) {
+int link_new(LinkConfigContext *ctx, sd_netlink **rtnl, sd_device *device, sd_device *device_db_clone, Link **ret) {
         _cleanup_(link_freep) Link *link = NULL;
         int r;
 
         assert(ctx);
         assert(rtnl);
         assert(device);
+        assert(device_db_clone);
         assert(ret);
 
         link = new(Link, 1);
@@ -381,6 +399,7 @@ int link_new(LinkConfigContext *ctx, sd_netlink **rtnl, sd_device *device, Link 
 
         *link = (Link) {
                 .device = sd_device_ref(device),
+                .device_db_clone = sd_device_ref(device_db_clone),
         };
 
         r = sd_device_get_sysname(device, &link->ifname);
@@ -414,8 +433,8 @@ int link_new(LinkConfigContext *ctx, sd_netlink **rtnl, sd_device *device, Link 
                         log_link_debug_errno(link, r, "Failed to get permanent hardware address, ignoring: %m");
         }
 
-        r = ethtool_get_driver(&ctx->ethtool_fd, link->ifname, &link->driver);
-        if (r < 0)
+        r = sd_device_get_property_value(link->device, "ID_NET_DRIVER", &link->driver);
+        if (r < 0 && r != -ENOENT)
                 log_link_debug_errno(link, r, "Failed to get driver, ignoring: %m");
 
         *ret = TAKE_PTR(link);
@@ -464,7 +483,7 @@ int link_get_config(LinkConfigContext *ctx, Link *link) {
         return -ENOENT;
 }
 
-static int link_apply_ethtool_settings(Link *link, int *ethtool_fd) {
+static int link_apply_ethtool_settings(Link *link, int *ethtool_fd, EventMode mode) {
         LinkConfig *config;
         const char *name;
         int r;
@@ -472,6 +491,11 @@ static int link_apply_ethtool_settings(Link *link, int *ethtool_fd) {
         assert(link);
         assert(link->config);
         assert(ethtool_fd);
+
+        if (mode != EVENT_UDEV_WORKER) {
+                log_link_debug(link, "Running in test mode, skipping application of ethtool settings.");
+                return 0;
+        }
 
         config = link->config;
         name = link->ifname;
@@ -547,7 +571,7 @@ static bool hw_addr_is_valid(Link *link, const struct hw_addr_data *hw_addr) {
                 return !ether_addr_is_null(&hw_addr->ether) && !ether_addr_is_broadcast(&hw_addr->ether);
 
         case ARPHRD_INFINIBAND:
-                /* The last 8 bytes cannot be zero*/
+                /* The last 8 bytes cannot be zero. */
                 assert(hw_addr->length == INFINIBAND_ALEN);
                 return !memeqzero(hw_addr->bytes + INFINIBAND_ALEN - 8, 8);
 
@@ -665,7 +689,7 @@ finalize:
         return 0;
 }
 
-static int link_apply_rtnl_settings(Link *link, sd_netlink **rtnl) {
+static int link_apply_rtnl_settings(Link *link, sd_netlink **rtnl, EventMode mode) {
         struct hw_addr_data hw_addr = {};
         LinkConfig *config;
         int r;
@@ -673,6 +697,11 @@ static int link_apply_rtnl_settings(Link *link, sd_netlink **rtnl) {
         assert(link);
         assert(link->config);
         assert(rtnl);
+
+        if (mode != EVENT_UDEV_WORKER) {
+                log_link_debug(link, "Running in test mode, skipping application of rtnl settings.");
+                return 0;
+        }
 
         config = link->config;
 
@@ -699,7 +728,7 @@ static bool enable_name_policy(void) {
         if (cached >= 0)
                 return cached;
 
-        r = proc_cmdline_get_bool("net.ifnames", &b);
+        r = proc_cmdline_get_bool("net.ifnames", /* flags = */ 0, &b);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse net.ifnames= kernel command line option, ignoring: %m");
         if (r <= 0)
@@ -722,8 +751,8 @@ static int link_generate_new_name(Link *link) {
         config = link->config;
         device = link->device;
 
-        if (link->action == SD_DEVICE_MOVE) {
-                log_link_debug(link, "Skipping to apply Name= and NamePolicy= on '%s' uevent.",
+        if (link->action != SD_DEVICE_ADD) {
+                log_link_debug(link, "Not applying Name= and NamePolicy= on '%s' uevent.",
                                device_action_to_string(link->action));
                 goto no_rename;
         }
@@ -791,19 +820,22 @@ no_rename:
         return 0;
 }
 
-static int link_apply_alternative_names(Link *link, sd_netlink **rtnl) {
-        _cleanup_strv_free_ char **altnames = NULL, **current_altnames = NULL;
+static int link_generate_alternative_names(Link *link) {
+        _cleanup_strv_free_ char **altnames = NULL;
         LinkConfig *config;
         sd_device *device;
         int r;
 
         assert(link);
-        assert(link->config);
-        assert(link->device);
-        assert(rtnl);
+        config = ASSERT_PTR(link->config);
+        device = ASSERT_PTR(link->device);
+        assert(!link->altnames);
 
-        config = link->config;
-        device = link->device;
+        if (link->action != SD_DEVICE_ADD) {
+                log_link_debug(link, "Not applying AlternativeNames= and AlternativeNamesPolicy= on '%s' uevent.",
+                               device_action_to_string(link->action));
+                return 0;
+        }
 
         if (config->alternative_names) {
                 altnames = strv_copy(config->alternative_names);
@@ -834,29 +866,14 @@ static int link_apply_alternative_names(Link *link, sd_netlink **rtnl) {
                         default:
                                 assert_not_reached();
                         }
-                        if (!isempty(n)) {
+                        if (ifname_valid_full(n, IFNAME_VALID_ALTERNATIVE)) {
                                 r = strv_extend(&altnames, n);
                                 if (r < 0)
                                         return log_oom();
                         }
                 }
 
-        strv_remove(altnames, link->ifname);
-
-        r = rtnl_get_link_alternative_names(rtnl, link->ifindex, &current_altnames);
-        if (r < 0)
-                log_link_debug_errno(link, r, "Failed to get alternative names, ignoring: %m");
-
-        STRV_FOREACH(p, current_altnames)
-                strv_remove(altnames, *p);
-
-        strv_uniq(altnames);
-        strv_sort(altnames);
-        r = rtnl_set_link_alternative_names(rtnl, link->ifindex, altnames);
-        if (r < 0)
-                log_link_full_errno(link, r == -EOPNOTSUPP ? LOG_DEBUG : LOG_WARNING, r,
-                                    "Could not set AlternativeName= or apply AlternativeNamesPolicy=, ignoring: %m");
-
+        link->altnames = TAKE_PTR(altnames);
         return 0;
 }
 
@@ -889,7 +906,7 @@ static int sr_iov_configure(Link *link, sd_netlink **rtnl, SRIOV *sr_iov) {
         return 0;
 }
 
-static int link_apply_sr_iov_config(Link *link, sd_netlink **rtnl) {
+static int link_apply_sr_iov_config(Link *link, sd_netlink **rtnl, EventMode mode) {
         SRIOV *sr_iov;
         uint32_t n;
         int r;
@@ -897,6 +914,11 @@ static int link_apply_sr_iov_config(Link *link, sd_netlink **rtnl) {
         assert(link);
         assert(link->config);
         assert(link->device);
+
+        if (mode != EVENT_UDEV_WORKER) {
+                log_link_debug(link, "Running in test mode, skipping application of SR-IOV settings.");
+                return 0;
+        }
 
         r = sr_iov_set_num_vfs(link->device, link->config->sr_iov_num_vfs, link->config->sr_iov_by_section);
         if (r < 0)
@@ -931,26 +953,122 @@ static int link_apply_sr_iov_config(Link *link, sd_netlink **rtnl) {
         return 0;
 }
 
-int link_apply_config(LinkConfigContext *ctx, sd_netlink **rtnl, Link *link) {
+static int link_apply_rps_cpu_mask(Link *link, EventMode mode) {
+        _cleanup_free_ char *mask_str = NULL;
+        LinkConfig *config;
+        int r;
+
+        assert(link);
+        config = ASSERT_PTR(link->config);
+
+        if (mode != EVENT_UDEV_WORKER) {
+                log_link_debug(link, "Running in test mode, skipping application of RPS setting.");
+                return 0;
+        }
+
+        /* Skip if the config is not specified. */
+        if (!config->rps_cpu_mask)
+                return 0;
+
+        mask_str = cpu_set_to_mask_string(config->rps_cpu_mask);
+        if (!mask_str)
+                return log_oom();
+
+        log_link_debug(link, "Applying RPS CPU mask: %s", mask_str);
+
+        /* Currently, this will set CPU mask to all rx queue of matched device. */
+        FOREACH_DEVICE_SYSATTR(link->device, attr) {
+                const char *c;
+
+                c = path_startswith(attr, "queues/");
+                if (!c)
+                        continue;
+
+                c = startswith(c, "rx-");
+                if (!c)
+                        continue;
+
+                c += strcspn(c, "/");
+
+                if (!path_equal(c, "/rps_cpus"))
+                        continue;
+
+                r = sd_device_set_sysattr_value(link->device, attr, mask_str);
+                if (r < 0)
+                        log_link_warning_errno(link, r, "Failed to write %s sysfs attribute, ignoring: %m", attr);
+        }
+
+        return 0;
+}
+
+static int link_apply_udev_properties(Link *link, EventMode mode) {
+        LinkConfig *config;
+        sd_device *device;
+
+        assert(link);
+
+        config = ASSERT_PTR(link->config);
+        device = ASSERT_PTR(link->device);
+
+        /* 1. apply ImportProperty=. */
+        STRV_FOREACH(p, config->import_properties)
+                (void) udev_builtin_import_property(device, link->device_db_clone, mode, *p);
+
+        /* 2. apply Property=. */
+        STRV_FOREACH(p, config->properties) {
+                _cleanup_free_ char *key = NULL;
+                const char *eq;
+
+                eq = strchr(*p, '=');
+                if (!eq)
+                        continue;
+
+                key = strndup(*p, eq - *p);
+                if (!key)
+                        return log_oom();
+
+                (void) udev_builtin_add_property(device, mode, key, eq + 1);
+        }
+
+        /* 3. apply UnsetProperty=. */
+        STRV_FOREACH(p, config->unset_properties)
+                (void) udev_builtin_add_property(device, mode, *p, NULL);
+
+        /* 4. set the default properties. */
+        (void) udev_builtin_add_property(device, mode, "ID_NET_LINK_FILE", config->filename);
+
+        _cleanup_free_ char *joined = NULL;
+        STRV_FOREACH(d, config->dropins) {
+                _cleanup_free_ char *escaped = NULL;
+
+                escaped = xescape(*d, ":");
+                if (!escaped)
+                        return log_oom();
+
+                if (!strextend_with_separator(&joined, ":", escaped))
+                        return log_oom();
+        }
+
+        (void) udev_builtin_add_property(device, mode, "ID_NET_LINK_FILE_DROPINS", joined);
+
+        if (link->new_name)
+                (void) udev_builtin_add_property(device, mode, "ID_NET_NAME", link->new_name);
+
+        return 0;
+}
+
+int link_apply_config(LinkConfigContext *ctx, sd_netlink **rtnl, Link *link, EventMode mode) {
         int r;
 
         assert(ctx);
         assert(rtnl);
         assert(link);
 
-        if (!IN_SET(link->action, SD_DEVICE_ADD, SD_DEVICE_BIND, SD_DEVICE_MOVE)) {
-                log_link_debug(link, "Skipping to apply .link settings on '%s' uevent.",
-                               device_action_to_string(link->action));
-
-                link->new_name = link->ifname;
-                return 0;
-        }
-
-        r = link_apply_ethtool_settings(link, &ctx->ethtool_fd);
+        r = link_apply_ethtool_settings(link, &ctx->ethtool_fd, mode);
         if (r < 0)
                 return r;
 
-        r = link_apply_rtnl_settings(link, rtnl);
+        r = link_apply_rtnl_settings(link, rtnl, mode);
         if (r < 0)
                 return r;
 
@@ -958,15 +1076,155 @@ int link_apply_config(LinkConfigContext *ctx, sd_netlink **rtnl, Link *link) {
         if (r < 0)
                 return r;
 
-        r = link_apply_alternative_names(link, rtnl);
+        r = link_generate_alternative_names(link);
         if (r < 0)
                 return r;
 
-        r = link_apply_sr_iov_config(link, rtnl);
+        r = link_apply_sr_iov_config(link, rtnl, mode);
         if (r < 0)
                 return r;
 
-        return 0;
+        r = link_apply_rps_cpu_mask(link, mode);
+        if (r < 0)
+                return r;
+
+        return link_apply_udev_properties(link, mode);
+}
+
+int config_parse_udev_property(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char ***properties = ASSERT_PTR(data);
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                /* Empty assignment resets the list */
+                *properties = strv_free(*properties);
+                return 0;
+        }
+
+        for (const char *p = rvalue;; ) {
+                _cleanup_free_ char *word = NULL, *resolved = NULL, *key = NULL;
+                const char *eq;
+
+                r = extract_first_word(&p, &word, NULL, EXTRACT_CUNESCAPE|EXTRACT_UNQUOTE);
+                if (r == -ENOMEM)
+                        return log_oom();
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Invalid syntax, ignoring assignment: %s", rvalue);
+                        return 0;
+                }
+                if (r == 0)
+                        return 0;
+
+                r = specifier_printf(word, SIZE_MAX, link_specifier_table, NULL, NULL, &resolved);
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Failed to resolve specifiers in %s, ignoring assignment: %m", word);
+                        continue;
+                }
+
+                /* The restriction for udev property is not clear. Let's apply the one for environment variable here. */
+                if (!env_assignment_is_valid(resolved)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                                   "Invalid udev property, ignoring assignment: %s", word);
+                        continue;
+                }
+
+                assert_se(eq = strchr(resolved, '='));
+                key = strndup(resolved, eq - resolved);
+                if (!key)
+                        return log_oom();
+
+                if (!device_property_can_set(key)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                                   "Invalid udev property name '%s', ignoring assignment: %s", key, resolved);
+                        continue;
+                }
+
+                r = strv_env_replace_consume(properties, TAKE_PTR(resolved));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to update properties: %m");
+        }
+}
+
+int config_parse_udev_property_name(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char ***properties = ASSERT_PTR(data);
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                /* Empty assignment resets the list */
+                *properties = strv_free(*properties);
+                return 0;
+        }
+
+        for (const char *p = rvalue;; ) {
+                _cleanup_free_ char *word = NULL, *resolved = NULL;
+
+                r = extract_first_word(&p, &word, NULL, EXTRACT_CUNESCAPE|EXTRACT_UNQUOTE);
+                if (r == -ENOMEM)
+                        return log_oom();
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Invalid syntax, ignoring assignment: %s", rvalue);
+                        return 0;
+                }
+                if (r == 0)
+                        return 0;
+
+                r = specifier_printf(word, SIZE_MAX, link_specifier_table, NULL, NULL, &resolved);
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Failed to resolve specifiers in %s, ignoring assignment: %m", word);
+                        continue;
+                }
+
+                /* The restriction for udev property is not clear. Let's apply the one for environment variable here. */
+                if (!env_name_is_valid(resolved)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                                   "Invalid udev property name, ignoring assignment: %s", resolved);
+                        continue;
+                }
+
+                if (!device_property_can_set(resolved)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0,
+                                   "Invalid udev property name, ignoring assignment: %s", resolved);
+                        continue;
+                }
+
+                r = strv_consume(properties, TAKE_PTR(resolved));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to update properties: %m");
+        }
 }
 
 int config_parse_ifalias(
@@ -1120,6 +1378,63 @@ int config_parse_wol_password(
         return 0;
 }
 
+int config_parse_rps_cpu_mask(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        _cleanup_(cpu_set_freep) CPUSet *allocated = NULL;
+        CPUSet *mask, **rps_cpu_mask = ASSERT_PTR(data);
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                *rps_cpu_mask = cpu_set_free(*rps_cpu_mask);
+                return 0;
+        }
+
+        if (*rps_cpu_mask)
+                mask = *rps_cpu_mask;
+        else {
+                allocated = new0(CPUSet, 1);
+                if (!allocated)
+                        return log_oom();
+
+                mask = allocated;
+        }
+
+        if (streq(rvalue, "disable"))
+                cpu_set_reset(mask);
+
+        else if (streq(rvalue, "all")) {
+                r = cpu_mask_add_all(mask);
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                   "Failed to create CPU affinity mask representing \"all\" cpus, ignoring: %m");
+                        return 0;
+                }
+        } else {
+                r = parse_cpu_set_extend(rvalue, mask, /* warn= */ true, unit, filename, line, lvalue);
+                if (r < 0)
+                        return 0;
+        }
+
+        if (allocated)
+                *rps_cpu_mask = TAKE_PTR(allocated);
+
+        return 0;
+}
+
 static const char* const mac_address_policy_table[_MAC_ADDRESS_POLICY_MAX] = {
         [MAC_ADDRESS_POLICY_PERSISTENT] = "persistent",
         [MAC_ADDRESS_POLICY_RANDOM] = "random",
@@ -1131,13 +1446,10 @@ DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(
         config_parse_mac_address_policy,
         mac_address_policy,
         MACAddressPolicy,
-        MAC_ADDRESS_POLICY_NONE,
-        "Failed to parse MAC address policy");
+        MAC_ADDRESS_POLICY_NONE);
 
 DEFINE_CONFIG_PARSE_ENUMV(config_parse_name_policy, name_policy, NamePolicy,
-                          _NAMEPOLICY_INVALID,
-                          "Failed to parse interface name policy");
+                          _NAMEPOLICY_INVALID);
 
 DEFINE_CONFIG_PARSE_ENUMV(config_parse_alternative_names_policy, alternative_names_policy, NamePolicy,
-                          _NAMEPOLICY_INVALID,
-                          "Failed to parse alternative names policy");
+                          _NAMEPOLICY_INVALID);

@@ -36,8 +36,9 @@ The following exceptions apply:
    verbatim from the Linux kernel source tree and are licensed under **GPL-2.0 WITH
    Linux-syscall-note** and are used within the scope of the Linux-syscall-note
    exception provisions
- * the src/shared/initreq.h header is licensed under original license,
-   **LGPL-2.0-or-later**.
+ * the following sources are licensed under the **LGPL-2.0-or-later** license:
+   - src/basic/utf8.c
+   - src/shared/initreq.h
  * the src/shared/linux/bpf_insn.h header is copied from the Linux kernel
    source tree and is licensed under either **BSD-2-Clause** or **GPL-2.0-only**,
    and thus is included in the systemd build under the BSD-2-Clause license.
@@ -53,8 +54,7 @@ The following exceptions apply:
  * the following sources are licensed under the **CC0-1.0** license:
    - src/basic/siphash24.c
    - src/basic/siphash24.h
-   - tools/check-includes.pl
-  * the following sources are licensed under the **MIT-0** license:
+ * the following sources are licensed under the **MIT-0** license:
    - all examples under man/
    - src/systemctl/systemd-sysv-install.SKELETON
    - config files and examples under /network
@@ -66,6 +66,12 @@ The following exceptions apply:
    - src/libsystemd/sd-journal/lookup3.h
  * the tools/chromiumos/gen_autosuspend_rules.py script is licensed under the
    **BSD-3-Clause** license.
+ * the following sources are under **Public Domain** (LicenseRef-alg-sha1-public-domain):
+   - src/fundamental/sha1-fundamental.c
+   - src/fundamental/sha1-fundamental.h
+ * the following files are licensed under **BSD-3-Clause** license:
+   - src/boot/efi/chid.c
+   - src/boot/efi/chid.h
  * Heebo fonts under docs/fonts/ are licensed under the **SIL Open Font License 1.1**,
  * any files under test/ without an explicit license we assume non-copyrightable
    (eg: computer-generated fuzzer data)

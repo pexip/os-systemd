@@ -4,14 +4,20 @@
 #include <stdlib.h>
 
 #include "bpf-dlopen.h"
+#include "compress.h"
 #include "cryptsetup-util.h"
 #include "elf-util.h"
+#include "gcrypt-util.h"
 #include "idn-util.h"
+#include "libarchive-util.h"
 #include "libfido2-util.h"
 #include "macro.h"
 #include "main-func.h"
+#include "module-util.h"
+#include "password-quality-util-passwdqc.h"
+#include "password-quality-util-pwquality.h"
 #include "pcre2-util.h"
-#include "pwquality-util.h"
+#include "pkcs11-util.h"
 #include "qrcode-util.h"
 #include "tests.h"
 #include "tpm2-util.h"
@@ -29,6 +35,10 @@ static int run(int argc, char **argv) {
 
 #if HAVE_LIBCRYPTSETUP
         assert_se(dlopen_cryptsetup() >= 0);
+#endif
+
+#if HAVE_PASSWDQC
+        assert_se(dlopen_passwdqc() >= 0);
 #endif
 
 #if HAVE_PWQUALITY
@@ -58,6 +68,34 @@ static int run(int argc, char **argv) {
 
 #if HAVE_PCRE2
         assert_se(dlopen_pcre2() >= 0);
+#endif
+
+#if HAVE_P11KIT
+        assert_se(dlopen_p11kit() >= 0);
+#endif
+
+#if HAVE_LIBARCHIVE
+        assert_se(dlopen_libarchive() >= 0);
+#endif
+
+#if HAVE_LZ4
+        assert_se(dlopen_lz4() >= 0);
+#endif
+
+#if HAVE_ZSTD
+        assert_se(dlopen_zstd() >= 0);
+#endif
+
+#if HAVE_XZ
+        assert_se(dlopen_lzma() >= 0);
+#endif
+
+#if HAVE_GCRYPT
+        assert_se(initialize_libgcrypt(/* secmem= */ false) >= 0);
+#endif
+
+#if HAVE_KMOD
+        assert_se(dlopen_libkmod() >= 0);
 #endif
 
         return 0;

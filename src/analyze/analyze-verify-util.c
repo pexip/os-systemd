@@ -5,6 +5,7 @@
 #include "all-units.h"
 #include "alloc-util.h"
 #include "analyze-verify-util.h"
+#include "analyze.h"
 #include "bus-error.h"
 #include "bus-util.h"
 #include "log.h"
@@ -36,12 +37,9 @@ static void log_syntax_callback(const char *unit, int level, void *userdata) {
 }
 
 int verify_prepare_filename(const char *filename, char **ret) {
-        int r;
-        const char *name;
-        _cleanup_free_ char *abspath = NULL;
-        _cleanup_free_ char *dir = NULL;
-        _cleanup_free_ char *with_instance = NULL;
+        _cleanup_free_ char *abspath = NULL, *name = NULL, *dir = NULL, *with_instance = NULL;
         char *c;
+        int r;
 
         assert(filename);
         assert(ret);
@@ -50,12 +48,15 @@ int verify_prepare_filename(const char *filename, char **ret) {
         if (r < 0)
                 return r;
 
-        name = basename(abspath);
+        r = path_extract_filename(abspath, &name);
+        if (r < 0)
+                return r;
+
         if (!unit_name_is_valid(name, UNIT_NAME_ANY))
                 return -EINVAL;
 
         if (unit_name_is_valid(name, UNIT_NAME_TEMPLATE)) {
-                r = unit_name_replace_instance(name, "i", &with_instance);
+                r = unit_name_replace_instance(name, arg_instance, &with_instance);
                 if (r < 0)
                         return r;
         }
@@ -152,10 +153,10 @@ int verify_set_unit_path(char **filenames) {
          * Treat explicit empty path to mean that nothing should be appended. */
         old = getenv("SYSTEMD_UNIT_PATH");
         if (!streq_ptr(old, "") &&
-            !strextend_with_separator(&joined, ":", old ?: ""))
+            !strextend_with_separator(&joined, ":", strempty(old)))
                 return -ENOMEM;
 
-        assert_se(set_unit_path(joined) >= 0);
+        assert_se(setenv_unit_path(joined) >= 0);
         return 0;
 }
 
@@ -197,32 +198,19 @@ int verify_executable(Unit *u, const ExecCommand *exec, const char *root) {
 }
 
 static int verify_executables(Unit *u, const char *root) {
-        ExecCommand *exec;
-        int r = 0, k;
-        unsigned i;
+        int r = 0;
 
         assert(u);
 
-        exec =  u->type == UNIT_SOCKET ? SOCKET(u)->control_command :
-                u->type == UNIT_MOUNT ? MOUNT(u)->control_command :
-                u->type == UNIT_SWAP ? SWAP(u)->control_command : NULL;
-        k = verify_executable(u, exec, root);
-        if (k < 0 && r == 0)
-                r = k;
-
         if (u->type == UNIT_SERVICE)
-                for (i = 0; i < ELEMENTSOF(SERVICE(u)->exec_command); i++) {
-                        k = verify_executable(u, SERVICE(u)->exec_command[i], root);
-                        if (k < 0 && r == 0)
-                                r = k;
-                }
+                FOREACH_ELEMENT(i, SERVICE(u)->exec_command)
+                        LIST_FOREACH(command, j, *i)
+                                RET_GATHER(r, verify_executable(u, j, root));
 
         if (u->type == UNIT_SOCKET)
-                for (i = 0; i < ELEMENTSOF(SOCKET(u)->exec_command); i++) {
-                        k = verify_executable(u, SOCKET(u)->exec_command[i], root);
-                        if (k < 0 && r == 0)
-                                r = k;
-                }
+                FOREACH_ELEMENT(i, SOCKET(u)->exec_command)
+                        LIST_FOREACH(command, j, *i)
+                                RET_GATHER(r, verify_executable(u, j, root));
 
         return r;
 }
@@ -255,7 +243,7 @@ static int verify_documentation(Unit *u, bool check_man) {
 
 static int verify_unit(Unit *u, bool check_man, const char *root) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        int r, k;
+        int r;
 
         assert(u);
 
@@ -263,35 +251,35 @@ static int verify_unit(Unit *u, bool check_man, const char *root) {
                 unit_dump(u, stdout, "\t");
 
         log_unit_debug(u, "Creating %s/start job", u->id);
-        r = manager_add_job(u->manager, JOB_START, u, JOB_REPLACE, NULL, &error, NULL);
+        r = manager_add_job(u->manager, JOB_START, u, JOB_REPLACE, &error, /* ret = */ NULL);
         if (r < 0)
                 log_unit_error_errno(u, r, "Failed to create %s/start: %s", u->id, bus_error_message(&error, r));
 
-        k = verify_socket(u);
-        if (k < 0 && r == 0)
-                r = k;
-
-        k = verify_executables(u, root);
-        if (k < 0 && r == 0)
-                r = k;
-
-        k = verify_documentation(u, check_man);
-        if (k < 0 && r == 0)
-                r = k;
+        RET_GATHER(r, verify_socket(u));
+        RET_GATHER(r, verify_executables(u, root));
+        RET_GATHER(r, verify_documentation(u, check_man));
 
         return r;
 }
 
-static void set_destroy_ignore_pointer_max(Set** s) {
+static void set_destroy_ignore_pointer_max(Set **s) {
         if (*s == POINTER_MAX)
                 return;
         set_free_free(*s);
 }
 
-int verify_units(char **filenames, LookupScope scope, bool check_man, bool run_generators, RecursiveErrors recursive_errors, const char *root) {
+int verify_units(
+                char **filenames,
+                RuntimeScope scope,
+                bool check_man,
+                bool run_generators,
+                RecursiveErrors recursive_errors,
+                const char *root) {
+
         const ManagerTestRunFlags flags =
                 MANAGER_TEST_RUN_MINIMAL |
                 MANAGER_TEST_RUN_ENV_GENERATORS |
+                MANAGER_TEST_DONT_OPEN_EXECUTOR |
                 (recursive_errors == RECURSIVE_ERRORS_NO) * MANAGER_TEST_RUN_IGNORE_DEPENDENCIES |
                 run_generators * MANAGER_TEST_RUN_GENERATORS;
 
@@ -299,7 +287,7 @@ int verify_units(char **filenames, LookupScope scope, bool check_man, bool run_g
         _cleanup_(set_destroy_ignore_pointer_max) Set *s = NULL;
         _unused_ _cleanup_(clear_log_syntax_callback) dummy_t dummy;
         Unit *units[strv_length(filenames)];
-        int r, k, i, count = 0;
+        int r, k, count = 0;
 
         if (strv_isempty(filenames))
                 return 0;
@@ -336,26 +324,21 @@ int verify_units(char **filenames, LookupScope scope, bool check_man, bool run_g
                 k = verify_prepare_filename(*filename, &prepared);
                 if (k < 0) {
                         log_error_errno(k, "Failed to prepare filename %s: %m", *filename);
-                        if (r == 0)
-                                r = k;
+                        RET_GATHER(r, k);
                         continue;
                 }
 
                 k = manager_load_startable_unit_or_warn(m, NULL, prepared, &units[count]);
                 if (k < 0) {
-                        if (r == 0)
-                                r = k;
+                        RET_GATHER(r, k);
                         continue;
                 }
 
                 count++;
         }
 
-        for (i = 0; i < count; i++) {
-                k = verify_unit(units[i], check_man, root);
-                if (k < 0 && r == 0)
-                        r = k;
-        }
+        FOREACH_ARRAY(i, units, count)
+                RET_GATHER(r, verify_unit(*i, check_man, root));
 
         if (s == POINTER_MAX)
                 return log_oom();

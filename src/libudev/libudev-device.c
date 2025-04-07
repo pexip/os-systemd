@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+/* Make sure the net/if.h header is included before any linux/ one */
+#include <net/if.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/sockios.h>
-#include <net/if.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -635,8 +636,6 @@ _public_ struct udev_list_entry *udev_device_get_devlinks_list_entry(struct udev
 
         if (device_get_devlinks_generation(udev_device->device) != udev_device->devlinks_generation ||
             !udev_device->devlinks_read) {
-                const char *devlink;
-
                 udev_list_cleanup(udev_device->devlinks);
 
                 FOREACH_DEVICE_DEVLINK(udev_device->device, devlink)
@@ -667,8 +666,6 @@ _public_ struct udev_list_entry *udev_device_get_properties_list_entry(struct ud
 
         if (device_get_properties_generation(udev_device->device) != udev_device->properties_generation ||
             !udev_device->properties_read) {
-                const char *key, *value;
-
                 udev_list_cleanup(udev_device->properties);
 
                 FOREACH_DEVICE_PROPERTY(udev_device->device, key, value)
@@ -787,8 +784,6 @@ _public_ struct udev_list_entry *udev_device_get_sysattr_list_entry(struct udev_
         assert_return_errno(udev_device, NULL, EINVAL);
 
         if (!udev_device->sysattrs_read) {
-                const char *sysattr;
-
                 udev_list_cleanup(udev_device->sysattrs);
 
                 FOREACH_DEVICE_SYSATTR(udev_device->device, sysattr)
@@ -842,8 +837,6 @@ _public_ struct udev_list_entry *udev_device_get_tags_list_entry(struct udev_dev
 
         if (device_get_tags_generation(udev_device->device) != udev_device->all_tags_generation ||
             !udev_device->all_tags_read) {
-                const char *tag;
-
                 udev_list_cleanup(udev_device->all_tags);
 
                 FOREACH_DEVICE_TAG(udev_device->device, tag)
@@ -862,8 +855,6 @@ _public_ struct udev_list_entry *udev_device_get_current_tags_list_entry(struct 
 
         if (device_get_tags_generation(udev_device->device) != udev_device->current_tags_generation ||
             !udev_device->current_tags_read) {
-                const char *tag;
-
                 udev_list_cleanup(udev_device->current_tags);
 
                 FOREACH_DEVICE_CURRENT_TAG(udev_device->device, tag)

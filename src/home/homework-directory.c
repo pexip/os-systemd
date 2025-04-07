@@ -4,6 +4,7 @@
 
 #include "btrfs-util.h"
 #include "fd-util.h"
+#include "homework-blob.h"
 #include "homework-directory.h"
 #include "homework-mount.h"
 #include "homework-quota.h"
@@ -108,7 +109,7 @@ int home_activate_directory(
 int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserRecord **ret_home) {
         _cleanup_(rm_rf_subvolume_and_freep) char *temporary = NULL;
         _cleanup_(user_record_unrefp) UserRecord *new_home = NULL;
-        _cleanup_close_ int mount_fd = -1;
+        _cleanup_close_ int mount_fd = -EBADF;
         _cleanup_free_ char *d = NULL;
         bool is_subvolume = false;
         const char *ip;
@@ -130,8 +131,8 @@ int home_create_directory_or_subvolume(UserRecord *h, HomeSetup *setup, UserReco
         switch (user_record_storage(h)) {
 
         case USER_SUBVOLUME:
-                RUN_WITH_UMASK(0077)
-                        r = btrfs_subvol_make(d);
+                WITH_UMASK(0077)
+                        r = btrfs_subvol_make(AT_FDCWD, d);
 
                 if (r >= 0) {
                         log_info("Subvolume created.");
@@ -265,7 +266,7 @@ int home_resize_directory(
                 UserRecord **ret_home) {
 
         _cleanup_(user_record_unrefp) UserRecord *embedded_home = NULL, *new_home = NULL;
-        int r;
+        int r, reconciled;
 
         assert(h);
         assert(setup);
@@ -276,21 +277,25 @@ int home_resize_directory(
         if (r < 0)
                 return r;
 
-        r = home_load_embedded_identity(h, setup->root_fd, NULL, USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL, cache, &embedded_home, &new_home);
-        if (r < 0)
-                return r;
+        reconciled = home_load_embedded_identity(h, setup->root_fd, NULL, USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL, cache, &embedded_home, &new_home);
+        if (reconciled < 0)
+                return reconciled;
 
         r = home_maybe_shift_uid(h, flags, setup);
         if (r < 0)
                 return r;
 
         r = home_update_quota_auto(h, NULL);
-        if (ERRNO_IS_NOT_SUPPORTED(r))
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                 return -ESOCKTNOSUPPORT; /* make recognizable */
         if (r < 0)
                 return r;
 
-        r = home_store_embedded_identity(new_home, setup->root_fd, h->uid, embedded_home);
+        r = home_store_embedded_identity(new_home, setup->root_fd, embedded_home);
+        if (r < 0)
+                return r;
+
+        r = home_reconcile_blob_dirs(new_home, setup->root_fd, reconciled);
         if (r < 0)
                 return r;
 

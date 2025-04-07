@@ -39,6 +39,12 @@ const BusLocator* const bus_network_mgr = &(BusLocator){
         .interface = "org.freedesktop.network1.Manager"
 };
 
+const BusLocator* const bus_oom_mgr = &(BusLocator){
+        .destination = "org.freedesktop.oom1",
+        .path = "/org/freedesktop/oom1",
+        .interface = "org.freedesktop.oom1.Manager"
+};
+
 const BusLocator* const bus_portable_mgr = &(BusLocator){
         .destination = "org.freedesktop.portable1",
         .path = "/org/freedesktop/portable1",
@@ -57,10 +63,22 @@ const BusLocator* const bus_systemd_mgr = &(BusLocator){
         .interface = "org.freedesktop.systemd1.Manager"
 };
 
+const BusLocator* const bus_sysupdate_mgr = &(BusLocator){
+        .destination = "org.freedesktop.sysupdate1",
+        .path = "/org/freedesktop/sysupdate1",
+        .interface = "org.freedesktop.sysupdate1.Manager"
+};
+
 const BusLocator* const bus_timedate = &(BusLocator){
         .destination = "org.freedesktop.timedate1",
         .path = "/org/freedesktop/timedate1",
         .interface = "org.freedesktop.timedate1"
+};
+
+const BusLocator* const bus_timesync_mgr = &(BusLocator){
+        .destination = "org.freedesktop.timesync1",
+        .path = "/org/freedesktop/timesync1",
+        .interface = "org.freedesktop.timesync1.Manager"
 };
 
 const BusLocator* const bus_hostname = &(BusLocator){

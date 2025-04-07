@@ -6,7 +6,8 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "chase-symlinks.h"
+#include "build.h"
+#include "chase.h"
 #include "dirent-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
@@ -34,9 +35,6 @@ static const char prefixes[] =
         "/usr/local/share\0"
         "/usr/lib\0"
         "/usr/share\0"
-#if HAVE_SPLIT_USR
-        "/lib\0"
-#endif
         ;
 
 static const char suffixes[] =
@@ -74,11 +72,11 @@ static int equivalent(const char *a, const char *b) {
         _cleanup_free_ char *x = NULL, *y = NULL;
         int r;
 
-        r = chase_symlinks(a, NULL, CHASE_TRAIL_SLASH, &x, NULL);
+        r = chase(a, NULL, CHASE_TRAIL_SLASH, &x, NULL);
         if (r < 0)
                 return r;
 
-        r = chase_symlinks(b, NULL, CHASE_TRAIL_SLASH, &y, NULL);
+        r = chase(b, NULL, CHASE_TRAIL_SLASH, &y, NULL);
         if (r < 0)
                 return r;
 
@@ -170,7 +168,7 @@ static int found_override(const char *top, const char *bottom) {
 
         fflush(stdout);
 
-        r = safe_fork("(diff)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
+        r = safe_fork("(diff)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -316,7 +314,7 @@ static int enumerate_dir(
                         dirs[n_dirs] = strdup(de->d_name);
                         if (!dirs[n_dirs])
                                 return -ENOMEM;
-                        n_dirs ++;
+                        n_dirs++;
                 }
 
                 if (!dirent_is_file(de))
@@ -328,7 +326,7 @@ static int enumerate_dir(
                 files[n_files] = strdup(de->d_name);
                 if (!files[n_files])
                         return -ENOMEM;
-                n_files ++;
+                n_files++;
         }
 
         strv_sort(dirs);
@@ -367,39 +365,7 @@ static int enumerate_dir(
         return 0;
 }
 
-static int should_skip_path(const char *prefix, const char *suffix) {
-#if HAVE_SPLIT_USR
-        _cleanup_free_ char *target = NULL, *dirname = NULL;
-        const char *p;
-
-        dirname = path_join(prefix, suffix);
-        if (!dirname)
-                return -ENOMEM;
-
-        if (chase_symlinks(dirname, NULL, 0, &target, NULL) < 0)
-                return false;
-
-        NULSTR_FOREACH(p, prefixes) {
-                _cleanup_free_ char *tmp = NULL;
-
-                if (path_startswith(dirname, p))
-                        continue;
-
-                tmp = path_join(p, suffix);
-                if (!tmp)
-                        return -ENOMEM;
-
-                if (path_equal(target, tmp)) {
-                        log_debug("%s redirects to %s, skipping.", dirname, target);
-                        return true;
-                }
-        }
-#endif
-        return false;
-}
-
 static int process_suffix(const char *suffix, const char *onlyprefix) {
-        const char *p;
         char *f, *key;
         OrderedHashmap *top, *bottom, *drops, *h;
         int r = 0, k, n_found = 0;
@@ -421,9 +387,6 @@ static int process_suffix(const char *suffix, const char *onlyprefix) {
 
         NULSTR_FOREACH(p, prefixes) {
                 _cleanup_free_ char *t = NULL;
-
-                if (should_skip_path(p, suffix) > 0)
-                        continue;
 
                 t = path_join(p, suffix);
                 if (!t) {
@@ -476,7 +439,6 @@ finish:
 }
 
 static int process_suffixes(const char *onlyprefix) {
-        const char *n;
         int n_found = 0, r;
 
         NULSTR_FOREACH(n, suffixes) {
@@ -491,8 +453,6 @@ static int process_suffixes(const char *onlyprefix) {
 }
 
 static int process_suffix_chop(const char *arg) {
-        const char *p;
-
         assert(arg);
 
         if (!path_is_absolute(arg))
@@ -651,9 +611,7 @@ static int run(int argc, char *argv[]) {
         pager_open(arg_pager_flags);
 
         if (optind < argc) {
-                int i;
-
-                for (i = optind; i < argc; i++) {
+                for (int i = optind; i < argc; i++) {
                         path_simplify(argv[i]);
 
                         k = process_suffix_chop(argv[i]);

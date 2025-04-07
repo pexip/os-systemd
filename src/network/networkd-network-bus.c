@@ -4,6 +4,7 @@
 #include "ether-addr-util.h"
 #include "networkd-manager.h"
 #include "networkd-network-bus.h"
+#include "path-util.h"
 #include "string-util.h"
 #include "strv.h"
 
@@ -54,28 +55,13 @@ static const sd_bus_vtable network_vtable[] = {
 };
 
 static char *network_bus_path(Network *network) {
-        _cleanup_free_ char *name = NULL;
-        char *networkname, *d, *path;
+        char *path;
         int r;
 
         assert(network);
-        assert(network->filename);
+        assert(network->name);
 
-        name = strdup(network->filename);
-        if (!name)
-                return NULL;
-
-        networkname = basename(name);
-
-        d = strrchr(networkname, '.');
-        if (!d)
-                return NULL;
-
-        assert(streq(d, ".network"));
-
-        *d = '\0';
-
-        r = sd_bus_path_encode("/org/freedesktop/network1/network", networkname, &path);
+        r = sd_bus_path_encode("/org/freedesktop/network1/network", network->name, &path);
         if (r < 0)
                 return NULL;
 

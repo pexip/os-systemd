@@ -97,7 +97,7 @@ TEST(chown_recursive) {
         /* We now apply an xattr to the dir, and check it again */
         p = strjoina(t, "/dir");
         r = RET_NERRNO(setxattr(p, "system.posix_acl_access", acl, sizeof(acl), 0));
-        if (r < 0 && ERRNO_IS_NOT_SUPPORTED(r))
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                 return (void) log_tests_skipped_errno(r, "no acl supported on /tmp");
 
         assert_se(r >= 0);
@@ -109,7 +109,7 @@ TEST(chown_recursive) {
         assert_se(st.st_gid == gid);
         assert_se(has_xattr(p));
 
-        assert_se(path_chown_recursive(t, 1, 2, 07777) >= 0);
+        assert_se(path_chown_recursive(t, 1, 2, 07777, 0) >= 0);
 
         p = strjoina(t, "/dir");
         assert_se(lstat(p, &st) >= 0);

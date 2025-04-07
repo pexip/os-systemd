@@ -16,6 +16,7 @@
 #include "conf-files.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "hashmap.h"
 #include "log.h"
 #include "memory-util.h"
@@ -54,7 +55,7 @@ typedef struct CatalogItem {
 } CatalogItem;
 
 static void catalog_hash_func(const CatalogItem *i, struct siphash *state) {
-        siphash24_compress(&i->id, sizeof(i->id), state);
+        siphash24_compress_typesafe(i->id, state);
         siphash24_compress_string(i->language, state);
 }
 
@@ -147,6 +148,7 @@ static int finish_item(
         _cleanup_free_ CatalogItem *i = NULL;
         _cleanup_free_ char *combined = NULL;
         char *prev;
+        int r;
 
         assert(h);
         assert(payload);
@@ -169,9 +171,11 @@ static int finish_item(
                 if (!combined)
                         return log_oom();
 
-                if (ordered_hashmap_update(h, i, combined) < 0)
-                        return log_oom();
-                combined = NULL;
+                r = ordered_hashmap_update(h, i, combined);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to update catalog item: %m");
+
+                TAKE_PTR(combined);
                 free(prev);
         } else {
                 /* A new item */
@@ -179,10 +183,12 @@ static int finish_item(
                 if (!combined)
                         return log_oom();
 
-                if (ordered_hashmap_put(h, i, combined) < 0)
-                        return log_oom();
-                i = NULL;
-                combined = NULL;
+                r = ordered_hashmap_put(h, i, combined);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to insert catalog item: %m");
+
+                TAKE_PTR(i);
+                TAKE_PTR(combined);
         }
 
         return 0;
@@ -217,10 +223,7 @@ static int catalog_entry_lang(
                 const char* deflang,
                 char **ret) {
 
-        size_t c;
-        char *z;
-
-        c = strlen(t);
+        size_t c = strlen(t);
         if (c < 2)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "[%s:%u] Language too short.", filename, line);
@@ -237,12 +240,7 @@ static int catalog_entry_lang(
                 log_warning("[%s:%u] language differs from default for file", filename, line);
         }
 
-        z = strdup(t);
-        if (!z)
-                return -ENOMEM;
-
-        *ret = z;
-        return 0;
+        return strdup_to(ret, t);
 }
 
 int catalog_import_file(OrderedHashmap *h, const char *path) {
@@ -377,10 +375,8 @@ static int64_t write_catalog(
                 CatalogItem *items,
                 size_t n) {
 
+        _cleanup_(unlink_and_freep) char *p = NULL;
         _cleanup_fclose_ FILE *w = NULL;
-        _cleanup_free_ char *p = NULL;
-        CatalogHeader header;
-        size_t k;
         int r;
 
         r = mkdir_parents(database, 0755);
@@ -389,54 +385,35 @@ static int64_t write_catalog(
 
         r = fopen_temporary(database, &w, &p);
         if (r < 0)
-                return log_error_errno(r, "Failed to open database for writing: %s: %m",
-                                       database);
+                return log_error_errno(r, "Failed to open database for writing: %s: %m", database);
 
-        header = (CatalogHeader) {
+        CatalogHeader header = {
                 .signature = CATALOG_SIGNATURE,
                 .header_size = htole64(CONST_ALIGN_TO(sizeof(CatalogHeader), 8)),
                 .catalog_item_size = htole64(sizeof(CatalogItem)),
                 .n_items = htole64(n),
         };
 
-        r = -EIO;
+        if (fwrite(&header, sizeof(header), 1, w) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "%s: failed to write header.", p);
 
-        k = fwrite(&header, 1, sizeof(header), w);
-        if (k != sizeof(header)) {
-                log_error("%s: failed to write header.", p);
-                goto error;
-        }
+        if (fwrite(items, sizeof(CatalogItem), n, w) != n)
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "%s: failed to write database.", p);
 
-        k = fwrite(items, 1, n * sizeof(CatalogItem), w);
-        if (k != n * sizeof(CatalogItem)) {
-                log_error("%s: failed to write database.", p);
-                goto error;
-        }
-
-        k = fwrite(sb->buf, 1, sb->len, w);
-        if (k != sb->len) {
-                log_error("%s: failed to write strings.", p);
-                goto error;
-        }
+        if (fwrite(sb->buf, sb->len, 1, w) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EIO), "%s: failed to write strings.", p);
 
         r = fflush_and_check(w);
-        if (r < 0) {
-                log_error_errno(r, "%s: failed to write database: %m", p);
-                goto error;
-        }
+        if (r < 0)
+                return log_error_errno(r, "%s: failed to write database: %m", p);
 
         (void) fchmod(fileno(w), 0644);
 
-        if (rename(p, database) < 0) {
-                r = log_error_errno(errno, "rename (%s -> %s) failed: %m", p, database);
-                goto error;
-        }
+        if (rename(p, database) < 0)
+                return log_error_errno(errno, "rename (%s -> %s) failed: %m", p, database);
 
+        p = mfree(p); /* free without unlinking */
         return ftello(w);
-
-error:
-        (void) unlink(p);
-        return r;
 }
 
 int catalog_update(const char* database, const char* root, const char* const* dirs) {
@@ -467,11 +444,12 @@ int catalog_update(const char* database, const char* root, const char* const* di
                         return log_error_errno(r, "Failed to import file '%s': %m", *f);
         }
 
-        if (ordered_hashmap_size(h) <= 0) {
+        if (ordered_hashmap_isempty(h)) {
                 log_info("No items in catalog.");
                 return 0;
-        } else
-                log_debug("Found %u items in catalog.", ordered_hashmap_size(h));
+        }
+
+        log_debug("Found %u items in catalog.", ordered_hashmap_size(h));
 
         items = new(CatalogItem, ordered_hashmap_size(h));
         if (!items)
@@ -483,7 +461,7 @@ int catalog_update(const char* database, const char* root, const char* const* di
                           SD_ID128_FORMAT_VAL(i->id),
                           isempty(i->language) ? "C" : i->language);
 
-                offset = strbuf_add_string(sb, payload, strlen(payload));
+                offset = strbuf_add_string(sb, payload);
                 if (offset < 0)
                         return log_oom();
 
@@ -506,7 +484,7 @@ int catalog_update(const char* database, const char* root, const char* const* di
 }
 
 static int open_mmap(const char *database, int *_fd, struct stat *_st, void **_p) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         const CatalogHeader *h;
         struct stat st;
         void *p;
@@ -602,15 +580,14 @@ static const char *find_id(void *p, sd_id128_t id) {
                 le64toh(f->offset);
 }
 
-int catalog_get(const char* database, sd_id128_t id, char **_text) {
-        _cleanup_close_ int fd = -1;
+int catalog_get(const char* database, sd_id128_t id, char **ret_text) {
+        _cleanup_close_ int fd = -EBADF;
         void *p = NULL;
-        struct stat st = {};
-        char *text = NULL;
+        struct stat st;
         int r;
         const char *s;
 
-        assert(_text);
+        assert(ret_text);
 
         r = open_mmap(database, &fd, &st, &p);
         if (r < 0)
@@ -622,18 +599,9 @@ int catalog_get(const char* database, sd_id128_t id, char **_text) {
                 goto finish;
         }
 
-        text = strdup(s);
-        if (!text) {
-                r = -ENOMEM;
-                goto finish;
-        }
-
-        *_text = text;
-        r = 0;
-
+        r = strdup_to(ret_text, s);
 finish:
-        if (p)
-                munmap(p, st.st_size);
+        (void) munmap(p, st.st_size);
 
         return r;
 }
@@ -670,7 +638,7 @@ static void dump_catalog_entry(FILE *f, sd_id128_t id, const char *s, bool oneli
 }
 
 int catalog_list(FILE *f, const char *database, bool oneline) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         void *p = NULL;
         struct stat st;
         const CatalogHeader *h;

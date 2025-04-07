@@ -8,7 +8,7 @@
 #include "tests.h"
 
 static void _test_one(int line, const char *input, const char *output) {
-        CalendarSpec *c;
+        _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
         _cleanup_free_ char *p = NULL, *q = NULL;
         usec_t u;
         int r;
@@ -16,30 +16,29 @@ static void _test_one(int line, const char *input, const char *output) {
         r = calendar_spec_from_string(input, &c);
         if (r < 0)
                 log_error_errno(r, "Failed to parse \"%s\": %m", input);
-        assert_se(r >= 0);
+        ASSERT_OK(r);
 
-        assert_se(calendar_spec_to_string(c, &p) >= 0);
+        ASSERT_OK(calendar_spec_to_string(c, &p));
         log_info("line %d: \"%s\" → \"%s\"%s%s", line, input, p,
                  !streq(p, output) ? " expected:" : "",
                  !streq(p, output) ? output : "");
 
-        assert_se(streq(p, output));
+        ASSERT_STREQ(p, output);
 
         u = now(CLOCK_REALTIME);
         r = calendar_spec_next_usec(c, u, &u);
         log_info("Next: %s", r < 0 ? STRERROR(r) : FORMAT_TIMESTAMP(u));
-        calendar_spec_free(c);
+        c = calendar_spec_free(c);
 
-        assert_se(calendar_spec_from_string(p, &c) >= 0);
-        assert_se(calendar_spec_to_string(c, &q) >= 0);
-        calendar_spec_free(c);
+        ASSERT_OK(calendar_spec_from_string(p, &c));
+        ASSERT_OK(calendar_spec_to_string(c, &q));
 
-        assert_se(streq(q, p));
+        ASSERT_STREQ(q, p);
 }
 #define test_one(input, output) _test_one(__LINE__, input, output)
 
 static void _test_next(int line, const char *input, const char *new_tz, usec_t after, usec_t expect) {
-        CalendarSpec *c;
+        _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
         usec_t u;
         char *old_tz;
         int r;
@@ -54,7 +53,7 @@ static void _test_next(int line, const char *input, const char *new_tz, usec_t a
         assert_se(set_unset_env("TZ", new_tz, true) == 0);
         tzset();
 
-        assert_se(calendar_spec_from_string(input, &c) >= 0);
+        ASSERT_OK(calendar_spec_from_string(input, &c));
 
         log_info("line %d: \"%s\" new_tz=%s", line, input, strnull(new_tz));
 
@@ -66,8 +65,6 @@ static void _test_next(int line, const char *input, const char *new_tz, usec_t a
         else
                 assert_se(r == -ENOENT);
 
-        calendar_spec_free(c);
-
         assert_se(set_unset_env("TZ", old_tz, true) == 0);
         tzset();
 }
@@ -76,7 +73,7 @@ static void _test_next(int line, const char *input, const char *new_tz, usec_t a
 TEST(timestamp) {
         char buf[FORMAT_TIMESTAMP_MAX];
         _cleanup_free_ char *t = NULL;
-        CalendarSpec *c;
+        _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
         usec_t x, y;
 
         /* Ensure that a timestamp is also a valid calendar specification. Convert forth and back */
@@ -85,23 +82,22 @@ TEST(timestamp) {
 
         assert_se(format_timestamp_style(buf, sizeof buf, x, TIMESTAMP_US));
         log_info("%s", buf);
-        assert_se(calendar_spec_from_string(buf, &c) >= 0);
-        assert_se(calendar_spec_to_string(c, &t) >= 0);
-        calendar_spec_free(c);
+        ASSERT_OK(calendar_spec_from_string(buf, &c));
+        ASSERT_OK(calendar_spec_to_string(c, &t));
         log_info("%s", t);
 
-        assert_se(parse_timestamp(t, &y) >= 0);
+        ASSERT_OK(parse_timestamp(t, &y));
         assert_se(y == x);
 }
 
 TEST(hourly_bug_4031) {
-        CalendarSpec *c;
+        _cleanup_(calendar_spec_freep) CalendarSpec *c = NULL;
         usec_t n, u, w;
         int r;
 
-        assert_se(calendar_spec_from_string("hourly", &c) >= 0);
+        ASSERT_OK(calendar_spec_from_string("hourly", &c));
         n = now(CLOCK_REALTIME);
-        assert_se((r = calendar_spec_next_usec(c, n, &u)) >= 0);
+        ASSERT_OK((r = calendar_spec_next_usec(c, n, &u)));
 
         log_info("Now: %s (%"PRIu64")", FORMAT_TIMESTAMP_STYLE(n, TIMESTAMP_US), n);
         log_info("Next hourly: %s (%"PRIu64")", r < 0 ? STRERROR(r) : FORMAT_TIMESTAMP_STYLE(u, TIMESTAMP_US), u);
@@ -113,8 +109,6 @@ TEST(hourly_bug_4031) {
         assert_se(u <= n + USEC_PER_HOUR);
         assert_se(u < w);
         assert_se(w <= u + USEC_PER_HOUR);
-
-        calendar_spec_free(c);
 }
 
 TEST(calendar_spec_one) {
@@ -262,7 +256,7 @@ TEST(calendar_spec_from_string) {
 
 static int intro(void) {
         /* Tests have hard-coded results that do not expect a specific timezone to be set by the caller */
-        assert_se(unsetenv("TZ") >= 0);
+        ASSERT_OK_ERRNO(unsetenv("TZ"));
 
         return EXIT_SUCCESS;
 }

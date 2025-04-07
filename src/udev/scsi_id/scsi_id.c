@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "build.h"
 #include "device-nodes.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -26,14 +27,15 @@
 #include "strv.h"
 #include "strxcpyx.h"
 #include "udev-util.h"
-#include "version.h"
 
 static const struct option options[] = {
         { "device",             required_argument, NULL, 'd' },
         { "config",             required_argument, NULL, 'f' },
         { "page",               required_argument, NULL, 'p' },
-        { "blacklisted",        no_argument,       NULL, 'b' },
-        { "whitelisted",        no_argument,       NULL, 'g' },
+        { "denylisted",         no_argument,       NULL, 'b' },
+        { "allowlisted",        no_argument,       NULL, 'g' },
+        { "blacklisted",        no_argument,       NULL, 'b' }, /* backward compat */
+        { "whitelisted",        no_argument,       NULL, 'g' }, /* backward compat */
         { "replace-whitespace", no_argument,       NULL, 'u' },
         { "sg-version",         required_argument, NULL, 's' },
         { "verbose",            no_argument,       NULL, 'v' },
@@ -81,6 +83,13 @@ static void set_type(unsigned type_num, char *to, size_t len) {
                 break;
         case 0xf:
                 type = "optical";
+                break;
+        case 0x14:
+                /*
+                 * Use "zbc" here to be brief and consistent with "lsscsi" command.
+                 * Other tools, e.g., "sg3_utils" would say "host managed zoned block".
+                 */
+                type = "zbc";
                 break;
         default:
                 type = "generic";
@@ -142,7 +151,7 @@ static int get_file_options(const char *vendor, const char *model,
                 if (*buf == '#')
                         continue;
 
-                r = extract_many_words(&buf, "=\",\n", 0, &key, &value, NULL);
+                r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
                 if (r < 2)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
 
@@ -150,7 +159,7 @@ static int get_file_options(const char *vendor, const char *model,
                         vendor_in = TAKE_PTR(value);
 
                         key = mfree(key);
-                        r = extract_many_words(&buf, "=\",\n", 0, &key, &value, NULL);
+                        r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
                         if (r < 2)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
 
@@ -158,7 +167,7 @@ static int get_file_options(const char *vendor, const char *model,
                                 model_in = TAKE_PTR(value);
 
                                 key = mfree(key);
-                                r = extract_many_words(&buf, "=\",\n", 0, &key, &value, NULL);
+                                r = extract_many_words(&buf, "=\",\n", 0, &key, &value);
                                 if (r < 2)
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error parsing config file line %d '%s'", lineno, buffer);
                         }
@@ -222,8 +231,8 @@ static void help(void) {
                "  -f --config=                     Location of config file\n"
                "  -p --page=0x80|0x83|pre-spc3-83  SCSI page (0x80, 0x83, pre-spc3-83)\n"
                "  -s --sg-version=3|4              Use SGv3 or SGv4\n"
-               "  -b --blacklisted                 Treat device as blacklisted\n"
-               "  -g --whitelisted                 Treat device as whitelisted\n"
+               "  -b --denylisted                  Treat device as denylisted\n"
+               "  -g --allowlisted                 Treat device as allowlisted\n"
                "  -u --replace-whitespace          Replace all whitespace by underscores\n"
                "  -v --verbose                     Verbose logging\n"
                "  -x --export                      Print values as environment keys\n",
@@ -295,7 +304,7 @@ static int set_options(int argc, char **argv,
                         break;
 
                 case 'V':
-                        printf("%s\n", GIT_VERSION);
+                        version();
                         exit(EXIT_SUCCESS);
 
                 case 'x':
@@ -471,10 +480,8 @@ int main(int argc, char **argv) {
         char maj_min_dev[MAX_PATH_LEN];
         int newargc;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         /*
          * Get config file options.

@@ -5,19 +5,17 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "def.h"
+#include "constants.h"
 #include "errno.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "mkdir.h"
 #include "nspawn-setuid.h"
 #include "process-util.h"
-#include "rlimit-util.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "user-util.h"
-#include "util.h"
 
 static int spawn_getent(const char *database, const char *key, pid_t *rpid) {
         int pipe_fds[2], r;
@@ -30,25 +28,17 @@ static int spawn_getent(const char *database, const char *key, pid_t *rpid) {
         if (pipe2(pipe_fds, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to allocate pipe: %m");
 
-        r = safe_fork("(getent)", FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG, &pid);
+        r = safe_fork_full("(getent)",
+                           (int[]) { -EBADF, pipe_fds[1], -EBADF }, NULL, 0,
+                           FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                           &pid);
         if (r < 0) {
                 safe_close_pair(pipe_fds);
                 return r;
         }
         if (r == 0) {
-                char *empty_env = NULL;
-
-                pipe_fds[0] = safe_close(pipe_fds[0]);
-
-                if (rearrange_stdio(-1, TAKE_FD(pipe_fds[1]), -1) < 0)
-                        _exit(EXIT_FAILURE);
-
-                (void) close_all_fds(NULL, 0);
-
-                (void) rlimit_nofile_safe();
-
-                execle("/usr/bin/getent", "getent", database, key, NULL, &empty_env);
-                execle("/bin/getent", "getent", database, key, NULL, &empty_env);
+                execle("/usr/bin/getent", "getent", database, key, NULL, &(char*[1]){});
+                execle("/bin/getent", "getent", database, key, NULL, &(char*[1]){});
                 _exit(EXIT_FAILURE);
         }
 
@@ -66,6 +56,8 @@ int change_uid_gid_raw(
                 size_t n_supplementary_gids,
                 bool chown_stdio) {
 
+        int r;
+
         if (!uid_is_valid(uid))
                 uid = 0;
         if (!gid_is_valid(gid))
@@ -77,14 +69,9 @@ int change_uid_gid_raw(
                 (void) fchown(STDERR_FILENO, uid, gid);
         }
 
-        if (setgroups(n_supplementary_gids, supplementary_gids) < 0)
-                return log_error_errno(errno, "Failed to set auxiliary groups: %m");
-
-        if (setresgid(gid, gid, gid) < 0)
-                return log_error_errno(errno, "setresgid() failed: %m");
-
-        if (setresuid(uid, uid, uid) < 0)
-                return log_error_errno(errno, "setresuid() failed: %m");
+        r = fully_set_uid_gid(uid, gid, supplementary_gids, n_supplementary_gids);
+        if (r < 0)
+                return log_error_errno(r, "Changing privileges failed: %m");
 
         return 0;
 }
@@ -94,7 +81,7 @@ int change_uid_gid(const char *user, bool chown_stdio, char **ret_home) {
         _cleanup_free_ gid_t *gids = NULL;
         _cleanup_free_ char *home = NULL, *line = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         unsigned n_gids = 0;
         uid_t uid;
         gid_t gid;

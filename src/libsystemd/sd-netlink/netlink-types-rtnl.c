@@ -17,6 +17,7 @@
 #include <linux/if_tunnel.h>
 #include <linux/ip.h>
 #include <linux/l2tp.h>
+#include <linux/net_namespace.h>
 #include <linux/netlink.h>
 #include <linux/nexthop.h>
 #include <linux/nl80211.h>
@@ -123,6 +124,7 @@ static const NLAPolicy rtnl_link_info_data_bond_policies[] = {
         [IFLA_BOND_AD_ACTOR_SYSTEM]     = BUILD_POLICY_WITH_SIZE(ETHER_ADDR, ETH_ALEN),
         [IFLA_BOND_TLB_DYNAMIC_LB]      = BUILD_POLICY(U8),
         [IFLA_BOND_PEER_NOTIF_DELAY]    = BUILD_POLICY(U32),
+        [IFLA_BOND_MISSED_MAX]          = BUILD_POLICY(U8),
 };
 
 static const NLAPolicy rtnl_link_info_data_bridge_policies[] = {
@@ -171,6 +173,8 @@ static const NLAPolicy rtnl_link_info_data_bridge_policies[] = {
         [IFLA_BR_MCAST_MLD_VERSION]          = BUILD_POLICY(U8),
         [IFLA_BR_VLAN_STATS_PER_PORT]        = BUILD_POLICY(U8),
         [IFLA_BR_MULTI_BOOLOPT]              = BUILD_POLICY_WITH_SIZE(BINARY, sizeof(struct br_boolopt_multi)),
+        [IFLA_BR_FDB_N_LEARNED]              = BUILD_POLICY(U32),
+        [IFLA_BR_FDB_MAX_LEARNED]            = BUILD_POLICY(U32),
 };
 
 static const NLAPolicy rtnl_link_info_data_can_policies[] = {
@@ -192,19 +196,20 @@ static const NLAPolicy rtnl_link_info_data_can_policies[] = {
 };
 
 static const NLAPolicy rtnl_link_info_data_geneve_policies[] = {
-        [IFLA_GENEVE_ID]                = BUILD_POLICY(U32),
-        [IFLA_GENEVE_REMOTE]            = BUILD_POLICY_WITH_SIZE(IN_ADDR, sizeof(struct in_addr)),
-        [IFLA_GENEVE_TTL]               = BUILD_POLICY(U8),
-        [IFLA_GENEVE_TOS]               = BUILD_POLICY(U8),
-        [IFLA_GENEVE_PORT]              = BUILD_POLICY(U16),
-        [IFLA_GENEVE_COLLECT_METADATA]  = BUILD_POLICY(FLAG),
-        [IFLA_GENEVE_REMOTE6]           = BUILD_POLICY_WITH_SIZE(IN_ADDR, sizeof(struct in6_addr)),
-        [IFLA_GENEVE_UDP_CSUM]          = BUILD_POLICY(U8),
-        [IFLA_GENEVE_UDP_ZERO_CSUM6_TX] = BUILD_POLICY(U8),
-        [IFLA_GENEVE_UDP_ZERO_CSUM6_RX] = BUILD_POLICY(U8),
-        [IFLA_GENEVE_LABEL]             = BUILD_POLICY(U32),
-        [IFLA_GENEVE_TTL_INHERIT]       = BUILD_POLICY(U8),
-        [IFLA_GENEVE_DF]                = BUILD_POLICY(U8),
+        [IFLA_GENEVE_ID]                  = BUILD_POLICY(U32),
+        [IFLA_GENEVE_REMOTE]              = BUILD_POLICY_WITH_SIZE(IN_ADDR, sizeof(struct in_addr)),
+        [IFLA_GENEVE_TTL]                 = BUILD_POLICY(U8),
+        [IFLA_GENEVE_TOS]                 = BUILD_POLICY(U8),
+        [IFLA_GENEVE_PORT]                = BUILD_POLICY(U16),
+        [IFLA_GENEVE_COLLECT_METADATA]    = BUILD_POLICY(FLAG),
+        [IFLA_GENEVE_REMOTE6]             = BUILD_POLICY_WITH_SIZE(IN_ADDR, sizeof(struct in6_addr)),
+        [IFLA_GENEVE_UDP_CSUM]            = BUILD_POLICY(U8),
+        [IFLA_GENEVE_UDP_ZERO_CSUM6_TX]   = BUILD_POLICY(U8),
+        [IFLA_GENEVE_UDP_ZERO_CSUM6_RX]   = BUILD_POLICY(U8),
+        [IFLA_GENEVE_LABEL]               = BUILD_POLICY(U32),
+        [IFLA_GENEVE_TTL_INHERIT]         = BUILD_POLICY(U8),
+        [IFLA_GENEVE_DF]                  = BUILD_POLICY(U8),
+        [IFLA_GENEVE_INNER_PROTO_INHERIT] = BUILD_POLICY(FLAG),
 };
 
 static const NLAPolicy rtnl_link_info_data_gre_policies[] = {
@@ -305,6 +310,7 @@ static const NLAPolicy rtnl_link_info_data_macvlan_policies[] = {
         [IFLA_MACVLAN_MACADDR_COUNT]     = BUILD_POLICY(U32),
         [IFLA_MACVLAN_BC_QUEUE_LEN]      = BUILD_POLICY(U32),
         [IFLA_MACVLAN_BC_QUEUE_LEN_USED] = BUILD_POLICY(U32),
+        [IFLA_MACVLAN_BC_CUTOFF]         = BUILD_POLICY(S32),
 };
 
 static const NLAPolicy rtnl_link_info_data_tun_policies[] = {
@@ -1184,6 +1190,13 @@ static const NLAPolicy rtnl_mdb_policies[] = {
 
 DEFINE_POLICY_SET(rtnl_mdb);
 
+static const NLAPolicy rtnl_nsid_policies[] = {
+        [NETNSA_FD]         = BUILD_POLICY(S32),
+        [NETNSA_NSID]       = BUILD_POLICY(U32),
+};
+
+DEFINE_POLICY_SET(rtnl_nsid);
+
 static const NLAPolicy rtnl_policies[] = {
         [RTM_NEWLINK]      = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_link, sizeof(struct ifinfomsg)),
         [RTM_DELLINK]      = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_link, sizeof(struct ifinfomsg)),
@@ -1219,6 +1232,9 @@ static const NLAPolicy rtnl_policies[] = {
         [RTM_NEWMDB]       = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_mdb, sizeof(struct br_port_msg)),
         [RTM_DELMDB]       = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_mdb, sizeof(struct br_port_msg)),
         [RTM_GETMDB]       = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_mdb, sizeof(struct br_port_msg)),
+        [RTM_NEWNSID]      = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_nsid, sizeof(struct rtgenmsg)),
+        [RTM_DELNSID]      = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_nsid, sizeof(struct rtgenmsg)),
+        [RTM_GETNSID]      = BUILD_POLICY_NESTED_WITH_SIZE(rtnl_nsid, sizeof(struct rtgenmsg)),
 };
 
 DEFINE_POLICY_SET(rtnl);

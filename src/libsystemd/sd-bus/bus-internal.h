@@ -8,10 +8,11 @@
 #include "bus-error.h"
 #include "bus-kernel.h"
 #include "bus-match.h"
-#include "def.h"
+#include "constants.h"
 #include "hashmap.h"
 #include "list.h"
 #include "prioq.h"
+#include "runtime-scope.h"
 #include "socket-util.h"
 #include "time-util.h"
 
@@ -68,7 +69,7 @@ struct node {
 struct node_callback {
         struct node *node;
 
-        bool is_fallback:1;
+        bool is_fallback;
         unsigned last_iteration;
 
         sd_bus_message_handler_t callback;
@@ -95,7 +96,7 @@ struct node_object_manager {
 struct node_vtable {
         struct node *node;
 
-        bool is_fallback:1;
+        bool is_fallback;
         unsigned last_iteration;
 
         char *interface;
@@ -189,33 +190,33 @@ struct sd_bus {
         int message_version;
         int message_endian;
 
-        bool can_fds:1;
-        bool bus_client:1;
-        bool ucred_valid:1;
-        bool is_server:1;
-        bool anonymous_auth:1;
-        bool prefer_readv:1;
-        bool prefer_writev:1;
-        bool match_callbacks_modified:1;
-        bool filter_callbacks_modified:1;
-        bool nodes_modified:1;
-        bool trusted:1;
-        bool manual_peer_interface:1;
-        bool is_system:1;
-        bool is_user:1;
-        bool allow_interactive_authorization:1;
-        bool exit_on_disconnect:1;
-        bool exited:1;
-        bool exit_triggered:1;
-        bool is_local:1;
-        bool watch_bind:1;
-        bool is_monitor:1;
-        bool accept_fd:1;
-        bool attach_timestamp:1;
-        bool connected_signal:1;
-        bool close_on_exit:1;
+        bool can_fds;
+        bool bus_client;
+        bool ucred_valid;
+        bool is_server;
+        bool anonymous_auth;
+        bool prefer_readv;
+        bool prefer_writev;
+        bool match_callbacks_modified;
+        bool filter_callbacks_modified;
+        bool nodes_modified;
+        bool trusted;
+        bool manual_peer_interface;
+        bool allow_interactive_authorization;
+        bool exit_on_disconnect;
+        bool exited;
+        bool exit_triggered;
+        bool is_local;
+        bool watch_bind;
+        bool is_monitor;
+        bool accept_fd;
+        bool attach_timestamp;
+        bool connected_signal;
+        bool close_on_exit;
 
-        signed int use_memfd:2;
+        RuntimeScope runtime_scope;
+
+        int use_memfd;
 
         void *rbuffer;
         size_t rbuffer_size;
@@ -253,6 +254,9 @@ struct sd_bus {
         char *address;
         unsigned address_index;
 
+        uid_t connect_as_uid;
+        gid_t connect_as_gid;
+
         int last_connect_error;
 
         enum bus_auth auth;
@@ -266,6 +270,9 @@ struct sd_bus {
         char *label;
         gid_t *groups;
         size_t n_groups;
+        union sockaddr_union sockaddr_peer;
+        socklen_t sockaddr_size_peer;
+        int pidfd;
 
         uint64_t creds_mask;
 
@@ -285,7 +292,7 @@ struct sd_bus {
         struct memfd_cache memfd_cache[MEMFD_CACHE_MAX];
         unsigned n_memfd_cache;
 
-        pid_t original_pid;
+        uint64_t origin_id;
         pid_t busexec_pid;
 
         unsigned iteration_counter;
@@ -353,7 +360,7 @@ bool service_name_is_valid(const char *p) _pure_;
 bool member_name_is_valid(const char *p) _pure_;
 bool object_path_is_valid(const char *p) _pure_;
 
-char *object_path_startswith(const char *a, const char *b) _pure_;
+char* object_path_startswith(const char *a, const char *b) _pure_;
 
 bool namespace_complex_pattern(const char *pattern, const char *value) _pure_;
 bool path_complex_pattern(const char *pattern, const char *value) _pure_;
@@ -362,7 +369,7 @@ bool namespace_simple_pattern(const char *pattern, const char *value) _pure_;
 bool path_simple_pattern(const char *pattern, const char *value) _pure_;
 
 int bus_message_type_from_string(const char *s, uint8_t *u);
-const char *bus_message_type_to_string(uint8_t u) _pure_;
+const char* bus_message_type_to_string(uint8_t u) _pure_;
 
 #define error_name_is_valid interface_name_is_valid
 
@@ -376,15 +383,25 @@ int bus_seal_synthetic_message(sd_bus *b, sd_bus_message *m);
 
 int bus_rqueue_make_room(sd_bus *bus);
 
-bool bus_pid_changed(sd_bus *bus);
+bool bus_origin_changed(sd_bus *bus);
 
-char *bus_address_escape(const char *v);
+char* bus_address_escape(const char *v);
 
 int bus_attach_io_events(sd_bus *b);
 int bus_attach_inotify_event(sd_bus *b);
 
 void bus_close_inotify_fd(sd_bus *b);
 void bus_close_io_fds(sd_bus *b);
+
+int bus_add_match_full(
+                sd_bus *bus,
+                sd_bus_slot **slot,
+                bool asynchronous,
+                const char *match,
+                sd_bus_message_handler_t callback,
+                sd_bus_message_handler_t install_callback,
+                void *userdata,
+                uint64_t timeout_usec);
 
 #define OBJECT_PATH_FOREACH_PREFIX(prefix, path)                        \
         for (char *_slash = ({ strcpy((prefix), (path)); streq((prefix), "/") ? NULL : strrchr((prefix), '/'); }) ; \
@@ -399,7 +416,7 @@ void bus_close_io_fds(sd_bus *b);
 int bus_set_address_system(sd_bus *bus);
 int bus_set_address_user(sd_bus *bus);
 int bus_set_address_system_remote(sd_bus *b, const char *host);
-int bus_set_address_machine(sd_bus *b, bool user, const char *machine);
+int bus_set_address_machine(sd_bus *b, RuntimeScope runtime_scope, const char *machine);
 
 int bus_maybe_reply_error(sd_bus_message *m, int r, sd_bus_error *error);
 
