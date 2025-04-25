@@ -14,7 +14,7 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "in-addr-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
 #include "log.h"
 #include "macro.h"
 #include "path-util.h"
@@ -69,7 +69,7 @@ static void test_socket_print_unix_one(const char *in, size_t len_in, const char
         assert_se(socket_address_print(&a, &out) >= 0);
         assert_se(c = cescape(in));
         log_info("\"%s\" → \"%s\" (expect \"%s\")", in, out, expected);
-        assert_se(streq(out, expected));
+        ASSERT_STREQ(out, expected);
 }
 
 TEST(socket_print_unix) {
@@ -158,7 +158,7 @@ TEST(in_addr_is_multicast) {
 TEST(getpeercred_getpeergroups) {
         int r;
 
-        r = safe_fork("(getpeercred)", FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        r = safe_fork("(getpeercred)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
         assert_se(r >= 0);
 
         if (r == 0) {
@@ -168,7 +168,7 @@ TEST(getpeercred_getpeergroups) {
                 uid_t test_uid;
                 gid_t test_gid;
                 struct ucred ucred;
-                int pair[2];
+                int pair[2] = EBADF_PAIR;
 
                 if (geteuid() == 0 && !userns_has_single_user()) {
                         test_uid = 1;
@@ -176,10 +176,7 @@ TEST(getpeercred_getpeergroups) {
                         test_gids = (gid_t*) gids;
                         n_test_gids = ELEMENTSOF(gids);
 
-                        assert_se(setgroups(n_test_gids, test_gids) >= 0);
-                        assert_se(setresgid(test_gid, test_gid, test_gid) >= 0);
-                        assert_se(setresuid(test_uid, test_uid, test_uid) >= 0);
-
+                        assert_se(fully_set_uid_gid(test_uid, test_gid, test_gids, n_test_gids) >= 0);
                 } else {
                         long ngroups_max;
 
@@ -223,12 +220,12 @@ TEST(getpeercred_getpeergroups) {
 
 TEST(passfd_read) {
         static const char file_contents[] = "test contents for passfd";
-        _cleanup_close_pair_ int pair[2] = { -1, -1 };
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
 
         assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
 
-        r = safe_fork("(passfd_read)", FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        r = safe_fork("(passfd_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
         assert_se(r >= 0);
 
         if (r == 0) {
@@ -248,34 +245,34 @@ TEST(passfd_read) {
 
         /* Parent */
         char buf[64];
-        struct iovec iov = IOVEC_INIT(buf, sizeof(buf)-1);
-        _cleanup_close_ int fd = -1;
+        struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
+        _cleanup_close_ int fd = -EBADF;
 
         pair[1] = safe_close(pair[1]);
 
         assert_se(receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd) == 0);
 
         assert_se(fd >= 0);
-        r = read(fd, buf, sizeof(buf)-1);
-        assert_se(r >= 0);
-        buf[r] = 0;
-        assert_se(streq(buf, file_contents));
+        ssize_t n = read(fd, buf, sizeof(buf)-1);
+        assert_se(n >= 0);
+        buf[n] = 0;
+        ASSERT_STREQ(buf, file_contents);
 }
 
 TEST(passfd_contents_read) {
-        _cleanup_close_pair_ int pair[2] = { -1, -1 };
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         static const char file_contents[] = "test contents in the file";
         static const char wire_contents[] = "test contents on the wire";
         int r;
 
         assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
 
-        r = safe_fork("(passfd_contents_read)", FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        r = safe_fork("(passfd_contents_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
         assert_se(r >= 0);
 
         if (r == 0) {
                 /* Child */
-                struct iovec iov = IOVEC_INIT_STRING(wire_contents);
+                struct iovec iov = IOVEC_MAKE_STRING(wire_contents);
                 char tmpfile[] = "/tmp/test-socket-util-passfd-contents-read-XXXXXX";
 
                 pair[0] = safe_close(pair[0]);
@@ -292,8 +289,8 @@ TEST(passfd_contents_read) {
 
         /* Parent */
         char buf[64];
-        struct iovec iov = IOVEC_INIT(buf, sizeof(buf)-1);
-        _cleanup_close_ int fd = -1;
+        struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
+        _cleanup_close_ int fd = -EBADF;
         ssize_t k;
 
         pair[1] = safe_close(pair[1]);
@@ -301,28 +298,93 @@ TEST(passfd_contents_read) {
         k = receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd);
         assert_se(k > 0);
         buf[k] = 0;
-        assert_se(streq(buf, wire_contents));
+        ASSERT_STREQ(buf, wire_contents);
 
         assert_se(fd >= 0);
         r = read(fd, buf, sizeof(buf)-1);
         assert_se(r >= 0);
         buf[r] = 0;
-        assert_se(streq(buf, file_contents));
+        ASSERT_STREQ(buf, file_contents);
+}
+
+TEST(pass_many_fds_contents_read) {
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
+        static const char file_contents[][STRLEN("test contents in the fileX") + 1] = {
+                "test contents in the file0",
+                "test contents in the file1",
+                "test contents in the file2"
+        };
+        static const char wire_contents[] = "test contents on the wire";
+        int r;
+
+        assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
+
+        r = safe_fork("(passfd_contents_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
+        assert_se(r >= 0);
+
+        if (r == 0) {
+                /* Child */
+                struct iovec iov = IOVEC_MAKE_STRING(wire_contents);
+                char tmpfile[][STRLEN("/tmp/test-socket-util-passfd-contents-read-XXXXXX") + 1] = {
+                        "/tmp/test-socket-util-passfd-contents-read-XXXXXX",
+                        "/tmp/test-socket-util-passfd-contents-read-XXXXXX",
+                        "/tmp/test-socket-util-passfd-contents-read-XXXXXX"
+                };
+                int tmpfds[3] = EBADF_TRIPLET;
+
+                pair[0] = safe_close(pair[0]);
+
+                for (size_t i = 0; i < 3; ++i) {
+                        assert_se(write_tmpfile(tmpfile[i], file_contents[i]) == 0);
+                        tmpfds[i] = open(tmpfile[i], O_RDONLY);
+                        assert_se(tmpfds[i] >= 0);
+                        assert_se(unlink(tmpfile[i]) == 0);
+                }
+
+                assert_se(send_many_fds_iov(pair[1], tmpfds, 3, &iov, 1, MSG_DONTWAIT) > 0);
+                close_many(tmpfds, 3);
+                _exit(EXIT_SUCCESS);
+        }
+
+        /* Parent */
+        char buf[64];
+        struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
+        _cleanup_free_ int *fds = NULL;
+        size_t n_fds = 0;
+        ssize_t k;
+
+        pair[1] = safe_close(pair[1]);
+
+        k = receive_many_fds_iov(pair[0], &iov, 1, &fds, &n_fds, MSG_DONTWAIT);
+        assert_se(k > 0);
+        buf[k] = 0;
+        ASSERT_STREQ(buf, wire_contents);
+
+        assert_se(n_fds == 3);
+
+        for (size_t i = 0; i < 3; ++i) {
+                assert_se(fds[i] >= 0);
+                r = read(fds[i], buf, sizeof(buf)-1);
+                assert_se(r >= 0);
+                buf[r] = 0;
+                ASSERT_STREQ(buf, file_contents[i]);
+                safe_close(fds[i]);
+        }
 }
 
 TEST(receive_nopassfd) {
-        _cleanup_close_pair_ int pair[2] = { -1, -1 };
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         static const char wire_contents[] = "no fd passed here";
         int r;
 
         assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
 
-        r = safe_fork("(receive_nopassfd)", FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        r = safe_fork("(receive_nopassfd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
         assert_se(r >= 0);
 
         if (r == 0) {
                 /* Child */
-                struct iovec iov = IOVEC_INIT_STRING(wire_contents);
+                struct iovec iov = IOVEC_MAKE_STRING(wire_contents);
 
                 pair[0] = safe_close(pair[0]);
 
@@ -332,7 +394,7 @@ TEST(receive_nopassfd) {
 
         /* Parent */
         char buf[64];
-        struct iovec iov = IOVEC_INIT(buf, sizeof(buf)-1);
+        struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
         int fd = -999;
         ssize_t k;
 
@@ -341,19 +403,19 @@ TEST(receive_nopassfd) {
         k = receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd);
         assert_se(k > 0);
         buf[k] = 0;
-        assert_se(streq(buf, wire_contents));
+        ASSERT_STREQ(buf, wire_contents);
 
         /* no fd passed here, confirm it was reset */
-        assert_se(fd == -1);
+        assert_se(fd == -EBADF);
 }
 
 TEST(send_nodata_nofd) {
-        _cleanup_close_pair_ int pair[2] = { -1, -1 };
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
 
         assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
 
-        r = safe_fork("(send_nodata_nofd)", FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        r = safe_fork("(send_nodata_nofd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
         assert_se(r >= 0);
 
         if (r == 0) {
@@ -366,7 +428,7 @@ TEST(send_nodata_nofd) {
 
         /* Parent */
         char buf[64];
-        struct iovec iov = IOVEC_INIT(buf, sizeof(buf)-1);
+        struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
         int fd = -999;
         ssize_t k;
 
@@ -381,29 +443,26 @@ TEST(send_nodata_nofd) {
 }
 
 TEST(send_emptydata) {
-        _cleanup_close_pair_ int pair[2] = { -1, -1 };
+        _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
 
         assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
 
-        r = safe_fork("(send_emptydata)", FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
+        r = safe_fork("(send_emptydata)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL);
         assert_se(r >= 0);
 
         if (r == 0) {
                 /* Child */
-                struct iovec iov = IOVEC_INIT_STRING("");  /* zero-length iov */
-                assert_se(iov.iov_len == 0);
-
                 pair[0] = safe_close(pair[0]);
 
                 /* This will succeed, since iov is set. */
-                assert_se(send_one_fd_iov(pair[1], -1, &iov, 1, MSG_DONTWAIT) == 0);
+                assert_se(send_one_fd_iov(pair[1], -1, &iovec_empty, 1, MSG_DONTWAIT) == 0);
                 _exit(EXIT_SUCCESS);
         }
 
         /* Parent */
         char buf[64];
-        struct iovec iov = IOVEC_INIT(buf, sizeof(buf)-1);
+        struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
         int fd = -999;
         ssize_t k;
 
@@ -418,7 +477,7 @@ TEST(send_emptydata) {
 }
 
 TEST(flush_accept) {
-        _cleanup_close_ int listen_stream = -1, listen_dgram = -1, listen_seqpacket = 1, connect_stream = -1, connect_dgram = -1, connect_seqpacket = -1;
+        _cleanup_close_ int listen_stream, listen_dgram, listen_seqpacket, connect_stream, connect_dgram, connect_seqpacket;
         static const union sockaddr_union sa = { .un.sun_family = AF_UNIX };
         union sockaddr_union lsa;
         socklen_t l;
@@ -488,7 +547,7 @@ TEST(sockaddr_un_set_path) {
         _cleanup_(unlink_and_freep) char *sh = NULL;
         _cleanup_free_ char *j = NULL;
         union sockaddr_union sa;
-        _cleanup_close_ int fd1 = -1, fd2 = -1, fd3 = -1;
+        _cleanup_close_ int fd1, fd2, fd3;
 
         assert_se(mkdtemp_malloc("/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaXXXXXX", &t) >= 0);
         assert_se(strlen(t) > SUN_PATH_LEN);

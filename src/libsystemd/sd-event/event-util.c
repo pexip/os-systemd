@@ -46,7 +46,7 @@ int event_reset_time(
                         return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "sd-event: Current clock id %i of event source \"%s\" is different from specified one %i.",
                                                (int)c,
-                                               strna((*s)->description ? : description),
+                                               strna((*s)->description ?: description),
                                                (int)clock);
 
                 r = sd_event_source_set_time(*s, usec);
@@ -97,21 +97,26 @@ int event_reset_time_relative(
                 const char *description,
                 bool force_reset) {
 
-        usec_t usec_now;
         int r;
 
         assert(e);
 
-        r = sd_event_now(e, clock, &usec_now);
-        if (r < 0)
-                return log_debug_errno(r, "sd-event: Failed to get the current time: %m");
+        if (usec > 0) {
+                usec_t usec_now;
 
-        return event_reset_time(e, s, clock, usec_add(usec_now, usec), accuracy, callback, userdata, priority, description, force_reset);
+                r = sd_event_now(e, clock, &usec_now);
+                if (r < 0)
+                        return log_debug_errno(r, "sd-event: Failed to get the current time: %m");
+
+                usec = usec_add(usec_now, usec);
+        }
+
+        return event_reset_time(e, s, clock, usec, accuracy, callback, userdata, priority, description, force_reset);
 }
 
 int event_add_time_change(sd_event *e, sd_event_source **ret, sd_event_io_handler_t callback, void *userdata) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
         assert(e);
@@ -145,4 +150,30 @@ int event_add_time_change(sd_event *e, sd_event_source **ret, sd_event_io_handle
         }
 
         return 0;
+}
+
+int event_add_child_pidref(
+                sd_event *e,
+                sd_event_source **s,
+                const PidRef *pid,
+                int options,
+                sd_event_child_handler_t callback,
+                void *userdata) {
+
+        if (!pidref_is_set(pid))
+                return -ESRCH;
+
+        if (pid->fd >= 0)
+                return sd_event_add_child_pidfd(e, s, pid->fd, options, callback, userdata);
+
+        return sd_event_add_child(e, s, pid->pid, options, callback, userdata);
+}
+
+dual_timestamp* event_dual_timestamp_now(sd_event *e, dual_timestamp *ts) {
+        assert(e);
+        assert(ts);
+
+        assert_se(sd_event_now(e, CLOCK_REALTIME, &ts->realtime) >= 0);
+        assert_se(sd_event_now(e, CLOCK_MONOTONIC, &ts->monotonic) >= 0);
+        return ts;
 }

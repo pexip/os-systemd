@@ -12,7 +12,6 @@
 #include "string-util.h"
 #include "tests.h"
 #include "user-util.h"
-#include "util.h"
 #include "virt.h"
 
 TEST(namespace_cleanup_tmpdir) {
@@ -85,7 +84,7 @@ TEST(tmpdir) {
 }
 
 static void test_shareable_ns(unsigned long nsflag) {
-        _cleanup_close_pair_ int s[2] = { -1, -1 };
+        _cleanup_close_pair_ int s[2] = EBADF_PAIR;
         bool permission_denied = false;
         pid_t pid1, pid2, pid3;
         int r, n = 0;
@@ -103,7 +102,7 @@ static void test_shareable_ns(unsigned long nsflag) {
 
         if (pid1 == 0) {
                 r = setup_shareable_ns(s, nsflag);
-                assert_se(r >= 0 || ERRNO_IS_PRIVILEGE(r));
+                assert_se(r >= 0 || ERRNO_IS_NEG_PRIVILEGE(r));
                 _exit(r >= 0 ? r : EX_NOPERM);
         }
 
@@ -112,7 +111,7 @@ static void test_shareable_ns(unsigned long nsflag) {
 
         if (pid2 == 0) {
                 r = setup_shareable_ns(s, nsflag);
-                assert_se(r >= 0 || ERRNO_IS_PRIVILEGE(r));
+                assert_se(r >= 0 || ERRNO_IS_NEG_PRIVILEGE(r));
                 _exit(r >= 0 ? r : EX_NOPERM);
         }
 
@@ -121,7 +120,7 @@ static void test_shareable_ns(unsigned long nsflag) {
 
         if (pid3 == 0) {
                 r = setup_shareable_ns(s, nsflag);
-                assert_se(r >= 0 || ERRNO_IS_PRIVILEGE(r));
+                assert_se(r >= 0 || ERRNO_IS_NEG_PRIVILEGE(r));
                 _exit(r >= 0 ? r : EX_NOPERM);
         }
 
@@ -166,11 +165,12 @@ TEST(ipcns) {
 }
 
 TEST(protect_kernel_logs) {
-        int r;
-        pid_t pid;
-        static const NamespaceInfo ns_info = {
+        static const NamespaceParameters p = {
+                .runtime_scope = RUNTIME_SCOPE_SYSTEM,
                 .protect_kernel_logs = true,
         };
+        pid_t pid;
+        int r;
 
         if (geteuid() > 0) {
                 (void) log_tests_skipped("not root");
@@ -187,45 +187,12 @@ TEST(protect_kernel_logs) {
         assert_se(pid >= 0);
 
         if (pid == 0) {
-                _cleanup_close_ int fd = -1;
+                _cleanup_close_ int fd = -EBADF;
 
                 fd = open("/dev/kmsg", O_RDONLY | O_CLOEXEC);
                 assert_se(fd > 0);
 
-                r = setup_namespace(NULL,
-                                    NULL,
-                                    NULL,
-                                    &ns_info,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL, 0,
-                                    NULL, 0,
-                                    NULL, 0,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    NULL,
-                                    0,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    0,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL,
-                                    NULL);
+                r = setup_namespace(&p, NULL);
                 assert_se(r == 0);
 
                 assert_se(setresuid(UID_NOBODY, UID_NOBODY, UID_NOBODY) >= 0);
@@ -238,9 +205,31 @@ TEST(protect_kernel_logs) {
         assert_se(wait_for_terminate_and_check("ns-kernellogs", pid, WAIT_LOG) == EXIT_SUCCESS);
 }
 
+TEST(idmapping_supported) {
+        assert_se(is_idmapping_supported("/run") >= 0);
+        assert_se(is_idmapping_supported("/var/lib") >= 0);
+        assert_se(is_idmapping_supported("/var/cache") >= 0);
+        assert_se(is_idmapping_supported("/var/log") >= 0);
+        assert_se(is_idmapping_supported("/etc") >= 0);
+}
+
+TEST(namespace_is_init) {
+        int r;
+
+        for (NamespaceType t = 0; t < _NAMESPACE_TYPE_MAX; t++) {
+                r = namespace_is_init(t);
+                if (r == -EBADR)
+                        log_info_errno(r, "In root namespace of type '%s': don't know", namespace_info[t].proc_name);
+                else {
+                        ASSERT_OK(r);
+                        log_info("In root namespace of type '%s': %s", namespace_info[t].proc_name, yes_no(r));
+                }
+        }
+}
+
 static int intro(void) {
         if (!have_namespaces())
-                return log_tests_skipped("Don't have namespace support");
+                return log_tests_skipped("Don't have namespace support or lacking privileges");
 
         return EXIT_SUCCESS;
 }

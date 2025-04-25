@@ -13,21 +13,30 @@
 
 #include "alloc-util.h"
 #include "analyze.h"
+#include "analyze-architectures.h"
 #include "analyze-blame.h"
 #include "analyze-calendar.h"
 #include "analyze-capability.h"
 #include "analyze-cat-config.h"
+#include "analyze-compare-versions.h"
 #include "analyze-condition.h"
 #include "analyze-critical-chain.h"
 #include "analyze-dot.h"
 #include "analyze-dump.h"
 #include "analyze-exit-status.h"
+#include "analyze-fdstore.h"
 #include "analyze-filesystems.h"
+#include "analyze-has-tpm2.h"
+#include "analyze-image-policy.h"
 #include "analyze-inspect-elf.h"
 #include "analyze-log-control.h"
+#include "analyze-malloc.h"
+#include "analyze-pcrs.h"
 #include "analyze-plot.h"
 #include "analyze-security.h"
 #include "analyze-service-watchdogs.h"
+#include "analyze-smbios11.h"
+#include "analyze-srk.h"
 #include "analyze-syscall-filter.h"
 #include "analyze-time.h"
 #include "analyze-time-data.h"
@@ -35,8 +44,8 @@
 #include "analyze-timestamp.h"
 #include "analyze-unit-files.h"
 #include "analyze-unit-paths.h"
-#include "analyze-compare-versions.h"
 #include "analyze-verify.h"
+#include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
@@ -46,7 +55,7 @@
 #include "capability-util.h"
 #include "conf-files.h"
 #include "copy.h"
-#include "def.h"
+#include "constants.h"
 #include "exit-status.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -79,21 +88,24 @@
 #include "time-util.h"
 #include "tmpfile-util.h"
 #include "unit-name.h"
-#include "util.h"
 #include "verb-log-control.h"
 #include "verbs.h"
-#include "version.h"
 
 DotMode arg_dot = DEP_ALL;
+CapabilityMode arg_capability = CAPABILITY_LITERAL;
 char **arg_dot_from_patterns = NULL, **arg_dot_to_patterns = NULL;
 usec_t arg_fuzz = 0;
 PagerFlags arg_pager_flags = 0;
+CatFlags arg_cat_flags = 0;
 BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 const char *arg_host = NULL;
-LookupScope arg_scope = LOOKUP_SCOPE_SYSTEM;
+RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 RecursiveErrors arg_recursive_errors = _RECURSIVE_ERRORS_INVALID;
 bool arg_man = true;
 bool arg_generators = false;
+const char *arg_instance = "test_instance";
+double arg_svg_timescale = 1.0;
+bool arg_detailed_svg = false;
 char *arg_root = NULL;
 static char *arg_image = NULL;
 char *arg_security_policy = NULL;
@@ -102,9 +114,12 @@ unsigned arg_threshold = 100;
 unsigned arg_iterations = 1;
 usec_t arg_base_time = USEC_INFINITY;
 char *arg_unit = NULL;
-JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 bool arg_quiet = false;
 char *arg_profile = NULL;
+bool arg_legend = true;
+bool arg_table = false;
+ImagePolicy *arg_image_policy = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_dot_from_patterns, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_dot_to_patterns, strv_freep);
@@ -113,20 +128,20 @@ STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_security_policy, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_unit, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_profile, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 
 int acquire_bus(sd_bus **bus, bool *use_full_bus) {
-        bool user = arg_scope != LOOKUP_SCOPE_SYSTEM;
         int r;
 
         if (use_full_bus && *use_full_bus) {
-                r = bus_connect_transport(arg_transport, arg_host, user, bus);
+                r = bus_connect_transport(arg_transport, arg_host, arg_runtime_scope, bus);
                 if (IN_SET(r, 0, -EHOSTDOWN))
                         return r;
 
                 *use_full_bus = false;
         }
 
-        return bus_connect_transport_systemd(arg_transport, arg_host, user, bus);
+        return bus_connect_transport_systemd(arg_transport, arg_host, arg_runtime_scope, bus);
 }
 
 int bus_get_unit_property_strv(sd_bus *bus, const char *path, const char *property, char ***strv) {
@@ -179,37 +194,53 @@ static int help(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...] COMMAND ...\n\n"
-               "%sProfile systemd, show unit dependencies, check unit files.%s\n"
-               "\nCommands:\n"
+        printf("%1$s [OPTIONS...] COMMAND ...\n\n"
+               "%5$sProfile systemd, show unit dependencies, check unit files.%6$s\n"
+               "\n%3$sBoot Analysis:%4$s\n"
                "  [time]                     Print time required to boot the machine\n"
                "  blame                      Print list of running units ordered by\n"
                "                             time to init\n"
                "  critical-chain [UNIT...]   Print a tree of the time critical chain\n"
                "                             of units\n"
+               "\n%3$sDependency Analysis:%4$s\n"
                "  plot                       Output SVG graphic showing service\n"
                "                             initialization\n"
-               "  dot [UNIT...]              Output dependency graph in %s format\n"
+               "  dot [UNIT...]              Output dependency graph in %7$s format\n"
                "  dump [PATTERN...]          Output state serialization of service\n"
                "                             manager\n"
-               "  cat-config                 Show configuration file and drop-ins\n"
+               "\n%3$sConfiguration Files and Search Paths:%4$s\n"
+               "  cat-config NAME|PATH...    Show configuration file and drop-ins\n"
                "  unit-files                 List files and symlinks for units\n"
                "  unit-paths                 List load directories for units\n"
+               "\n%3$sEnumerate OS Concepts:%4$s\n"
                "  exit-status [STATUS...]    List exit status definitions\n"
                "  capability [CAP...]        List capability definitions\n"
                "  syscall-filter [NAME...]   List syscalls in seccomp filters\n"
                "  filesystems [NAME...]      List known filesystems\n"
+               "  architectures [NAME...]    List known architectures\n"
+               "  smbios11                   List strings passed via SMBIOS Type #11\n"
+               "\n%3$sExpression Evaluation:%4$s\n"
                "  condition CONDITION...     Evaluate conditions and asserts\n"
                "  compare-versions VERSION1 [OP] VERSION2\n"
                "                             Compare two version strings\n"
-               "  verify FILE...             Check unit files for correctness\n"
+               "  image-policy POLICY...     Analyze image policy string\n"
+               "\n%3$sClock & Time:%4$s\n"
                "  calendar SPEC...           Validate repetitive calendar time\n"
                "                             events\n"
                "  timestamp TIMESTAMP...     Validate a timestamp\n"
                "  timespan SPAN...           Validate a time span\n"
+               "\n%3$sUnit & Service Analysis:%4$s\n"
+               "  verify FILE...             Check unit files for correctness\n"
                "  security [UNIT...]         Analyze security of unit\n"
+               "  fdstore SERVICE...         Show file descriptor store contents of service\n"
+               "  malloc [D-BUS SERVICE...]  Dump malloc stats of a D-Bus service\n"
+               "\n%3$sExecutable Analysis:%4$s\n"
                "  inspect-elf FILE...        Parse and print ELF package metadata\n"
-               "\nOptions:\n"
+               "\n%3$sTPM Operations:%4$s\n"
+               "  has-tpm2                   Report whether TPM2 support is available\n"
+               "  pcrs [PCR...]              Show TPM2 PCRs and their names\n"
+               "  srk [>FILE]                Write TPM2 SRK (to FILE)\n"
+               "\n%3$sOptions:%4$s\n"
                "     --recursive-errors=MODE Control which units are verified\n"
                "     --offline=BOOL          Perform a security review on unit file(s)\n"
                "     --threshold=N           Exit with a non-zero status when overall\n"
@@ -217,8 +248,10 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --security-policy=PATH  Use custom JSON security policy instead\n"
                "                             of built-in one\n"
                "     --json=pretty|short|off Generate JSON output of the security\n"
-               "                             analysis table\n"
+               "                             analysis table, or plot's raw time data\n"
                "     --no-pager              Do not pipe output into a pager\n"
+               "     --no-legend             Disable column headers and hints in plot\n"
+               "                             with either --table or --json=\n"
                "     --system                Operate on system systemd instance\n"
                "     --user                  Operate on user systemd instance\n"
                "     --global                Operate on global user configuration\n"
@@ -233,22 +266,33 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --man[=BOOL]            Do [not] check for existence of man pages\n"
                "     --generators[=BOOL]     Do [not] run unit generators\n"
                "                             (requires privileges)\n"
+               "     --instance=NAME         Specify fallback instance name for template units\n"
                "     --iterations=N          Show the specified number of iterations\n"
                "     --base-time=TIMESTAMP   Calculate calendar times relative to\n"
                "                             specified time\n"
                "     --profile=name|PATH     Include the specified profile in the\n"
                "                             security review of the unit(s)\n"
+               "     --unit=UNIT             Evaluate conditions and asserts of unit\n"
+               "     --table                 Output plot's raw time data as a table\n"
+               "     --scale-svg=FACTOR      Stretch x-axis of plot by FACTOR (default: 1.0)\n"
+               "     --detailed              Add more details to SVG plot,\n"
+               "                             e.g. show activation timestamps\n"
                "  -h --help                  Show this help\n"
                "     --version               Show package version\n"
                "  -q --quiet                 Do not emit hints\n"
+               "     --tldr                  Skip comments and empty lines\n"
                "     --root=PATH             Operate on an alternate filesystem root\n"
                "     --image=PATH            Operate on disk image as filesystem root\n"
-               "\nSee the %s for details.\n",
+               "     --image-policy=POLICY   Specify disk image dissection policy\n"
+               "  -m --mask                  Parse parameter as numeric capability mask\n"
+               "\nSee the %2$s for details.\n",
                program_invocation_short_name,
+               link,
+               ansi_underline(),
+               ansi_normal(),
                ansi_highlight(),
                ansi_normal(),
-               dot_link,
-               link);
+               dot_link);
 
         /* When updating this list, including descriptions, apply changes to
          * shell-completion/bash/systemd-analyze and shell-completion/zsh/_systemd-analyze too. */
@@ -263,6 +307,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_REQUIRE,
                 ARG_ROOT,
                 ARG_IMAGE,
+                ARG_IMAGE_POLICY,
                 ARG_SYSTEM,
                 ARG_USER,
                 ARG_GLOBAL,
@@ -272,6 +317,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NO_PAGER,
                 ARG_MAN,
                 ARG_GENERATORS,
+                ARG_INSTANCE,
                 ARG_ITERATIONS,
                 ARG_BASE_TIME,
                 ARG_RECURSIVE_ERRORS,
@@ -280,6 +326,11 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_SECURITY_POLICY,
                 ARG_JSON,
                 ARG_PROFILE,
+                ARG_TABLE,
+                ARG_NO_LEGEND,
+                ARG_TLDR,
+                ARG_SCALE_FACTOR_SVG,
+                ARG_DETAILED_SVG,
         };
 
         static const struct option options[] = {
@@ -290,6 +341,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "require",          no_argument,       NULL, ARG_REQUIRE          },
                 { "root",             required_argument, NULL, ARG_ROOT             },
                 { "image",            required_argument, NULL, ARG_IMAGE            },
+                { "image-policy",     required_argument, NULL, ARG_IMAGE_POLICY     },
                 { "recursive-errors", required_argument, NULL, ARG_RECURSIVE_ERRORS },
                 { "offline",          required_argument, NULL, ARG_OFFLINE          },
                 { "threshold",        required_argument, NULL, ARG_THRESHOLD        },
@@ -303,6 +355,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "no-pager",         no_argument,       NULL, ARG_NO_PAGER         },
                 { "man",              optional_argument, NULL, ARG_MAN              },
                 { "generators",       optional_argument, NULL, ARG_GENERATORS       },
+                { "instance",         required_argument, NULL, ARG_INSTANCE         },
                 { "host",             required_argument, NULL, 'H'                  },
                 { "machine",          required_argument, NULL, 'M'                  },
                 { "iterations",       required_argument, NULL, ARG_ITERATIONS       },
@@ -310,6 +363,12 @@ static int parse_argv(int argc, char *argv[]) {
                 { "unit",             required_argument, NULL, 'U'                  },
                 { "json",             required_argument, NULL, ARG_JSON             },
                 { "profile",          required_argument, NULL, ARG_PROFILE          },
+                { "table",            optional_argument, NULL, ARG_TABLE            },
+                { "no-legend",        optional_argument, NULL, ARG_NO_LEGEND        },
+                { "tldr",             no_argument,       NULL, ARG_TLDR             },
+                { "mask",             no_argument,       NULL, 'm'                  },
+                { "scale-svg",        required_argument, NULL, ARG_SCALE_FACTOR_SVG },
+                { "detailed",         no_argument,       NULL, ARG_DETAILED_SVG     },
                 {}
         };
 
@@ -318,7 +377,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:U:q", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hqH:M:U:m", options, NULL)) >= 0)
                 switch (c) {
 
                 case 'h':
@@ -355,16 +414,22 @@ static int parse_argv(int argc, char *argv[]) {
                                 return r;
                         break;
 
+                case ARG_IMAGE_POLICY:
+                        r = parse_image_policy_argument(optarg, &arg_image_policy);
+                        if (r < 0)
+                                return r;
+                        break;
+
                 case ARG_SYSTEM:
-                        arg_scope = LOOKUP_SCOPE_SYSTEM;
+                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
                         break;
 
                 case ARG_USER:
-                        arg_scope = LOOKUP_SCOPE_USER;
+                        arg_runtime_scope = RUNTIME_SCOPE_USER;
                         break;
 
                 case ARG_GLOBAL:
-                        arg_scope = LOOKUP_SCOPE_GLOBAL;
+                        arg_runtime_scope = RUNTIME_SCOPE_GLOBAL;
                         break;
 
                 case ARG_ORDER:
@@ -419,6 +484,10 @@ static int parse_argv(int argc, char *argv[]) {
                                 return r;
                         break;
 
+                case ARG_INSTANCE:
+                        arg_instance = optarg;
+                        break;
+
                 case ARG_OFFLINE:
                         r = parse_boolean_argument("--offline", optarg, &arg_offline);
                         if (r < 0)
@@ -448,14 +517,12 @@ static int parse_argv(int argc, char *argv[]) {
                         r = safe_atou(optarg, &arg_iterations);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse iterations: %s", optarg);
-
                         break;
 
                 case ARG_BASE_TIME:
                         r = parse_timestamp(optarg, &arg_base_time);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse --base-time= parameter: %s", optarg);
-
                         break;
 
                 case ARG_PROFILE:
@@ -486,6 +553,31 @@ static int parse_argv(int argc, char *argv[]) {
                         free_and_replace(arg_unit, mangled);
                         break;
                 }
+
+                case ARG_TABLE:
+                        arg_table = true;
+                        break;
+
+                case ARG_NO_LEGEND:
+                        arg_legend = false;
+                        break;
+
+                case ARG_TLDR:
+                        arg_cat_flags = CAT_TLDR;
+                        break;
+
+                case 'm':
+                        arg_capability = CAPABILITY_MASK;
+                        break;
+
+                case ARG_SCALE_FACTOR_SVG:
+                        arg_svg_timescale = strtod(optarg, NULL);
+                        break;
+
+                case ARG_DETAILED_SVG:
+                        arg_detailed_svg = true;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -497,20 +589,23 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --offline= is only supported for security right now.");
 
-        if (arg_json_format_flags != JSON_FORMAT_OFF && !STRPTR_IN_SET(argv[optind], "security", "inspect-elf"))
+        if (arg_offline && optind >= argc - 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Option --json= is only supported for security and inspect-elf right now.");
+                                       "Option --offline= requires one or more units to perform a security review.");
+
+        if (sd_json_format_enabled(arg_json_format_flags) && !STRPTR_IN_SET(argv[optind], "security", "inspect-elf", "plot", "fdstore", "pcrs", "architectures", "capability", "exit-status"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Option --json= is only supported for security, inspect-elf, plot, fdstore, pcrs, architectures, capability, exit-status right now.");
 
         if (arg_threshold != 100 && !streq_ptr(argv[optind], "security"))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --threshold= is only supported for security right now.");
 
-        if (arg_scope == LOOKUP_SCOPE_GLOBAL &&
-            !STR_IN_SET(argv[optind] ?: "time", "dot", "unit-paths", "verify"))
+        if (arg_runtime_scope == RUNTIME_SCOPE_GLOBAL && !streq_ptr(argv[optind], "unit-paths"))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Option --global only makes sense with verbs dot, unit-paths, verify.");
+                                       "Option --global only makes sense with verb unit-paths.");
 
-        if (streq_ptr(argv[optind], "cat-config") && arg_scope == LOOKUP_SCOPE_USER)
+        if (streq_ptr(argv[optind], "cat-config") && arg_runtime_scope == RUNTIME_SCOPE_USER)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --user is not supported for cat-config right now.");
 
@@ -518,7 +613,7 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --security-policy= is only supported for security.");
 
-        if ((arg_root || arg_image) && (!STRPTR_IN_SET(argv[optind], "cat-config", "verify", "condition")) &&
+        if ((arg_root || arg_image) && (!STRPTR_IN_SET(argv[optind], "cat-config", "verify", "condition", "inspect-elf")) &&
            (!(streq_ptr(argv[optind], "security") && arg_offline)))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Options --root= and --image= are only supported for cat-config, verify, condition and security when used with --offline= right now.");
@@ -536,12 +631,25 @@ static int parse_argv(int argc, char *argv[]) {
         if (streq_ptr(argv[optind], "condition") && arg_unit && optind < argc - 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No conditions can be passed if --unit= is used.");
 
+        if ((!arg_legend && !STRPTR_IN_SET(argv[optind], "plot", "architectures")) ||
+           (streq_ptr(argv[optind], "plot") && !arg_legend && !arg_table && !sd_json_format_enabled(arg_json_format_flags)))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Option --no-legend is only supported for plot with either --table or --json=.");
+
+        if (arg_table && !streq_ptr(argv[optind], "plot"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Option --table is only supported for plot right now.");
+
+        if (arg_table && sd_json_format_enabled(arg_json_format_flags))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--table and --json= are mutually exclusive.");
+
+        if (arg_capability != CAPABILITY_LITERAL && !streq_ptr(argv[optind], "capability"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Option --mask is only supported for capability.");
+
         return 1; /* work to do */
 }
 
 static int run(int argc, char *argv[]) {
         _cleanup_(loop_device_unrefp) LoopDevice *loop_device = NULL;
-        _cleanup_(umount_and_rmdir_and_freep) char *unlink_dir = NULL;
+        _cleanup_(umount_and_freep) char *mounted_dir = NULL;
 
         static const Verb verbs[] = {
                 { "help",              VERB_ANY, VERB_ANY, 0,            help                   },
@@ -575,6 +683,14 @@ static int run(int argc, char *argv[]) {
                 { "timespan",          2,        VERB_ANY, 0,            verb_timespan          },
                 { "security",          VERB_ANY, VERB_ANY, 0,            verb_security          },
                 { "inspect-elf",       2,        VERB_ANY, 0,            verb_elf_inspection    },
+                { "malloc",            VERB_ANY, VERB_ANY, 0,            verb_malloc            },
+                { "fdstore",           2,        VERB_ANY, 0,            verb_fdstore           },
+                { "image-policy",      2,        2,        0,            verb_image_policy      },
+                { "has-tpm2",          VERB_ANY, 1,        0,            verb_has_tpm2          },
+                { "pcrs",              VERB_ANY, VERB_ANY, 0,            verb_pcrs              },
+                { "srk",               VERB_ANY, 1,        0,            verb_srk               },
+                { "architectures",     VERB_ANY, VERB_ANY, 0,            verb_architectures     },
+                { "smbios11",          VERB_ANY, 1,        0,            verb_smbios11          },
                 {}
         };
 
@@ -595,15 +711,18 @@ static int run(int argc, char *argv[]) {
 
                 r = mount_image_privately_interactively(
                                 arg_image,
+                                arg_image_policy,
                                 DISSECT_IMAGE_GENERIC_ROOT |
                                 DISSECT_IMAGE_RELAX_VAR_CHECK |
-                                DISSECT_IMAGE_READ_ONLY,
-                                &unlink_dir,
+                                DISSECT_IMAGE_READ_ONLY |
+                                DISSECT_IMAGE_ALLOW_USERSPACE_VERITY,
+                                &mounted_dir,
+                                /* ret_dir_fd= */ NULL,
                                 &loop_device);
                 if (r < 0)
                         return r;
 
-                arg_root = strdup(unlink_dir);
+                arg_root = strdup(mounted_dir);
                 if (!arg_root)
                         return log_oom();
         }

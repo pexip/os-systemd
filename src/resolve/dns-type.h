@@ -136,27 +136,27 @@ bool dns_type_is_obsolete(uint16_t type);
 bool dns_type_may_wildcard(uint16_t type);
 bool dns_type_apex_only(uint16_t type);
 bool dns_type_needs_authentication(uint16_t type);
-bool dns_type_is_zone_transer(uint16_t type);
+bool dns_type_is_zone_transfer(uint16_t type);
 int dns_type_to_af(uint16_t type);
 
 bool dns_class_is_pseudo(uint16_t class);
 bool dns_class_is_valid_rr(uint16_t class);
 
 /* TYPE?? follows http://tools.ietf.org/html/rfc3597#section-5 */
-const char *dns_type_to_string(int type);
+const char* dns_type_to_string(int type);
 int dns_type_from_string(const char *s);
 
-const char *dns_class_to_string(uint16_t class);
+const char* dns_class_to_string(uint16_t class);
 int dns_class_from_string(const char *name);
 
 /* https://tools.ietf.org/html/draft-ietf-dane-protocol-23#section-7.2 */
-const char *tlsa_cert_usage_to_string(uint8_t cert_usage);
+const char* tlsa_cert_usage_to_string(uint8_t cert_usage);
 
 /* https://tools.ietf.org/html/draft-ietf-dane-protocol-23#section-7.3 */
-const char *tlsa_selector_to_string(uint8_t selector);
+const char* tlsa_selector_to_string(uint8_t selector);
 
 /* https://tools.ietf.org/html/draft-ietf-dane-protocol-23#section-7.4 */
-const char *tlsa_matching_type_to_string(uint8_t selector);
+const char* tlsa_matching_type_to_string(uint8_t selector);
 
 /* https://tools.ietf.org/html/rfc6844#section-5.1 */
 #define CAA_FLAG_CRITICAL (1u << 7)

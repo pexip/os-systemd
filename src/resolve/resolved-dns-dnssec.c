@@ -7,13 +7,14 @@
 #include "gcrypt-util.h"
 #include "hexdecoct.h"
 #include "memory-util.h"
+#include "memstream-util.h"
 #include "openssl-util.h"
 #include "resolved-dns-dnssec.h"
 #include "resolved-dns-packet.h"
 #include "sort-util.h"
 #include "string-table.h"
 
-#if PREFER_OPENSSL
+#if PREFER_OPENSSL && OPENSSL_VERSION_MAJOR >= 3
 #  pragma GCC diagnostic push
 #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(RSA*, RSA_free, NULL);
@@ -349,7 +350,7 @@ static int dnssec_ecdsa_verify_raw(
         if (!s)
                 return -EIO;
 
-        /* TODO: We should eventually use use the EVP API once it supports ECDSA signature verification */
+        /* TODO: We should eventually use the EVP API once it supports ECDSA signature verification */
 
         sig = ECDSA_SIG_new();
         if (!sig)
@@ -811,11 +812,10 @@ static int dnssec_rrset_serialize_sig(
                 char **ret_sig_data,
                 size_t *ret_sig_size) {
 
-        _cleanup_free_ char *sig_data = NULL;
-        size_t sig_size = 0;
-        _cleanup_fclose_ FILE *f = NULL;
+        _cleanup_(memstream_done) MemStream m = {};
         uint8_t wire_format_name[DNS_WIRE_FORMAT_HOSTNAME_MAX];
         DnsResourceRecord *rr;
+        FILE *f;
         int r;
 
         assert(rrsig);
@@ -824,7 +824,7 @@ static int dnssec_rrset_serialize_sig(
         assert(ret_sig_data);
         assert(ret_sig_size);
 
-        f = open_memstream_unlocked(&sig_data, &sig_size);
+        f = memstream_init(&m);
         if (!f)
                 return -ENOMEM;
 
@@ -867,14 +867,7 @@ static int dnssec_rrset_serialize_sig(
                 fwrite(DNS_RESOURCE_RECORD_RDATA(rr), 1, l, f);
         }
 
-        r = fflush_and_check(f);
-        f = safe_fclose(f);  /* sig_data may be reallocated when f is closed. */
-        if (r < 0)
-                return r;
-
-        *ret_sig_data = TAKE_PTR(sig_data);
-        *ret_sig_size = sig_size;
-        return 0;
+        return memstream_finalize(&m, ret_sig_data, ret_sig_size);
 }
 
 static int dnssec_rrset_verify_sig(
@@ -897,8 +890,11 @@ static int dnssec_rrset_verify_sig(
         _cleanup_(gcry_md_closep) gcry_md_hd_t md = NULL;
         void *hash;
         size_t hash_size;
+        int r;
 
-        initialize_libgcrypt(false);
+        r = initialize_libgcrypt(false);
+        if (r < 0)
+                return r;
 #endif
 
         switch (rrsig->rrsig.algorithm) {
@@ -1223,7 +1219,7 @@ int dnssec_verify_rrset_search(
                         if (realtime == USEC_INFINITY)
                                 realtime = now(CLOCK_REALTIME);
 
-                        /* Have we seen an unreasonable number of invalid signaures? */
+                        /* Have we seen an unreasonable number of invalid signatures? */
                         if (nvalidations > DNSSEC_INVALID_MAX) {
                                 if (ret_rrsig)
                                         *ret_rrsig = NULL;
@@ -1341,6 +1337,7 @@ static hash_md_t digest_to_hash_md(uint8_t algorithm) {
 
 int dnssec_verify_dnskey_by_ds(DnsResourceRecord *dnskey, DnsResourceRecord *ds, bool mask_revoke) {
         uint8_t wire_format[DNS_WIRE_FORMAT_HOSTNAME_MAX];
+        size_t encoded_length;
         int r;
 
         assert(dnskey);
@@ -1367,6 +1364,7 @@ int dnssec_verify_dnskey_by_ds(DnsResourceRecord *dnskey, DnsResourceRecord *ds,
         r = dns_name_to_wire_format(dns_resource_key_name(dnskey->key), wire_format, sizeof wire_format, true);
         if (r < 0)
                 return r;
+        encoded_length = r;
 
         hash_md_t md_algorithm = digest_to_hash_md(ds->ds.digest_type);
 
@@ -1390,7 +1388,7 @@ int dnssec_verify_dnskey_by_ds(DnsResourceRecord *dnskey, DnsResourceRecord *ds,
         if (EVP_DigestInit_ex(ctx, md_algorithm, NULL) <= 0)
                 return -EIO;
 
-        if (EVP_DigestUpdate(ctx, wire_format, r) <= 0)
+        if (EVP_DigestUpdate(ctx, wire_format, encoded_length) <= 0)
                 return -EIO;
 
         if (mask_revoke)
@@ -1414,7 +1412,9 @@ int dnssec_verify_dnskey_by_ds(DnsResourceRecord *dnskey, DnsResourceRecord *ds,
         if (md_algorithm < 0)
                 return -EOPNOTSUPP;
 
-        initialize_libgcrypt(false);
+        r = initialize_libgcrypt(false);
+        if (r < 0)
+                return r;
 
         _cleanup_(gcry_md_closep) gcry_md_hd_t md = NULL;
 
@@ -1428,7 +1428,7 @@ int dnssec_verify_dnskey_by_ds(DnsResourceRecord *dnskey, DnsResourceRecord *ds,
         if (gcry_err_code(err) != GPG_ERR_NO_ERROR || !md)
                 return -EIO;
 
-        gcry_md_write(md, wire_format, r);
+        gcry_md_write(md, wire_format, encoded_length);
         if (mask_revoke)
                 md_add_uint16(md, dnskey->dnskey.flags & ~DNSKEY_FLAG_REVOKE);
         else
@@ -1559,8 +1559,11 @@ int dnssec_nsec3_hash(DnsResourceRecord *nsec3, const char *name, void *ret) {
         if (algorithm < 0)
                 return algorithm;
 
-        initialize_libgcrypt(false);
+        r = initialize_libgcrypt(false);
+        if (r < 0)
+                return r;
 
+        size_t encoded_length;
         unsigned hash_size = gcry_md_get_algo_dlen(algorithm);
         assert(hash_size > 0);
 
@@ -1570,13 +1573,14 @@ int dnssec_nsec3_hash(DnsResourceRecord *nsec3, const char *name, void *ret) {
         r = dns_name_to_wire_format(name, wire_format, sizeof(wire_format), true);
         if (r < 0)
                 return r;
+        encoded_length = r;
 
         _cleanup_(gcry_md_closep) gcry_md_hd_t md = NULL;
         gcry_error_t err = gcry_md_open(&md, algorithm, 0);
         if (gcry_err_code(err) != GPG_ERR_NO_ERROR || !md)
                 return -EIO;
 
-        gcry_md_write(md, wire_format, r);
+        gcry_md_write(md, wire_format, encoded_length);
         gcry_md_write(md, nsec3->nsec3.salt, nsec3->nsec3.salt_size);
 
         void *result = gcry_md_read(md, 0);
@@ -1970,7 +1974,7 @@ found_closest_encloser:
 }
 
 static int dnssec_nsec_wildcard_equal(DnsResourceRecord *rr, const char *name) {
-        char label[DNS_LABEL_MAX];
+        char label[DNS_LABEL_MAX+1];
         const char *n;
         int r;
 
@@ -2583,6 +2587,7 @@ static const char* const dnssec_result_table[_DNSSEC_RESULT_MAX] = {
         [DNSSEC_FAILED_AUXILIARY]      = "failed-auxiliary",
         [DNSSEC_NSEC_MISMATCH]         = "nsec-mismatch",
         [DNSSEC_INCOMPATIBLE_SERVER]   = "incompatible-server",
+        [DNSSEC_UPSTREAM_FAILURE]      = "upstream-failure",
         [DNSSEC_TOO_MANY_VALIDATIONS]  = "too-many-validations",
 };
 DEFINE_STRING_TABLE_LOOKUP(dnssec_result, DnssecResult);

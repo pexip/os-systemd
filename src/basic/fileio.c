@@ -13,24 +13,29 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
 #include "hexdecoct.h"
+#include "label.h"
 #include "log.h"
 #include "macro.h"
 #include "mkdir.h"
+#include "nulstr-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "socket-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "sync-util.h"
+#include "terminal-util.h"
 #include "tmpfile-util.h"
 
 /* The maximum size of the file we'll read in one go in read_full_file() (64M). */
-#define READ_FULL_BYTES_MAX (64U*1024U*1024U - 1U)
+#define READ_FULL_BYTES_MAX (64U * U64_MB - UINT64_C(1))
+/* Used when a size is specified for read_full_file() with READ_FULL_FILE_UNBASE64 or _UNHEX */
+#define READ_FULL_FILE_ENCODED_STRING_AMPLIFICATION_BOUNDARY 3
 
 /* The maximum size of virtual files (i.e. procfs, sysfs, and other virtual "API" files) we'll read in one go
  * in read_virtual_file(). Note that this limit is different (and much lower) than the READ_FULL_BYTES_MAX
@@ -41,20 +46,7 @@
  * exponentially in a loop. We use a size limit of 4M-2 because 4M-1 is the maximum buffer that /proc/sys/
  * allows us to read() (larger reads will fail with ENOMEM), and we want to read one extra byte so that we
  * can detect EOFs. */
-#define READ_VIRTUAL_BYTES_MAX (4U*1024U*1024U - 2U)
-
-int fopen_unlocked(const char *path, const char *options, FILE **ret) {
-        assert(ret);
-
-        FILE *f = fopen(path, options);
-        if (!f)
-                return -errno;
-
-        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
-
-        *ret = f;
-        return 0;
-}
+#define READ_VIRTUAL_BYTES_MAX (4U * U64_MB - UINT64_C(2))
 
 int fdopen_unlocked(int fd, const char *options, FILE **ret) {
         assert(ret);
@@ -78,7 +70,7 @@ int take_fdopen_unlocked(int *fd, const char *options, FILE **ret) {
         if (r < 0)
                 return r;
 
-        *fd = -1;
+        *fd = -EBADF;
 
         return 0;
 }
@@ -90,7 +82,7 @@ FILE* take_fdopen(int *fd, const char *options) {
         if (!f)
                 return NULL;
 
-        *fd = -1;
+        *fd = -EBADF;
 
         return f;
 }
@@ -102,7 +94,7 @@ DIR* take_fdopendir(int *dfd) {
         if (!d)
                 return NULL;
 
-        *dfd = -1;
+        *dfd = -EBADF;
 
         return d;
 }
@@ -127,14 +119,14 @@ FILE* fmemopen_unlocked(void *buf, size_t size, const char *mode) {
         return f;
 }
 
-int write_string_stream_ts(
+int write_string_stream_full(
                 FILE *f,
                 const char *line,
                 WriteStringFileFlags flags,
                 const struct timespec *ts) {
 
         bool needs_nl;
-        int r, fd = -1;
+        int r, fd = -EBADF;
 
         assert(f);
         assert(line);
@@ -209,7 +201,21 @@ int write_string_stream_ts(
         return 0;
 }
 
-static int write_string_file_atomic(
+static mode_t write_string_file_flags_to_mode(WriteStringFileFlags flags) {
+
+        /* We support three different modes, that are the ones that really make sense for text files like this:
+         *
+         *     → 0600 (i.e. root-only)
+         *     → 0444 (i.e. read-only)
+         *     → 0644 (i.e. writable for root, readable for everyone else)
+         */
+
+        return FLAGS_SET(flags, WRITE_STRING_FILE_MODE_0600) ? 0600 :
+                FLAGS_SET(flags, WRITE_STRING_FILE_MODE_0444) ? 0444 : 0644;
+}
+
+static int write_string_file_atomic_at(
+                int dir_fd,
                 const char *fn,
                 const char *line,
                 WriteStringFileFlags flags,
@@ -225,22 +231,40 @@ static int write_string_file_atomic(
         /* Note that we'd really like to use O_TMPFILE here, but can't really, since we want replacement
          * semantics here, and O_TMPFILE can't offer that. i.e. rename() replaces but linkat() doesn't. */
 
-        r = fopen_temporary(fn, &f, &p);
-        if (r < 0)
-                return r;
+        mode_t mode = write_string_file_flags_to_mode(flags);
 
-        r = write_string_stream_ts(f, line, flags, ts);
-        if (r < 0)
-                goto fail;
+        bool call_label_ops_post = false;
+        if (FLAGS_SET(flags, WRITE_STRING_FILE_LABEL)) {
+                r = label_ops_pre(dir_fd, fn, mode);
+                if (r < 0)
+                        return r;
 
-        r = fchmod_umask(fileno(f), FLAGS_SET(flags, WRITE_STRING_FILE_MODE_0600) ? 0600 : 0644);
-        if (r < 0)
-                goto fail;
-
-        if (rename(p, fn) < 0) {
-                r = -errno;
-                goto fail;
+                call_label_ops_post = true;
         }
+
+        r = fopen_temporary_at(dir_fd, fn, &f, &p);
+        if (r < 0)
+                goto fail;
+
+        if (call_label_ops_post) {
+                call_label_ops_post = false;
+
+                r = label_ops_post(fileno(f), /* path= */ NULL, /* created= */ true);
+                if (r < 0)
+                        goto fail;
+        }
+
+        r = write_string_stream_full(f, line, flags, ts);
+        if (r < 0)
+                goto fail;
+
+        r = fchmod_umask(fileno(f), mode);
+        if (r < 0)
+                goto fail;
+
+        r = RET_NERRNO(renameat(dir_fd, p, dir_fd, fn));
+        if (r < 0)
+                goto fail;
 
         if (FLAGS_SET(flags, WRITE_STRING_FILE_SYNC)) {
                 /* Sync the rename, too */
@@ -252,18 +276,26 @@ static int write_string_file_atomic(
         return 0;
 
 fail:
-        (void) unlink(p);
+        if (call_label_ops_post)
+                (void) label_ops_post(f ? fileno(f) : dir_fd, f ? NULL : fn, /* created= */ !!f);
+
+        if (f)
+                (void) unlinkat(dir_fd, p, 0);
         return r;
 }
 
-int write_string_file_ts(
+int write_string_file_full(
+                int dir_fd,
                 const char *fn,
                 const char *line,
                 WriteStringFileFlags flags,
-                const struct timespec *ts) {
+                const struct timespec *ts,
+                const char *label_fn) {
 
+        bool call_label_ops_post = false, made_file = false;
         _cleanup_fclose_ FILE *f = NULL;
-        int q, r, fd;
+        _cleanup_close_ int fd = -EBADF;
+        int r;
 
         assert(fn);
         assert(line);
@@ -272,7 +304,7 @@ int write_string_file_ts(
         assert(!((flags & WRITE_STRING_FILE_VERIFY_ON_FAILURE) && (flags & WRITE_STRING_FILE_SYNC)));
 
         if (flags & WRITE_STRING_FILE_MKDIR_0755) {
-                r = mkdir_parents(fn, 0755);
+                r = mkdirat_parents(dir_fd, fn, 0755);
                 if (r < 0)
                         return r;
         }
@@ -280,55 +312,77 @@ int write_string_file_ts(
         if (flags & WRITE_STRING_FILE_ATOMIC) {
                 assert(flags & WRITE_STRING_FILE_CREATE);
 
-                r = write_string_file_atomic(fn, line, flags, ts);
+                r = write_string_file_atomic_at(dir_fd, fn, line, flags, ts);
                 if (r < 0)
                         goto fail;
 
                 return r;
-        } else
-                assert(!ts);
+        }
+
+        mode_t mode = write_string_file_flags_to_mode(flags);
+
+        if (FLAGS_SET(flags, WRITE_STRING_FILE_LABEL|WRITE_STRING_FILE_CREATE)) {
+                r = label_ops_pre(dir_fd, label_fn ?: fn, mode);
+                if (r < 0)
+                        goto fail;
+
+                call_label_ops_post = true;
+        }
 
         /* We manually build our own version of fopen(..., "we") that works without O_CREAT and with O_NOFOLLOW if needed. */
-        fd = open(fn, O_CLOEXEC|O_NOCTTY |
-                  (FLAGS_SET(flags, WRITE_STRING_FILE_NOFOLLOW) ? O_NOFOLLOW : 0) |
-                  (FLAGS_SET(flags, WRITE_STRING_FILE_CREATE) ? O_CREAT : 0) |
-                  (FLAGS_SET(flags, WRITE_STRING_FILE_TRUNCATE) ? O_TRUNC : 0) |
-                  (FLAGS_SET(flags, WRITE_STRING_FILE_SUPPRESS_REDUNDANT_VIRTUAL) ? O_RDWR : O_WRONLY),
-                  (FLAGS_SET(flags, WRITE_STRING_FILE_MODE_0600) ? 0600 : 0666));
+        fd = openat_report_new(
+                        dir_fd, fn, O_CLOEXEC | O_NOCTTY |
+                        (FLAGS_SET(flags, WRITE_STRING_FILE_NOFOLLOW) ? O_NOFOLLOW : 0) |
+                        (FLAGS_SET(flags, WRITE_STRING_FILE_CREATE) ? O_CREAT : 0) |
+                        (FLAGS_SET(flags, WRITE_STRING_FILE_TRUNCATE) ? O_TRUNC : 0) |
+                        (FLAGS_SET(flags, WRITE_STRING_FILE_SUPPRESS_REDUNDANT_VIRTUAL) ? O_RDWR : O_WRONLY),
+                        mode,
+                        &made_file);
         if (fd < 0) {
-                r = -errno;
+                r = fd;
                 goto fail;
         }
 
-        r = fdopen_unlocked(fd, "w", &f);
-        if (r < 0) {
-                safe_close(fd);
-                goto fail;
+        if (call_label_ops_post) {
+                call_label_ops_post = false;
+
+                r = label_ops_post(fd, /* path= */ NULL, made_file);
+                if (r < 0)
+                        goto fail;
         }
+
+        r = take_fdopen_unlocked(&fd, "w", &f);
+        if (r < 0)
+                goto fail;
 
         if (flags & WRITE_STRING_FILE_DISABLE_BUFFER)
                 setvbuf(f, NULL, _IONBF, 0);
 
-        r = write_string_stream_ts(f, line, flags, ts);
+        r = write_string_stream_full(f, line, flags, ts);
         if (r < 0)
                 goto fail;
 
         return 0;
 
 fail:
+        if (call_label_ops_post)
+                (void) label_ops_post(fd >= 0 ? fd : dir_fd, fd >= 0 ? NULL : fn, made_file);
+
+        if (made_file)
+                (void) unlinkat(dir_fd, fn, 0);
+
         if (!(flags & WRITE_STRING_FILE_VERIFY_ON_FAILURE))
                 return r;
 
         f = safe_fclose(f);
+        fd = safe_close(fd);
 
-        /* OK, the operation failed, but let's see if the right
-         * contents in place already. If so, eat up the error. */
+        /* OK, the operation failed, but let's see if the right contents in place already. If so, eat up the
+         * error. */
+        if (verify_file(fn, line, !(flags & WRITE_STRING_FILE_AVOID_NEWLINE) || (flags & WRITE_STRING_FILE_VERIFY_IGNORE_NEWLINE)) > 0)
+                return 0;
 
-        q = verify_file(fn, line, !(flags & WRITE_STRING_FILE_AVOID_NEWLINE) || (flags & WRITE_STRING_FILE_VERIFY_IGNORE_NEWLINE));
-        if (q <= 0)
-                return r;
-
-        return 0;
+        return r;
 }
 
 int write_string_filef(
@@ -350,21 +404,38 @@ int write_string_filef(
         return write_string_file(fn, p, flags);
 }
 
-int read_one_line_file(const char *fn, char **line) {
+int write_base64_file_at(
+                int dir_fd,
+                const char *fn,
+                const struct iovec *data,
+                WriteStringFileFlags flags) {
+
+        _cleanup_free_ char *encoded = NULL;
+        ssize_t n;
+
+        n = base64mem_full(data ? data->iov_base : NULL, data ? data->iov_len : 0, 79, &encoded);
+        if (n < 0)
+                return n;
+
+        return write_string_file_at(dir_fd, fn, encoded, flags);
+}
+
+int read_one_line_file_at(int dir_fd, const char *filename, char **ret) {
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
-        assert(fn);
-        assert(line);
+        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(filename);
+        assert(ret);
 
-        r = fopen_unlocked(fn, "re", &f);
+        r = fopen_unlocked_at(dir_fd, filename, "re", 0, &f);
         if (r < 0)
                 return r;
 
-        return read_line(f, LONG_LINE_MAX, line);
+        return read_line(f, LONG_LINE_MAX, ret);
 }
 
-int verify_file(const char *fn, const char *blob, bool accept_extra_nl) {
+int verify_file_at(int dir_fd, const char *fn, const char *blob, bool accept_extra_nl) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *buf = NULL;
         size_t l, k;
@@ -382,7 +453,7 @@ int verify_file(const char *fn, const char *blob, bool accept_extra_nl) {
         if (!buf)
                 return -ENOMEM;
 
-        r = fopen_unlocked(fn, "re", &f);
+        r = fopen_unlocked_at(dir_fd, fn, "re", 0, &f);
         if (r < 0)
                 return r;
 
@@ -500,7 +571,7 @@ int read_virtual_file_fd(int fd, size_t max_size, char **ret_contents, size_t *r
                  * at least one more byte to be able to distinguish EOF from truncation. */
                 if (max_size != SIZE_MAX && n > max_size) {
                         n = size; /* Make sure we never use more than what we sized the buffer for (so that
-                                   * we have one free byte in it for the trailing NUL we add below).*/
+                                   * we have one free byte in it for the trailing NUL we add below). */
                         truncated = true;
                         break;
                 }
@@ -554,7 +625,7 @@ int read_virtual_file_at(
                 char **ret_contents,
                 size_t *ret_size) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
 
@@ -582,7 +653,7 @@ int read_full_stream_full(
                 size_t *ret_size) {
 
         _cleanup_free_ char *buf = NULL;
-        size_t n, n_next = 0, l;
+        size_t n, n_next = 0, l, expected_decoded_size = size;
         int fd, r;
 
         assert(f);
@@ -592,6 +663,13 @@ int read_full_stream_full(
 
         if (offset != UINT64_MAX && offset > LONG_MAX) /* fseek() can only deal with "long" offsets */
                 return -ERANGE;
+
+        if ((flags & (READ_FULL_FILE_UNBASE64 | READ_FULL_FILE_UNHEX)) != 0) {
+                if (size <= SIZE_MAX / READ_FULL_FILE_ENCODED_STRING_AMPLIFICATION_BOUNDARY)
+                        size *= READ_FULL_FILE_ENCODED_STRING_AMPLIFICATION_BOUNDARY;
+                else
+                        size = SIZE_MAX;
+        }
 
         fd = fileno(f);
         if (fd >= 0) { /* If the FILE* object is backed by an fd (as opposed to memory or such, see
@@ -717,6 +795,11 @@ int read_full_stream_full(
                         explicit_bzero_safe(buf, n);
                 free_and_replace(buf, decoded);
                 n = l = decoded_size;
+
+                if (FLAGS_SET(flags, READ_FULL_FILE_FAIL_WHEN_LARGER) && l > expected_decoded_size) {
+                        r = -E2BIG;
+                        goto finalize;
+                }
         }
 
         if (!ret_size) {
@@ -756,62 +839,19 @@ int read_full_file_full(
                 size_t *ret_size) {
 
         _cleanup_fclose_ FILE *f = NULL;
+        XfopenFlags xflags = XFOPEN_UNLOCKED;
         int r;
 
         assert(filename);
         assert(ret_contents);
 
-        r = xfopenat(dir_fd, filename, "re", 0, &f);
-        if (r < 0) {
-                _cleanup_close_ int sk = -1;
+        if (FLAGS_SET(flags, READ_FULL_FILE_CONNECT_SOCKET) && /* If this is enabled, let's try to connect to it */
+            offset == UINT64_MAX)                              /* Seeking is not supported on AF_UNIX sockets */
+                xflags |= XFOPEN_SOCKET;
 
-                /* ENXIO is what Linux returns if we open a node that is an AF_UNIX socket */
-                if (r != -ENXIO)
-                        return r;
-
-                /* If this is enabled, let's try to connect to it */
-                if (!FLAGS_SET(flags, READ_FULL_FILE_CONNECT_SOCKET))
-                        return -ENXIO;
-
-                /* Seeking is not supported on AF_UNIX sockets */
-                if (offset != UINT64_MAX)
-                        return -ENXIO;
-
-                sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
-                if (sk < 0)
-                        return -errno;
-
-                if (bind_name) {
-                        /* If the caller specified a socket name to bind to, do so before connecting. This is
-                         * useful to communicate some minor, short meta-information token from the client to
-                         * the server. */
-                        union sockaddr_union bsa;
-
-                        r = sockaddr_un_set_path(&bsa.un, bind_name);
-                        if (r < 0)
-                                return r;
-
-                        if (bind(sk, &bsa.sa, r) < 0)
-                                return -errno;
-                }
-
-                r = connect_unix_path(sk, dir_fd, filename);
-                if (IN_SET(r, -ENOTSOCK, -EINVAL)) /* propagate original error if this is not a socket after all */
-                        return -ENXIO;
-                if (r < 0)
-                        return r;
-
-                if (shutdown(sk, SHUT_WR) < 0)
-                        return -errno;
-
-                f = fdopen(sk, "r");
-                if (!f)
-                        return -errno;
-
-                TAKE_FD(sk);
-        }
-
-        (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
+        r = xfopenat_full(dir_fd, filename, "re", 0, xflags, bind_name, &f);
+        if (r < 0)
+                return r;
 
         return read_full_stream_full(f, filename, offset, size, flags, ret_contents, ret_size);
 }
@@ -858,7 +898,6 @@ int executable_is_script(const char *path, char **interpreter) {
 int get_proc_field(const char *filename, const char *pattern, const char *terminator, char **field) {
         _cleanup_free_ char *status = NULL;
         char *t, *f;
-        size_t len;
         int r;
 
         assert(terminator);
@@ -910,9 +949,7 @@ int get_proc_field(const char *filename, const char *pattern, const char *termin
                         t--;
         }
 
-        len = strcspn(t, terminator);
-
-        f = strndup(t, len);
+        f = strdupcspn(t, terminator);
         if (!f)
                 return -ENOMEM;
 
@@ -921,8 +958,7 @@ int get_proc_field(const char *filename, const char *pattern, const char *termin
 }
 
 DIR *xopendirat(int fd, const char *name, int flags) {
-        int nfd;
-        DIR *d;
+        _cleanup_close_ int nfd = -EBADF;
 
         assert(!(flags & O_CREAT));
 
@@ -933,13 +969,7 @@ DIR *xopendirat(int fd, const char *name, int flags) {
         if (nfd < 0)
                 return NULL;
 
-        d = fdopendir(nfd);
-        if (!d) {
-                safe_close(nfd);
-                return NULL;
-        }
-
-        return d;
+        return take_fdopendir(&nfd);
 }
 
 int fopen_mode_to_flags(const char *mode) {
@@ -988,35 +1018,231 @@ int fopen_mode_to_flags(const char *mode) {
         return flags;
 }
 
-int xfopenat(int dir_fd, const char *path, const char *mode, int flags, FILE **ret) {
+static int xfopenat_regular(int dir_fd, const char *path, const char *mode, int open_flags, FILE **ret) {
         FILE *f;
 
         /* A combination of fopen() with openat() */
 
-        if (dir_fd == AT_FDCWD && flags == 0) {
+        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(path);
+        assert(mode);
+        assert(ret);
+
+        if (dir_fd == AT_FDCWD && open_flags == 0)
                 f = fopen(path, mode);
-                if (!f)
-                        return -errno;
-        } else {
-                int fd, mode_flags;
+        else {
+                _cleanup_close_ int fd = -EBADF;
+                int mode_flags;
 
                 mode_flags = fopen_mode_to_flags(mode);
                 if (mode_flags < 0)
                         return mode_flags;
 
-                fd = openat(dir_fd, path, mode_flags | flags);
+                fd = openat(dir_fd, path, mode_flags | open_flags);
                 if (fd < 0)
                         return -errno;
 
-                f = fdopen(fd, mode);
-                if (!f) {
-                        safe_close(fd);
-                        return -errno;
-                }
+                f = take_fdopen(&fd, mode);
         }
+        if (!f)
+                return -errno;
 
         *ret = f;
         return 0;
+}
+
+static int xfopenat_unix_socket(int dir_fd, const char *path, const char *bind_name, FILE **ret) {
+        _cleanup_close_ int sk = -EBADF;
+        FILE *f;
+        int r;
+
+        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(path);
+        assert(ret);
+
+        sk = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
+        if (sk < 0)
+                return -errno;
+
+        if (bind_name) {
+                /* If the caller specified a socket name to bind to, do so before connecting. This is
+                 * useful to communicate some minor, short meta-information token from the client to
+                 * the server. */
+                union sockaddr_union bsa;
+
+                r = sockaddr_un_set_path(&bsa.un, bind_name);
+                if (r < 0)
+                        return r;
+
+                if (bind(sk, &bsa.sa, r) < 0)
+                        return -errno;
+        }
+
+        r = connect_unix_path(sk, dir_fd, path);
+        if (r < 0)
+                return r;
+
+        if (shutdown(sk, SHUT_WR) < 0)
+                return -errno;
+
+        f = take_fdopen(&sk, "r");
+        if (!f)
+                return -errno;
+
+        *ret = f;
+        return 0;
+}
+
+int xfopenat_full(
+                int dir_fd,
+                const char *path,
+                const char *mode,
+                int open_flags,
+                XfopenFlags flags,
+                const char *bind_name,
+                FILE **ret) {
+
+        FILE *f = NULL;  /* avoid false maybe-uninitialized warning */
+        int r;
+
+        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(path);
+        assert(mode);
+        assert(ret);
+
+        r = xfopenat_regular(dir_fd, path, mode, open_flags, &f);
+        if (r == -ENXIO && FLAGS_SET(flags, XFOPEN_SOCKET)) {
+                /* ENXIO is what Linux returns if we open a node that is an AF_UNIX socket */
+                r = xfopenat_unix_socket(dir_fd, path, bind_name, &f);
+                if (IN_SET(r, -ENOTSOCK, -EINVAL))
+                        return -ENXIO; /* propagate original error if this is not a socket after all */
+        }
+        if (r < 0)
+                return r;
+
+        if (FLAGS_SET(flags, XFOPEN_UNLOCKED))
+                (void) __fsetlocking(f, FSETLOCKING_BYCALLER);
+
+        *ret = f;
+        return 0;
+}
+
+int fdopen_independent(int fd, const char *mode, FILE **ret) {
+        _cleanup_close_ int copy_fd = -EBADF;
+        _cleanup_fclose_ FILE *f = NULL;
+        int mode_flags;
+
+        assert(fd >= 0);
+        assert(mode);
+        assert(ret);
+
+        /* A combination of fdopen() + fd_reopen(). i.e. reopens the inode the specified fd points to and
+         * returns a FILE* for it */
+
+        mode_flags = fopen_mode_to_flags(mode);
+        if (mode_flags < 0)
+                return mode_flags;
+
+        /* Flags returned by fopen_mode_to_flags might contain O_CREAT, but it doesn't make sense for fd_reopen
+         * since we're working on an existing fd anyway. Let's drop it here to avoid triggering assertion. */
+        copy_fd = fd_reopen(fd, mode_flags & ~O_CREAT);
+        if (copy_fd < 0)
+                return copy_fd;
+
+        f = take_fdopen(&copy_fd, mode);
+        if (!f)
+                return -errno;
+
+        *ret = TAKE_PTR(f);
+        return 0;
+}
+
+static int search_and_open_internal(
+                const char *path,
+                int mode,            /* if ret_fd is NULL this is an [FRWX]_OK mode for access(), otherwise an open mode for open() */
+                const char *root,
+                char **search,
+                int *ret_fd,
+                char **ret_path) {
+
+        int r;
+
+        assert(!ret_fd || !FLAGS_SET(mode, O_CREAT)); /* We don't support O_CREAT for this */
+        assert(path);
+
+        if (path_is_absolute(path)) {
+                _cleanup_close_ int fd = -EBADF;
+
+                if (ret_fd)
+                        /* We only specify 0777 here to appease static analyzers, it's never used since we
+                         * don't support O_CREAT here */
+                        r = fd = RET_NERRNO(open(path, mode, 0777));
+                else
+                        r = RET_NERRNO(access(path, mode));
+                if (r < 0)
+                        return r;
+
+                if (ret_path) {
+                        r = path_simplify_alloc(path, ret_path);
+                        if (r < 0)
+                                return r;
+                }
+
+                if (ret_fd)
+                        *ret_fd = TAKE_FD(fd);
+
+                return 0;
+        }
+
+        if (!path_strv_resolve_uniq(search, root))
+                return -ENOMEM;
+
+        STRV_FOREACH(i, search) {
+                _cleanup_close_ int fd = -EBADF;
+                _cleanup_free_ char *p = NULL;
+
+                p = path_join(root, *i, path);
+                if (!p)
+                        return -ENOMEM;
+
+                if (ret_fd)
+                        /* as above, 0777 is static analyzer appeasement */
+                        r = fd = RET_NERRNO(open(p, mode, 0777));
+                else
+                        r = RET_NERRNO(access(p, F_OK));
+                if (r >= 0) {
+                        if (ret_path)
+                                *ret_path = path_simplify(TAKE_PTR(p));
+
+                        if (ret_fd)
+                                *ret_fd = TAKE_FD(fd);
+
+                        return 0;
+                }
+                if (r != -ENOENT)
+                        return r;
+        }
+
+        return -ENOENT;
+}
+
+int search_and_open(
+                const char *path,
+                int mode,
+                const char *root,
+                char **search,
+                int *ret_fd,
+                char **ret_path) {
+
+        _cleanup_strv_free_ char **copy = NULL;
+
+        assert(path);
+
+        copy = strv_copy((char**) search);
+        if (!copy)
+                return -ENOMEM;
+
+        return search_and_open_internal(path, mode, root, copy, ret_fd, ret_path);
 }
 
 static int search_and_fopen_internal(
@@ -1024,118 +1250,78 @@ static int search_and_fopen_internal(
                 const char *mode,
                 const char *root,
                 char **search,
-                FILE **ret,
+                FILE **ret_file,
                 char **ret_path) {
 
+        _cleanup_free_ char *found_path = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
         assert(path);
-        assert(mode);
-        assert(ret);
+        assert(mode || !ret_file);
 
-        if (!path_strv_resolve_uniq(search, root))
-                return -ENOMEM;
+        r = search_and_open(
+                        path,
+                        mode ? fopen_mode_to_flags(mode) : 0,
+                        root,
+                        search,
+                        ret_file ? &fd : NULL,
+                        ret_path ? &found_path : NULL);
+        if (r < 0)
+                return r;
 
-        STRV_FOREACH(i, search) {
-                _cleanup_free_ char *p = NULL;
-                FILE *f;
-
-                p = path_join(root, *i, path);
-                if (!p)
-                        return -ENOMEM;
-
-                f = fopen(p, mode);
-                if (f) {
-                        if (ret_path)
-                                *ret_path = path_simplify(TAKE_PTR(p));
-
-                        *ret = f;
-                        return 0;
-                }
-
-                if (errno != ENOENT)
+        if (ret_file) {
+                FILE *f = take_fdopen(&fd, mode);
+                if (!f)
                         return -errno;
+
+                *ret_file = f;
         }
 
-        return -ENOENT;
+        if (ret_path)
+                *ret_path = TAKE_PTR(found_path);
+
+        return 0;
 }
 
 int search_and_fopen(
-                const char *filename,
+                const char *path,
                 const char *mode,
                 const char *root,
                 const char **search,
-                FILE **ret,
+                FILE **ret_file,
                 char **ret_path) {
 
         _cleanup_strv_free_ char **copy = NULL;
 
-        assert(filename);
-        assert(mode);
-        assert(ret);
-
-        if (path_is_absolute(filename)) {
-                _cleanup_fclose_ FILE *f = NULL;
-
-                f = fopen(filename, mode);
-                if (!f)
-                        return -errno;
-
-                if (ret_path) {
-                        char *p;
-
-                        p = strdup(filename);
-                        if (!p)
-                                return -ENOMEM;
-
-                        *ret_path = path_simplify(p);
-                }
-
-                *ret = TAKE_PTR(f);
-                return 0;
-        }
+        assert(path);
+        assert(mode || !ret_file);
 
         copy = strv_copy((char**) search);
         if (!copy)
                 return -ENOMEM;
 
-        return search_and_fopen_internal(filename, mode, root, copy, ret, ret_path);
+        return search_and_fopen_internal(path, mode, root, copy, ret_file, ret_path);
 }
 
 int search_and_fopen_nulstr(
-                const char *filename,
+                const char *path,
                 const char *mode,
                 const char *root,
                 const char *search,
-                FILE **ret,
+                FILE **ret_file,
                 char **ret_path) {
 
-        _cleanup_strv_free_ char **s = NULL;
+        _cleanup_strv_free_ char **l = NULL;
 
-        if (path_is_absolute(filename)) {
-                _cleanup_fclose_ FILE *f = NULL;
+        assert(path);
+        assert(mode || !ret_file);
 
-                f = fopen(filename, mode);
-                if (!f)
-                        return -errno;
-
-                if (ret_path) {
-                        char *p;
-
-                        p = strdup(filename);
-                        if (!p)
-                                return -ENOMEM;
-
-                        *ret_path = path_simplify(p);
-                }
-
-                *ret = TAKE_PTR(f);
-                return 0;
-        }
-
-        s = strv_split_nulstr(search);
-        if (!s)
+        l = strv_split_nulstr(search);
+        if (!l)
                 return -ENOMEM;
 
-        return search_and_fopen_internal(filename, mode, root, s, ret, ret_path);
+        return search_and_fopen_internal(path, mode, root, l, ret_file, ret_path);
 }
 
 int fflush_and_check(FILE *f) {
@@ -1206,33 +1392,54 @@ int read_timestamp_file(const char *fn, usec_t *ret) {
         return 0;
 }
 
-int fputs_with_space(FILE *f, const char *s, const char *separator, bool *space) {
-        int r;
-
+int fputs_with_separator(FILE *f, const char *s, const char *separator, bool *space) {
         assert(s);
+        assert(space);
 
-        /* Outputs the specified string with fputs(), but optionally prefixes it with a separator. The *space parameter
-         * when specified shall initially point to a boolean variable initialized to false. It is set to true after the
-         * first invocation. This call is supposed to be use in loops, where a separator shall be inserted between each
-         * element, but not before the first one. */
+        /* Outputs the specified string with fputs(), but optionally prefixes it with a separator.
+         * The *space parameter when specified shall initially point to a boolean variable initialized
+         * to false. It is set to true after the first invocation. This call is supposed to be use in loops,
+         * where a separator shall be inserted between each element, but not before the first one. */
 
         if (!f)
                 f = stdout;
 
-        if (space) {
-                if (!separator)
-                        separator = " ";
+        if (!separator)
+                separator = " ";
 
-                if (*space) {
-                        r = fputs(separator, f);
-                        if (r < 0)
-                                return r;
-                }
+        if (*space)
+                if (fputs(separator, f) < 0)
+                        return -EIO;
 
-                *space = true;
-        }
+        *space = true;
 
-        return fputs(s, f);
+        if (fputs(s, f) < 0)
+                return -EIO;
+
+        return 0;
+}
+
+int fputs_with_newline(FILE *f, const char *s) {
+
+        /* This is like fputs() but outputs a trailing newline char, but only if the string isn't empty
+         * and doesn't end in a newline already. Returns 0 in case we didn't append a newline, > 0 otherwise. */
+
+        if (isempty(s))
+                return 0;
+
+        if (!f)
+                f = stdout;
+
+        if (fputs(s, f) < 0)
+                return -EIO;
+
+        if (endswith(s, "\n"))
+                return 0;
+
+        if (fputc('\n', f) < 0)
+                return -EIO;
+
+        return 1;
 }
 
 /* A bitmask of the EOL markers we know */
@@ -1245,7 +1452,7 @@ typedef enum EndOfLineMarker {
 
 static EndOfLineMarker categorize_eol(char c, ReadLineFlags flags) {
 
-        if (!IN_SET(flags, READ_LINE_ONLY_NUL)) {
+        if (!FLAGS_SET(flags, READ_LINE_ONLY_NUL)) {
                 if (c == '\n')
                         return EOL_TEN;
                 if (c == '\r')
@@ -1352,7 +1559,7 @@ int read_line_full(FILE *f, size_t limit, ReadLineFlags flags, char **ret) {
                                                      * and don't call isatty() on an invalid fd */
                                                 flags |= READ_LINE_NOT_A_TTY;
                                         else
-                                                flags |= isatty(fd) ? READ_LINE_IS_A_TTY : READ_LINE_NOT_A_TTY;
+                                                flags |= isatty_safe(fd) ? READ_LINE_IS_A_TTY : READ_LINE_NOT_A_TTY;
                                 }
                                 if (FLAGS_SET(flags, READ_LINE_IS_A_TTY))
                                         break;
@@ -1381,6 +1588,30 @@ int read_line_full(FILE *f, size_t limit, ReadLineFlags flags, char **ret) {
         }
 
         return (int) count;
+}
+
+int read_stripped_line(FILE *f, size_t limit, char **ret) {
+        _cleanup_free_ char *s = NULL;
+        int r, k;
+
+        assert(f);
+
+        r = read_line(f, limit, ret ? &s : NULL);
+        if (r < 0)
+                return r;
+
+        if (ret) {
+                const char *p = strstrip(s);
+                if (p == s)
+                        *ret = TAKE_PTR(s);
+                else {
+                        k = strdup_to(ret, p);
+                        if (k < 0)
+                                return k;
+                }
+        }
+
+        return r > 0;          /* Return 1 if something was read. */
 }
 
 int safe_fgetc(FILE *f, char *ret) {

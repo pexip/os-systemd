@@ -6,7 +6,8 @@
 #include <unistd.h>
 
 #include "ask-password-api.h"
-#include "def.h"
+#include "build.h"
+#include "constants.h"
 #include "log.h"
 #include "macro.h"
 #include "main-func.h"
@@ -37,14 +38,14 @@ static int help(void) {
                 return log_oom();
 
         printf("%1$s [OPTIONS...] MESSAGE\n\n"
-               "%3$sQuery the user for a system passphrase, via the TTY or an UI agent.%4$s\n\n"
+               "%3$sQuery the user for a passphrase, via the TTY or a UI agent.%4$s\n\n"
                "  -h --help           Show this help\n"
                "     --icon=NAME      Icon name\n"
                "     --id=ID          Query identifier (e.g. \"cryptsetup:/dev/sda5\")\n"
                "     --keyname=NAME   Kernel key name for caching passwords (e.g. \"cryptsetup\")\n"
                "     --credential=NAME\n"
-               "                      Credential name for LoadCredential=/SetCredential=\n"
-               "                      credentials\n"
+               "                      Credential name for ImportCredential=, LoadCredential= or\n"
+               "                      SetCredential= credentials\n"
                "     --timeout=SEC    Timeout in seconds\n"
                "     --echo=yes|no|masked\n"
                "                      Control whether to show password while typing (echo)\n"
@@ -57,6 +58,8 @@ static int help(void) {
                "     --no-output      Do not print password to standard output\n"
                "  -n                  Do not suffix password written to standard output with\n"
                "                      newline\n"
+               "     --user           Ask only our own user's agents\n"
+               "     --system         Ask agents of the system and of all users\n"
                "\nSee the %2$s for details.\n",
                program_invocation_short_name,
                link,
@@ -80,6 +83,8 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_NO_OUTPUT,
                 ARG_VERSION,
                 ARG_CREDENTIAL,
+                ARG_USER,
+                ARG_SYSTEM,
         };
 
         static const struct option options[] = {
@@ -96,6 +101,8 @@ static int parse_argv(int argc, char *argv[]) {
                 { "keyname",       required_argument, NULL, ARG_KEYNAME       },
                 { "no-output",     no_argument,       NULL, ARG_NO_OUTPUT     },
                 { "credential",    required_argument, NULL, ARG_CREDENTIAL    },
+                { "user",          no_argument,       NULL, ARG_USER          },
+                { "system",        no_argument,       NULL, ARG_SYSTEM        },
                 {}
         };
 
@@ -141,14 +148,12 @@ static int parse_argv(int argc, char *argv[]) {
                                 /* Empty argument or explicit string "masked" for default behaviour. */
                                 arg_flags &= ~(ASK_PASSWORD_ECHO|ASK_PASSWORD_SILENT);
                         else {
-                                bool b;
-
-                                r = parse_boolean_argument("--echo=", optarg, &b);
+                                r = parse_boolean_argument("--echo=", optarg, NULL);
                                 if (r < 0)
                                         return r;
 
-                                SET_FLAG(arg_flags, ASK_PASSWORD_ECHO, b);
-                                SET_FLAG(arg_flags, ASK_PASSWORD_SILENT, !b);
+                                SET_FLAG(arg_flags, ASK_PASSWORD_ECHO, r);
+                                SET_FLAG(arg_flags, ASK_PASSWORD_SILENT, !r);
                         }
                         break;
 
@@ -184,6 +189,14 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_credential_name = optarg;
                         break;
 
+                case ARG_USER:
+                        arg_flags |= ASK_PASSWORD_USER;
+                        break;
+
+                case ARG_SYSTEM:
+                        arg_flags &= ~ASK_PASSWORD_USER;
+                        break;
+
                 case 'n':
                         arg_newline = false;
                         break;
@@ -198,13 +211,11 @@ static int parse_argv(int argc, char *argv[]) {
         if (isempty(emoji) || streq(emoji, "auto"))
                 SET_FLAG(arg_flags, ASK_PASSWORD_HIDE_EMOJI, FLAGS_SET(arg_flags, ASK_PASSWORD_ECHO));
         else {
-                bool b;
-
-                r = parse_boolean_argument("--emoji=", emoji, &b);
+                r = parse_boolean_argument("--emoji=", emoji, NULL);
                 if (r < 0)
                          return r;
 
-                SET_FLAG(arg_flags, ASK_PASSWORD_HIDE_EMOJI, !b);
+                SET_FLAG(arg_flags, ASK_PASSWORD_HIDE_EMOJI, !r);
         }
 
         if (argc > optind) {
@@ -229,20 +240,26 @@ static int run(int argc, char *argv[]) {
         usec_t timeout;
         int r;
 
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
+
+        /* Unprivileged? Then imply ASK_PASSWORD_USER by default */
+        SET_FLAG(arg_flags, ASK_PASSWORD_USER, geteuid() != 0);
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
-        if (arg_timeout > 0)
-                timeout = usec_add(now(CLOCK_MONOTONIC), arg_timeout);
-        else
-                timeout = 0;
+        timeout = arg_timeout > 0 ? usec_add(now(CLOCK_MONOTONIC), arg_timeout) : 0;
 
-        r = ask_password_auto(arg_message, arg_icon, arg_id, arg_key_name, arg_credential_name ?: "password", timeout, arg_flags, &l);
+        AskPasswordRequest req = {
+                .message = arg_message,
+                .icon = arg_icon,
+                .id = arg_id,
+                .keyring = arg_key_name,
+                .credential = arg_credential_name ?: "password",
+        };
+
+        r = ask_password_auto(&req, timeout, arg_flags, &l);
         if (r < 0)
                 return log_error_errno(r, "Failed to query password: %m");
 

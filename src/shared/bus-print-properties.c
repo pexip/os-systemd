@@ -109,6 +109,12 @@ static int bus_print_property(const char *name, const char *expected_value, sd_b
 
                         bus_print_property_value(name, expected_value, flags, FORMAT_TIMESTAMP(u));
 
+                /* Managed OOM pressure default implies "unset" and use the default set in oomd.conf. Without
+                 * this condition, we will print "infinity" which implies there is no limit on memory
+                 * pressure duration and is incorrect. */
+                else if (streq(name, "ManagedOOMMemoryPressureDurationUSec") && u == USEC_INFINITY)
+                        bus_print_property_value(name, expected_value, flags, "[not set]");
+
                 else if (strstr(name, "USec"))
                         bus_print_property_value(name, expected_value, flags, FORMAT_TIMESPAN(u, 0));
 
@@ -136,7 +142,7 @@ static int bus_print_property(const char *name, const char *expected_value, sd_b
                 } else if (streq(name, "MountFlags")) {
                         const char *result;
 
-                        result = mount_propagation_flags_to_string(u);
+                        result = mount_propagation_flag_to_string(u);
                         if (!result)
                                 return -EINVAL;
 
@@ -145,7 +151,7 @@ static int bus_print_property(const char *name, const char *expected_value, sd_b
                 } else if (STR_IN_SET(name, "CapabilityBoundingSet", "AmbientCapabilities")) {
                         _cleanup_free_ char *s = NULL;
 
-                        r = capability_set_to_string_alloc(u, &s);
+                        r = capability_set_to_string(u, &s);
                         if (r < 0)
                                 return r;
 
@@ -157,13 +163,18 @@ static int bus_print_property(const char *name, const char *expected_value, sd_b
                 else if ((STR_IN_SET(name, "CPUWeight", "StartupCPUWeight", "IOWeight", "StartupIOWeight") && u == CGROUP_WEIGHT_INVALID) ||
                            (STR_IN_SET(name, "CPUShares", "StartupCPUShares") && u == CGROUP_CPU_SHARES_INVALID) ||
                            (STR_IN_SET(name, "BlockIOWeight", "StartupBlockIOWeight") && u == CGROUP_BLKIO_WEIGHT_INVALID) ||
-                           (STR_IN_SET(name, "MemoryCurrent", "TasksCurrent") && u == UINT64_MAX) ||
+                           (STR_IN_SET(name, "MemoryCurrent", "MemoryAvailable", "TasksCurrent") && u == UINT64_MAX) ||
+                           (startswith(name, "Memory") && ENDSWITH_SET(name, "Current", "Peak") && u == CGROUP_LIMIT_MAX) ||
+                           (startswith(name, "IO") && ENDSWITH_SET(name, "Bytes", "Operations") && u == UINT64_MAX) ||
                            (endswith(name, "NSec") && u == UINT64_MAX))
 
                         bus_print_property_value(name, expected_value, flags, "[not set]");
 
-                else if ((STR_IN_SET(name, "DefaultMemoryLow", "DefaultMemoryMin", "MemoryLow", "MemoryHigh", "MemoryMax", "MemorySwapMax", "MemoryLimit", "MemoryAvailable") && u == CGROUP_LIMIT_MAX) ||
-                         (STR_IN_SET(name, "TasksMax", "DefaultTasksMax") && u == UINT64_MAX) ||
+                else if ((ENDSWITH_SET(name, "MemoryLow", "MemoryMin",
+                                             "MemoryHigh", "MemoryMax",
+                                             "MemorySwapMax", "MemoryZSwapMax", "MemoryLimit") &&
+                          u == CGROUP_LIMIT_MAX) ||
+                         (endswith(name, "TasksMax") && u == UINT64_MAX) ||
                          (startswith(name, "Limit") && u == UINT64_MAX) ||
                          (startswith(name, "DefaultLimit") && u == UINT64_MAX))
 
@@ -358,8 +369,10 @@ int bus_message_print_all_properties(
                 if (!name_with_equal)
                         return log_oom();
 
-                if (!filter || strv_contains(filter, name) ||
+                if (!filter ||
+                    strv_contains(filter, name) ||
                     (expected_value = strv_find_startswith(filter, name_with_equal))) {
+
                         r = sd_bus_message_peek_type(m, NULL, &contents);
                         if (r < 0)
                                 return r;

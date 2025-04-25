@@ -58,7 +58,7 @@ Exec.OOMScoreAdjust,          config_parse_oom_score_adjust, 0,                 
 Exec.CPUAffinity,             config_parse_cpu_affinity,   0,                        0
 Exec.ResolvConf,              config_parse_resolv_conf,    0,                        offsetof(Settings, resolv_conf)
 Exec.LinkJournal,             config_parse_link_journal,   0,                        0
-Exec.Timezone,                config_parse_timezone,       0,                        offsetof(Settings, timezone)
+Exec.Timezone,                config_parse_timezone_mode,  0,                        offsetof(Settings, timezone)
 Exec.SuppressSync,            config_parse_tristate,       0,                        offsetof(Settings, suppress_sync)
 Files.ReadOnly,               config_parse_tristate,       0,                        offsetof(Settings, read_only)
 Files.Volatile,               config_parse_volatile_mode,  0,                        offsetof(Settings, volatile_mode)
@@ -72,9 +72,9 @@ Files.PrivateUsersChown,      config_parse_userns_chown,   0,                   
 Files.PrivateUsersOwnership,  config_parse_userns_ownership, 0,                      offsetof(Settings, userns_ownership)
 Files.BindUser,               config_parse_bind_user,      0,                        offsetof(Settings, bind_user)
 Network.Private,              config_parse_tristate,       0,                        offsetof(Settings, private_network)
-Network.Interface,            config_parse_strv,           0,                        offsetof(Settings, network_interfaces)
-Network.MACVLAN,              config_parse_strv,           0,                        offsetof(Settings, network_macvlan)
-Network.IPVLAN,               config_parse_strv,           0,                        offsetof(Settings, network_ipvlan)
+Network.Interface,            config_parse_network_iface_pair, 0,                    offsetof(Settings, network_interfaces)
+Network.MACVLAN,              config_parse_macvlan_iface_pair, 0,                    offsetof(Settings, network_macvlan)
+Network.IPVLAN,               config_parse_ipvlan_iface_pair, 0,                     offsetof(Settings, network_ipvlan)
 Network.VirtualEthernet,      config_parse_tristate,       0,                        offsetof(Settings, network_veth)
 Network.VirtualEthernetExtra, config_parse_veth_extra,     0,                        0
 Network.Bridge,               config_parse_ifname,         0,                        offsetof(Settings, network_bridge)

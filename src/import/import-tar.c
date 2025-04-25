@@ -20,13 +20,13 @@
 #include "machine-pool.h"
 #include "mkdir-label.h"
 #include "path-util.h"
+#include "pretty-print.h"
 #include "process-util.h"
 #include "qcow2-util.h"
 #include "ratelimit.h"
 #include "rm-rf.h"
 #include "string-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
 struct TarImport {
         sd_event *event;
@@ -98,8 +98,9 @@ int tar_import_new(
         int r;
 
         assert(ret);
+        assert(image_root);
 
-        root = strdup(image_root ?: "/var/lib/machines");
+        root = strdup(image_root);
         if (!root)
                 return -ENOMEM;
 
@@ -108,8 +109,8 @@ int tar_import_new(
                 return -ENOMEM;
 
         *i = (TarImport) {
-                .input_fd = -1,
-                .tar_fd = -1,
+                .input_fd = -EBADF,
+                .tar_fd = -EBADF,
                 .on_finished = on_finished,
                 .userdata = userdata,
                 .last_percent = UINT_MAX,
@@ -149,8 +150,17 @@ static void tar_import_report_progress(TarImport *i) {
         if (!ratelimit_below(&i->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Imported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(i->written_compressed),
+                                FORMAT_BYTES(i->input_stat.st_size));
+        else
+                log_info("Imported %u%%.", percent);
 
         i->last_percent = percent;
 }
@@ -226,7 +236,7 @@ static int tar_import_fork_tar(TarImport *i) {
                 (void) rm_rf(d, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME);
 
         if (i->flags & IMPORT_BTRFS_SUBVOL)
-                r = btrfs_subvol_make_fallback(d, 0755);
+                r = btrfs_subvol_make_fallback(AT_FDCWD, d, 0755);
         else
                 r = RET_NERRNO(mkdir(d, 0755));
         if (r == -EEXIST && (i->flags & IMPORT_DIRECT)) /* EEXIST is OK if in direct mode, but not otherwise,
@@ -251,7 +261,7 @@ static int tar_import_write(const void *p, size_t sz, void *userdata) {
         TarImport *i = userdata;
         int r;
 
-        r = loop_write(i->tar_fd, p, sz, false);
+        r = loop_write(i->tar_fd, p, sz);
         if (r < 0)
                 return r;
 
@@ -322,6 +332,9 @@ static int tar_import_process(TarImport *i) {
         return 0;
 
 finish:
+        if (r >= 0 && isatty_safe(STDERR_FILENO))
+                clear_progress_bar(/* prefix= */ NULL);
+
         if (i->on_finished)
                 i->on_finished(i, r, i->userdata);
         else

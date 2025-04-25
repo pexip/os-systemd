@@ -84,7 +84,7 @@ static int load_kexec_kernel(void) {
         if (arg_dry_run)
                 return 0;
 
-        r = safe_fork("(kexec)", FORK_WAIT|FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
+        r = safe_fork("(kexec)", FORK_WAIT|FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pid);
         if (r < 0)
                 return r;
         if (r == 0) {
@@ -155,25 +155,16 @@ int verb_start_special(int argc, char *argv[], void *userdata) {
                         return r;
         }
 
-        if (a == ACTION_REBOOT) {
-                const char *arg = NULL;
+        if (arg_reboot_argument && IN_SET(a, ACTION_HALT, ACTION_POWEROFF, ACTION_REBOOT, ACTION_KEXEC)) {
+                /* If we are going through an action that involves systemd-shutdown, let's set the reboot
+                 * parameter, even if it's not a regular reboot. After all we nowadays send the string to
+                 * our supervisor via sd_notify() too. */
+                r = update_reboot_parameter_and_warn(arg_reboot_argument, /* keep= */ false);
+                if (r < 0)
+                        return r;
+        }
 
-                if (argc > 1) {
-                        if (arg_reboot_argument)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Both --reboot-argument= and positional argument passed to reboot command, refusing.");
-
-                        log_notice("Positional argument to reboot command is deprecated, please use --reboot-argument= instead. Accepting anyway.");
-                        arg = argv[1];
-                } else
-                        arg = arg_reboot_argument;
-
-                if (arg) {
-                        r = update_reboot_parameter_and_warn(arg, false);
-                        if (r < 0)
-                                return r;
-                }
-
-        } else if (a == ACTION_KEXEC) {
+        if (a == ACTION_KEXEC) {
                 r = load_kexec_kernel();
                 if (r < 0 && arg_force >= 1)
                         log_notice("Failed to load kexec kernel, continuing without.");
@@ -203,34 +194,59 @@ int verb_start_special(int argc, char *argv[], void *userdata) {
                 r = verb_trivial_method(argc, argv, userdata);
         else {
                 /* First try logind, to allow authentication with polkit */
-                if (IN_SET(a,
-                           ACTION_POWEROFF,
-                           ACTION_REBOOT,
-                           ACTION_KEXEC,
-                           ACTION_HALT,
-                           ACTION_SUSPEND,
-                           ACTION_HIBERNATE,
-                           ACTION_HYBRID_SLEEP,
-                           ACTION_SUSPEND_THEN_HIBERNATE)) {
+                switch (a) {
 
-                        r = logind_reboot(a);
-                        if (r >= 0)
-                                return r;
-                        if (IN_SET(r, -EACCES, -EOPNOTSUPP, -EINPROGRESS))
-                                /* Requested operation requires auth, is not supported or already in progress */
-                                return r;
+                case ACTION_POWEROFF:
+                case ACTION_REBOOT:
+                case ACTION_KEXEC:
+                case ACTION_HALT:
+                case ACTION_SOFT_REBOOT:
+                        if (arg_when == 0) {
+                                r = logind_reboot(a);
+                                if (r >= 0 || IN_SET(r, -EACCES, -EOPNOTSUPP, -EINPROGRESS))
+                                        /* The latter indicates that the requested operation requires auth,
+                                         * is not supported or already in progress, in which cases we ignore the error. */
+                                        return r;
+                        } else {
+                                r = logind_schedule_shutdown(a);
+                                if (r != -ENOSYS)
+                                        return r;
+                        }
 
                         /* On all other errors, try low-level operation. In order to minimize the difference
                          * between operation with and without logind, we explicitly enable non-blocking mode
                          * for this, as logind's shutdown operations are always non-blocking. */
+                        arg_no_block = true;
+                        break;
+
+                case ACTION_SUSPEND:
+                case ACTION_HIBERNATE:
+                case ACTION_HYBRID_SLEEP:
+                case ACTION_SUSPEND_THEN_HIBERNATE:
+
+                        /* For sleep operations, do not automatically fall back to low-level operation for
+                         * errors other than logind not available. There's a high chance that logind did
+                         * some extra sanity check and that didn't pass. */
+                        r = logind_reboot(a);
+                        if (r >= 0 || (r != -ENOSYS && arg_force == 0))
+                                return r;
 
                         arg_no_block = true;
+                        break;
 
-                } else if (IN_SET(a, ACTION_EXIT))
+                case ACTION_SLEEP:
+                        return logind_reboot(a);
+
+                case ACTION_EXIT:
                         /* Since exit is so close in behaviour to power-off/reboot, let's also make
                          * it asynchronous, in order to not confuse the user needlessly with unexpected
                          * behaviour. */
                         arg_no_block = true;
+                        break;
+
+                default:
+                        ;
+                }
 
                 r = verb_start(argc, argv, userdata);
         }
@@ -245,10 +261,10 @@ int verb_start_special(int argc, char *argv[], void *userdata) {
 int verb_start_system_special(int argc, char *argv[], void *userdata) {
         /* Like start_special above, but raises an error when running in user mode */
 
-        if (arg_scope != LOOKUP_SCOPE_SYSTEM)
+        if (arg_runtime_scope != RUNTIME_SCOPE_SYSTEM)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Bad action for %s mode.",
-                                       arg_scope == LOOKUP_SCOPE_GLOBAL ? "--global" : "--user");
+                                       runtime_scope_cmdline_option_to_string(arg_runtime_scope));
 
         return verb_start_special(argc, argv, userdata);
 }

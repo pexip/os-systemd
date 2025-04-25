@@ -18,7 +18,6 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "tunnel.h"
-#include "util.h"
 
 #define DEFAULT_IPV6_TTL   64
 #define IP6_FLOWINFO_FLOWLABEL  htobe32(0x000FFFFF)
@@ -26,16 +25,16 @@
 
 static const char* const ip6tnl_mode_table[_NETDEV_IP6_TNL_MODE_MAX] = {
         [NETDEV_IP6_TNL_MODE_IP6IP6] = "ip6ip6",
-        [NETDEV_IP6_TNL_MODE_IPIP6] = "ipip6",
+        [NETDEV_IP6_TNL_MODE_IPIP6]  = "ipip6",
         [NETDEV_IP6_TNL_MODE_ANYIP6] = "any",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(ip6tnl_mode, Ip6TnlMode);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_ip6tnl_mode, ip6tnl_mode, Ip6TnlMode, "Failed to parse ip6 tunnel Mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_ip6tnl_mode, ip6tnl_mode, Ip6TnlMode);
 
 #define HASH_KEY SD_ID128_MAKE(74,c4,de,12,f3,d9,41,34,bb,3d,c1,a4,42,93,50,87)
 
-int dhcp4_pd_create_6rd_tunnel_name(Link *link, char **ret) {
+static int dhcp4_pd_create_6rd_tunnel_name(Link *link) {
         _cleanup_free_ char *ifname_alloc = NULL;
         uint8_t ipv4masklen, sixrd_prefixlen, *buf, *p;
         struct in_addr ipv4address;
@@ -48,13 +47,16 @@ int dhcp4_pd_create_6rd_tunnel_name(Link *link, char **ret) {
         assert(link);
         assert(link->dhcp_lease);
 
+        if (link->dhcp4_6rd_tunnel_name)
+                return 0; /* Already set. Do not change even if the 6rd option is changed. */
+
         r = sd_dhcp_lease_get_address(link->dhcp_lease, &ipv4address);
         if (r < 0)
-                return log_link_debug_errno(link, r, "Failed to get DHCPv4 address: %m");
+                return r;
 
         r = sd_dhcp_lease_get_6rd(link->dhcp_lease, &ipv4masklen, &sixrd_prefixlen, &sixrd_prefix, NULL, NULL);
         if (r < 0)
-                return log_link_debug_errno(link, r, "Failed to get 6rd option: %m");
+                return r;
 
         sz = sizeof(uint8_t) * 2 + sizeof(struct in6_addr) + sizeof(struct in_addr);
         buf = newa(uint8_t, sz);
@@ -81,20 +83,43 @@ int dhcp4_pd_create_6rd_tunnel_name(Link *link, char **ret) {
 
         ifname_alloc = strdup(ifname);
         if (!ifname_alloc)
-                return log_oom_debug();
+                return -ENOMEM;
 
-        *ret = TAKE_PTR(ifname_alloc);
+        link->dhcp4_6rd_tunnel_name = TAKE_PTR(ifname_alloc);
         return 0;
 }
 
-static int dhcp4_pd_create_6rd_tunnel_message(
-                Link *link,
-                sd_netlink_message *m,
-                const struct in_addr *ipv4address,
-                uint8_t ipv4masklen,
-                const struct in6_addr *sixrd_prefix,
-                uint8_t sixrd_prefixlen) {
+int dhcp4_pd_create_6rd_tunnel(Link *link, link_netlink_message_handler_t callback) {
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
+        uint8_t ipv4masklen, sixrd_prefixlen;
+        struct in_addr ipv4address;
+        struct in6_addr sixrd_prefix;
+        Link *sit = NULL;
         int r;
+
+        assert(link);
+        assert(link->manager);
+        assert(link->manager->rtnl);
+        assert(link->dhcp_lease);
+        assert(callback);
+
+        r = sd_dhcp_lease_get_address(link->dhcp_lease, &ipv4address);
+        if (r < 0)
+                return r;
+
+        r = sd_dhcp_lease_get_6rd(link->dhcp_lease, &ipv4masklen, &sixrd_prefixlen, &sixrd_prefix, NULL, NULL);
+        if (r < 0)
+                return r;
+
+        r = dhcp4_pd_create_6rd_tunnel_name(link);
+        if (r < 0)
+                return r;
+
+        (void) link_get_by_name(link->manager, link->dhcp4_6rd_tunnel_name, &sit);
+
+        r = sd_rtnl_message_new_link(link->manager->rtnl, &m, RTM_NEWLINK, sit ? sit->ifindex : 0);
+        if (r < 0)
+                return r;
 
         r = sd_netlink_message_append_string(m, IFLA_IFNAME, link->dhcp4_6rd_tunnel_name);
         if (r < 0)
@@ -108,7 +133,7 @@ static int dhcp4_pd_create_6rd_tunnel_message(
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_append_in_addr(m, IFLA_IPTUN_LOCAL, ipv4address);
+        r = sd_netlink_message_append_in_addr(m, IFLA_IPTUN_LOCAL, &ipv4address);
         if (r < 0)
                 return r;
 
@@ -116,7 +141,7 @@ static int dhcp4_pd_create_6rd_tunnel_message(
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_append_in6_addr(m, IFLA_IPTUN_6RD_PREFIX, sixrd_prefix);
+        r = sd_netlink_message_append_in6_addr(m, IFLA_IPTUN_6RD_PREFIX, &sixrd_prefix);
         if (r < 0)
                 return r;
 
@@ -124,7 +149,7 @@ static int dhcp4_pd_create_6rd_tunnel_message(
         if (r < 0)
                 return r;
 
-        struct in_addr relay_prefix = *ipv4address;
+        struct in_addr relay_prefix = ipv4address;
         (void) in4_addr_mask(&relay_prefix, ipv4masklen);
         r = sd_netlink_message_append_u32(m, IFLA_IPTUN_6RD_RELAY_PREFIX, relay_prefix.s_addr);
         if (r < 0)
@@ -142,48 +167,12 @@ static int dhcp4_pd_create_6rd_tunnel_message(
         if (r < 0)
                 return r;
 
-        return 0;
-}
-
-int dhcp4_pd_create_6rd_tunnel(Link *link, link_netlink_message_handler_t callback) {
-        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
-        uint8_t ipv4masklen, sixrd_prefixlen;
-        struct in_addr ipv4address;
-        struct in6_addr sixrd_prefix;
-        int r;
-
-        assert(link);
-        assert(link->ifindex > 0);
-        assert(link->manager);
-        assert(link->dhcp_lease);
-        assert(link->dhcp4_6rd_tunnel_name);
-        assert(callback);
-
-        r = sd_dhcp_lease_get_address(link->dhcp_lease, &ipv4address);
-        if (r < 0)
-                return log_link_debug_errno(link, r, "Failed to get DHCPv4 address: %m");
-
-        r = sd_dhcp_lease_get_6rd(link->dhcp_lease, &ipv4masklen, &sixrd_prefixlen, &sixrd_prefix, NULL, NULL);
-        if (r < 0)
-                return log_link_debug_errno(link, r, "Failed to get 6rd option: %m");
-
-        r = sd_rtnl_message_new_link(link->manager->rtnl, &m, RTM_NEWLINK, 0);
-        if (r < 0)
-                return log_link_debug_errno(link, r, "Failed to create netlink message: %m");
-
-        r = dhcp4_pd_create_6rd_tunnel_message(link, m,
-                                               &ipv4address, ipv4masklen,
-                                               &sixrd_prefix, sixrd_prefixlen);
-        if (r < 0)
-                return log_link_debug_errno(link, r, "Failed to fill netlink message: %m");
-
         r = netlink_call_async(link->manager->rtnl, NULL, m, callback,
                                link_netlink_destroy_callback, link);
         if (r < 0)
-                return log_link_debug_errno(link, r, "Could not send netlink message: %m");
+                return r;
 
         link_ref(link);
-
         return 0;
 }
 
@@ -200,19 +189,11 @@ static int tunnel_get_local_address(Tunnel *t, Link *link, union in_addr_union *
 }
 
 static int netdev_ipip_sit_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        union in_addr_union local;
-        Tunnel *t;
-        int r;
-
-        assert(netdev);
         assert(m);
 
-        if (netdev->kind == NETDEV_KIND_IPIP)
-                t = IPIP(netdev);
-        else
-                t = SIT(netdev);
-
-        assert(t);
+        union in_addr_union local;
+        Tunnel *t = ASSERT_PTR(netdev)->kind == NETDEV_KIND_IPIP ? IPIP(netdev) : SIT(netdev);
+        int r;
 
         if (t->external) {
                 r = sd_netlink_message_append_flag(m, IFLA_IPTUN_COLLECT_METADATA);
@@ -269,8 +250,8 @@ static int netdev_ipip_sit_fill_message_create(NetDev *netdev, Link *link, sd_ne
                         if (r < 0)
                                 return r;
 
-                        /* u16 is deliberate here, even though we're passing a netmask that can never be >128. The kernel is
-                         * expecting to receive the prefixlen as a u16.
+                        /* u16 is deliberate here, even though we're passing a netmask that can never be
+                         * >128. The kernel is expecting to receive the prefixlen as a u16.
                          */
                         r = sd_netlink_message_append_u16(m, IFLA_IPTUN_6RD_PREFIXLEN, t->sixrd_prefixlen);
                         if (r < 0)
@@ -316,8 +297,6 @@ static int netdev_gre_erspan_fill_message_create(NetDev *netdev, Link *link, sd_
         default:
                 assert_not_reached();
         }
-
-        assert(t);
 
         if (t->external) {
                 r = sd_netlink_message_append_flag(m, IFLA_GRE_COLLECT_METADATA);
@@ -376,6 +355,10 @@ static int netdev_gre_erspan_fill_message_create(NetDev *netdev, Link *link, sd_
                 return r;
 
         r = sd_netlink_message_append_u8(m, IFLA_GRE_PMTUDISC, t->pmtudisc);
+        if (r < 0)
+                return r;
+
+        r = sd_netlink_message_append_u8(m, IFLA_GRE_IGNORE_DF, t->ignore_df);
         if (r < 0)
                 return r;
 
@@ -438,10 +421,8 @@ static int netdev_gre_erspan_fill_message_create(NetDev *netdev, Link *link, sd_
 
 static int netdev_ip6gre_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
         union in_addr_union local;
-        uint32_t ikey = 0;
-        uint32_t okey = 0;
-        uint16_t iflags = 0;
-        uint16_t oflags = 0;
+        uint32_t ikey = 0, okey = 0;
+        uint16_t iflags = 0, oflags = 0;
         Tunnel *t;
         int r;
 
@@ -452,8 +433,6 @@ static int netdev_ip6gre_fill_message_create(NetDev *netdev, Link *link, sd_netl
                 t = IP6GRE(netdev);
         else
                 t = IP6GRETAP(netdev);
-
-        assert(t);
 
         if (t->external) {
                 r = sd_netlink_message_append_flag(m, IFLA_GRE_COLLECT_METADATA);
@@ -532,20 +511,13 @@ static int netdev_ip6gre_fill_message_create(NetDev *netdev, Link *link, sd_netl
 }
 
 static int netdev_vti_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        union in_addr_union local;
-        uint32_t ikey, okey;
-        Tunnel *t;
-        int r;
-
         assert(netdev);
         assert(m);
 
-        if (netdev->kind == NETDEV_KIND_VTI)
-                t = VTI(netdev);
-        else
-                t = VTI6(netdev);
-
-        assert(t);
+        union in_addr_union local;
+        uint32_t ikey, okey;
+        Tunnel *t = netdev->kind == NETDEV_KIND_VTI ? VTI(netdev) : VTI6(netdev);
+        int r;
 
         if (link || t->assign_to_loopback) {
                 r = sd_netlink_message_append_u32(m, IFLA_VTI_LINK, link ? link->ifindex : LOOPBACK_IFINDEX);
@@ -584,17 +556,13 @@ static int netdev_vti_fill_message_create(NetDev *netdev, Link *link, sd_netlink
 }
 
 static int netdev_ip6tnl_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        union in_addr_union local;
-        uint8_t proto;
-        Tunnel *t;
-        int r;
-
         assert(netdev);
         assert(m);
 
-        t = IP6TNL(netdev);
-
-        assert(t);
+        union in_addr_union local;
+        uint8_t proto;
+        Tunnel *t = IP6TNL(netdev);
+        int r;
 
         switch (t->ip6tnl_mode) {
         case NETDEV_IP6_TNL_MODE_IP6IP6:
@@ -670,13 +638,9 @@ static int netdev_ip6tnl_fill_message_create(NetDev *netdev, Link *link, sd_netl
 }
 
 static int netdev_tunnel_is_ready_to_create(NetDev *netdev, Link *link) {
-        Tunnel *t;
-
         assert(netdev);
 
-        t = TUNNEL(netdev);
-
-        assert(t);
+        Tunnel *t = ASSERT_PTR(TUNNEL(netdev));
 
         if (t->independent)
                 return true;
@@ -685,14 +649,10 @@ static int netdev_tunnel_is_ready_to_create(NetDev *netdev, Link *link) {
 }
 
 static int netdev_tunnel_verify(NetDev *netdev, const char *filename) {
-        Tunnel *t;
-
         assert(netdev);
         assert(filename);
 
-        t = TUNNEL(netdev);
-
-        assert(t);
+        Tunnel *t = ASSERT_PTR(TUNNEL(netdev));
 
         if (netdev->kind == NETDEV_KIND_IP6TNL &&
             t->ip6tnl_mode == _NETDEV_IP6_TNL_MODE_INVALID)
@@ -740,7 +700,20 @@ static int netdev_tunnel_verify(NetDev *netdev, const char *filename) {
                                               "The local address cannot be '%s' when Independent= or AssignToLoopback= is enabled, ignoring.",
                                               strna(netdev_local_address_type_to_string(t->local_type)));
 
+        if (t->pmtudisc > 0 && t->ignore_df)
+                return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
+                                              "IgnoreDontFragment= cannot be enabled when DiscoverPathMTU= is enabled");
+        if (t->pmtudisc < 0)
+                t->pmtudisc = !t->ignore_df;
         return 0;
+}
+
+static bool tunnel_needs_reconfigure(NetDev *netdev, NetDevLocalAddressType type) {
+        assert(type >= 0 && type < _NETDEV_LOCAL_ADDRESS_TYPE_MAX);
+
+        Tunnel *t = ASSERT_PTR(TUNNEL(netdev));
+
+        return t->local_type == type;
 }
 
 static int unset_local(Tunnel *t) {
@@ -916,7 +889,8 @@ int config_parse_ipv6_flowlabel(
                 void *userdata) {
 
         Tunnel *t = ASSERT_PTR(userdata);
-        int k, r;
+        uint32_t k;
+        int r;
 
         assert(filename);
         assert(rvalue);
@@ -927,21 +901,15 @@ int config_parse_ipv6_flowlabel(
                 return 0;
         }
 
-        r = safe_atoi(rvalue, &k);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse tunnel IPv6 flowlabel, ignoring assignment: %s", rvalue);
-                return 0;
-        }
-
-        if (k > 0xFFFFF) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid tunnel IPv6 flowlabel, ignoring assignment: %s", rvalue);
-                return 0;
-        }
-
+        r = config_parse_uint32_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        0, 0xFFFFF, true,
+                        &k);
+        if (r <= 0)
+                return r;
         t->ipv6_flowlabel = htobe32(k) & IP6_FLOWINFO_FLOWLABEL;
         t->flags &= ~IP6_TNL_F_USE_ORIG_FLOWLABEL;
+
         return 0;
 }
 
@@ -957,33 +925,26 @@ int config_parse_encap_limit(
                 void *data,
                 void *userdata) {
 
-        Tunnel *t = ASSERT_PTR(userdata);
-        int k, r;
-
         assert(filename);
         assert(rvalue);
 
+        Tunnel *t = ASSERT_PTR(userdata);
+        int r;
+
         if (streq(rvalue, "none")) {
-                t->flags |= IP6_TNL_F_IGN_ENCAP_LIMIT;
                 t->encap_limit = 0;
+                t->flags |= IP6_TNL_F_IGN_ENCAP_LIMIT;
                 return 0;
         }
 
-        r = safe_atoi(rvalue, &k);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse Tunnel Encapsulation Limit option, ignoring assignment: %s", rvalue);
-                return 0;
-        }
-
-        if (k > 255 || k < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid Tunnel Encapsulation value, ignoring assignment: %d", k);
-                return 0;
-        }
-
-        t->encap_limit = k;
+        r = config_parse_uint8_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        0, UINT8_MAX, true,
+                        &t->encap_limit);
+        if (r <= 0)
+                return r;
         t->flags &= ~IP6_TNL_F_IGN_ENCAP_LIMIT;
+
         return 0;
 }
 
@@ -1036,32 +997,21 @@ int config_parse_erspan_version(
                 void *data,
                 void *userdata) {
 
-        uint8_t n, *v = ASSERT_PTR(data);
-        int r;
-
         assert(filename);
         assert(lvalue);
         assert(rvalue);
+
+        uint8_t *v = ASSERT_PTR(data);
 
         if (isempty(rvalue)) {
                 *v = 1; /* defaults to 1 */
                 return 0;
         }
 
-        r = safe_atou8(rvalue, &n);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse erspan version \"%s\", ignoring: %m", rvalue);
-                return 0;
-        }
-        if (!IN_SET(n, 0, 1, 2)) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid erspan version \"%s\", which must be 0, 1 or 2, ignoring.", rvalue);
-                return 0;
-        }
-
-        *v = n;
-        return 0;
+        return config_parse_uint8_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        0, 2, true,
+                        v);
 }
 
 int config_parse_erspan_index(
@@ -1076,32 +1026,21 @@ int config_parse_erspan_index(
                 void *data,
                 void *userdata) {
 
-        uint32_t n, *v = ASSERT_PTR(data);
-        int r;
-
         assert(filename);
         assert(lvalue);
         assert(rvalue);
+
+        uint32_t *v = ASSERT_PTR(data);
 
         if (isempty(rvalue)) {
                 *v = 0; /* defaults to 0 */
                 return 0;
         }
 
-        r = safe_atou32(rvalue, &n);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse erspan index \"%s\", ignoring: %m", rvalue);
-                return 0;
-        }
-        if (n >= 0x100000) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid erspan index \"%s\", which must be less than 0x100000, ignoring.", rvalue);
-                return 0;
-        }
-
-        *v = n;
-        return 0;
+        return config_parse_uint32_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        0, 0x100000 - 1, true,
+                        v);
 }
 
 int config_parse_erspan_direction(
@@ -1116,11 +1055,11 @@ int config_parse_erspan_direction(
                 void *data,
                 void *userdata) {
 
-        uint8_t *v = ASSERT_PTR(data);
-
         assert(filename);
         assert(lvalue);
         assert(rvalue);
+
+        uint8_t *v = ASSERT_PTR(data);
 
         if (isempty(rvalue) || streq(rvalue, "ingress"))
                 *v = 0; /* defaults to ingress */
@@ -1145,45 +1084,28 @@ int config_parse_erspan_hwid(
                 void *data,
                 void *userdata) {
 
-        uint16_t n, *v = ASSERT_PTR(data);
-        int r;
-
         assert(filename);
         assert(lvalue);
         assert(rvalue);
+
+        uint16_t *v = ASSERT_PTR(data);
 
         if (isempty(rvalue)) {
                 *v = 0; /* defaults to 0 */
                 return 0;
         }
 
-        r = safe_atou16(rvalue, &n);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse erspan hwid \"%s\", ignoring: %m", rvalue);
-                return 0;
-        }
-        if (n >= 64) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Invalid erspan index \"%s\", which must be less than 64, ignoring.", rvalue);
-                return 0;
-        }
-
-        *v = n;
-        return 0;
+        return config_parse_uint16_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        0, 63, true,
+                        v);
 }
 
 static void netdev_tunnel_init(NetDev *netdev) {
-        Tunnel *t;
-
-        assert(netdev);
-
-        t = TUNNEL(netdev);
-
-        assert(t);
+        Tunnel *t = ASSERT_PTR(TUNNEL(netdev));
 
         t->local_type = _NETDEV_LOCAL_ADDRESS_TYPE_INVALID;
-        t->pmtudisc = true;
+        t->pmtudisc = -1;
         t->fou_encap_type = NETDEV_FOO_OVER_UDP_ENCAP_DIRECT;
         t->isatap = -1;
         t->gre_erspan_sequence = -1;
@@ -1197,6 +1119,11 @@ static void netdev_tunnel_init(NetDev *netdev) {
                 t->ttl = DEFAULT_IPV6_TTL;
 }
 
+static bool tunnel_can_set_mac(NetDev *netdev, const struct hw_addr_data *hw_addr) {
+        assert(IN_SET(netdev->kind, NETDEV_KIND_GRETAP, NETDEV_KIND_IP6GRETAP, NETDEV_KIND_ERSPAN));
+        return true;
+}
+
 const NetDevVTable ipip_vtable = {
         .object_size = sizeof(Tunnel),
         .init = netdev_tunnel_init,
@@ -1205,6 +1132,7 @@ const NetDevVTable ipip_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
         .iftype = ARPHRD_TUNNEL,
 };
 
@@ -1216,6 +1144,7 @@ const NetDevVTable sit_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
         .iftype = ARPHRD_SIT,
 };
 
@@ -1227,6 +1156,7 @@ const NetDevVTable vti_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
         .iftype = ARPHRD_TUNNEL,
 };
 
@@ -1238,6 +1168,7 @@ const NetDevVTable vti6_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
         .iftype = ARPHRD_TUNNEL6,
 };
 
@@ -1249,6 +1180,7 @@ const NetDevVTable gre_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
         .iftype = ARPHRD_IPGRE,
 };
 
@@ -1260,6 +1192,8 @@ const NetDevVTable gretap_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
+        .can_set_mac = tunnel_can_set_mac,
         .iftype = ARPHRD_ETHER,
         .generate_mac = true,
 };
@@ -1272,6 +1206,7 @@ const NetDevVTable ip6gre_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
         .iftype = ARPHRD_IP6GRE,
 };
 
@@ -1283,6 +1218,8 @@ const NetDevVTable ip6gretap_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
+        .can_set_mac = tunnel_can_set_mac,
         .iftype = ARPHRD_ETHER,
         .generate_mac = true,
 };
@@ -1295,6 +1232,7 @@ const NetDevVTable ip6tnl_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
         .iftype = ARPHRD_TUNNEL6,
 };
 
@@ -1306,6 +1244,8 @@ const NetDevVTable erspan_vtable = {
         .create_type = NETDEV_CREATE_STACKED,
         .is_ready_to_create = netdev_tunnel_is_ready_to_create,
         .config_verify = netdev_tunnel_verify,
+        .needs_reconfigure = tunnel_needs_reconfigure,
+        .can_set_mac = tunnel_can_set_mac,
         .iftype = ARPHRD_ETHER,
         .generate_mac = true,
 };

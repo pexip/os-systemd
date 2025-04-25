@@ -6,13 +6,6 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
-#include <util.h>
-
-/* When we include libgen.h because we need dirname() we immediately
- * undefine basename() since libgen.h defines it as a macro to the POSIX
- * version which is really broken. We prefer GNU basename(). */
-#include <libgen.h>
-#undef basename
 
 #include "sd-bus.h"
 
@@ -28,6 +21,7 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "log.h"
+#include "mountpoint-util.h"
 #include "namespace-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -121,13 +115,13 @@ bool slow_tests_enabled(void) {
 }
 
 void test_setup_logging(int level) {
+        log_set_assert_return_is_critical(true);
         log_set_max_level(level);
-        log_parse_environment();
-        log_open();
+        log_setup();
 }
 
 int write_tmpfile(char *pattern, const char *contents) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         assert(pattern);
         assert(contents);
@@ -174,17 +168,21 @@ bool have_namespaces(void) {
 }
 
 bool userns_has_single_user(void) {
-        _cleanup_(uid_range_freep) UidRange *uidrange = NULL;
+        _cleanup_(uid_range_freep) UIDRange *uidrange = NULL, *gidrange = NULL;
 
         /* Check if we're in a user namespace with only a single user mapped in. We special case this
          * scenario in a few tests because it's the only kind of namespace that can be created unprivileged
          * and as such happens more often than not, so we make sure to deal with it so that all tests pass
          * in such environments. */
 
-        if (uid_range_load_userns(&uidrange, NULL) < 0)
+        if (uid_range_load_userns(NULL, UID_RANGE_USERNS_INSIDE, &uidrange) < 0)
                 return false;
 
-        return uidrange->n_entries == 1 && uidrange->entries[0].nr == 1;
+        if (uid_range_load_userns(NULL, GID_RANGE_USERNS_INSIDE, &gidrange) < 0)
+                return false;
+
+        return uidrange->n_entries == 1 && uidrange->entries[0].nr == 1 &&
+                gidrange->n_entries == 1 && gidrange->entries[0].nr == 1;
 }
 
 bool can_memlock(void) {
@@ -210,12 +208,16 @@ static int allocate_scope(void) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(bus_wait_for_jobs_freep) BusWaitForJobs *w = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_free_ char *scope = NULL;
+        _cleanup_free_ char *scope = NULL, *cgroup_root = NULL;
         const char *object;
         int r;
 
         /* Let's try to run this test in a scope of its own, with delegation turned on, so that PID 1 doesn't
          * interfere with our cgroup management. */
+        if (cg_pid_get_path(NULL, 0, &cgroup_root) >= 0 && cg_is_delegated(cgroup_root) && stderr_is_journal()) {
+                log_debug("Already running as a unit with delegated cgroup, not allocating a cgroup subroot.");
+                return 0;
+        }
 
         r = sd_bus_default_system(&bus);
         if (r < 0)
@@ -223,7 +225,7 @@ static int allocate_scope(void) {
 
         r = bus_wait_for_jobs_new(bus, &w);
         if (r < 0)
-                return log_oom();
+                return log_error_errno(r, "Could not watch jobs: %m");
 
         if (asprintf(&scope, "%s-%" PRIx64 ".scope", program_invocation_short_name, random_u64()) < 0)
                 return log_oom();
@@ -271,7 +273,7 @@ static int allocate_scope(void) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        r = bus_wait_for_jobs_one(w, object, false, NULL);
+        r = bus_wait_for_jobs_one(w, object, BUS_WAIT_JOBS_LOG_ERROR, NULL);
         if (r < 0)
                 return r;
 
@@ -288,7 +290,7 @@ static int enter_cgroup(char **ret_cgroup, bool enter_subroot) {
                 log_warning_errno(r, "Couldn't allocate a scope unit for this test, proceeding without.");
 
         r = cg_pid_get_path(NULL, 0, &cgroup_root);
-        if (r == -ENOMEDIUM)
+        if (IN_SET(r, -ENOMEDIUM, -ENOENT))
                 return log_warning_errno(r, "cg_pid_get_path(NULL, 0, ...) failed: %m");
         assert(r >= 0);
 
@@ -308,7 +310,7 @@ static int enter_cgroup(char **ret_cgroup, bool enter_subroot) {
         if (r < 0)
                 return r;
 
-        r = cg_attach_everywhere(supported, cgroup_subroot, 0, NULL, NULL);
+        r = cg_attach_everywhere(supported, cgroup_subroot, 0);
         if (r < 0)
                 return r;
 
@@ -326,7 +328,7 @@ int enter_cgroup_root(char **ret_cgroup) {
         return enter_cgroup(ret_cgroup, false);
 }
 
-const char *ci_environment(void) {
+const char* ci_environment(void) {
         /* We return a string because we might want to provide multiple bits of information later on: not
          * just the general CI environment type, but also whether we're sanitizing or not, etc. The caller is
          * expected to use strstr on the returned value. */
@@ -349,6 +351,8 @@ const char *ci_environment(void) {
                 return (ans = "github-actions");
         if (getenv("AUTOPKGTEST_ARTIFACTS") || getenv("AUTOPKGTEST_TMP"))
                 return (ans = "autopkgtest");
+        if (getenv("SALSA_CI_IMAGES"))
+                return (ans = "salsa-ci");
 
         FOREACH_STRING(var, "CI", "CONTINOUS_INTEGRATION") {
                 /* Those vars are booleans according to Semaphore and Travis docs:

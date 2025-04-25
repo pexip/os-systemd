@@ -9,35 +9,12 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 
+#include "constants.h"
 #include "macro-fundamental.h"
-
-#if !defined(HAS_FEATURE_MEMORY_SANITIZER)
-#  if defined(__has_feature)
-#    if __has_feature(memory_sanitizer)
-#      define HAS_FEATURE_MEMORY_SANITIZER 1
-#    endif
-#  endif
-#  if !defined(HAS_FEATURE_MEMORY_SANITIZER)
-#    define HAS_FEATURE_MEMORY_SANITIZER 0
-#  endif
-#endif
-
-#if !defined(HAS_FEATURE_ADDRESS_SANITIZER)
-#  ifdef __SANITIZE_ADDRESS__
-#      define HAS_FEATURE_ADDRESS_SANITIZER 1
-#  elif defined(__has_feature)
-#    if __has_feature(address_sanitizer)
-#      define HAS_FEATURE_ADDRESS_SANITIZER 1
-#    endif
-#  endif
-#  if !defined(HAS_FEATURE_ADDRESS_SANITIZER)
-#    define HAS_FEATURE_ADDRESS_SANITIZER 0
-#  endif
-#endif
 
 /* Note: on GCC "no_sanitize_address" is a function attribute only, on llvm it may also be applied to global
  * variables. We define a specific macro which knows this. Note that on GCC we don't need this decorator so much, since
- * our primary usecase for this attribute is registration structures placed in named ELF sections which shall not be
+ * our primary use case for this attribute is registration structures placed in named ELF sections which shall not be
  * padded, but GCC doesn't pad those anyway if AddressSanitizer is enabled. */
 #if HAS_FEATURE_ADDRESS_SANITIZER && defined(__clang__)
 #define _variable_no_sanitize_address_ __attribute__((__no_sanitize_address__))
@@ -53,31 +30,6 @@
 #define _function_no_sanitize_float_cast_overflow_
 #endif
 
-/* Temporarily disable some warnings */
-#define DISABLE_WARNING_DEPRECATED_DECLARATIONS                         \
-        _Pragma("GCC diagnostic push");                                 \
-        _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
-
-#define DISABLE_WARNING_FORMAT_NONLITERAL                               \
-        _Pragma("GCC diagnostic push");                                 \
-        _Pragma("GCC diagnostic ignored \"-Wformat-nonliteral\"")
-
-#define DISABLE_WARNING_MISSING_PROTOTYPES                              \
-        _Pragma("GCC diagnostic push");                                 \
-        _Pragma("GCC diagnostic ignored \"-Wmissing-prototypes\"")
-
-#define DISABLE_WARNING_NONNULL                                         \
-        _Pragma("GCC diagnostic push");                                 \
-        _Pragma("GCC diagnostic ignored \"-Wnonnull\"")
-
-#define DISABLE_WARNING_SHADOW                                          \
-        _Pragma("GCC diagnostic push");                                 \
-        _Pragma("GCC diagnostic ignored \"-Wshadow\"")
-
-#define DISABLE_WARNING_INCOMPATIBLE_POINTER_TYPES                      \
-        _Pragma("GCC diagnostic push");                                 \
-        _Pragma("GCC diagnostic ignored \"-Wincompatible-pointer-types\"")
-
 #if HAVE_WSTRINGOP_TRUNCATION
 #  define DISABLE_WARNING_STRINGOP_TRUNCATION                           \
         _Pragma("GCC diagnostic push");                                 \
@@ -87,14 +39,7 @@
         _Pragma("GCC diagnostic push")
 #endif
 
-#define DISABLE_WARNING_TYPE_LIMITS \
-        _Pragma("GCC diagnostic push");                                 \
-        _Pragma("GCC diagnostic ignored \"-Wtype-limits\"")
-
-#define REENABLE_WARNING                                                \
-        _Pragma("GCC diagnostic pop")
-
-/* automake test harness */
+/* test harness */
 #define EXIT_TEST_SKIP 77
 
 /* builtins */
@@ -105,6 +50,13 @@
 #else
 #error "neither int nor long are four bytes long?!?"
 #endif
+
+static inline uint64_t u64_multiply_safe(uint64_t a, uint64_t b) {
+        if (_unlikely_(a != 0 && b > (UINT64_MAX / a)))
+                return 0; /* overflow */
+
+        return a * b;
+}
 
 /* align to next higher power-of-2 (except for: 0 => 0, overflow => 0) */
 static inline unsigned long ALIGN_POWER2(unsigned long u) {
@@ -194,12 +146,12 @@ static inline int __coverity_check_and_return__(int condition) {
 #define assert_message_se(expr, message)                                \
         do {                                                            \
                 if (_unlikely_(!(expr)))                                \
-                        log_assert_failed(message, PROJECT_FILE, __LINE__, __PRETTY_FUNCTION__); \
+                        log_assert_failed(message, PROJECT_FILE, __LINE__, __func__); \
         } while (false)
 
 #define assert_log(expr, message) ((_likely_(expr))                     \
         ? (true)                                                        \
-        : (log_assert_failed_return(message, PROJECT_FILE, __LINE__, __PRETTY_FUNCTION__), false))
+        : (log_assert_failed_return(message, PROJECT_FILE, __LINE__, __func__), false))
 
 #endif  /* __COVERITY__ */
 
@@ -214,7 +166,7 @@ static inline int __coverity_check_and_return__(int condition) {
 #endif
 
 #define assert_not_reached()                                            \
-        log_assert_failed_unreachable(PROJECT_FILE, __LINE__, __PRETTY_FUNCTION__)
+        log_assert_failed_unreachable(PROJECT_FILE, __LINE__, __func__)
 
 #define assert_return(expr, r)                                          \
         do {                                                            \
@@ -259,14 +211,9 @@ static inline int __coverity_check_and_return__(int condition) {
 #define PTR_TO_UINT64(p) ((uint64_t) ((uintptr_t) (p)))
 #define UINT64_TO_PTR(u) ((void *) ((uintptr_t) (u)))
 
-#define PTR_TO_SIZE(p) ((size_t) ((uintptr_t) (p)))
-#define SIZE_TO_PTR(u) ((void *) ((uintptr_t) (u)))
-
 #define CHAR_TO_STR(x) ((char[2]) { x, 0 })
 
 #define char_array_0(x) x[sizeof(x)-1] = 0;
-
-#define sizeof_field(struct_type, member) sizeof(((struct_type *) 0)->member)
 
 /* Maximum buffer size needed for formatting an unsigned integer type as hex, including space for '0x'
  * prefix and trailing NUL suffix. */
@@ -312,33 +259,6 @@ static inline int __coverity_check_and_return__(int condition) {
 
 /* Pointers range from NULL to POINTER_MAX */
 #define POINTER_MAX ((void*) UINTPTR_MAX)
-
-/* Iterates through a specified list of pointers. Accepts NULL pointers, but uses POINTER_MAX as internal marker for EOL. */
-#define FOREACH_POINTER(p, x, ...)                                                       \
-        for (typeof(p) *_l = (typeof(p)[]) { ({ p = x; }), ##__VA_ARGS__, POINTER_MAX }; \
-             p != (typeof(p)) POINTER_MAX;                                               \
-             p = *(++_l))
-
-#define DEFINE_TRIVIAL_DESTRUCTOR(name, type, func)             \
-        static inline void name(type *p) {                      \
-                func(p);                                        \
-        }
-
-/* When func() returns the void value (NULL, -1, …) of the appropriate type */
-#define DEFINE_TRIVIAL_CLEANUP_FUNC(type, func)                 \
-        static inline void func##p(type *p) {                   \
-                if (*p)                                         \
-                        *p = func(*p);                          \
-        }
-
-/* When func() doesn't return the appropriate type, set variable to empty afterwards */
-#define DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(type, func, empty)     \
-        static inline void func##p(type *p) {                   \
-                if (*p != (empty)) {                            \
-                        func(*p);                               \
-                        *p = (empty);                           \
-                }                                               \
-        }
 
 #define _DEFINE_TRIVIAL_REF_FUNC(type, name, scope)             \
         scope type *name##_ref(type *p) {                       \
@@ -423,7 +343,7 @@ typedef struct {
 
 assert_cc(sizeof(dummy_t) == 0);
 
-/* A little helper for subtracting 1 off a pointer in a safe UB-free way. This is intended to be used for for
+/* A little helper for subtracting 1 off a pointer in a safe UB-free way. This is intended to be used for
  * loops that count down from a high pointer until some base. A naive loop would implement this like this:
  *
  * for (p = end-1; p >= base; p--) …
@@ -438,5 +358,14 @@ assert_cc(sizeof(dummy_t) == 0);
                 typeof(p) _q = (p);                      \
                 _q && _q > (base) ? &_q[-1] : NULL;      \
         })
+
+/* Iterate through each argument passed. All must be the same type as 'entry' or must be implicitly
+ * convertible. The iteration variable 'entry' must already be defined. */
+#define FOREACH_ARGUMENT(entry, ...)                                     \
+        _FOREACH_ARGUMENT(entry, UNIQ_T(_entries_, UNIQ), UNIQ_T(_current_, UNIQ), UNIQ_T(_va_sentinel_, UNIQ), ##__VA_ARGS__)
+#define _FOREACH_ARGUMENT(entry, _entries_, _current_, _va_sentinel_, ...)      \
+        for (typeof(entry) _va_sentinel_[1] = {}, _entries_[] = { __VA_ARGS__ __VA_OPT__(,) _va_sentinel_[0] }, *_current_ = _entries_; \
+             ((long)(_current_ - _entries_) < (long)(ELEMENTSOF(_entries_) - 1)) && ({ entry = *_current_; true; }); \
+             _current_++)
 
 #include "log.h"

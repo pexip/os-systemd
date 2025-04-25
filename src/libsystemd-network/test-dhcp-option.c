@@ -7,10 +7,12 @@
 #include <string.h>
 
 #include "alloc-util.h"
-#include "dhcp-internal.h"
-#include "dhcp-protocol.h"
+#include "dhcp-option.h"
+#include "dhcp-packet.h"
+#include "ether-addr-util.h"
 #include "macro.h"
 #include "memory-util.h"
+#include "tests.h"
 
 struct option_desc {
         uint8_t sname[64];
@@ -361,18 +363,19 @@ static void test_option_set(void) {
 }
 
 int main(int argc, char *argv[]) {
+        test_setup_logging(LOG_DEBUG);
+
         test_invalid_buffer_length();
         test_message_init();
 
         test_options(NULL);
 
-        for (unsigned i = 0; i < ELEMENTSOF(option_tests); i++)
-                test_options(&option_tests[i]);
+        FOREACH_ELEMENT(desc, option_tests)
+                test_options(desc);
 
         test_option_set();
 
-        for (unsigned i = 0; i < ELEMENTSOF(option_tests); i++) {
-                struct option_desc *desc = &option_tests[i];
+        FOREACH_ELEMENT(desc, option_tests) {
                 if (!desc->success || desc->snamelen > 0 || desc->filelen > 0)
                         continue;
                 test_option_removal(desc);

@@ -9,6 +9,7 @@
 #include "string-util.h"
 
 int systemd_installation_has_version(const char *root, const char *minimal_version) {
+        bool found = false;
         int r;
 
         /* Try to guess if systemd installation is later than the specified version. This
@@ -47,10 +48,14 @@ int systemd_installation_has_version(const char *root, const char *minimal_versi
                 *c = '\0'; /* truncate the glob part */
 
                 STRV_FOREACH(name, names) {
+                        _cleanup_free_ char *bn = NULL;
                         /* This is most likely to run only once, hence let's not optimize anything. */
                         char *t, *t2;
 
-                        t = startswith(basename(*name), "libsystemd-shared-");
+                        if (path_extract_filename(*name, &bn) < 0)
+                                continue;
+
+                        t = startswith(bn, "libsystemd-shared-");
                         if (!t)
                                 continue;
 
@@ -58,6 +63,8 @@ int systemd_installation_has_version(const char *root, const char *minimal_versi
                         if (!t2)
                                 continue;
                         *t2 = '\0';
+
+                        found = true;
 
                         r = strverscmp_improved(t, minimal_version);
                         log_debug("Found libsystemd shared at \"%s.so\", version %s (%s).",
@@ -68,5 +75,5 @@ int systemd_installation_has_version(const char *root, const char *minimal_versi
                 }
         }
 
-        return false;
+        return !found ? -ENOENT : false;
 }

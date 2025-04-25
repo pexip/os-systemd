@@ -13,7 +13,6 @@
 #include "parse-util.h"
 #include "socket-util.h"
 #include "string-util.h"
-#include "util.h"
 
 int expose_port_parse(ExposePort **l, const char *s) {
         const char *split, *e;
@@ -74,12 +73,7 @@ int expose_port_parse(ExposePort **l, const char *s) {
 }
 
 void expose_port_free_all(ExposePort *p) {
-
-        while (p) {
-                ExposePort *q = p;
-                LIST_REMOVE(ports, p, q);
-                free(q);
-        }
+        LIST_CLEAR(ports, p, free);
 }
 
 int expose_port_flush(FirewallContext **fw_ctx, ExposePort* l, int af, union in_addr_union *exposed) {
@@ -161,7 +155,7 @@ int expose_port_execute(sd_netlink *rtnl, FirewallContext **fw_ctx, ExposePort *
 }
 
 int expose_port_send_rtnl(int send_fd) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         int r;
 
         assert(send_fd >= 0);

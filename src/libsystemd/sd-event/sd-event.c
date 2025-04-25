@@ -1,12 +1,16 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/epoll.h>
+#if HAVE_PIDFD_OPEN
+#include <sys/pidfd.h>
+#endif
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 #include "sd-id128.h"
+#include "sd-messages.h"
 
 #include "alloc-util.h"
 #include "env-util.h"
@@ -15,15 +19,24 @@
 #include "fs-util.h"
 #include "glyph-util.h"
 #include "hashmap.h"
+#include "hexdecoct.h"
 #include "list.h"
+#include "logarithm.h"
 #include "macro.h"
+#include "mallinfo-util.h"
 #include "memory-util.h"
+#include "missing_magic.h"
 #include "missing_syscall.h"
 #include "missing_threads.h"
+#include "origin-id.h"
+#include "path-util.h"
 #include "prioq.h"
 #include "process-util.h"
+#include "psi-util.h"
 #include "set.h"
 #include "signal-util.h"
+#include "socket-util.h"
+#include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
 #include "strxcpyx.h"
@@ -52,7 +65,7 @@ static bool event_source_is_offline(sd_event_source *s) {
 static const char* const event_source_type_table[_SOURCE_EVENT_SOURCE_TYPE_MAX] = {
         [SOURCE_IO]                  = "io",
         [SOURCE_TIME_REALTIME]       = "realtime",
-        [SOURCE_TIME_BOOTTIME]       = "bootime",
+        [SOURCE_TIME_BOOTTIME]       = "boottime",
         [SOURCE_TIME_MONOTONIC]      = "monotonic",
         [SOURCE_TIME_REALTIME_ALARM] = "realtime-alarm",
         [SOURCE_TIME_BOOTTIME_ALARM] = "boottime-alarm",
@@ -63,6 +76,7 @@ static const char* const event_source_type_table[_SOURCE_EVENT_SOURCE_TYPE_MAX] 
         [SOURCE_EXIT]                = "exit",
         [SOURCE_WATCHDOG]            = "watchdog",
         [SOURCE_INOTIFY]             = "inotify",
+        [SOURCE_MEMORY_PRESSURE]     = "memory-pressure",
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(event_source_type, int);
@@ -85,7 +99,8 @@ DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(event_source_type, int);
                SOURCE_TIME_BOOTTIME_ALARM,      \
                SOURCE_SIGNAL,                   \
                SOURCE_DEFER,                    \
-               SOURCE_INOTIFY)
+               SOURCE_INOTIFY,                  \
+               SOURCE_MEMORY_PRESSURE)
 
 /* This is used to assert that we didn't pass an unexpected source type to event_source_time_prioq_put().
  * Time sources and ratelimited sources can be passed, so effectively this is the same as the
@@ -130,7 +145,10 @@ struct sd_event {
         /* A list of inotify objects that already have events buffered which aren't processed yet */
         LIST_HEAD(struct inotify_data, buffered_inotify_data_list);
 
-        pid_t original_pid;
+        /* A list of memory pressure event sources that still need their subscription string written */
+        LIST_HEAD(sd_event_source, memory_pressure_write_list);
+
+        uint64_t origin_id;
 
         uint64_t iteration;
         triple_timestamp timestamp;
@@ -160,12 +178,14 @@ struct sd_event {
         unsigned delays[sizeof(usec_t) * 8];
 };
 
+DEFINE_PRIVATE_ORIGIN_ID_HELPERS(sd_event, event);
+
 static thread_local sd_event *default_event = NULL;
 
 static void source_disconnect(sd_event_source *s);
 static void event_gc_inode_data(sd_event *e, struct inode_data *d);
 
-static sd_event *event_resolve(sd_event *e) {
+static sd_event* event_resolve(sd_event *e) {
         return e == SD_EVENT_DEFAULT ? default_event : e;
 }
 
@@ -321,7 +341,7 @@ static void free_clock_data(struct clock_data *d) {
         prioq_free(d->latest);
 }
 
-static sd_event *event_free(sd_event *e) {
+static sd_event* event_free(sd_event *e) {
         sd_event_source *s;
 
         assert(e);
@@ -378,25 +398,25 @@ _public_ int sd_event_new(sd_event** ret) {
 
         *e = (sd_event) {
                 .n_ref = 1,
-                .epoll_fd = -1,
-                .watchdog_fd = -1,
+                .epoll_fd = -EBADF,
+                .watchdog_fd = -EBADF,
                 .realtime.wakeup = WAKEUP_CLOCK_DATA,
-                .realtime.fd = -1,
+                .realtime.fd = -EBADF,
                 .realtime.next = USEC_INFINITY,
                 .boottime.wakeup = WAKEUP_CLOCK_DATA,
-                .boottime.fd = -1,
+                .boottime.fd = -EBADF,
                 .boottime.next = USEC_INFINITY,
                 .monotonic.wakeup = WAKEUP_CLOCK_DATA,
-                .monotonic.fd = -1,
+                .monotonic.fd = -EBADF,
                 .monotonic.next = USEC_INFINITY,
                 .realtime_alarm.wakeup = WAKEUP_CLOCK_DATA,
-                .realtime_alarm.fd = -1,
+                .realtime_alarm.fd = -EBADF,
                 .realtime_alarm.next = USEC_INFINITY,
                 .boottime_alarm.wakeup = WAKEUP_CLOCK_DATA,
-                .boottime_alarm.fd = -1,
+                .boottime_alarm.fd = -EBADF,
                 .boottime_alarm.next = USEC_INFINITY,
                 .perturb = USEC_INFINITY,
-                .original_pid = getpid_cached(),
+                .origin_id = origin_id_query(),
         };
 
         r = prioq_ensure_allocated(&e->pending, pending_prioq_compare);
@@ -425,30 +445,50 @@ fail:
         return r;
 }
 
-DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(sd_event, sd_event, event_free);
+/* Define manually so we can add the origin check */
+_public_ sd_event* sd_event_ref(sd_event *e) {
+        if (!e)
+                return NULL;
+        if (event_origin_changed(e))
+                return NULL;
+
+        e->n_ref++;
+
+        return e;
+}
+
+_public_ sd_event* sd_event_unref(sd_event *e) {
+        if (!e)
+                return NULL;
+        if (event_origin_changed(e))
+                return NULL;
+
+        assert(e->n_ref > 0);
+        if (--e->n_ref > 0)
+                return NULL;
+
+        return event_free(e);
+}
+
 #define PROTECT_EVENT(e)                                                \
         _unused_ _cleanup_(sd_event_unrefp) sd_event *_ref = sd_event_ref(e);
 
 _public_ sd_event_source* sd_event_source_disable_unref(sd_event_source *s) {
-        if (s)
-                (void) sd_event_source_set_enabled(s, SD_EVENT_OFF);
+        int r;
+
+        r = sd_event_source_set_enabled(s, SD_EVENT_OFF);
+        if (r < 0)
+                log_debug_errno(r, "Failed to disable event source %p (%s): %m",
+                                s, strna(s->description));
+
         return sd_event_source_unref(s);
-}
-
-static bool event_pid_changed(sd_event *e) {
-        assert(e);
-
-        /* We don't support people creating an event loop and keeping
-         * it around over a fork(). Let's complain. */
-
-        return e->original_pid != getpid_cached();
 }
 
 static void source_io_unregister(sd_event_source *s) {
         assert(s);
         assert(s->type == SOURCE_IO);
 
-        if (event_pid_changed(s->event))
+        if (event_origin_changed(s->event))
                 return;
 
         if (!s->io.registered)
@@ -489,7 +529,7 @@ static void source_child_pidfd_unregister(sd_event_source *s) {
         assert(s);
         assert(s->type == SOURCE_CHILD);
 
-        if (event_pid_changed(s->event))
+        if (event_origin_changed(s->event))
                 return;
 
         if (!s->child.registered)
@@ -522,6 +562,65 @@ static int source_child_pidfd_register(sd_event_source *s, int enabled) {
 
         s->child.registered = true;
         return 0;
+}
+
+static void source_memory_pressure_unregister(sd_event_source *s) {
+        assert(s);
+        assert(s->type == SOURCE_MEMORY_PRESSURE);
+
+        if (event_origin_changed(s->event))
+                return;
+
+        if (!s->memory_pressure.registered)
+                return;
+
+        if (epoll_ctl(s->event->epoll_fd, EPOLL_CTL_DEL, s->memory_pressure.fd, NULL) < 0)
+                log_debug_errno(errno, "Failed to remove source %s (type %s) from epoll, ignoring: %m",
+                                strna(s->description), event_source_type_to_string(s->type));
+
+        s->memory_pressure.registered = false;
+}
+
+static int source_memory_pressure_register(sd_event_source *s, int enabled) {
+        assert(s);
+        assert(s->type == SOURCE_MEMORY_PRESSURE);
+        assert(enabled != SD_EVENT_OFF);
+
+        struct epoll_event ev = {
+                .events = s->memory_pressure.write_buffer_size > 0 ? EPOLLOUT :
+                          (s->memory_pressure.events | (enabled == SD_EVENT_ONESHOT ? EPOLLONESHOT : 0)),
+                .data.ptr = s,
+        };
+
+        if (epoll_ctl(s->event->epoll_fd,
+                      s->memory_pressure.registered ? EPOLL_CTL_MOD : EPOLL_CTL_ADD,
+                      s->memory_pressure.fd, &ev) < 0)
+                return -errno;
+
+        s->memory_pressure.registered = true;
+        return 0;
+}
+
+static void source_memory_pressure_add_to_write_list(sd_event_source *s) {
+        assert(s);
+        assert(s->type == SOURCE_MEMORY_PRESSURE);
+
+        if (s->memory_pressure.in_write_list)
+                return;
+
+        LIST_PREPEND(memory_pressure.write_list, s->event->memory_pressure_write_list, s);
+        s->memory_pressure.in_write_list = true;
+}
+
+static void source_memory_pressure_remove_from_write_list(sd_event_source *s) {
+        assert(s);
+        assert(s->type == SOURCE_MEMORY_PRESSURE);
+
+        if (!s->memory_pressure.in_write_list)
+                return;
+
+        LIST_REMOVE(memory_pressure.write_list, s->event->memory_pressure_write_list, s);
+        s->memory_pressure.in_write_list = false;
 }
 
 static clockid_t event_source_type_to_clock(EventSourceType t) {
@@ -621,7 +720,7 @@ static int event_make_signal_data(
 
         assert(e);
 
-        if (event_pid_changed(e))
+        if (event_origin_changed(e))
                 return -ECHILD;
 
         if (e->signal_sources && e->signal_sources[sig])
@@ -643,7 +742,7 @@ static int event_make_signal_data(
 
                 *d = (struct signal_data) {
                         .wakeup = WAKEUP_SIGNAL_DATA,
-                        .fd = -1,
+                        .fd = -EBADF,
                         .priority = priority,
                 };
 
@@ -718,7 +817,7 @@ static void event_unmask_signal_data(sd_event *e, struct signal_data *d, int sig
                 return;
         }
 
-        if (event_pid_changed(e))
+        if (event_origin_changed(e))
                 return;
 
         assert(d->fd >= 0);
@@ -881,7 +980,7 @@ static void source_disconnect(sd_event_source *s) {
                 break;
 
         case SOURCE_CHILD:
-                if (event_pid_changed(s->event))
+                if (event_origin_changed(s->event))
                         s->child.process_owned = false;
 
                 if (s->child.pid > 0) {
@@ -946,6 +1045,11 @@ static void source_disconnect(sd_event_source *s) {
 
                 break;
         }
+
+        case SOURCE_MEMORY_PRESSURE:
+                source_memory_pressure_remove_from_write_list(s);
+                source_memory_pressure_unregister(s);
+                break;
 
         default:
                 assert_not_reached();
@@ -1017,6 +1121,11 @@ static sd_event_source* source_free(sd_event_source *s) {
                         s->child.pidfd = safe_close(s->child.pidfd);
         }
 
+        if (s->type == SOURCE_MEMORY_PRESSURE) {
+                s->memory_pressure.fd = safe_close(s->memory_pressure.fd);
+                s->memory_pressure.write_buffer = mfree(s->memory_pressure.write_buffer);
+        }
+
         if (s->destroy_callback)
                 s->destroy_callback(s->userdata);
 
@@ -1064,33 +1173,59 @@ static int source_set_pending(sd_event_source *s, bool b) {
                 assert(s->inotify.inode_data->inotify_data);
 
                 if (b)
-                        s->inotify.inode_data->inotify_data->n_pending ++;
+                        s->inotify.inode_data->inotify_data->n_pending++;
                 else {
                         assert(s->inotify.inode_data->inotify_data->n_pending > 0);
-                        s->inotify.inode_data->inotify_data->n_pending --;
+                        s->inotify.inode_data->inotify_data->n_pending--;
                 }
         }
 
         return 1;
 }
 
-static sd_event_source *source_new(sd_event *e, bool floating, EventSourceType type) {
+static sd_event_source* source_new(sd_event *e, bool floating, EventSourceType type) {
+
+        /* Let's allocate exactly what we need. Note that the difference of the smallest event source
+         * structure to the largest is 144 bytes on x86-64 at the time of writing, i.e. more than two cache
+         * lines. */
+        static const size_t size_table[_SOURCE_EVENT_SOURCE_TYPE_MAX] = {
+                [SOURCE_IO]                  = endoffsetof_field(sd_event_source, io),
+                [SOURCE_TIME_REALTIME]       = endoffsetof_field(sd_event_source, time),
+                [SOURCE_TIME_BOOTTIME]       = endoffsetof_field(sd_event_source, time),
+                [SOURCE_TIME_MONOTONIC]      = endoffsetof_field(sd_event_source, time),
+                [SOURCE_TIME_REALTIME_ALARM] = endoffsetof_field(sd_event_source, time),
+                [SOURCE_TIME_BOOTTIME_ALARM] = endoffsetof_field(sd_event_source, time),
+                [SOURCE_SIGNAL]              = endoffsetof_field(sd_event_source, signal),
+                [SOURCE_CHILD]               = endoffsetof_field(sd_event_source, child),
+                [SOURCE_DEFER]               = endoffsetof_field(sd_event_source, defer),
+                [SOURCE_POST]                = endoffsetof_field(sd_event_source, post),
+                [SOURCE_EXIT]                = endoffsetof_field(sd_event_source, exit),
+                [SOURCE_INOTIFY]             = endoffsetof_field(sd_event_source, inotify),
+                [SOURCE_MEMORY_PRESSURE]     = endoffsetof_field(sd_event_source, memory_pressure),
+        };
+
         sd_event_source *s;
 
         assert(e);
+        assert(type >= 0);
+        assert(type < _SOURCE_EVENT_SOURCE_TYPE_MAX);
+        assert(size_table[type] > 0);
 
-        s = new(sd_event_source, 1);
+        s = malloc0(size_table[type]);
         if (!s)
                 return NULL;
+        /* We use expand_to_usable() here to tell gcc that it should consider this an object of the full
+         * size, even if we only allocate the initial part we need. */
+        s = expand_to_usable(s, sizeof(sd_event_source));
 
-        *s = (struct sd_event_source) {
-                .n_ref = 1,
-                .event = e,
-                .floating = floating,
-                .type = type,
-                .pending_index = PRIOQ_IDX_NULL,
-                .prepare_index = PRIOQ_IDX_NULL,
-        };
+        /* Note: we cannot use compound initialization here, because sizeof(sd_event_source) is likely larger
+         * than what we allocated here. */
+        s->n_ref = 1;
+        s->event = e;
+        s->floating = floating;
+        s->type = type;
+        s->pending_index = PRIOQ_IDX_NULL;
+        s->prepare_index = PRIOQ_IDX_NULL;
 
         if (!floating)
                 sd_event_ref(e);
@@ -1123,7 +1258,7 @@ _public_ int sd_event_add_io(
         assert_return(fd >= 0, -EBADF);
         assert_return(!(events & ~(EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLPRI|EPOLLERR|EPOLLHUP|EPOLLET)), -EINVAL);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!callback)
                 callback = io_exit_callback;
@@ -1179,7 +1314,7 @@ static int event_setup_timer_fd(
         if (_likely_(d->fd >= 0))
                 return 0;
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         fd = timerfd_create(clock, TFD_NONBLOCK|TFD_CLOEXEC);
         if (fd < 0)
@@ -1270,7 +1405,7 @@ _public_ int sd_event_add_time(
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(accuracy != UINT64_MAX, -EINVAL);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!clock_supported(clock)) /* Checks whether the kernel supports the clock */
                 return -EOPNOTSUPP;
@@ -1357,7 +1492,7 @@ _public_ int sd_event_add_signal(
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         /* Let's make sure our special flag stays outside of the valid signal range */
         assert_cc(_NSIG < SD_EVENT_SIGNAL_PROCMASK);
@@ -1447,7 +1582,7 @@ static int child_exit_callback(sd_event_source *s, const siginfo_t *si, void *us
 
 static bool shall_use_pidfd(void) {
         /* Mostly relevant for debugging, i.e. this is used in test-event.c to test the event loop once with and once without pidfd */
-        return getenv_bool_secure("SYSTEMD_PIDFD") != 0;
+        return secure_getenv_bool("SYSTEMD_PIDFD") != 0;
 }
 
 _public_ int sd_event_add_child(
@@ -1467,7 +1602,7 @@ _public_ int sd_event_add_child(
         assert_return(!(options & ~(WEXITED|WSTOPPED|WCONTINUED)), -EINVAL);
         assert_return(options != 0, -EINVAL);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!callback)
                 callback = child_exit_callback;
@@ -1515,7 +1650,7 @@ _public_ int sd_event_add_child(
                 } else
                         s->child.pidfd_owned = true; /* If we allocate the pidfd we own it by default */
         } else
-                s->child.pidfd = -1;
+                s->child.pidfd = -EBADF;
 
         if (EVENT_SOURCE_WATCH_PIDFD(s)) {
                 /* We have a pidfd and we only want to watch for exit */
@@ -1554,7 +1689,6 @@ _public_ int sd_event_add_child_pidfd(
                 sd_event_child_handler_t callback,
                 void *userdata) {
 
-
         _cleanup_(source_freep) sd_event_source *s = NULL;
         pid_t pid;
         int r;
@@ -1565,7 +1699,7 @@ _public_ int sd_event_add_child_pidfd(
         assert_return(!(options & ~(WEXITED|WSTOPPED|WCONTINUED)), -EINVAL);
         assert_return(options != 0, -EINVAL);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!callback)
                 callback = child_exit_callback;
@@ -1646,7 +1780,7 @@ _public_ int sd_event_add_defer(
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!callback)
                 callback = generic_exit_callback;
@@ -1682,7 +1816,7 @@ _public_ int sd_event_add_post(
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!callback)
                 callback = generic_exit_callback;
@@ -1720,7 +1854,7 @@ _public_ int sd_event_add_exit(
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(callback, -EINVAL);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         r = prioq_ensure_allocated(&e->exit, exit_prioq_compare);
         if (r < 0)
@@ -1738,6 +1872,260 @@ _public_ int sd_event_add_exit(
         r = prioq_put(s->event->exit, s, &s->exit.prioq_index);
         if (r < 0)
                 return r;
+
+        if (ret)
+                *ret = s;
+        TAKE_PTR(s);
+
+        return 0;
+}
+
+_public_ int sd_event_trim_memory(void) {
+        int r;
+
+        /* A default implementation of a memory pressure callback. Simply releases our own allocation caches
+         * and glibc's. This is automatically used when people call sd_event_add_memory_pressure() with a
+         * NULL callback parameter. */
+
+        log_debug("Memory pressure event, trimming malloc() memory.");
+
+#if HAVE_GENERIC_MALLINFO
+        generic_mallinfo before_mallinfo = generic_mallinfo_get();
+#endif
+
+        usec_t before_timestamp = now(CLOCK_MONOTONIC);
+        hashmap_trim_pools();
+        r = malloc_trim(0);
+        usec_t after_timestamp = now(CLOCK_MONOTONIC);
+
+        if (r > 0)
+                log_debug("Successfully trimmed some memory.");
+        else
+                log_debug("Couldn't trim any memory.");
+
+        usec_t period = after_timestamp - before_timestamp;
+
+#if HAVE_GENERIC_MALLINFO
+        generic_mallinfo after_mallinfo = generic_mallinfo_get();
+        size_t l = LESS_BY((size_t) before_mallinfo.hblkhd, (size_t) after_mallinfo.hblkhd) +
+                LESS_BY((size_t) before_mallinfo.arena, (size_t) after_mallinfo.arena);
+        log_struct(LOG_DEBUG,
+                   LOG_MESSAGE("Memory trimming took %s, returned %s to OS.",
+                               FORMAT_TIMESPAN(period, 0),
+                               FORMAT_BYTES(l)),
+                   "MESSAGE_ID=" SD_MESSAGE_MEMORY_TRIM_STR,
+                   "TRIMMED_BYTES=%zu", l,
+                   "TRIMMED_USEC=" USEC_FMT, period);
+#else
+        log_struct(LOG_DEBUG,
+                   LOG_MESSAGE("Memory trimming took %s.",
+                               FORMAT_TIMESPAN(period, 0)),
+                   "MESSAGE_ID=" SD_MESSAGE_MEMORY_TRIM_STR,
+                   "TRIMMED_USEC=" USEC_FMT, period);
+#endif
+
+        return 0;
+}
+
+static int memory_pressure_callback(sd_event_source *s, void *userdata) {
+        assert(s);
+
+        sd_event_trim_memory();
+        return 0;
+}
+
+_public_ int sd_event_add_memory_pressure(
+                sd_event *e,
+                sd_event_source **ret,
+                sd_event_handler_t callback,
+                void *userdata) {
+
+        _cleanup_free_ char *w = NULL;
+        _cleanup_(source_freep) sd_event_source *s = NULL;
+        _cleanup_close_ int path_fd = -EBADF, fd = -EBADF;
+        _cleanup_free_ void *write_buffer = NULL;
+        const char *watch, *watch_fallback = NULL, *env;
+        size_t write_buffer_size = 0;
+        struct stat st;
+        uint32_t events;
+        bool locked;
+        int r;
+
+        assert_return(e, -EINVAL);
+        assert_return(e = event_resolve(e), -ENOPKG);
+        assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
+        assert_return(!event_origin_changed(e), -ECHILD);
+
+        if (!callback)
+                callback = memory_pressure_callback;
+
+        s = source_new(e, !ret, SOURCE_MEMORY_PRESSURE);
+        if (!s)
+                return -ENOMEM;
+
+        s->wakeup = WAKEUP_EVENT_SOURCE;
+        s->memory_pressure.callback = callback;
+        s->userdata = userdata;
+        s->enabled = SD_EVENT_ON;
+        s->memory_pressure.fd = -EBADF;
+
+        env = secure_getenv("MEMORY_PRESSURE_WATCH");
+        if (env) {
+                if (isempty(env) || path_equal(env, "/dev/null"))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EHOSTDOWN),
+                                               "Memory pressure logic is explicitly disabled via $MEMORY_PRESSURE_WATCH.");
+
+                if (!path_is_absolute(env) || !path_is_normalized(env))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                               "$MEMORY_PRESSURE_WATCH set to invalid path: %s", env);
+
+                watch = env;
+
+                env = secure_getenv("MEMORY_PRESSURE_WRITE");
+                if (env) {
+                        r = unbase64mem(env, &write_buffer, &write_buffer_size);
+                        if (r < 0)
+                                return r;
+                }
+
+                locked = true;
+        } else {
+
+                r = is_pressure_supported();
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return -EOPNOTSUPP;
+
+                /* By default we want to watch memory pressure on the local cgroup, but we'll fall back on
+                 * the system wide pressure if for some reason we cannot (which could be: memory controller
+                 * not delegated to us, or PSI simply not available in the kernel). On legacy cgroupv1 we'll
+                 * only use the system-wide logic. */
+                r = cg_all_unified();
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        watch = "/proc/pressure/memory";
+                else {
+                        _cleanup_free_ char *cg = NULL;
+
+                        r = cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, 0, &cg);
+                        if (r < 0)
+                                return r;
+
+                        w = path_join("/sys/fs/cgroup", cg, "memory.pressure");
+                        if (!w)
+                                return -ENOMEM;
+
+                        watch = w;
+                        watch_fallback = "/proc/pressure/memory";
+                }
+
+                /* Android uses three levels in its userspace low memory killer logic:
+                 *     some  70000 1000000
+                 *     some 100000 1000000
+                 *     full  70000 1000000
+                 *
+                 * GNOME's low memory monitor uses:
+                 *     some  70000 1000000
+                 *     some 100000 1000000
+                 *     full 100000 1000000
+                 *
+                 * We'll default to the middle level that both agree on. Except we do it on a 2s window
+                 * (i.e. 200ms per 2s, rather than 100ms per 1s), because that's the window duration the
+                 * kernel will allow us to do unprivileged, also in the future. */
+                if (asprintf((char**) &write_buffer,
+                             "%s " USEC_FMT " " USEC_FMT,
+                             MEMORY_PRESSURE_DEFAULT_TYPE,
+                             MEMORY_PRESSURE_DEFAULT_THRESHOLD_USEC,
+                             MEMORY_PRESSURE_DEFAULT_WINDOW_USEC) < 0)
+                        return -ENOMEM;
+
+                write_buffer_size = strlen(write_buffer) + 1;
+                locked = false;
+        }
+
+        path_fd = open(watch, O_PATH|O_CLOEXEC);
+        if (path_fd < 0) {
+                if (errno != ENOENT)
+                        return -errno;
+
+                /* We got ENOENT. Three options now: try the fallback if we have one, or return the error as
+                 * is (if based on user/env config), or return -EOPNOTSUPP (because we picked the path, and
+                 * the PSI service apparently is not supported) */
+                if (!watch_fallback)
+                        return locked ? -ENOENT : -EOPNOTSUPP;
+
+                path_fd = open(watch_fallback, O_PATH|O_CLOEXEC);
+                if (path_fd < 0) {
+                        if (errno == ENOENT) /* PSI is not available in the kernel even under the fallback path? */
+                                return -EOPNOTSUPP;
+                        return -errno;
+                }
+        }
+
+        if (fstat(path_fd, &st) < 0)
+                return -errno;
+
+        if (S_ISSOCK(st.st_mode)) {
+                fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+                if (fd < 0)
+                        return -errno;
+
+                r = connect_unix_path(fd, path_fd, NULL);
+                if (r < 0)
+                        return r;
+
+                events = EPOLLIN;
+
+        } else if (S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISCHR(st.st_mode)) {
+                fd = fd_reopen(path_fd, (write_buffer_size > 0 ? O_RDWR : O_RDONLY) |O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+                if (fd < 0)
+                        return fd;
+
+                if (S_ISREG(st.st_mode)) {
+                        struct statfs sfs;
+
+                        /* If this is a regular file validate this is a procfs or cgroupfs file, where we look for EPOLLPRI */
+
+                        if (fstatfs(fd, &sfs) < 0)
+                                return -errno;
+
+                        if (!is_fs_type(&sfs, PROC_SUPER_MAGIC) &&
+                            !is_fs_type(&sfs, CGROUP2_SUPER_MAGIC))
+                                return -ENOTTY;
+
+                        events = EPOLLPRI;
+                } else
+                        /* For fifos and char devices just watch for EPOLLIN */
+                        events = EPOLLIN;
+
+        } else if (S_ISDIR(st.st_mode))
+                return -EISDIR;
+        else
+                return -EBADF;
+
+        s->memory_pressure.fd = TAKE_FD(fd);
+        s->memory_pressure.write_buffer = TAKE_PTR(write_buffer);
+        s->memory_pressure.write_buffer_size = write_buffer_size;
+        s->memory_pressure.events = events;
+        s->memory_pressure.locked = locked;
+
+        /* So here's the thing: if we are talking to PSI we need to write the watch string before adding the
+         * fd to epoll (if we ignore this, then the watch won't work). Hence we'll not actually register the
+         * fd with the epoll right-away. Instead, we just add the event source to a list of memory pressure
+         * event sources on which writes must be executed before the first event loop iteration is
+         * executed. (We could also write the data here, right away, but we want to give the caller the
+         * freedom to call sd_event_source_set_memory_pressure_type() and
+         * sd_event_source_set_memory_pressure_rate() before we write it. */
+
+        if (s->memory_pressure.write_buffer_size > 0)
+                source_memory_pressure_add_to_write_list(s);
+        else {
+                r = source_memory_pressure_register(s, s->enabled);
+                if (r < 0)
+                        return r;
+        }
 
         if (ret)
                 *ret = s;
@@ -1764,7 +2152,7 @@ static void event_free_inotify_data(sd_event *e, struct inotify_data *d) {
         assert_se(hashmap_remove(e->inotify_data, &d->priority) == d);
 
         if (d->fd >= 0) {
-                if (!event_pid_changed(e) &&
+                if (!event_origin_changed(e) &&
                     epoll_ctl(e->epoll_fd, EPOLL_CTL_DEL, d->fd, NULL) < 0)
                         log_debug_errno(errno, "Failed to remove inotify fd from epoll, ignoring: %m");
 
@@ -1778,7 +2166,7 @@ static int event_make_inotify_data(
                 int64_t priority,
                 struct inotify_data **ret) {
 
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct inotify_data *d;
         int r;
 
@@ -1850,8 +2238,8 @@ static int inode_data_compare(const struct inode_data *x, const struct inode_dat
 static void inode_data_hash_func(const struct inode_data *d, struct siphash *state) {
         assert(d);
 
-        siphash24_compress(&d->dev, sizeof(d->dev), state);
-        siphash24_compress(&d->ino, sizeof(d->ino), state);
+        siphash24_compress_typesafe(d->dev, state);
+        siphash24_compress_typesafe(d->ino, state);
 }
 
 DEFINE_PRIVATE_HASH_OPS(inode_data_hash_ops, struct inode_data, inode_data_hash_func, inode_data_compare);
@@ -1875,7 +2263,7 @@ static void event_free_inode_data(
         if (d->inotify_data) {
 
                 if (d->wd >= 0) {
-                        if (d->inotify_data->fd >= 0 && !event_pid_changed(e)) {
+                        if (d->inotify_data->fd >= 0 && !event_origin_changed(e)) {
                                 /* So here's a problem. At the time this runs the watch descriptor might already be
                                  * invalidated, because an IN_IGNORED event might be queued right the moment we enter
                                  * the syscall. Hence, whenever we get EINVAL, ignore it entirely, since it's a very
@@ -1891,6 +2279,7 @@ static void event_free_inode_data(
                 assert_se(hashmap_remove(d->inotify_data->inodes, d) == d);
         }
 
+        free(d->path);
         free(d);
 }
 
@@ -1975,7 +2364,7 @@ static int event_make_inode_data(
                 .dev = dev,
                 .ino = ino,
                 .wd = -1,
-                .fd = -1,
+                .fd = -EBADF,
                 .inotify_data = inotify_data,
         };
 
@@ -2071,7 +2460,7 @@ static int event_add_inotify_fd_internal(
                 sd_event_inotify_handler_t callback,
                 void *userdata) {
 
-        _cleanup_close_ int donated_fd = donate ? fd : -1;
+        _cleanup_close_ int donated_fd = donate ? fd : -EBADF;
         _cleanup_(source_freep) sd_event_source *s = NULL;
         struct inotify_data *inotify_data = NULL;
         struct inode_data *inode_data = NULL;
@@ -2082,7 +2471,7 @@ static int event_add_inotify_fd_internal(
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(fd >= 0, -EBADF);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!callback)
                 callback = inotify_exit_callback;
@@ -2131,6 +2520,15 @@ static int event_add_inotify_fd_internal(
                 }
 
                 LIST_PREPEND(to_close, e->inode_data_to_close_list, inode_data);
+
+                _cleanup_free_ char *path = NULL;
+                r = fd_get_path(inode_data->fd, &path);
+                if (r < 0 && r != -ENOSYS) { /* The path is optional, hence ignore -ENOSYS. */
+                        event_gc_inode_data(e, inode_data);
+                        return r;
+                }
+
+                free_and_replace(inode_data->path, path);
         }
 
         /* Link our event source to the inode data object */
@@ -2173,9 +2571,9 @@ _public_ int sd_event_add_inotify(
 
         assert_return(path, -EINVAL);
 
-        fd = open(path, O_PATH|O_CLOEXEC|
-                  (mask & IN_ONLYDIR ? O_DIRECTORY : 0)|
-                  (mask & IN_DONT_FOLLOW ? O_NOFOLLOW : 0));
+        fd = open(path, O_PATH | O_CLOEXEC |
+                        (mask & IN_ONLYDIR ? O_DIRECTORY : 0) |
+                        (mask & IN_DONT_FOLLOW ? O_NOFOLLOW : 0));
         if (fd < 0)
                 return -errno;
 
@@ -2215,24 +2613,25 @@ DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(sd_event_source, sd_event_source, event_sou
 
 _public_ int sd_event_source_set_description(sd_event_source *s, const char *description) {
         assert_return(s, -EINVAL);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return free_and_strdup(&s->description, description);
 }
 
-_public_ int sd_event_source_get_description(sd_event_source *s, const char **description) {
+_public_ int sd_event_source_get_description(sd_event_source *s, const char **ret) {
         assert_return(s, -EINVAL);
-        assert_return(description, -EINVAL);
+        assert_return(ret, -EINVAL);
 
         if (!s->description)
                 return -ENXIO;
 
-        *description = s->description;
+        *ret = s->description;
         return 0;
 }
 
-_public_ sd_event *sd_event_source_get_event(sd_event_source *s) {
+_public_ sd_event* sd_event_source_get_event(sd_event_source *s) {
         assert_return(s, NULL);
+        assert_return(!event_origin_changed(s->event), NULL);
 
         return s->event;
 }
@@ -2241,7 +2640,7 @@ _public_ int sd_event_source_get_pending(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type != SOURCE_EXIT, -EDOM);
         assert_return(s->event->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return s->pending;
 }
@@ -2249,7 +2648,7 @@ _public_ int sd_event_source_get_pending(sd_event_source *s) {
 _public_ int sd_event_source_get_io_fd(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_IO, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return s->io.fd;
 }
@@ -2260,7 +2659,7 @@ _public_ int sd_event_source_set_io_fd(sd_event_source *s, int fd) {
         assert_return(s, -EINVAL);
         assert_return(fd >= 0, -EBADF);
         assert_return(s->type == SOURCE_IO, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->io.fd == fd)
                 return 0;
@@ -2292,6 +2691,7 @@ _public_ int sd_event_source_set_io_fd(sd_event_source *s, int fd) {
 _public_ int sd_event_source_get_io_fd_own(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_IO, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return s->io.owned;
 }
@@ -2299,18 +2699,19 @@ _public_ int sd_event_source_get_io_fd_own(sd_event_source *s) {
 _public_ int sd_event_source_set_io_fd_own(sd_event_source *s, int own) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_IO, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         s->io.owned = own;
         return 0;
 }
 
-_public_ int sd_event_source_get_io_events(sd_event_source *s, uint32_t* events) {
+_public_ int sd_event_source_get_io_events(sd_event_source *s, uint32_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(events, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(s->type == SOURCE_IO, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *events = s->io.events;
+        *ret = s->io.events;
         return 0;
 }
 
@@ -2321,7 +2722,7 @@ _public_ int sd_event_source_set_io_events(sd_event_source *s, uint32_t events) 
         assert_return(s->type == SOURCE_IO, -EDOM);
         assert_return(!(events & ~(EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLPRI|EPOLLERR|EPOLLHUP|EPOLLET)), -EINVAL);
         assert_return(s->event->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         /* edge-triggered updates are never skipped, so we can reset edges */
         if (s->io.events == events && !(events & EPOLLET))
@@ -2342,30 +2743,31 @@ _public_ int sd_event_source_set_io_events(sd_event_source *s, uint32_t events) 
         return 0;
 }
 
-_public_ int sd_event_source_get_io_revents(sd_event_source *s, uint32_t* revents) {
+_public_ int sd_event_source_get_io_revents(sd_event_source *s, uint32_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(revents, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(s->type == SOURCE_IO, -EDOM);
         assert_return(s->pending, -ENODATA);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *revents = s->io.revents;
+        *ret = s->io.revents;
         return 0;
 }
 
 _public_ int sd_event_source_get_signal(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_SIGNAL, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return s->signal.sig;
 }
 
-_public_ int sd_event_source_get_priority(sd_event_source *s, int64_t *priority) {
+_public_ int sd_event_source_get_priority(sd_event_source *s, int64_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(ret, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *priority = s->priority;
+        *ret = s->priority;
         return 0;
 }
 
@@ -2377,7 +2779,7 @@ _public_ int sd_event_source_set_priority(sd_event_source *s, int64_t priority) 
 
         assert_return(s, -EINVAL);
         assert_return(s->event->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->priority == priority)
                 return 0;
@@ -2413,6 +2815,13 @@ _public_ int sd_event_source_set_priority(sd_event_source *s, int64_t priority) 
                         }
 
                         LIST_PREPEND(to_close, s->event->inode_data_to_close_list, new_inode_data);
+
+                        _cleanup_free_ char *path = NULL;
+                        r = fd_get_path(new_inode_data->fd, &path);
+                        if (r < 0 && r != -ENOSYS)
+                                goto fail;
+
+                        free_and_replace(new_inode_data->path, path);
                 }
 
                 /* Move the event source to the new inode data structure */
@@ -2477,7 +2886,7 @@ _public_ int sd_event_source_get_enabled(sd_event_source *s, int *ret) {
                 return false;
 
         assert_return(s, -EINVAL);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (ret)
                 *ret = s->enabled;
@@ -2533,6 +2942,10 @@ static int event_source_offline(
 
         case SOURCE_EXIT:
                 prioq_reshuffle(s->event->exit, s, &s->exit.prioq_index);
+                break;
+
+        case SOURCE_MEMORY_PRESSURE:
+                source_memory_pressure_unregister(s);
                 break;
 
         case SOURCE_TIME_REALTIME:
@@ -2622,6 +3035,13 @@ static int event_source_online(
                         s->event->n_online_child_sources++;
                 break;
 
+        case SOURCE_MEMORY_PRESSURE:
+                r = source_memory_pressure_register(s, enabled);
+                if (r < 0)
+                        return r;
+
+                break;
+
         case SOURCE_TIME_REALTIME:
         case SOURCE_TIME_BOOTTIME:
         case SOURCE_TIME_MONOTONIC:
@@ -2660,7 +3080,7 @@ _public_ int sd_event_source_set_enabled(sd_event_source *s, int m) {
                 return 0;
 
         assert_return(s, -EINVAL);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         /* If we are dead anyway, we are fine with turning off sources, but everything else needs to fail. */
         if (s->event->state == SD_EVENT_FINISHED)
@@ -2688,13 +3108,13 @@ _public_ int sd_event_source_set_enabled(sd_event_source *s, int m) {
         return 0;
 }
 
-_public_ int sd_event_source_get_time(sd_event_source *s, uint64_t *usec) {
+_public_ int sd_event_source_get_time(sd_event_source *s, uint64_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(usec, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(EVENT_SOURCE_IS_TIME(s->type), -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *usec = s->time.next;
+        *ret = s->time.next;
         return 0;
 }
 
@@ -2704,7 +3124,7 @@ _public_ int sd_event_source_set_time(sd_event_source *s, uint64_t usec) {
         assert_return(s, -EINVAL);
         assert_return(EVENT_SOURCE_IS_TIME(s->type), -EDOM);
         assert_return(s->event->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         r = source_set_pending(s, false);
         if (r < 0)
@@ -2722,6 +3142,7 @@ _public_ int sd_event_source_set_time_relative(sd_event_source *s, uint64_t usec
 
         assert_return(s, -EINVAL);
         assert_return(EVENT_SOURCE_IS_TIME(s->type), -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (usec == USEC_INFINITY)
                 return sd_event_source_set_time(s, USEC_INFINITY);
@@ -2737,13 +3158,13 @@ _public_ int sd_event_source_set_time_relative(sd_event_source *s, uint64_t usec
         return sd_event_source_set_time(s, usec);
 }
 
-_public_ int sd_event_source_get_time_accuracy(sd_event_source *s, uint64_t *usec) {
+_public_ int sd_event_source_get_time_accuracy(sd_event_source *s, uint64_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(usec, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(EVENT_SOURCE_IS_TIME(s->type), -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *usec = s->time.accuracy;
+        *ret = s->time.accuracy;
         return 0;
 }
 
@@ -2754,7 +3175,7 @@ _public_ int sd_event_source_set_time_accuracy(sd_event_source *s, uint64_t usec
         assert_return(usec != UINT64_MAX, -EINVAL);
         assert_return(EVENT_SOURCE_IS_TIME(s->type), -EDOM);
         assert_return(s->event->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         r = source_set_pending(s, false);
         if (r < 0)
@@ -2769,30 +3190,30 @@ _public_ int sd_event_source_set_time_accuracy(sd_event_source *s, uint64_t usec
         return 0;
 }
 
-_public_ int sd_event_source_get_time_clock(sd_event_source *s, clockid_t *clock) {
+_public_ int sd_event_source_get_time_clock(sd_event_source *s, clockid_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(clock, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(EVENT_SOURCE_IS_TIME(s->type), -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *clock = event_source_type_to_clock(s->type);
+        *ret = event_source_type_to_clock(s->type);
         return 0;
 }
 
-_public_ int sd_event_source_get_child_pid(sd_event_source *s, pid_t *pid) {
+_public_ int sd_event_source_get_child_pid(sd_event_source *s, pid_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(pid, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(s->type == SOURCE_CHILD, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *pid = s->child.pid;
+        *ret = s->child.pid;
         return 0;
 }
 
 _public_ int sd_event_source_get_child_pidfd(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_CHILD, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->child.pidfd < 0)
                 return -EOPNOTSUPP;
@@ -2803,7 +3224,7 @@ _public_ int sd_event_source_get_child_pidfd(sd_event_source *s) {
 _public_ int sd_event_source_send_child_signal(sd_event_source *s, int sig, const siginfo_t *si, unsigned flags) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_CHILD, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
         assert_return(SIGNAL_VALID(sig), -EINVAL);
 
         /* If we already have seen indication the process exited refuse sending a signal early. This way we
@@ -2848,6 +3269,7 @@ _public_ int sd_event_source_send_child_signal(sd_event_source *s, int sig, cons
 _public_ int sd_event_source_get_child_pidfd_own(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_CHILD, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->child.pidfd < 0)
                 return -EOPNOTSUPP;
@@ -2858,6 +3280,7 @@ _public_ int sd_event_source_get_child_pidfd_own(sd_event_source *s) {
 _public_ int sd_event_source_set_child_pidfd_own(sd_event_source *s, int own) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_CHILD, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->child.pidfd < 0)
                 return -EOPNOTSUPP;
@@ -2869,6 +3292,7 @@ _public_ int sd_event_source_set_child_pidfd_own(sd_event_source *s, int own) {
 _public_ int sd_event_source_get_child_process_own(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_CHILD, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return s->child.process_owned;
 }
@@ -2876,18 +3300,35 @@ _public_ int sd_event_source_get_child_process_own(sd_event_source *s) {
 _public_ int sd_event_source_set_child_process_own(sd_event_source *s, int own) {
         assert_return(s, -EINVAL);
         assert_return(s->type == SOURCE_CHILD, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         s->child.process_owned = own;
         return 0;
 }
 
-_public_ int sd_event_source_get_inotify_mask(sd_event_source *s, uint32_t *mask) {
+_public_ int sd_event_source_get_inotify_mask(sd_event_source *s, uint32_t *ret) {
         assert_return(s, -EINVAL);
-        assert_return(mask, -EINVAL);
+        assert_return(ret, -EINVAL);
         assert_return(s->type == SOURCE_INOTIFY, -EDOM);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
-        *mask = s->inotify.mask;
+        *ret = s->inotify.mask;
+        return 0;
+}
+
+_public_ int sd_event_source_get_inotify_path(sd_event_source *s, const char **ret) {
+        assert_return(s, -EINVAL);
+        assert_return(ret, -EINVAL);
+        assert_return(s->type == SOURCE_INOTIFY, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
+
+        if (!s->inotify.inode_data)
+                return -ESTALE; /* already disconnected. */
+
+        if (!s->inotify.inode_data->path)
+                return -ENOSYS; /* /proc was not mounted? */
+
+        *ret = s->inotify.inode_data->path;
         return 0;
 }
 
@@ -2897,7 +3338,7 @@ _public_ int sd_event_source_set_prepare(sd_event_source *s, sd_event_handler_t 
         assert_return(s, -EINVAL);
         assert_return(s->type != SOURCE_EXIT, -EDOM);
         assert_return(s->event->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(s->event), -ECHILD);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->prepare == callback)
                 return 0;
@@ -2925,6 +3366,7 @@ _public_ int sd_event_source_set_prepare(sd_event_source *s, sd_event_handler_t 
 
 _public_ void* sd_event_source_get_userdata(sd_event_source *s) {
         assert_return(s, NULL);
+        assert_return(!event_origin_changed(s->event), NULL);
 
         return s->userdata;
 }
@@ -2933,6 +3375,7 @@ _public_ void *sd_event_source_set_userdata(sd_event_source *s, void *userdata) 
         void *ret;
 
         assert_return(s, NULL);
+        assert_return(!event_origin_changed(s->event), NULL);
 
         ret = s->userdata;
         s->userdata = userdata;
@@ -3179,7 +3622,7 @@ static int event_arm_timer(
         assert_se(d->fd >= 0);
 
         if (t == 0) {
-                /* We don' want to disarm here, just mean some time looooong ago. */
+                /* We don't want to disarm here, just mean some time looooong ago. */
                 its.it_value.tv_sec = 0;
                 its.it_value.tv_nsec = 1;
         } else
@@ -3598,10 +4041,119 @@ static int process_inotify(sd_event *e) {
                 if (r < 0)
                         return r;
                 if (r > 0)
-                        done ++;
+                        done++;
         }
 
         return done;
+}
+
+static int process_memory_pressure(sd_event_source *s, uint32_t revents) {
+        assert(s);
+        assert(s->type == SOURCE_MEMORY_PRESSURE);
+
+        if (s->pending)
+                s->memory_pressure.revents |= revents;
+        else
+                s->memory_pressure.revents = revents;
+
+        return source_set_pending(s, true);
+}
+
+static int source_memory_pressure_write(sd_event_source *s) {
+        ssize_t n;
+        int r;
+
+        assert(s);
+        assert(s->type == SOURCE_MEMORY_PRESSURE);
+
+        /* once we start writing, the buffer is locked, we allow no further changes. */
+        s->memory_pressure.locked = true;
+
+        if (s->memory_pressure.write_buffer_size > 0) {
+                n = write(s->memory_pressure.fd, s->memory_pressure.write_buffer, s->memory_pressure.write_buffer_size);
+                if (n < 0) {
+                        if (!ERRNO_IS_TRANSIENT(errno)) {
+                                /* If kernel is built with CONFIG_PSI_DEFAULT_DISABLED it will expose PSI
+                                 * files, but then generates EOPNOSUPP on read() and write() (instead of on
+                                 * open()!). This sucks hard, since we can only detect this kind of failure
+                                 * so late. Let's make the best of it, and turn off the event source like we
+                                 * do for failed event source handlers. */
+
+                                log_debug_errno(errno, "Writing memory pressure settings to kernel failed, disabling memory pressure event source: %m");
+                                assert_se(sd_event_source_set_enabled(s, SD_EVENT_OFF) >= 0);
+                                return 0;
+                        }
+
+                        n = 0;
+                }
+        } else
+                n = 0;
+
+        assert(n >= 0);
+
+        if ((size_t) n == s->memory_pressure.write_buffer_size) {
+                s->memory_pressure.write_buffer = mfree(s->memory_pressure.write_buffer);
+
+                if (n > 0) {
+                        s->memory_pressure.write_buffer_size = 0;
+
+                        /* Update epoll events mask, since we have now written everything and don't care for EPOLLOUT anymore */
+                        r = source_memory_pressure_register(s, s->enabled);
+                        if (r < 0)
+                                return r;
+                }
+        } else if (n > 0) {
+                _cleanup_free_ void *c = NULL;
+
+                assert((size_t) n < s->memory_pressure.write_buffer_size);
+
+                c = memdup((uint8_t*) s->memory_pressure.write_buffer + n, s->memory_pressure.write_buffer_size - n);
+                if (!c)
+                        return -ENOMEM;
+
+                free_and_replace(s->memory_pressure.write_buffer, c);
+                s->memory_pressure.write_buffer_size -= n;
+                return 1;
+        }
+
+        return 0;
+}
+
+static int source_memory_pressure_initiate_dispatch(sd_event_source *s) {
+        int r;
+
+        assert(s);
+        assert(s->type == SOURCE_MEMORY_PRESSURE);
+
+        r = source_memory_pressure_write(s);
+        if (r < 0)
+                return r;
+        if (r > 0)
+                return 1; /* if we wrote something, then don't continue with dispatching user dispatch
+                           * function. Instead, shortcut it so that we wait for next EPOLLOUT immediately. */
+
+        /* No pending incoming IO? Then let's not continue further */
+        if ((s->memory_pressure.revents & (EPOLLIN|EPOLLPRI)) == 0) {
+
+                /* Treat IO errors on the notifier the same ways errors returned from a callback */
+                if ((s->memory_pressure.revents & (EPOLLHUP|EPOLLERR|EPOLLRDHUP)) != 0)
+                        return -EIO;
+
+                return 1; /* leave dispatch, we already processed everything */
+        }
+
+        if (s->memory_pressure.revents & EPOLLIN) {
+                uint8_t pipe_buf[PIPE_BUF];
+                ssize_t n;
+
+                /* If the fd is readable, then flush out anything that might be queued */
+
+                n = read(s->memory_pressure.fd, pipe_buf, sizeof(pipe_buf));
+                if (n < 0 && !ERRNO_IS_TRANSIENT(errno))
+                        return -errno;
+        }
+
+        return 0; /* go on, dispatch to user callback */
 }
 
 static int source_dispatch(sd_event_source *s) {
@@ -3650,6 +4202,16 @@ static int source_dispatch(sd_event_source *s) {
                         if (r < 0)
                                 return r;
                 }
+        }
+
+        if (s->type == SOURCE_MEMORY_PRESSURE) {
+                r = source_memory_pressure_initiate_dispatch(s);
+                if (r == -EIO) /* handle EIO errors similar to callback errors */
+                        goto finish;
+                if (r < 0)
+                        return r;
+                if (r > 0) /* already handled */
+                        return 1;
         }
 
         if (s->enabled == SD_EVENT_ONESHOT) {
@@ -3738,6 +4300,10 @@ static int source_dispatch(sd_event_source *s) {
                 break;
         }
 
+        case SOURCE_MEMORY_PRESSURE:
+                r = s->memory_pressure.callback(s, s->userdata);
+                break;
+
         case SOURCE_WATCHDOG:
         case _SOURCE_EVENT_SOURCE_TYPE_MAX:
         case _SOURCE_EVENT_SOURCE_TYPE_INVALID:
@@ -3746,6 +4312,7 @@ static int source_dispatch(sd_event_source *s) {
 
         s->dispatching = false;
 
+finish:
         if (r < 0) {
                 log_debug_errno(r, "Event source %s (type %s) returned error, %s: %m",
                                 strna(s->description),
@@ -3777,12 +4344,9 @@ static int event_prepare(sd_event *e) {
                         break;
 
                 s->prepare_iteration = e->iteration;
-                r = prioq_reshuffle(e->prepare, s, &s->prepare_index);
-                if (r < 0)
-                        return r;
+                prioq_reshuffle(e->prepare, s, &s->prepare_index);
 
                 assert(s->prepare);
-
                 s->dispatching = true;
                 r = s->prepare(s, s->userdata);
                 s->dispatching = false;
@@ -3899,12 +4463,36 @@ static void event_close_inode_data_fds(sd_event *e) {
         }
 }
 
+static int event_memory_pressure_write_list(sd_event *e) {
+        int r;
+
+        assert(e);
+
+        for (;;) {
+                sd_event_source *s;
+
+                s = LIST_POP(memory_pressure.write_list, e->memory_pressure_write_list);
+                if (!s)
+                        break;
+
+                assert(s->type == SOURCE_MEMORY_PRESSURE);
+                assert(s->memory_pressure.write_buffer_size > 0);
+                s->memory_pressure.in_write_list = false;
+
+                r = source_memory_pressure_write(s);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
 _public_ int sd_event_prepare(sd_event *e) {
         int r;
 
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
         assert_return(e->state == SD_EVENT_INITIAL, -EBUSY);
 
@@ -3924,6 +4512,10 @@ _public_ int sd_event_prepare(sd_event *e) {
         e->state = SD_EVENT_PREPARING;
         r = event_prepare(e);
         e->state = SD_EVENT_INITIAL;
+        if (r < 0)
+                return r;
+
+        r = event_memory_pressure_write_list(e);
         if (r < 0)
                 return r;
 
@@ -3972,15 +4564,18 @@ static int epoll_wait_usec(
                 usec_t timeout) {
 
         int msec;
-#if 0
+        /* A wrapper that uses epoll_pwait2() if available, and falls back to epoll_wait() if not. */
+
+#if HAVE_EPOLL_PWAIT2
         static bool epoll_pwait2_absent = false;
         int r;
 
-        /* A wrapper that uses epoll_pwait2() if available, and falls back to epoll_wait() if not.
-         *
-         * FIXME: this is temporarily disabled until epoll_pwait2() becomes more widely available.
-         * See https://github.com/systemd/systemd/pull/18973 and
-         * https://github.com/systemd/systemd/issues/19052. */
+        /* epoll_pwait2() was added to Linux 5.11 (2021-02-14) and to glibc in 2.35 (2022-02-03). In contrast
+         * to other syscalls we don't bother with our own fallback syscall wrappers on old libcs, since this
+         * is not that obvious to implement given the libc and kernel definitions differ in the last
+         * argument. Moreover, the only reason to use it is the more accurate timeouts (which is not a
+         * biggie), let's hence rely on glibc's definitions, and fallback to epoll_pwait() when that's
+         * missing. */
 
         if (!epoll_pwait2_absent && timeout != USEC_INFINITY) {
                 r = epoll_pwait2(fd,
@@ -4058,7 +4653,7 @@ static int process_epoll(sd_event *e, usec_t timeout, int64_t threshold, int64_t
 
         /* Set timestamp only when this is called first time. */
         if (threshold == INT64_MAX)
-                triple_timestamp_get(&e->timestamp);
+                triple_timestamp_now(&e->timestamp);
 
         for (size_t i = 0; i < m; i++) {
 
@@ -4087,6 +4682,10 @@ static int process_epoll(sd_event *e, usec_t timeout, int64_t threshold, int64_t
 
                                 case SOURCE_CHILD:
                                         r = process_pidfd(e, s, e->event_queue[i].events);
+                                        break;
+
+                                case SOURCE_MEMORY_PRESSURE:
+                                        r = process_memory_pressure(s, e->event_queue[i].events);
                                         break;
 
                                 default:
@@ -4132,7 +4731,7 @@ _public_ int sd_event_wait(sd_event *e, uint64_t timeout) {
 
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
         assert_return(e->state == SD_EVENT_ARMED, -EBUSY);
 
@@ -4235,7 +4834,7 @@ _public_ int sd_event_dispatch(sd_event *e) {
 
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
         assert_return(e->state == SD_EVENT_PENDING, -EBUSY);
 
@@ -4259,13 +4858,13 @@ _public_ int sd_event_dispatch(sd_event *e) {
 
 static void event_log_delays(sd_event *e) {
         char b[ELEMENTSOF(e->delays) * DECIMAL_STR_MAX(unsigned) + 1], *p;
-        size_t l, i;
+        size_t l;
 
         p = b;
         l = sizeof(b);
-        for (i = 0; i < ELEMENTSOF(e->delays); i++) {
-                l = strpcpyf(&p, l, "%u ", e->delays[i]);
-                e->delays[i] = 0;
+        FOREACH_ELEMENT(delay, e->delays) {
+                l = strpcpyf(&p, l, "%u ", *delay);
+                *delay = 0;
         }
         log_debug("Event loop iterations: %s", b);
 }
@@ -4275,7 +4874,7 @@ _public_ int sd_event_run(sd_event *e, uint64_t timeout) {
 
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
         assert_return(e->state == SD_EVENT_INITIAL, -EBUSY);
 
@@ -4323,7 +4922,7 @@ _public_ int sd_event_loop(sd_event *e) {
 
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
         assert_return(e->state == SD_EVENT_INITIAL, -EBUSY);
 
         PROTECT_EVENT(e);
@@ -4340,7 +4939,7 @@ _public_ int sd_event_loop(sd_event *e) {
 _public_ int sd_event_get_fd(sd_event *e) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         return e->epoll_fd;
 }
@@ -4348,21 +4947,21 @@ _public_ int sd_event_get_fd(sd_event *e) {
 _public_ int sd_event_get_state(sd_event *e) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         return e->state;
 }
 
-_public_ int sd_event_get_exit_code(sd_event *e, int *code) {
+_public_ int sd_event_get_exit_code(sd_event *e, int *ret) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(code, -EINVAL);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!e->exit_requested)
                 return -ENODATA;
 
-        *code = e->exit_code;
+        if (ret)
+                *ret = e->exit_code;
         return 0;
 }
 
@@ -4370,7 +4969,7 @@ _public_ int sd_event_exit(sd_event *e, int code) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         e->exit_requested = true;
         e->exit_code = code;
@@ -4378,22 +4977,22 @@ _public_ int sd_event_exit(sd_event *e, int code) {
         return 0;
 }
 
-_public_ int sd_event_now(sd_event *e, clockid_t clock, uint64_t *usec) {
+_public_ int sd_event_now(sd_event *e, clockid_t clock, uint64_t *ret) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(usec, -EINVAL);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(ret, -EINVAL);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (!TRIPLE_TIMESTAMP_HAS_CLOCK(clock))
                 return -EOPNOTSUPP;
 
         if (!triple_timestamp_is_set(&e->timestamp)) {
                 /* Implicitly fall back to now() if we never ran before and thus have no cached time. */
-                *usec = now(clock);
+                *ret = now(clock);
                 return 1;
         }
 
-        *usec = triple_timestamp_by_clock(&e->timestamp, clock);
+        *ret = triple_timestamp_by_clock(&e->timestamp, clock);
         return 0;
 }
 
@@ -4421,18 +5020,17 @@ _public_ int sd_event_default(sd_event **ret) {
         return 1;
 }
 
-_public_ int sd_event_get_tid(sd_event *e, pid_t *tid) {
+_public_ int sd_event_get_tid(sd_event *e, pid_t *ret) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(tid, -EINVAL);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(ret, -EINVAL);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
-        if (e->tid != 0) {
-                *tid = e->tid;
-                return 0;
-        }
+        if (e->tid == 0)
+                return -ENXIO;
 
-        return -ENXIO;
+        *ret = e->tid;
+        return 0;
 }
 
 _public_ int sd_event_set_watchdog(sd_event *e, int b) {
@@ -4440,7 +5038,7 @@ _public_ int sd_event_set_watchdog(sd_event *e, int b) {
 
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (e->watchdog == !!b)
                 return e->watchdog;
@@ -4479,7 +5077,7 @@ _public_ int sd_event_set_watchdog(sd_event *e, int b) {
                 }
         }
 
-        e->watchdog = !!b;
+        e->watchdog = b;
         return e->watchdog;
 
 fail:
@@ -4490,7 +5088,7 @@ fail:
 _public_ int sd_event_get_watchdog(sd_event *e) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         return e->watchdog;
 }
@@ -4498,7 +5096,7 @@ _public_ int sd_event_get_watchdog(sd_event *e) {
 _public_ int sd_event_get_iteration(sd_event *e, uint64_t *ret) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         *ret = e->iteration;
         return 0;
@@ -4506,6 +5104,8 @@ _public_ int sd_event_get_iteration(sd_event *e, uint64_t *ret) {
 
 _public_ int sd_event_source_set_destroy_callback(sd_event_source *s, sd_event_destroy_t callback) {
         assert_return(s, -EINVAL);
+        assert_return(s->event, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         s->destroy_callback = callback;
         return 0;
@@ -4513,6 +5113,7 @@ _public_ int sd_event_source_set_destroy_callback(sd_event_source *s, sd_event_d
 
 _public_ int sd_event_source_get_destroy_callback(sd_event_source *s, sd_event_destroy_t *ret) {
         assert_return(s, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (ret)
                 *ret = s->destroy_callback;
@@ -4522,12 +5123,14 @@ _public_ int sd_event_source_get_destroy_callback(sd_event_source *s, sd_event_d
 
 _public_ int sd_event_source_get_floating(sd_event_source *s) {
         assert_return(s, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return s->floating;
 }
 
 _public_ int sd_event_source_set_floating(sd_event_source *s, int b) {
         assert_return(s, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->floating == !!b)
                 return 0;
@@ -4551,6 +5154,7 @@ _public_ int sd_event_source_set_floating(sd_event_source *s, int b) {
 _public_ int sd_event_source_get_exit_on_failure(sd_event_source *s) {
         assert_return(s, -EINVAL);
         assert_return(s->type != SOURCE_EXIT, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         return s->exit_on_failure;
 }
@@ -4558,6 +5162,7 @@ _public_ int sd_event_source_get_exit_on_failure(sd_event_source *s) {
 _public_ int sd_event_source_set_exit_on_failure(sd_event_source *s, int b) {
         assert_return(s, -EINVAL);
         assert_return(s->type != SOURCE_EXIT, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (s->exit_on_failure == !!b)
                 return 0;
@@ -4570,6 +5175,7 @@ _public_ int sd_event_source_set_ratelimit(sd_event_source *s, uint64_t interval
         int r;
 
         assert_return(s, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         /* Turning on ratelimiting on event source types that don't support it, is a loggable offense. Doing
          * so is a programming error. */
@@ -4587,6 +5193,7 @@ _public_ int sd_event_source_set_ratelimit(sd_event_source *s, uint64_t interval
 
 _public_ int sd_event_source_set_ratelimit_expire_callback(sd_event_source *s, sd_event_handler_t callback) {
         assert_return(s, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         s->ratelimit_expire_callback = callback;
         return 0;
@@ -4594,6 +5201,7 @@ _public_ int sd_event_source_set_ratelimit_expire_callback(sd_event_source *s, s
 
 _public_ int sd_event_source_get_ratelimit(sd_event_source *s, uint64_t *ret_interval, unsigned *ret_burst) {
         assert_return(s, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         /* Querying whether an event source has ratelimiting configured is not a loggable offense, hence
          * don't use assert_return(). Unlike turning on ratelimiting it's not really a programming error. */
@@ -4613,6 +5221,7 @@ _public_ int sd_event_source_get_ratelimit(sd_event_source *s, uint64_t *ret_int
 
 _public_ int sd_event_source_is_ratelimited(sd_event_source *s) {
         assert_return(s, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
 
         if (!EVENT_SOURCE_CAN_RATE_LIMIT(s->type))
                 return false;
@@ -4623,6 +5232,27 @@ _public_ int sd_event_source_is_ratelimited(sd_event_source *s) {
         return s->ratelimited;
 }
 
+_public_ int sd_event_source_leave_ratelimit(sd_event_source *s) {
+        int r;
+
+        assert_return(s, -EINVAL);
+
+        if (!EVENT_SOURCE_CAN_RATE_LIMIT(s->type))
+                return 0;
+
+        if (!ratelimit_configured(&s->rate_limit))
+                return 0;
+
+        if (!s->ratelimited)
+                return 0;
+
+        r = event_source_leave_ratelimit(s, /* run_callback */ false);
+        if (r < 0)
+                return r;
+
+        return 1; /* tell caller that we indeed just left the ratelimit state */
+}
+
 _public_ int sd_event_set_signal_exit(sd_event *e, int b) {
         bool change = false;
         int r;
@@ -4630,7 +5260,7 @@ _public_ int sd_event_set_signal_exit(sd_event *e, int b) {
         assert_return(e, -EINVAL);
         assert_return(e = event_resolve(e), -ENOPKG);
         assert_return(e->state != SD_EVENT_FINISHED, -ESTALE);
-        assert_return(!event_pid_changed(e), -ECHILD);
+        assert_return(!event_origin_changed(e), -ECHILD);
 
         if (b) {
                 /* We want to maintain pointers to these event sources, so that we can destroy them when told
@@ -4676,4 +5306,94 @@ _public_ int sd_event_set_signal_exit(sd_event *e, int b) {
         }
 
         return change;
+}
+
+_public_ int sd_event_source_set_memory_pressure_type(sd_event_source *s, const char *ty) {
+        _cleanup_free_ char *b = NULL;
+        _cleanup_free_ void *w = NULL;
+
+        assert_return(s, -EINVAL);
+        assert_return(s->type == SOURCE_MEMORY_PRESSURE, -EDOM);
+        assert_return(ty, -EINVAL);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
+
+        if (!STR_IN_SET(ty, "some", "full"))
+                return -EINVAL;
+
+        if (s->memory_pressure.locked) /* Refuse adjusting parameters, if caller told us how to watch for events */
+                return -EBUSY;
+
+        char* space = memchr(s->memory_pressure.write_buffer, ' ', s->memory_pressure.write_buffer_size);
+        if (!space)
+                return -EINVAL;
+
+        size_t l = (char*) space - (char*) s->memory_pressure.write_buffer;
+        b = memdup_suffix0(s->memory_pressure.write_buffer, l);
+        if (!b)
+                return -ENOMEM;
+        if (!STR_IN_SET(b, "some", "full"))
+                return -EINVAL;
+
+        if (streq(b, ty))
+                return 0;
+
+        size_t nl = strlen(ty) + (s->memory_pressure.write_buffer_size - l);
+        w = new(char, nl);
+        if (!w)
+                return -ENOMEM;
+
+        memcpy(stpcpy(w, ty), space, (s->memory_pressure.write_buffer_size - l));
+
+        free_and_replace(s->memory_pressure.write_buffer, w);
+        s->memory_pressure.write_buffer_size = nl;
+        s->memory_pressure.locked = false;
+
+        return 1;
+}
+
+_public_ int sd_event_source_set_memory_pressure_period(sd_event_source *s, uint64_t threshold_usec, uint64_t window_usec) {
+        _cleanup_free_ char *b = NULL;
+        _cleanup_free_ void *w = NULL;
+
+        assert_return(s, -EINVAL);
+        assert_return(s->type == SOURCE_MEMORY_PRESSURE, -EDOM);
+        assert_return(!event_origin_changed(s->event), -ECHILD);
+
+        if (threshold_usec <= 0 || threshold_usec >= UINT64_MAX)
+                return -ERANGE;
+        if (window_usec <= 0 || window_usec >= UINT64_MAX)
+                return -ERANGE;
+        if (threshold_usec > window_usec)
+                return -EINVAL;
+
+        if (s->memory_pressure.locked) /* Refuse adjusting parameters, if caller told us how to watch for events */
+                return -EBUSY;
+
+        char* space = memchr(s->memory_pressure.write_buffer, ' ', s->memory_pressure.write_buffer_size);
+        if (!space)
+                return -EINVAL;
+
+        size_t l = (char*) space - (char*) s->memory_pressure.write_buffer;
+        b = memdup_suffix0(s->memory_pressure.write_buffer, l);
+        if (!b)
+                return -ENOMEM;
+        if (!STR_IN_SET(b, "some", "full"))
+                return -EINVAL;
+
+        if (asprintf((char**) &w,
+                     "%s " USEC_FMT " " USEC_FMT "",
+                     b,
+                     threshold_usec,
+                     window_usec) < 0)
+                return -EINVAL;
+
+        l = strlen(w) + 1;
+        if (memcmp_nn(s->memory_pressure.write_buffer, s->memory_pressure.write_buffer_size, w, l) == 0)
+                return 0;
+
+        free_and_replace(s->memory_pressure.write_buffer, w);
+        s->memory_pressure.write_buffer_size = l;
+        s->memory_pressure.locked = false;
+
+        return 1;
 }

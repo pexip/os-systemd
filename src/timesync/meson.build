@@ -2,17 +2,14 @@
 
 sources = files(
         'timesyncd-conf.c',
-        'timesyncd-conf.h',
         'timesyncd-manager.c',
-        'timesyncd-manager.h',
-        'timesyncd-ntp-message.h',
         'timesyncd-server.c',
-        'timesyncd-server.h')
+)
 
 systemd_timesyncd_sources = files(
         'timesyncd.c',
         'timesyncd-bus.c',
-        'timesyncd-bus.h')
+)
 
 sources += custom_target(
         'timesyncd-gperf.c',
@@ -24,16 +21,43 @@ if get_option('link-timesyncd-shared')
         timesyncd_link_with = [libshared]
 else
         timesyncd_link_with = [libsystemd_static,
-                               libshared_static,
-                               libbasic_gcrypt]
+                               libshared_static]
 endif
 
 libtimesyncd_core = static_library(
         'timesyncd-core',
         sources,
         include_directories : includes,
+        dependencies : userspace,
         link_with : timesyncd_link_with,
         build_by_default : false)
+
+executables += [
+        libexec_template + {
+                'name' : 'systemd-timesyncd',
+                'conditions' : ['ENABLE_TIMESYNCD'],
+                'sources' : systemd_timesyncd_sources,
+                'link_with' : libtimesyncd_core,
+                'dependencies' : [
+                        libm,
+                        threads,
+                ],
+        },
+        libexec_template + {
+                'name' : 'systemd-time-wait-sync',
+                'conditions' : ['ENABLE_TIMESYNCD'],
+                'sources' : files('wait-sync.c'),
+                'link_with' : libtimesyncd_core,
+        },
+        test_template + {
+                'sources' : files('test-timesync.c'),
+                'link_with' : [
+                        libshared,
+                        libtimesyncd_core,
+                ],
+                'dependencies' : libm,
+        },
+]
 
 custom_target(
         'timesyncd.conf',
@@ -41,7 +65,7 @@ custom_target(
         output : 'timesyncd.conf',
         command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
         install : conf.get('ENABLE_TIMESYNCD') == 1 and install_sysconfdir_samples,
-        install_dir : pkgsysconfdir)
+        install_dir : pkgconfigfiledir)
 
 if conf.get('ENABLE_TIMESYNCD') == 1
         install_data('org.freedesktop.timesync1.conf',
@@ -53,12 +77,3 @@ if conf.get('ENABLE_TIMESYNCD') == 1
         install_data('org.freedesktop.timesync1.policy',
                      install_dir : polkitpolicydir)
 endif
-
-############################################################
-
-tests += [
-        [files('test-timesync.c'),
-         [libtimesyncd_core,
-          libshared],
-         [libm]],
-]

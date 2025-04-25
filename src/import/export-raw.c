@@ -9,14 +9,15 @@
 #include "copy.h"
 #include "export-raw.h"
 #include "fd-util.h"
+#include "format-util.h"
 #include "fs-util.h"
 #include "import-common.h"
 #include "missing_fcntl.h"
+#include "pretty-print.h"
 #include "ratelimit.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
 #define COPY_BUFFER_SIZE (16*1024)
 
@@ -85,8 +86,8 @@ int raw_export_new(
                 return -ENOMEM;
 
         *e = (RawExport) {
-                .output_fd = -1,
-                .input_fd = -1,
+                .output_fd = -EBADF,
+                .input_fd = -EBADF,
                 .on_finished = on_finished,
                 .userdata = userdata,
                 .last_percent = UINT_MAX,
@@ -121,8 +122,17 @@ static void raw_export_report_progress(RawExport *e) {
         if (!ratelimit_below(&e->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Exported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(e->written_uncompressed),
+                                FORMAT_BYTES(e->st.st_size));
+        else
+                log_info("Exported %u%%.", percent);
 
         e->last_percent = percent;
 }
@@ -139,7 +149,7 @@ static int raw_export_process(RawExport *e) {
                  * reflink source to destination directly. Let's see
                  * if this works. */
 
-                r = btrfs_reflink(e->input_fd, e->output_fd);
+                r = reflink(e->input_fd, e->output_fd);
                 if (r >= 0) {
                         r = 0;
                         goto finish;
@@ -216,8 +226,11 @@ static int raw_export_process(RawExport *e) {
 
 finish:
         if (r >= 0) {
+                if (isatty_safe(STDERR_FILENO))
+                        clear_progress_bar(/* prefix= */ NULL);
+
                 (void) copy_times(e->input_fd, e->output_fd, COPY_CRTIME);
-                (void) copy_xattr(e->input_fd, e->output_fd, 0);
+                (void) copy_xattr(e->input_fd, NULL, e->output_fd, NULL, 0);
         }
 
         if (e->on_finished)
@@ -258,7 +271,7 @@ static int reflink_snapshot(int fd, const char *path) {
                 (void) unlink(t);
         }
 
-        r = btrfs_reflink(fd, new_fd);
+        r = reflink(fd, new_fd);
         if (r < 0) {
                 safe_close(new_fd);
                 return r;
@@ -268,7 +281,7 @@ static int reflink_snapshot(int fd, const char *path) {
 }
 
 int raw_export_start(RawExport *e, const char *path, int fd, ImportCompressType compress) {
-        _cleanup_close_ int sfd = -1, tfd = -1;
+        _cleanup_close_ int sfd = -EBADF, tfd = -EBADF;
         int r;
 
         assert(e);

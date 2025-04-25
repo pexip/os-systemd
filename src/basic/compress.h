@@ -2,8 +2,16 @@
 #pragma once
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <unistd.h>
+
+#if HAVE_LZ4
+#include <lz4.h>
+#include <lz4frame.h>
+#endif
+
+#include "dlfcn-util.h"
 
 typedef enum Compression {
         COMPRESSION_NONE,
@@ -16,6 +24,8 @@ typedef enum Compression {
 
 const char* compression_to_string(Compression compression);
 Compression compression_from_string(const char *compression);
+
+bool compression_supported(Compression c);
 
 int compress_blob_xz(const void *src, uint64_t src_size,
                      void *dst, size_t dst_alloc_size, size_t *dst_size);
@@ -60,7 +70,24 @@ int decompress_stream_xz(int fdf, int fdt, uint64_t max_size);
 int decompress_stream_lz4(int fdf, int fdt, uint64_t max_size);
 int decompress_stream_zstd(int fdf, int fdt, uint64_t max_size);
 
-static inline int compress_blob_explicit(
+#if HAVE_LZ4
+extern DLSYM_PROTOTYPE(LZ4_compress_default);
+extern DLSYM_PROTOTYPE(LZ4_decompress_safe);
+extern DLSYM_PROTOTYPE(LZ4_decompress_safe_partial);
+extern DLSYM_PROTOTYPE(LZ4_versionNumber);
+
+int dlopen_lz4(void);
+#endif
+
+#if HAVE_ZSTD
+int dlopen_zstd(void);
+#endif
+
+#if HAVE_XZ
+int dlopen_lzma(void);
+#endif
+
+static inline int compress_blob(
                 Compression compression,
                 const void *src, uint64_t src_size,
                 void *dst, size_t dst_alloc_size, size_t *dst_size) {
@@ -76,12 +103,6 @@ static inline int compress_blob_explicit(
                 return -EOPNOTSUPP;
         }
 }
-
-#define compress_blob(src, src_size, dst, dst_alloc_size, dst_size) \
-        compress_blob_explicit(                                     \
-                DEFAULT_COMPRESSION,                                \
-                src, src_size,                                      \
-                dst, dst_alloc_size, dst_size)
 
 static inline int compress_stream(int fdf, int fdt, uint64_t max_bytes, uint64_t *ret_uncompressed_size) {
         switch (DEFAULT_COMPRESSION) {

@@ -52,11 +52,11 @@ static inline uint32_t usec_to_sec(usec_t usec, usec_t now_usec) {
 }
 
 CONFIG_PARSER_PROTOTYPE(config_parse_link_local_address_family);
-CONFIG_PARSER_PROTOTYPE(config_parse_address_family_with_kernel);
 CONFIG_PARSER_PROTOTYPE(config_parse_ip_masquerade);
 CONFIG_PARSER_PROTOTYPE(config_parse_mud_url);
 
-const char *network_config_source_to_string(NetworkConfigSource s) _const_;
+const char* network_config_source_to_string(NetworkConfigSource s) _const_;
+NetworkConfigSource network_config_source_from_string(const char* s) _pure_;
 
 int network_config_state_to_string_alloc(NetworkConfigState s, char **ret);
 
@@ -91,6 +91,7 @@ int network_config_state_to_string_alloc(NetworkConfigState s, char **ret);
                                     0);                                 \
         }                                                               \
         static inline bool name##_is_requesting(const type *t) {        \
+                assert(t);                                              \
                 return FLAGS_SET(t->state, NETWORK_CONFIG_STATE_REQUESTING); \
         }                                                               \
         static inline void name##_enter_configuring(type *t) {          \
@@ -124,10 +125,6 @@ int network_config_state_to_string_alloc(NetworkConfigState s, char **ret);
                                     NETWORK_CONFIG_STATE_REMOVING,      \
                                     NETWORK_CONFIG_STATE_REMOVING);     \
         }                                                               \
-        static inline bool name##_is_removing(const type *t) {          \
-                assert(t);                                              \
-                return FLAGS_SET(t->state, NETWORK_CONFIG_STATE_REMOVING); \
-        }                                                               \
         static inline void name##_enter_removed(type *t) {              \
                 name##_update_state(t,                                  \
                                     NETWORK_CONFIG_STATE_CONFIGURED |   \
@@ -135,23 +132,23 @@ int network_config_state_to_string_alloc(NetworkConfigState s, char **ret);
                                     0);                                 \
         }
 
-const char *address_family_to_string(AddressFamily b) _const_;
+const char* address_family_to_string(AddressFamily b) _const_;
 AddressFamily address_family_from_string(const char *s) _pure_;
 
 AddressFamily link_local_address_family_from_string(const char *s) _pure_;
 
-const char *routing_policy_rule_address_family_to_string(AddressFamily b) _const_;
+const char* routing_policy_rule_address_family_to_string(AddressFamily b) _const_;
 AddressFamily routing_policy_rule_address_family_from_string(const char *s) _pure_;
 
-const char *nexthop_address_family_to_string(AddressFamily b) _const_;
+const char* nexthop_address_family_to_string(AddressFamily b) _const_;
 AddressFamily nexthop_address_family_from_string(const char *s) _pure_;
 
-const char *duplicate_address_detection_address_family_to_string(AddressFamily b) _const_;
+const char* duplicate_address_detection_address_family_to_string(AddressFamily b) _const_;
 AddressFamily duplicate_address_detection_address_family_from_string(const char *s) _pure_;
 
 AddressFamily dhcp_deprecated_address_family_from_string(const char *s) _pure_;
 
-const char *dhcp_lease_server_type_to_string(sd_dhcp_lease_server_type_t t) _const_;
+const char* dhcp_lease_server_type_to_string(sd_dhcp_lease_server_type_t t) _const_;
 sd_dhcp_lease_server_type_t dhcp_lease_server_type_from_string(const char *s) _pure_;
 
 int log_link_message_full_errno(Link *link, sd_netlink_message *m, int level, int err, const char *msg);

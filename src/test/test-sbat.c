@@ -8,12 +8,24 @@
 #include "sbat.h"
 #include "tests.h"
 
-TEST(sbat_section_text) {
-        log_info("---SBAT-----------&<----------------------------------------\n"
+TEST(BOOT_SBAT) {
+        log_info("---SBAT-----------&<-----------------------------------------\n"
                  "%s"
                  "------------------>&-----------------------------------------",
 #ifdef SBAT_DISTRO
-                 SBAT_SECTION_TEXT
+                 SBAT_BOOT_SECTION_TEXT
+#else
+                 "(not defined)"
+#endif
+        );
+}
+
+TEST(STUB_SBAT) {
+        log_info("---SBAT-----------&<-----------------------------------------\n"
+                 "%s"
+                 "------------------>&-----------------------------------------",
+#ifdef SBAT_DISTRO
+                 SBAT_STUB_SECTION_TEXT
 #else
                  "(not defined)"
 #endif

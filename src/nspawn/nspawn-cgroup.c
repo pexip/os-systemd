@@ -13,15 +13,15 @@
 #include "mountpoint-util.h"
 #include "nspawn-cgroup.h"
 #include "nspawn-mount.h"
+#include "nsresource.h"
 #include "path-util.h"
 #include "rm-rf.h"
 #include "string-util.h"
 #include "strv.h"
 #include "user-util.h"
-#include "util.h"
 
 static int chown_cgroup_path(const char *path, uid_t uid_shift) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         fd = open(path, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
         if (fd < 0)
@@ -43,38 +43,6 @@ static int chown_cgroup_path(const char *path, uid_t uid_shift) {
                 if (fchownat(fd, fn, uid_shift, uid_shift, 0) < 0)
                         log_full_errno(errno == ENOENT ? LOG_DEBUG :  LOG_WARNING, errno,
                                        "Failed to chown \"%s/%s\", ignoring: %m", path, fn);
-
-        return 0;
-}
-
-int chown_cgroup(pid_t pid, CGroupUnified unified_requested, uid_t uid_shift) {
-        _cleanup_free_ char *path = NULL, *fs = NULL;
-        int r;
-
-        r = cg_pid_get_path(NULL, pid, &path);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get container cgroup path: %m");
-
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, path, NULL, &fs);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
-
-        r = chown_cgroup_path(fs, uid_shift);
-        if (r < 0)
-                return log_error_errno(r, "Failed to chown() cgroup %s: %m", fs);
-
-        if (unified_requested == CGROUP_UNIFIED_SYSTEMD || (unified_requested == CGROUP_UNIFIED_NONE && cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER) > 0)) {
-                _cleanup_free_ char *lfs = NULL;
-                /* Always propagate access rights from unified to legacy controller */
-
-                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER_LEGACY, path, NULL, &lfs);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
-
-                r = chown_cgroup_path(lfs, uid_shift);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to chown() cgroup %s: %m", lfs);
-        }
 
         return 0;
 }
@@ -143,10 +111,17 @@ finish:
         return r;
 }
 
-int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested) {
-        _cleanup_free_ char *cgroup = NULL;
+int create_subcgroup(
+                pid_t pid,
+                bool keep_unit,
+                CGroupUnified unified_requested,
+                uid_t uid_shift,
+                int userns_fd,
+                bool privileged) {
+
+        _cleanup_free_ char *cgroup = NULL, *payload = NULL;
         CGroupMask supported;
-        const char *payload;
+        char *e;
         int r;
 
         assert(pid > 1);
@@ -177,15 +152,67 @@ int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested)
         if (r < 0)
                 return log_error_errno(r, "Failed to get our control group: %m");
 
-        payload = strjoina(cgroup, "/payload");
-        r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, payload, pid);
+        /* If the service manager already placed us in the supervisor cgroup, let's handle that. */
+        e = endswith(cgroup, "/supervisor");
+        if (e)
+                *e = 0; /* chop off, we want the main path delegated to us */
+
+        payload = path_join(cgroup, "payload");
+        if (!payload)
+                return log_oom();
+
+        if (privileged)
+                r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, payload, pid);
+        else
+                r = cg_create(SYSTEMD_CGROUP_CONTROLLER, payload);
         if (r < 0)
                 return log_error_errno(r, "Failed to create %s subcgroup: %m", payload);
 
-        if (keep_unit) {
-                const char *supervisor;
+        if (privileged) {
+                _cleanup_free_ char *fs = NULL;
+                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, payload, NULL, &fs);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
 
-                supervisor = strjoina(cgroup, "/supervisor");
+                r = chown_cgroup_path(fs, uid_shift);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to chown() cgroup %s: %m", fs);
+
+        } else if (userns_fd >= 0) {
+                _cleanup_close_ int cgroup_fd = -EBADF;
+
+                cgroup_fd = cg_path_open(SYSTEMD_CGROUP_CONTROLLER, payload);
+                if (cgroup_fd < 0)
+                        return log_error_errno(cgroup_fd, "Failed to open cgroup %s: %m", payload);
+
+                r = cg_fd_attach(cgroup_fd, pid);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add process " PID_FMT " to cgroup %s: %m", pid, payload);
+
+                r = nsresource_add_cgroup(userns_fd, cgroup_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add cgroup %s to userns: %m", payload);
+        }
+
+        if (unified_requested == CGROUP_UNIFIED_SYSTEMD || (unified_requested == CGROUP_UNIFIED_NONE && cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER) > 0)) {
+                _cleanup_free_ char *lfs = NULL;
+                /* Always propagate access rights from unified to legacy controller */
+
+                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER_LEGACY, payload, NULL, &lfs);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
+
+                r = chown_cgroup_path(lfs, uid_shift);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to chown() cgroup %s: %m", lfs);
+        }
+
+        if (keep_unit) {
+                _cleanup_free_ char *supervisor = NULL;
+                supervisor = path_join(cgroup, "supervisor");
+                if (!supervisor)
+                        return log_oom();
+
                 r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, supervisor, 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to create %s subcgroup: %m", supervisor);
@@ -255,7 +282,7 @@ static int mount_legacy_cgroup_hierarchy(
 
         to = strjoina(strempty(dest), "/sys/fs/cgroup/", hierarchy);
 
-        r = path_is_mount_point(to, dest, 0);
+        r = path_is_mount_point_full(to, dest, /* flags = */ 0);
         if (r < 0 && r != -ENOENT)
                 return log_error_errno(r, "Failed to determine if %s is mounted already: %m", to);
         if (r > 0)
@@ -307,7 +334,7 @@ static int mount_legacy_cgns_supported(
         (void) mkdir_p(cgroup_root, 0755);
 
         /* Mount a tmpfs to /sys/fs/cgroup if it's not mounted there yet. */
-        r = path_is_mount_point(cgroup_root, dest, AT_SYMLINK_FOLLOW);
+        r = path_is_mount_point_full(cgroup_root, dest, AT_SYMLINK_FOLLOW);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine if /sys/fs/cgroup is already mounted: %m");
         if (r == 0) {
@@ -320,7 +347,7 @@ static int mount_legacy_cgns_supported(
                  * uid/gid as seen from e.g. /proc/1/mountinfo. So we simply
                  * pass uid 0 and not uid_shift to tmpfs_patch_options().
                  */
-                r = tmpfs_patch_options("mode=755" TMPFS_LIMITS_SYS_FS_CGROUP, 0, selinux_apifs_context, &options);
+                r = tmpfs_patch_options("mode=0755" TMPFS_LIMITS_SYS_FS_CGROUP, 0, selinux_apifs_context, &options);
                 if (r < 0)
                         return log_oom();
 
@@ -393,7 +420,8 @@ skip_controllers:
 
         if (!userns)
                 return mount_nofollow_verbose(LOG_ERR, NULL, cgroup_root, NULL,
-                                              MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
+                                              MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY,
+                                              "mode=0755");
 
         return 0;
 }
@@ -416,13 +444,16 @@ static int mount_legacy_cgns_unsupported(
         (void) mkdir_p(cgroup_root, 0755);
 
         /* Mount a tmpfs to /sys/fs/cgroup if it's not mounted there yet. */
-        r = path_is_mount_point(cgroup_root, dest, AT_SYMLINK_FOLLOW);
+        r = path_is_mount_point_full(cgroup_root, dest, AT_SYMLINK_FOLLOW);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine if /sys/fs/cgroup is already mounted: %m");
         if (r == 0) {
                 _cleanup_free_ char *options = NULL;
 
-                r = tmpfs_patch_options("mode=755" TMPFS_LIMITS_SYS_FS_CGROUP, uid_shift == 0 ? UID_INVALID : uid_shift, selinux_apifs_context, &options);
+                r = tmpfs_patch_options("mode=0755" TMPFS_LIMITS_SYS_FS_CGROUP,
+                                        uid_shift == 0 ? UID_INVALID : uid_shift,
+                                        selinux_apifs_context,
+                                        &options);
                 if (r < 0)
                         return log_oom();
 
@@ -501,7 +532,8 @@ skip_controllers:
                 return r;
 
         return mount_nofollow_verbose(LOG_ERR, NULL, cgroup_root, NULL,
-                                      MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY, "mode=755");
+                                      MS_REMOUNT|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_STRICTATIME|MS_RDONLY,
+                                      "mode=0755");
 }
 
 static int mount_unified_cgroups(const char *dest) {
@@ -514,7 +546,7 @@ static int mount_unified_cgroups(const char *dest) {
 
         (void) mkdir_p(p, 0755);
 
-        r = path_is_mount_point(p, dest, AT_SYMLINK_FOLLOW);
+        r = path_is_mount_point_full(p, dest, AT_SYMLINK_FOLLOW);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine if %s is mounted already: %m", p);
         if (r > 0) {

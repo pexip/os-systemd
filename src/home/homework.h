@@ -50,8 +50,8 @@ typedef struct HomeSetup {
 
 #define HOME_SETUP_INIT                                 \
         {                                               \
-                .root_fd = -1,                          \
-                .image_fd = -1,                         \
+                .root_fd = -EBADF,                      \
+                .image_fd = -EBADF,                     \
                 .partition_offset = UINT64_MAX,         \
                 .partition_size = UINT64_MAX,           \
                 .key_serial = -1,                       \
@@ -87,7 +87,7 @@ int home_maybe_shift_uid(UserRecord *h, HomeSetupFlags flags, HomeSetup *setup);
 int home_populate(UserRecord *h, int dir_fd);
 
 int home_load_embedded_identity(UserRecord *h, int root_fd, UserRecord *header_home, UserReconcileMode mode, PasswordCache *cache, UserRecord **ret_embedded_home, UserRecord **ret_new_home);
-int home_store_embedded_identity(UserRecord *h, int root_fd, uid_t uid, UserRecord *old_home);
+int home_store_embedded_identity(UserRecord *h, int root_fd, UserRecord *old_home);
 int home_extend_embedded_identity(UserRecord *h, UserRecord *used, HomeSetup *setup);
 
 int user_record_authenticate(UserRecord *h, UserRecord *secret, PasswordCache *cache, bool strict_verify);

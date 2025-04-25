@@ -2,11 +2,19 @@
 
 busctl_sources = files(
         'busctl-introspect.c',
-        'busctl-introspect.h',
-        'busctl.c')
+        'busctl.c',
+)
 
-tests += [
-        [files('test-busctl-introspect.c',
-               'busctl-introspect.c',
-               'busctl-introspect.h')],
+executables += [
+        executable_template + {
+                'name' : 'busctl',
+                'public' : true,
+                'sources' : busctl_sources,
+        },
+        test_template + {
+                'sources' : files(
+                        'test-busctl-introspect.c',
+                        'busctl-introspect.c',
+                )
+        },
 ]

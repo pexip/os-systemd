@@ -4,27 +4,34 @@
 
 #include "alloc-util.h"
 #include "blockdev-util.h"
-#include "chase-symlinks.h"
+#include "build-path.h"
+#include "chase.h"
 #include "conf-parser.h"
 #include "dirent-util.h"
+#include "event-util.h"
 #include "fd-util.h"
 #include "glyph-util.h"
 #include "gpt.h"
 #include "hexdecoct.h"
 #include "install-file.h"
+#include "mkdir.h"
 #include "parse-helpers.h"
 #include "parse-util.h"
+#include "percent-util.h"
 #include "process-util.h"
+#include "random-util.h"
 #include "rm-rf.h"
+#include "signal-util.h"
+#include "socket-util.h"
 #include "specifier.h"
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "strv.h"
 #include "sync-util.h"
+#include "sysupdate-feature.h"
 #include "sysupdate-pattern.h"
 #include "sysupdate-resource.h"
 #include "sysupdate-transfer.h"
-#include "sysupdate-util.h"
 #include "sysupdate.h"
 #include "tmpfile-util.h"
 #include "web-util.h"
@@ -32,17 +39,24 @@
 /* Default value for InstancesMax= for fs object targets */
 #define DEFAULT_FILE_INSTANCES_MAX 3
 
-Transfer *transfer_free(Transfer *t) {
+Transfer* transfer_free(Transfer *t) {
         if (!t)
                 return NULL;
 
         t->temporary_path = rm_rf_subvolume_and_free(t->temporary_path);
 
-        free(t->definition_path);
+        free(t->id);
+
         free(t->min_version);
         strv_free(t->protected_versions);
         free(t->current_symlink);
         free(t->final_path);
+
+        strv_free(t->features);
+        strv_free(t->requisite_features);
+
+        strv_free(t->changelog);
+        strv_free(t->appstream);
 
         partition_info_destroy(&t->partition_info);
 
@@ -52,7 +66,7 @@ Transfer *transfer_free(Transfer *t) {
         return mfree(t);
 }
 
-Transfer *transfer_new(void) {
+Transfer* transfer_new(Context *ctx) {
         Transfer *t;
 
         t = new(Transfer, 1);
@@ -77,16 +91,12 @@ Transfer *transfer_new(void) {
                 .install_read_only = -1,
 
                 .partition_info = PARTITION_INFO_NULL,
+
+                .context = ctx,
         };
 
         return t;
 }
-
-static const Specifier specifier_table[] = {
-        COMMON_SYSTEM_SPECIFIERS,
-        COMMON_TMP_SPECIFIERS,
-        {}
-};
 
 static int config_parse_protect_version(
                 const char *unit,
@@ -158,6 +168,48 @@ static int config_parse_min_version(
         }
 
         return free_and_replace(*version, resolved);
+}
+
+static int config_parse_url_specifiers(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+        char ***s = ASSERT_PTR(data);
+        _cleanup_free_ char *resolved = NULL;
+        int r;
+
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                *s = strv_free(*s);
+                return 0;
+        }
+
+        r = specifier_printf(rvalue, NAME_MAX, specifier_table, arg_root, NULL, &resolved);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to expand specifiers in %s=, ignoring: %s", lvalue, rvalue);
+                return 0;
+        }
+
+        if (!http_url_is_valid(resolved)) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
+                           "%s= URL is not valid, ignoring: %s", lvalue, rvalue);
+                return 0;
+        }
+
+        r = strv_push(s, TAKE_PTR(resolved));
+        if (r < 0)
+                return log_oom();
+
+        return 0;
 }
 
 static int config_parse_current_symlink(
@@ -297,7 +349,6 @@ static int config_parse_resource_path(
                 const char *rvalue,
                 void *data,
                 void *userdata) {
-
         _cleanup_free_ char *resolved = NULL;
         Resource *rr = ASSERT_PTR(data);
         int r;
@@ -318,14 +369,17 @@ static int config_parse_resource_path(
         }
 
         /* Note that we don't validate the path as being absolute or normalized. We'll do that in
-         * transfer_read_definition() as we might not know yet whether Path refers to an URL or a file system
+         * transfer_read_definition() as we might not know yet whether Path refers to a URL or a file system
          * path. */
 
         rr->path_auto = false;
         return free_and_replace(rr->path, resolved);
 }
 
-static DEFINE_CONFIG_PARSE_ENUM(config_parse_resource_type, resource_type, ResourceType, "Invalid resource type");
+static DEFINE_CONFIG_PARSE_ENUM(config_parse_resource_type, resource_type, ResourceType);
+
+static DEFINE_CONFIG_PARSE_ENUM_WITH_DEFAULT(config_parse_resource_path_relto, path_relative_to, PathRelativeTo,
+                                             PATH_RELATIVE_TO_ROOT);
 
 static int config_parse_resource_ptype(
                 const char *unit,
@@ -344,7 +398,7 @@ static int config_parse_resource_ptype(
 
         assert(rvalue);
 
-        r = gpt_partition_type_uuid_from_string(rvalue, &rr->partition_type);
+        r = gpt_partition_type_from_string(rvalue, &rr->partition_type);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed parse partition type, ignoring: %s", rvalue);
@@ -411,47 +465,97 @@ static int config_parse_partition_flags(
         return 0;
 }
 
-int transfer_read_definition(Transfer *t, const char *path) {
-        int r;
-
+static bool transfer_decide_if_enabled(Transfer *t, Hashmap *known_features) {
         assert(t);
-        assert(path);
+
+        /* Requisite feature disabled -> transfer disabled */
+        STRV_FOREACH(id, t->requisite_features) {
+                Feature *f = hashmap_get(known_features, *id);
+                if (!f || !f->enabled) /* missing features are implicitly disabled */
+                        return false;
+        }
+
+        /* No features defined -> transfer implicitly enabled */
+        if (strv_isempty(t->features))
+                return true;
+
+        /* At least one feature enabled -> transfer enabled */
+        STRV_FOREACH(id, t->features) {
+                Feature *f = hashmap_get(known_features, *id);
+                if (f && f->enabled)
+                        return true;
+        }
+
+        /* All listed features disabled -> transfer disabled */
+        return false;
+}
+
+int transfer_read_definition(Transfer *t, const char *path, const char **dirs, Hashmap *known_features) {
+        assert(t);
 
         ConfigTableItem table[] = {
-                { "Transfer",    "MinVersion",              config_parse_min_version,          0, &t->min_version        },
-                { "Transfer",    "ProtectVersion",          config_parse_protect_version,      0, &t->protected_versions },
-                { "Transfer",    "Verify",                  config_parse_bool,                 0, &t->verify             },
-                { "Source",      "Type",                    config_parse_resource_type,        0, &t->source.type        },
-                { "Source",      "Path",                    config_parse_resource_path,        0, &t->source             },
-                { "Source",      "MatchPattern",            config_parse_resource_pattern,     0, &t->source.patterns    },
-                { "Target",      "Type",                    config_parse_resource_type,        0, &t->target.type        },
-                { "Target",      "Path",                    config_parse_resource_path,        0, &t->target             },
-                { "Target",      "MatchPattern",            config_parse_resource_pattern,     0, &t->target.patterns    },
-                { "Target",      "MatchPartitionType",      config_parse_resource_ptype,       0, &t->target             },
-                { "Target",      "PartitionUUID",           config_parse_partition_uuid,       0, t                      },
-                { "Target",      "PartitionFlags",          config_parse_partition_flags,      0, t                      },
-                { "Target",      "PartitionNoAuto",         config_parse_tristate,             0, &t->no_auto            },
-                { "Target",      "PartitionGrowFileSystem", config_parse_tristate,             0, &t->growfs             },
-                { "Target",      "ReadOnly",                config_parse_tristate,             0, &t->read_only          },
-                { "Target",      "Mode",                    config_parse_mode,                 0, &t->mode               },
-                { "Target",      "TriesLeft",               config_parse_uint64,               0, &t->tries_left         },
-                { "Target",      "TriesDone",               config_parse_uint64,               0, &t->tries_done         },
-                { "Target",      "InstancesMax",            config_parse_instances_max,        0, &t->instances_max      },
-                { "Target",      "RemoveTemporary",         config_parse_bool,                 0, &t->remove_temporary   },
-                { "Target",      "CurrentSymlink",          config_parse_current_symlink,      0, &t->current_symlink    },
+                { "Transfer",    "MinVersion",              config_parse_min_version,          0, &t->min_version             },
+                { "Transfer",    "ProtectVersion",          config_parse_protect_version,      0, &t->protected_versions      },
+                { "Transfer",    "Verify",                  config_parse_bool,                 0, &t->verify                  },
+                { "Transfer",    "ChangeLog",               config_parse_url_specifiers,       0, &t->changelog               },
+                { "Transfer",    "AppStream",               config_parse_url_specifiers,       0, &t->appstream               },
+                { "Transfer",    "Features",                config_parse_strv,                 0, &t->features                },
+                { "Transfer",    "RequisiteFeatures",       config_parse_strv,                 0, &t->requisite_features      },
+                { "Source",      "Type",                    config_parse_resource_type,        0, &t->source.type             },
+                { "Source",      "Path",                    config_parse_resource_path,        0, &t->source                  },
+                { "Source",      "PathRelativeTo",          config_parse_resource_path_relto,  0, &t->source.path_relative_to },
+                { "Source",      "MatchPattern",            config_parse_resource_pattern,     0, &t->source.patterns         },
+                { "Target",      "Type",                    config_parse_resource_type,        0, &t->target.type             },
+                { "Target",      "Path",                    config_parse_resource_path,        0, &t->target                  },
+                { "Target",      "PathRelativeTo",          config_parse_resource_path_relto,  0, &t->target.path_relative_to },
+                { "Target",      "MatchPattern",            config_parse_resource_pattern,     0, &t->target.patterns         },
+                { "Target",      "MatchPartitionType",      config_parse_resource_ptype,       0, &t->target                  },
+                { "Target",      "PartitionUUID",           config_parse_partition_uuid,       0, t                           },
+                { "Target",      "PartitionFlags",          config_parse_partition_flags,      0, t                           },
+                { "Target",      "PartitionNoAuto",         config_parse_tristate,             0, &t->no_auto                 },
+                { "Target",      "PartitionGrowFileSystem", config_parse_tristate,             0, &t->growfs                  },
+                { "Target",      "ReadOnly",                config_parse_tristate,             0, &t->read_only               },
+                { "Target",      "Mode",                    config_parse_mode,                 0, &t->mode                    },
+                { "Target",      "TriesLeft",               config_parse_uint64,               0, &t->tries_left              },
+                { "Target",      "TriesDone",               config_parse_uint64,               0, &t->tries_done              },
+                { "Target",      "InstancesMax",            config_parse_instances_max,        0, &t->instances_max           },
+                { "Target",      "RemoveTemporary",         config_parse_bool,                 0, &t->remove_temporary        },
+                { "Target",      "CurrentSymlink",          config_parse_current_symlink,      0, &t->current_symlink         },
                 {}
         };
 
-        r = config_parse(NULL, path, NULL,
-                         "Transfer\0"
-                         "Source\0"
-                         "Target\0",
-                         config_item_table_lookup, table,
-                         CONFIG_PARSE_WARN,
-                         t,
-                         NULL);
+        _cleanup_free_ char *filename = NULL;
+        char *e;
+        int r;
+
+        assert(path);
+        assert(dirs);
+
+        r = path_extract_filename(path, &filename);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract filename from path '%s': %m", path);
+
+        r = config_parse_many(
+                        STRV_MAKE_CONST(path),
+                        dirs,
+                        strjoina(filename, ".d"),
+                        arg_root,
+                        "Transfer\0"
+                        "Source\0"
+                        "Target\0",
+                        config_item_table_lookup, table,
+                        CONFIG_PARSE_WARN,
+                        /* userdata= */ NULL,
+                        /* stats_by_path= */ NULL,
+                        /* drop_in_files= */ NULL);
         if (r < 0)
                 return r;
+
+        e = ASSERT_PTR(endswith(filename, ".transfer") ?: endswith(filename, ".conf"));
+        *e = 0; /* Remove the file extension */
+        t->id = TAKE_PTR(filename);
+
+        t->enabled = transfer_decide_if_enabled(t, known_features);
 
         if (!RESOURCE_IS_SOURCE(t->source.type))
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
@@ -498,6 +602,14 @@ int transfer_read_definition(Transfer *t, const char *path) {
                 return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
                                   "Source specification lacks Path=.");
 
+        if (t->source.path_relative_to == PATH_RELATIVE_TO_EXPLICIT && !arg_transfer_source)
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "PathRelativeTo=explicit requires --transfer-source= to be specified.");
+
+        if (t->target.path_relative_to == PATH_RELATIVE_TO_EXPLICIT)
+                return log_syntax(NULL, LOG_ERR, path, 1, SYNTHETIC_ERRNO(EINVAL),
+                                  "PathRelativeTo=explicit can only be used in source specifications.");
+
         if (t->source.path) {
                 if (RESOURCE_IS_FILESYSTEM(t->source.type) || t->source.type == RESOURCE_PARTITION)
                         if (!path_is_absolute(t->source.path) || !path_is_normalized(t->source.path))
@@ -527,6 +639,7 @@ int transfer_read_definition(Transfer *t, const char *path) {
                                   "Target path is not a normalized, absolute path: %s", t->target.path);
 
         if (strv_isempty(t->target.patterns)) {
+                log_syntax(NULL, LOG_INFO, path, 1, 0, "Target specification lacks MatchPattern= expression. Assuming same value as in source specification.");
                 strv_free(t->target.patterns);
                 t->target.patterns = strv_copy(t->source.patterns);
                 if (!t->target.patterns)
@@ -558,11 +671,11 @@ int transfer_resolve_paths(
 
         assert(t);
 
-        r = resource_resolve_path(&t->source, root, node);
+        r = resource_resolve_path(&t->source, root, arg_transfer_source, node);
         if (r < 0)
                 return r;
 
-        r = resource_resolve_path(&t->target, root, node);
+        r = resource_resolve_path(&t->target, root, /*relative_to_directory=*/ NULL, node);
         if (r < 0)
                 return r;
 
@@ -570,7 +683,7 @@ int transfer_resolve_paths(
 }
 
 static void transfer_remove_temporary(Transfer *t) {
-        _cleanup_(closedirp) DIR *d = NULL;
+        _cleanup_closedir_ DIR *d = NULL;
         int r;
 
         assert(t);
@@ -636,6 +749,8 @@ int transfer_vacuum(
         assert(instances_max >= 1);
         if (instances_max == UINT64_MAX) /* Keep infinite instances? */
                 limit = UINT64_MAX;
+        else if (space == UINT64_MAX) /* forcibly delete all instances? */
+                limit = 0;
         else if (space > instances_max)
                 return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
                                        "Asked to delete more instances than total maximum allowed number of instances, refusing.");
@@ -645,7 +760,7 @@ int transfer_vacuum(
         else
                 limit = instances_max - space;
 
-        if (t->target.type == RESOURCE_PARTITION) {
+        if (t->target.type == RESOURCE_PARTITION && space != UINT64_MAX) {
                 uint64_t rm, remain;
 
                 /* If we are looking at a partition table, we also have to take into account how many
@@ -654,18 +769,18 @@ int transfer_vacuum(
                 if (t->target.n_empty + t->target.n_instances < 2)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
                                                "Partition table has less than two partition slots of the right type " SD_ID128_UUID_FORMAT_STR " (%s), refusing.",
-                                               SD_ID128_FORMAT_VAL(t->target.partition_type),
-                                               gpt_partition_type_uuid_to_string(t->target.partition_type));
+                                               SD_ID128_FORMAT_VAL(t->target.partition_type.uuid),
+                                               gpt_partition_type_uuid_to_string(t->target.partition_type.uuid));
                 if (space > t->target.n_empty + t->target.n_instances)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
                                                "Partition table does not have enough partition slots of right type " SD_ID128_UUID_FORMAT_STR " (%s) for operation.",
-                                               SD_ID128_FORMAT_VAL(t->target.partition_type),
-                                               gpt_partition_type_uuid_to_string(t->target.partition_type));
+                                               SD_ID128_FORMAT_VAL(t->target.partition_type.uuid),
+                                               gpt_partition_type_uuid_to_string(t->target.partition_type.uuid));
                 if (space == t->target.n_empty + t->target.n_instances)
                         return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
                                                "Asked to empty all partition table slots of the right type " SD_ID128_UUID_FORMAT_STR " (%s), can't allow that. One instance must always remain.",
-                                               SD_ID128_FORMAT_VAL(t->target.partition_type),
-                                               gpt_partition_type_uuid_to_string(t->target.partition_type));
+                                               SD_ID128_FORMAT_VAL(t->target.partition_type.uuid),
+                                               gpt_partition_type_uuid_to_string(t->target.partition_type.uuid));
 
                 rm = LESS_BY(space, t->target.n_empty);
                 remain = LESS_BY(t->target.n_instances, rm);
@@ -699,7 +814,11 @@ int transfer_vacuum(
 
                 assert(oldest->resource);
 
-                log_info("%s Removing old '%s' (%s).", special_glyph(SPECIAL_GLYPH_RECYCLING), oldest->path, resource_type_to_string(oldest->resource->type));
+                log_info("%s Removing %s '%s' (%s).",
+                         special_glyph(SPECIAL_GLYPH_RECYCLING),
+                         space == UINT64_MAX ? "disabled" : "old",
+                         oldest->path,
+                         resource_type_to_string(oldest->resource->type));
 
                 switch (t->target.type) {
 
@@ -709,6 +828,8 @@ int transfer_vacuum(
                         r = rm_rf(oldest->path, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_SUBVOLUME|REMOVE_MISSING_OK|REMOVE_CHMOD);
                         if (r < 0 && r != -ENOENT)
                                 return log_error_errno(r, "Failed to make room, deleting '%s' failed: %m", oldest->path);
+
+                        (void) rmdir_parents(oldest->path, t->target.path);
 
                         break;
 
@@ -776,33 +897,258 @@ static void compile_pattern_fields(
         memcpy(ret->sha256sum, i->metadata.sha256sum, sizeof(ret->sha256sum));
 }
 
-static int run_helper(
-                const char *name,
-                const char *path,
-                const char * const cmdline[]) {
+typedef struct CalloutContext {
+        const Transfer *transfer;
+        const Instance *instance;
+        TransferProgress callback;
+        PidRef pid;
+        const char *name;
+        int helper_errno;
+        void* userdata;
+} CalloutContext;
 
+static CalloutContext *callout_context_free(CalloutContext *ctx) {
+        if (!ctx)
+                return NULL;
+
+        /* We don't own any data but need to clean up the job pid */
+        pidref_done(&ctx->pid);
+
+        return mfree(ctx);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(CalloutContext*, callout_context_free);
+
+static int callout_context_new(const Transfer *t, const Instance *i, TransferProgress cb,
+                               const char *name, void* userdata, CalloutContext **ret) {
+        _cleanup_(callout_context_freep) CalloutContext *ctx = NULL;
+
+        assert(t);
+        assert(i);
+        assert(cb);
+
+        ctx = new(CalloutContext, 1);
+        if (!ctx)
+                return -ENOMEM;
+
+        *ctx = (CalloutContext) {
+                .transfer = t,
+                .instance = i,
+                .callback = cb,
+                .pid = PIDREF_NULL,
+                .name = name,
+                .userdata = userdata,
+        };
+
+        *ret = TAKE_PTR(ctx);
+        return 0;
+}
+
+static int helper_on_exit(sd_event_source *s, const siginfo_t *si, void *userdata) {
+        _cleanup_(callout_context_freep) CalloutContext *ctx = ASSERT_PTR(userdata);
         int r;
 
-        assert(name);
-        assert(path);
-        assert(cmdline);
+        assert(s);
+        assert(si);
+        assert(ctx);
 
-        r = safe_fork(name, FORK_RESET_SIGNALS|FORK_DEATHSIG|FORK_LOG|FORK_WAIT, NULL);
-        if (r < 0)
-                return r;
-        if (r == 0) {
-                /* Child */
+        pidref_done(&ctx->pid);
 
-                (void) unsetenv("NOTIFY_SOCKET");
-                execv(path, (char *const*) cmdline);
-                log_error_errno(errno, "Failed to execute %s tool: %m", path);
-                _exit(EXIT_FAILURE);
+        if (si->si_code == CLD_EXITED) {
+                if (si->si_status == EXIT_SUCCESS) {
+                        r = 0;
+                        log_debug("%s succeeded.", ctx->name);
+                } else if (ctx->helper_errno != 0) {
+                        r = -ctx->helper_errno;
+                        log_error_errno(r, "%s failed with exit status %i: %m", ctx->name, si->si_status);
+                } else {
+                        r = -EPROTO;
+                        log_error("%s failed with exit status %i.", ctx->name, si->si_status);
+                }
+        } else {
+                r = -EPROTO;
+                if (IN_SET(si->si_code, CLD_KILLED, CLD_DUMPED))
+                        log_error("%s terminated by signal %s.", ctx->name, signal_to_string(si->si_status));
+                else
+                        log_error("%s failed due to unknown reason.", ctx->name);
+        }
+
+        return sd_event_exit(sd_event_source_get_event(s), r);
+}
+
+static int helper_on_notify(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        char buf[NOTIFY_BUFFER_MAX+1];
+        struct iovec iovec = {
+                .iov_base = buf,
+                .iov_len = sizeof(buf)-1,
+        };
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred))) control;
+        struct msghdr msghdr = {
+                .msg_iov = &iovec,
+                .msg_iovlen = 1,
+                .msg_control = &control,
+                .msg_controllen = sizeof(control),
+        };
+        struct ucred *ucred;
+        CalloutContext *ctx = ASSERT_PTR(userdata);
+        char *progress_str, *errno_str;
+        int progress;
+        ssize_t n;
+        int r;
+
+        n = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
+        if (ERRNO_IS_NEG_TRANSIENT(n))
+                return 0;
+        if (n == -ECHRNG) {
+                log_warning_errno(n, "Got message with truncated control data (unexpected fds sent?), ignoring.");
+                return 0;
+        }
+        if (n == -EXFULL) {
+                log_warning_errno(n, "Got message with truncated payload data, ignoring.");
+                return 0;
+        }
+        if (n < 0)
+                return (int) n;
+
+        cmsg_close_all(&msghdr);
+
+        ucred = CMSG_FIND_DATA(&msghdr, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
+        if (!ucred || ucred->pid <= 0) {
+                log_warning("Got notification datagram lacking credential information, ignoring.");
+                return 0;
+        }
+        if (ucred->pid != ctx->pid.pid) {
+                log_warning("Got notification datagram from unexpected peer, ignoring.");
+                return 0;
+        }
+
+        buf[n] = 0;
+
+        progress_str = find_line_startswith(buf, "X_IMPORT_PROGRESS=");
+        errno_str = find_line_startswith(buf, "ERRNO=");
+
+        if (errno_str) {
+                truncate_nl(errno_str);
+                r = parse_errno(errno_str);
+                if (r < 0)
+                        log_warning_errno(r, "Got invalid errno value '%s', ignoring: %m", errno_str);
+                else {
+                        ctx->helper_errno = r;
+                        log_debug_errno(r, "Got errno from callout: %i (%m)", r);
+                }
+        }
+
+        if (progress_str) {
+                truncate_nl(progress_str);
+                progress = parse_percent(progress_str);
+                if (progress < 0)
+                        log_warning("Got invalid percent value '%s', ignoring.", progress_str);
+                else {
+                        r = ctx->callback(ctx->transfer, ctx->instance, progress);
+                        if (r < 0)
+                                return r;
+                }
         }
 
         return 0;
 }
 
-int transfer_acquire_instance(Transfer *t, Instance *i) {
+static int run_callout(
+                const char *name,
+                char *cmdline[],
+                const Transfer *transfer,
+                const Instance *instance,
+                TransferProgress callback,
+                void *userdata) {
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *exit_source = NULL, *notify_source = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        _cleanup_free_ char *bind_name = NULL;
+        union sockaddr_union bsa;
+        int r;
+
+        assert(name);
+        assert(cmdline);
+        assert(cmdline[0]);
+
+        _cleanup_(callout_context_freep) CalloutContext *ctx = NULL;
+
+        r = callout_context_new(transfer, instance, callback, name, userdata, &ctx);
+        if (r < 0)
+                return log_oom();
+
+        r = sd_event_new(&event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create event: %m");
+
+        /* Kill the helper & return an error if we get interrupted by a signal */
+        r = sd_event_add_signal(event, NULL, SIGINT | SD_EVENT_SIGNAL_PROCMASK, NULL, INT_TO_PTR(-ECANCELED));
+        if (r < 0)
+                return log_error_errno(r, "Failed to register signal to event: %m");
+        r = sd_event_add_signal(event, NULL, SIGTERM | SD_EVENT_SIGNAL_PROCMASK, NULL, INT_TO_PTR(-ECANCELED));
+        if (r < 0)
+                return log_error_errno(r, "Failed to register signal to event: %m");
+
+        fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+        if (fd < 0)
+                return log_error_errno(errno, "Failed to create UNIX socket for notification: %m");
+
+        if (asprintf(&bind_name, "@%" PRIx64 "/sysupdate/" PID_FMT "/notify", random_u64(), getpid_cached()) < 0)
+                return log_oom();
+
+        r = sockaddr_un_set_path(&bsa.un, bind_name);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set socket path: %m");
+
+        if (bind(fd, &bsa.sa, r) < 0)
+                return log_error_errno(errno, "Failed to bind to notification socket: %m");
+
+        r = setsockopt_int(fd, SOL_SOCKET, SO_PASSCRED, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set socket options: %m");
+
+        r = pidref_safe_fork(ctx->name, FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_LOG, &ctx->pid);
+        if (r < 0)
+                return log_error_errno(r, "Failed to fork process %s: %m", ctx->name);
+        if (r == 0) {
+                /* Child */
+                if (setenv("NOTIFY_SOCKET", bind_name, 1) < 0) {
+                        log_error_errno(errno, "setenv() failed: %m");
+                        _exit(EXIT_FAILURE);
+                }
+                r = invoke_callout_binary(cmdline[0], (char *const*) cmdline);
+                log_error_errno(r, "Failed to execute %s tool: %m", cmdline[0]);
+                _exit(EXIT_FAILURE);
+        }
+
+        /* Quit the loop w/ when child process exits */
+        r = event_add_child_pidref(event, &exit_source, &ctx->pid, WEXITED, helper_on_exit, (void*) ctx);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add child process to event loop: %m");
+
+        r = sd_event_source_set_child_process_own(exit_source, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to take ownership of child process: %m");
+
+        /* Propagate sd_notify calls */
+        r = sd_event_add_io(event, &notify_source, fd, EPOLLIN, helper_on_notify, TAKE_PTR(ctx));
+        if (r < 0)
+                return log_error_errno(r, "Failed to add notification propagation to event loop: %m");
+
+        (void) sd_event_source_set_description(notify_source, "notify-socket");
+
+        (void) sd_event_source_set_priority(notify_source, SD_EVENT_PRIORITY_NORMAL - 5);
+
+        r = sd_event_source_set_io_fd_own(notify_source, true);
+        if (r < 0)
+                return log_error_errno(r, "Event loop failed to take ownership of notification source: %m");
+        TAKE_FD(fd);
+
+        /* Process events until the helper quits */
+        return sd_event_loop(event);
+}
+
+int transfer_acquire_instance(Transfer *t, Instance *i, TransferProgress cb, void *userdata) {
         _cleanup_free_ char *formatted_pattern = NULL, *digest = NULL;
         char offset[DECIMAL_STR_MAX(uint64_t)+1], max_size[DECIMAL_STR_MAX(uint64_t)+1];
         const char *where = NULL;
@@ -812,8 +1158,8 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
 
         assert(t);
         assert(i);
-        assert(i->resource);
-        assert(t == container_of(i->resource, Transfer, source));
+        assert(i->resource == &t->source);
+        assert(cb);
 
         /* Does this instance already exist in the target? Then we don't need to acquire anything */
         existing = resource_find_instance(&t->target, i->metadata.version);
@@ -834,12 +1180,16 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
 
         if (RESOURCE_IS_FILESYSTEM(t->target.type)) {
 
-                if (!filename_is_valid(formatted_pattern))
+                if (!path_is_valid_full(formatted_pattern, /* accept_dot_dot = */ false))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Formatted pattern is not suitable as file name, refusing: %s", formatted_pattern);
 
                 t->final_path = path_join(t->target.path, formatted_pattern);
                 if (!t->final_path)
                         return log_oom();
+
+                r = mkdir_parents(t->final_path, 0755);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot create target directory: %m");
 
                 r = tempfn_random(t->final_path, "sysupdate", &t->temporary_path);
                 if (r < 0)
@@ -858,7 +1208,7 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
                 r = find_suitable_partition(
                                 t->target.path,
                                 i->metadata.size,
-                                t->target.partition_type_set ? &t->target.partition_type : NULL,
+                                t->target.partition_type_set ? &t->target.partition_type.uuid : NULL,
                                 &t->partition_info);
                 if (r < 0)
                         return r;
@@ -898,36 +1248,32 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
                          * importer has some tricks up its sleeve, such as sparse file generation, which we
                          * want to take benefit of, too.) */
 
-                        r = run_helper("(sd-import-raw)",
-                                       import_binary_path(),
-                                       (const char* const[]) {
-                                               "systemd-import",
+                        r = run_callout("(sd-import-raw)",
+                                        STRV_MAKE(
+                                               SYSTEMD_IMPORT_PATH,
                                                "raw",
                                                "--direct",          /* just copy/unpack the specified file, don't do anything else */
                                                arg_sync ? "--sync=yes" : "--sync=no",
                                                i->path,
-                                               t->temporary_path,
-                                               NULL
-                                       });
+                                               t->temporary_path),
+                                        t, i, cb, userdata);
                         break;
 
                 case RESOURCE_PARTITION:
 
                         /* regular file → partition */
 
-                        r = run_helper("(sd-import-raw)",
-                                       import_binary_path(),
-                                       (const char* const[]) {
-                                               "systemd-import",
+                        r = run_callout("(sd-import-raw)",
+                                        STRV_MAKE(
+                                               SYSTEMD_IMPORT_PATH,
                                                "raw",
                                                "--direct",          /* just copy/unpack the specified file, don't do anything else */
                                                "--offset", offset,
                                                "--size-max", max_size,
                                                arg_sync ? "--sync=yes" : "--sync=no",
                                                i->path,
-                                               t->target.path,
-                                               NULL
-                                       });
+                                               t->target.path),
+                                        t, i, cb, userdata);
                         break;
 
                 default:
@@ -942,18 +1288,16 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
 
                 /* directory/subvolume → directory/subvolume */
 
-                r = run_helper("(sd-import-fs)",
-                               import_fs_binary_path(),
-                               (const char* const[]) {
-                                       "systemd-import-fs",
+                r = run_callout("(sd-import-fs)",
+                                STRV_MAKE(
+                                       SYSTEMD_IMPORT_FS_PATH,
                                        "run",
                                        "--direct",          /* just untar the specified file, don't do anything else */
                                        arg_sync ? "--sync=yes" : "--sync=no",
                                        t->target.type == RESOURCE_SUBVOLUME ? "--btrfs-subvol=yes" : "--btrfs-subvol=no",
                                        i->path,
-                                       t->temporary_path,
-                                       NULL
-                               });
+                                       t->temporary_path),
+                                t, i, cb, userdata);
                 break;
 
         case RESOURCE_TAR:
@@ -961,18 +1305,16 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
 
                 /* tar → directory/subvolume */
 
-                r = run_helper("(sd-import-tar)",
-                               import_binary_path(),
-                               (const char* const[]) {
-                                       "systemd-import",
+                r = run_callout("(sd-import-tar)",
+                                STRV_MAKE(
+                                       SYSTEMD_IMPORT_PATH,
                                        "tar",
                                        "--direct",          /* just untar the specified file, don't do anything else */
                                        arg_sync ? "--sync=yes" : "--sync=no",
                                        t->target.type == RESOURCE_SUBVOLUME ? "--btrfs-subvol=yes" : "--btrfs-subvol=no",
                                        i->path,
-                                       t->temporary_path,
-                                       NULL
-                               });
+                                       t->temporary_path),
+                                t, i, cb, userdata);
                 break;
 
         case RESOURCE_URL_FILE:
@@ -983,28 +1325,25 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
 
                         /* url file → regular file */
 
-                        r = run_helper("(sd-pull-raw)",
-                                       pull_binary_path(),
-                                       (const char* const[]) {
-                                               "systemd-pull",
+                        r = run_callout("(sd-pull-raw)",
+                                       STRV_MAKE(
+                                               SYSTEMD_PULL_PATH,
                                                "raw",
                                                "--direct",          /* just download the specified URL, don't download anything else */
                                                "--verify", digest,  /* validate by explicit SHA256 sum */
                                                arg_sync ? "--sync=yes" : "--sync=no",
                                                i->path,
-                                               t->temporary_path,
-                                               NULL
-                                       });
+                                               t->temporary_path),
+                                        t, i, cb, userdata);
                         break;
 
                 case RESOURCE_PARTITION:
 
                         /* url file → partition */
 
-                        r = run_helper("(sd-pull-raw)",
-                                       pull_binary_path(),
-                                       (const char* const[]) {
-                                               "systemd-pull",
+                        r = run_callout("(sd-pull-raw)",
+                                        STRV_MAKE(
+                                               SYSTEMD_PULL_PATH,
                                                "raw",
                                                "--direct",              /* just download the specified URL, don't download anything else */
                                                "--verify", digest,      /* validate by explicit SHA256 sum */
@@ -1012,9 +1351,8 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
                                                "--size-max", max_size,
                                                arg_sync ? "--sync=yes" : "--sync=no",
                                                i->path,
-                                               t->target.path,
-                                               NULL
-                                       });
+                                               t->target.path),
+                                        t, i, cb, userdata);
                         break;
 
                 default:
@@ -1026,19 +1364,17 @@ int transfer_acquire_instance(Transfer *t, Instance *i) {
         case RESOURCE_URL_TAR:
                 assert(IN_SET(t->target.type, RESOURCE_DIRECTORY, RESOURCE_SUBVOLUME));
 
-                r = run_helper("(sd-pull-tar)",
-                               pull_binary_path(),
-                               (const char*const[]) {
-                                       "systemd-pull",
+                r = run_callout("(sd-pull-tar)",
+                                STRV_MAKE(
+                                       SYSTEMD_PULL_PATH,
                                        "tar",
                                        "--direct",          /* just download the specified URL, don't download anything else */
                                        "--verify", digest,  /* validate by explicit SHA256 sum */
                                        t->target.type == RESOURCE_SUBVOLUME ? "--btrfs-subvol=yes" : "--btrfs-subvol=no",
                                        arg_sync ? "--sync=yes" : "--sync=no",
                                        i->path,
-                                       t->temporary_path,
-                                       NULL
-                               });
+                                       t->temporary_path),
+                                t, i, cb, userdata);
                 break;
 
         default:
@@ -1211,7 +1547,7 @@ int transfer_install_instance(
                         assert_not_reached();
 
                 if (resolve_link_path && root) {
-                        r = chase_symlinks(link_path, root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &resolved, NULL);
+                        r = chase(link_path, root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &resolved, NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to resolve current symlink path '%s': %m", link_path);
 

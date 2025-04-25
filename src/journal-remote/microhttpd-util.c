@@ -14,7 +14,6 @@
 #include "microhttpd-util.h"
 #include "string-util.h"
 #include "strv.h"
-#include "util.h"
 
 void microhttpd_logger(void *arg, const char *fmt, va_list ap) {
         char *f;
@@ -119,17 +118,15 @@ static void log_reset_gnutls_level(void) {
 }
 
 static int log_enable_gnutls_category(const char *cat) {
-        unsigned i;
-
         if (streq(cat, "all")) {
-                for (i = 0; i < ELEMENTSOF(gnutls_log_map); i++)
-                        gnutls_log_map[i].enabled = true;
+                FOREACH_ELEMENT(entry, gnutls_log_map)
+                        entry->enabled = true;
                 log_reset_gnutls_level();
                 return 0;
         } else
-                for (i = 0; i < ELEMENTSOF(gnutls_log_map); i++)
-                        if (strv_contains((char**)gnutls_log_map[i].names, cat)) {
-                                gnutls_log_map[i].enabled = true;
+                FOREACH_ELEMENT(entry, gnutls_log_map)
+                        if (strv_contains((char**)entry->names, cat)) {
+                                entry->enabled = true;
                                 log_reset_gnutls_level();
                                 return 0;
                         }

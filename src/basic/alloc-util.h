@@ -20,34 +20,34 @@ typedef void* (*mfree_func_t)(void *p);
  * proceeding and smashing the stack limits. Note that by default RLIMIT_STACK is 8M on Linux. */
 #define ALLOCA_MAX (4U*1024U*1024U)
 
-#define new(t, n) ((t*) malloc_multiply((n), sizeof(t)))
+#define new(t, n) ((t*) malloc_multiply(n, sizeof(t)))
 
 #define new0(t, n) ((t*) calloc((n) ?: 1, sizeof(t)))
 
 #define alloca_safe(n)                                                  \
         ({                                                              \
-                size_t _nn_ = n;                                        \
+                size_t _nn_ = (n);                                      \
                 assert(_nn_ <= ALLOCA_MAX);                             \
                 alloca(_nn_ == 0 ? 1 : _nn_);                           \
         })                                                              \
 
 #define newa(t, n)                                                      \
         ({                                                              \
-                size_t _n_ = n;                                         \
-                assert(!size_multiply_overflow(sizeof(t), _n_));        \
-                (t*) alloca_safe(sizeof(t)*_n_);                        \
+                size_t _n_ = (n);                                       \
+                assert_se(MUL_ASSIGN_SAFE(&_n_, sizeof(t)));            \
+                (t*) alloca_safe(_n_);                                  \
         })
 
 #define newa0(t, n)                                                     \
         ({                                                              \
-                size_t _n_ = n;                                         \
-                assert(!size_multiply_overflow(sizeof(t), _n_));        \
-                (t*) alloca0((sizeof(t)*_n_));                          \
+                size_t _n_ = (n);                                       \
+                assert_se(MUL_ASSIGN_SAFE(&_n_, sizeof(t)));            \
+                (t*) alloca0(_n_);                                      \
         })
 
-#define newdup(t, p, n) ((t*) memdup_multiply(p, (n), sizeof(t)))
+#define newdup(t, p, n) ((t*) memdup_multiply(p, n, sizeof(t)))
 
-#define newdup_suffix0(t, p, n) ((t*) memdup_suffix0_multiply(p, (n), sizeof(t)))
+#define newdup_suffix0(t, p, n) ((t*) memdup_suffix0_multiply(p, n, sizeof(t)))
 
 #define malloc0(n) (calloc(1, (n) ?: 1))
 
@@ -146,12 +146,19 @@ static inline void *memdup_suffix0_multiply(const void *p, size_t need, size_t s
 
 void* greedy_realloc(void **p, size_t need, size_t size);
 void* greedy_realloc0(void **p, size_t need, size_t size);
+void* greedy_realloc_append(void **p, size_t *n_p, const void *from, size_t n_from, size_t size);
 
 #define GREEDY_REALLOC(array, need)                                     \
         greedy_realloc((void**) &(array), (need), sizeof((array)[0]))
 
 #define GREEDY_REALLOC0(array, need)                                    \
         greedy_realloc0((void**) &(array), (need), sizeof((array)[0]))
+
+#define GREEDY_REALLOC_APPEND(array, n_array, from, n_from)             \
+        ({                                                              \
+                const typeof(*(array)) *_from_ = (from);                \
+                greedy_realloc_append((void**) &(array), &(n_array), _from_, (n_from), sizeof((array)[0])); \
+        })
 
 #define alloca0(n)                                      \
         ({                                              \
@@ -223,7 +230,6 @@ static inline size_t malloc_sizeof_safe(void **xp) {
                 MALLOC_SIZEOF_SAFE(x)/sizeof((x)[0]),                   \
                 VOID_0))
 
-
 /* These are like strdupa()/strndupa(), but honour ALLOCA_MAX */
 #define strdupa_safe(s)                                                 \
         ({                                                              \
@@ -234,7 +240,40 @@ static inline size_t malloc_sizeof_safe(void **xp) {
 #define strndupa_safe(s, n)                                             \
         ({                                                              \
                 const char *_t = (s);                                   \
-                (char*) memdupa_suffix0(_t, strnlen(_t, (n)));          \
+                (char*) memdupa_suffix0(_t, strnlen(_t, n));            \
         })
+
+/* Free every element of the array. */
+static inline void free_many(void **p, size_t n) {
+        assert(p || n == 0);
+
+        FOREACH_ARRAY(i, p, n)
+                *i = mfree(*i);
+}
+
+/* Typesafe wrapper for char** rather than void**. Unfortunately C won't implicitly cast this. */
+static inline void free_many_charp(char **c, size_t n) {
+        free_many((void**) c, n);
+}
+
+_alloc_(2) static inline void *realloc0(void *p, size_t new_size) {
+        size_t old_size;
+        void *q;
+
+        /* Like realloc(), but initializes anything appended to zero */
+
+        old_size = MALLOC_SIZEOF_SAFE(p);
+
+        q = realloc(p, new_size);
+        if (!q)
+                return NULL;
+
+        new_size = MALLOC_SIZEOF_SAFE(q); /* Update with actually allocated space */
+
+        if (new_size > old_size)
+                memset((uint8_t*) q + old_size, 0, new_size - old_size);
+
+        return q;
+}
 
 #include "memory-util.h"

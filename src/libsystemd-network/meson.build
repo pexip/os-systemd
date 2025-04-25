@@ -2,49 +2,37 @@
 
 sources = files(
         'arp-util.c',
-        'arp-util.h',
-        'dhcp-client-internal.h',
-        'dhcp-identifier.c',
-        'dhcp-identifier.h',
-        'dhcp-internal.h',
-        'dhcp-lease-internal.h',
         'dhcp-network.c',
         'dhcp-option.c',
         'dhcp-packet.c',
-        'dhcp-protocol.h',
-        'dhcp-server-internal.h',
-        'dhcp6-internal.h',
-        'dhcp6-lease-internal.h',
         'dhcp6-network.c',
         'dhcp6-option.c',
-        'dhcp6-option.h',
         'dhcp6-protocol.c',
-        'dhcp6-protocol.h',
+        'icmp6-packet.c',
         'icmp6-util.c',
-        'icmp6-util.h',
         'lldp-neighbor.c',
-        'lldp-neighbor.h',
         'lldp-network.c',
-        'lldp-network.h',
-        'lldp-rx-internal.h',
-        'ndisc-internal.h',
-        'ndisc-router.c',
-        'ndisc-router.h',
+        'ndisc-option.c',
         'network-common.c',
-        'network-common.h',
         'network-internal.c',
-        'network-internal.h',
-        'radv-internal.h',
+        'sd-dhcp-client-id.c',
         'sd-dhcp-client.c',
+        'sd-dhcp-duid.c',
         'sd-dhcp-lease.c',
+        'sd-dhcp-server-lease.c',
         'sd-dhcp-server.c',
         'sd-dhcp6-client.c',
         'sd-dhcp6-lease.c',
+        'sd-dns-resolver.c',
         'sd-ipv4acd.c',
         'sd-ipv4ll.c',
         'sd-lldp-rx.c',
         'sd-lldp-tx.c',
         'sd-ndisc.c',
+        'sd-ndisc-neighbor.c',
+        'sd-ndisc-redirect.c',
+        'sd-ndisc-router.c',
+        'sd-ndisc-router-solicit.c',
         'sd-radv.c',
 )
 
@@ -52,82 +40,93 @@ libsystemd_network = static_library(
         'systemd-network',
         sources,
         include_directories : includes,
+        dependencies : userspace,
         build_by_default : false)
 
 libsystemd_network_includes = [includes, include_directories('.')]
 
 ############################################################
 
-tests += [
-        [files('test-dhcp-option.c'),
-         [libshared,
-          libsystemd_network]],
+network_test_template = test_template + {
+        'link_with' : [
+                libshared,
+                libsystemd_network,
+        ],
+        'suite' : 'network',
+}
 
-        [files('test-sd-dhcp-lease.c'),
-         [libshared,
-          libsystemd_network]],
+network_fuzz_template = fuzz_template + {
+        'link_with' : [
+                libshared,
+                libsystemd_network,
+        ],
+}
 
-        [files('test-dhcp-client.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('test-dhcp-server.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('test-ipv4ll.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('test-ipv4ll-manual.c'),
-         [libshared,
-          libsystemd_network],
-         [], [], '', 'manual'],
-
-        [files('test-acd.c'),
-         [libshared,
-          libsystemd_network],
-         [], [], '', 'manual'],
-
-        [files('test-ndisc-rs.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('test-ndisc-ra.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('test-dhcp6-client.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('test-lldp-rx.c'),
-         [libshared,
-          libsystemd_network]],
-]
-
-fuzzers += [
-        [files('fuzz-dhcp-client.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('fuzz-dhcp6-client.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('fuzz-dhcp-server.c'),
-         [libsystemd_network,
-          libshared]],
-
-        [files('fuzz-dhcp-server-relay.c'),
-         [libsystemd_network,
-          libshared]],
-
-        [files('fuzz-lldp-rx.c'),
-         [libshared,
-          libsystemd_network]],
-
-        [files('fuzz-ndisc-rs.c'),
-         [libshared,
-          libsystemd_network]],
+executables += [
+        network_test_template + {
+                'sources' : files('test-acd.c'),
+                'type' : 'manual',
+        },
+        network_test_template + {
+                'sources' : files('test-dhcp-client.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-dhcp-option.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-dhcp-server.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-dhcp6-client.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-ipv4ll-manual.c'),
+                'type' : 'manual',
+        },
+        network_test_template + {
+                'sources' : files('test-ipv4ll.c'),
+        },
+        network_test_template + {
+                'sources' : files('test-lldp-rx.c'),
+        },
+        network_test_template + {
+                'sources' : files(
+                        'test-ndisc-ra.c',
+                        'icmp6-test-util.c',
+                ),
+        },
+        network_test_template + {
+                'sources' : files(
+                        'test-ndisc-rs.c',
+                        'icmp6-test-util.c',
+                ),
+        },
+        network_test_template + {
+                'sources' : files('test-ndisc-send.c'),
+                'type' : 'manual',
+        },
+        network_test_template + {
+                'sources' : files('test-sd-dhcp-lease.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files('fuzz-dhcp-client.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files('fuzz-dhcp6-client.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files('fuzz-dhcp-server.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files('fuzz-dhcp-server-relay.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files('fuzz-lldp-rx.c'),
+        },
+        network_fuzz_template + {
+                'sources' : files(
+                        'fuzz-ndisc-rs.c',
+                        'icmp6-test-util.c',
+                ),
+        },
 ]

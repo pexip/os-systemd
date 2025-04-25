@@ -11,8 +11,10 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "io-util.h"
+#include "iovec-util.h"
+#include "journal-internal.h"
 #include "journal-util.h"
+#include "journald-client.h"
 #include "journald-context.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -179,6 +181,9 @@ static void client_context_reset(Server *s, ClientContext *c) {
 
         c->log_ratelimit_interval = s->ratelimit_interval;
         c->log_ratelimit_burst = s->ratelimit_burst;
+
+        c->log_filter_allowed_patterns = set_free_free(c->log_filter_allowed_patterns);
+        c->log_filter_denied_patterns = set_free_free(c->log_filter_denied_patterns);
 }
 
 static ClientContext* client_context_free(Server *s, ClientContext *c) {
@@ -205,7 +210,7 @@ static void client_context_read_uid_gid(ClientContext *c, const struct ucred *uc
         if (ucred && uid_is_valid(ucred->uid))
                 c->uid = ucred->uid;
         else
-                (void) get_process_uid(c->pid, &c->uid);
+                (void) pid_get_uid(c->pid, &c->uid);
 
         if (ucred && gid_is_valid(ucred->gid))
                 c->gid = ucred->gid;
@@ -219,13 +224,13 @@ static void client_context_read_basic(ClientContext *c) {
         assert(c);
         assert(pid_is_valid(c->pid));
 
-        if (get_process_comm(c->pid, &t) >= 0)
+        if (pid_get_comm(c->pid, &t) >= 0)
                 free_and_replace(c->comm, t);
 
         if (get_process_exe(c->pid, &t) >= 0)
                 free_and_replace(c->exe, t);
 
-        if (get_process_cmdline(c->pid, SIZE_MAX, PROCESS_CMDLINE_QUOTE, &t) >= 0)
+        if (pid_get_cmdline(c->pid, SIZE_MAX, PROCESS_CMDLINE_QUOTE, &t) >= 0)
                 free_and_replace(c->cmdline, t);
 
         if (get_process_capeff(c->pid, &t) >= 0)
@@ -288,6 +293,8 @@ static int client_context_read_cgroup(Server *s, ClientContext *c, const char *u
 
                 return r;
         }
+
+        (void) client_context_read_log_filter_patterns(c, t);
 
         /* Let's shortcut this if the cgroup path didn't change */
         if (streq_ptr(c->cgroup, t))
@@ -519,8 +526,8 @@ static void client_context_really_refresh(
         client_context_read_basic(c);
         (void) client_context_read_label(c, label, label_size);
 
-        (void) audit_session_from_pid(c->pid, &c->auditid);
-        (void) audit_loginuid_from_pid(c->pid, &c->loginuid);
+        (void) audit_session_from_pid(&PIDREF_MAKE_FROM_PID(c->pid), &c->auditid);
+        (void) audit_loginuid_from_pid(&PIDREF_MAKE_FROM_PID(c->pid), &c->loginuid);
 
         (void) client_context_read_cgroup(s, c, unit_id);
         (void) client_context_read_invocation_id(s, c);
@@ -533,7 +540,7 @@ static void client_context_really_refresh(
 
         if (c->in_lru) {
                 assert(c->n_ref == 0);
-                assert_se(prioq_reshuffle(s->client_contexts_lru, c, &c->lru_index) >= 0);
+                prioq_reshuffle(s->client_contexts_lru, c, &c->lru_index);
         }
 }
 
@@ -602,10 +609,10 @@ static void client_context_try_shrink_to(Server *s, size_t limit) {
 
                         assert(c->n_ref == 0);
 
-                        if (!pid_is_unwaited(c->pid))
+                        if (pid_is_unwaited(c->pid) == 0)
                                 client_context_free(s, c);
                         else
-                                idx ++;
+                                idx++;
                 }
 
                 s->last_cache_pid_flush = t;
@@ -629,6 +636,10 @@ static void client_context_try_shrink_to(Server *s, size_t limit) {
         }
 }
 
+void client_context_flush_regular(Server *s) {
+        client_context_try_shrink_to(s, 0);
+}
+
 void client_context_flush_all(Server *s) {
         assert(s);
 
@@ -637,10 +648,10 @@ void client_context_flush_all(Server *s) {
         s->my_context = client_context_release(s, s->my_context);
         s->pid1_context = client_context_release(s, s->pid1_context);
 
-        client_context_try_shrink_to(s, 0);
+        client_context_flush_regular(s);
 
-        assert(prioq_size(s->client_contexts_lru) == 0);
-        assert(hashmap_size(s->client_contexts) == 0);
+        assert(prioq_isempty(s->client_contexts_lru));
+        assert(hashmap_isempty(s->client_contexts));
 
         s->client_contexts_lru = prioq_free(s->client_contexts_lru);
         s->client_contexts = hashmap_free(s->client_contexts);
@@ -771,7 +782,8 @@ void client_context_acquire_default(Server *s) {
 
                 r = client_context_acquire(s, ucred.pid, &ucred, NULL, 0, NULL, &s->my_context);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to acquire our own context, ignoring: %m");
+                        log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
+                                                    "Failed to acquire our own context, ignoring: %m");
         }
 
         if (!s->namespace && !s->pid1_context) {
@@ -780,7 +792,8 @@ void client_context_acquire_default(Server *s) {
 
                 r = client_context_acquire(s, 1, NULL, NULL, 0, NULL, &s->pid1_context);
                 if (r < 0)
-                        log_warning_errno(r, "Failed to acquire PID1's context, ignoring: %m");
+                        log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
+                                                    "Failed to acquire PID1's context, ignoring: %m");
 
         }
 }

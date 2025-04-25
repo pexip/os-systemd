@@ -126,9 +126,16 @@ int import_url_change_suffix(
         return 0;
 }
 
+static const char* const import_type_table[_IMPORT_TYPE_MAX] = {
+        [IMPORT_RAW] = "raw",
+        [IMPORT_TAR] = "tar",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(import_type, ImportType);
+
 static const char* const import_verify_table[_IMPORT_VERIFY_MAX] = {
-        [IMPORT_VERIFY_NO] = "no",
-        [IMPORT_VERIFY_CHECKSUM] = "checksum",
+        [IMPORT_VERIFY_NO]        = "no",
+        [IMPORT_VERIFY_CHECKSUM]  = "checksum",
         [IMPORT_VERIFY_SIGNATURE] = "signature",
 };
 
@@ -167,6 +174,8 @@ int raw_strip_suffixes(const char *p, char **ret) {
                 ".xz\0"
                 ".gz\0"
                 ".bz2\0"
+                ".sysext.raw\0"
+                ".confext.raw\0"
                 ".raw\0"
                 ".qcow2\0"
                 ".img\0"
@@ -179,7 +188,6 @@ int raw_strip_suffixes(const char *p, char **ret) {
                 return -ENOMEM;
 
         for (;;) {
-                const char *sfx;
                 bool changed = false;
 
                 NULSTR_FOREACH(sfx, suffixes) {

@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
+#include <stdbool.h>
+
 bool reboot_parameter_is_valid(const char *parameter);
 int update_reboot_parameter_and_warn(const char *parameter, bool keep);
 
@@ -13,4 +15,8 @@ typedef enum RebootFlags {
 int read_reboot_parameter(char **parameter);
 int reboot_with_parameter(RebootFlags flags);
 
-int shall_restore_state(void);
+bool shall_restore_state(void);
+
+bool kexec_loaded(void);
+
+int create_shutdown_run_nologin_or_warn(void);

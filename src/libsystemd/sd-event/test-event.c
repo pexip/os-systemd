@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#if HAVE_PIDFD_OPEN
+#include <sys/pidfd.h>
+#endif
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "sd-event.h"
 
@@ -21,7 +25,6 @@
 #include "string-util.h"
 #include "tests.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
 static int prepare_handler(sd_event_source *s, void *userdata) {
         log_info("preparing %c", PTR_TO_INT(userdata));
@@ -92,7 +95,7 @@ static int signal_handler(sd_event_source *s, const struct signalfd_siginfo *si,
 
         assert_se(userdata == INT_TO_PTR('e'));
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGUSR2, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, SIGUSR2) >= 0);
 
         pid = fork();
         assert_se(pid >= 0);
@@ -122,7 +125,7 @@ static int signal_handler(sd_event_source *s, const struct signalfd_siginfo *si,
         zero(plain_si);
         plain_si.si_signo = SIGUSR2;
         plain_si.si_code = SI_QUEUE;
-        plain_si.si_pid = getpid();
+        plain_si.si_pid = getpid_cached();
         plain_si.si_uid = getuid();
         plain_si.si_value.sival_int = 4711;
 
@@ -142,7 +145,7 @@ static int defer_handler(sd_event_source *s, void *userdata) {
 
         assert_se(userdata == INT_TO_PTR('d'));
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGUSR1, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGUSR1) >= 0);
 
         assert_se(sd_event_add_signal(sd_event_source_get_event(s), &p, SIGUSR1, signal_handler, INT_TO_PTR('e')) >= 0);
         assert_se(sd_event_source_set_enabled(p, SD_EVENT_ONESHOT) >= 0);
@@ -199,7 +202,8 @@ static void test_basic_one(bool with_pidfd) {
         sd_event *e = NULL;
         sd_event_source *w = NULL, *x = NULL, *y = NULL, *z = NULL, *q = NULL, *t = NULL;
         static const char ch = 'x';
-        int a[2] = { -1, -1 }, b[2] = { -1, -1}, d[2] = { -1, -1}, k[2] = { -1, -1 };
+        int a[2] = EBADF_PAIR, b[2] = EBADF_PAIR,
+            d[2] = EBADF_PAIR, k[2] = EBADF_PAIR;
         uint64_t event_now;
         int64_t priority;
 
@@ -226,8 +230,7 @@ static void test_basic_one(bool with_pidfd) {
 
         got_a = false, got_b = false, got_c = false, got_d = 0;
 
-        /* Add a oneshot handler, trigger it, reenable it, and trigger
-         * it again. */
+        /* Add a oneshot handler, trigger it, reenable it, and trigger it again. */
         assert_se(sd_event_add_io(e, &w, d[0], EPOLLIN, io_handler, INT_TO_PTR('d')) >= 0);
         assert_se(sd_event_source_set_enabled(w, SD_EVENT_ONESHOT) >= 0);
         assert_se(write(d[1], &ch, 1) >= 0);
@@ -254,7 +257,7 @@ static void test_basic_one(bool with_pidfd) {
         assert_se(sd_event_source_set_prepare(z, prepare_handler) >= 0);
 
         /* Test for floating event sources */
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGRTMIN+1, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGRTMIN+1) >= 0);
         assert_se(sd_event_add_signal(e, NULL, SIGRTMIN+1, NULL, NULL) >= 0);
 
         assert_se(write(a[1], &ch, 1) >= 0);
@@ -346,7 +349,7 @@ TEST(rtqueue) {
 
         assert_se(sd_event_default(&e) >= 0);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGRTMIN+2, SIGRTMIN+3, SIGUSR2, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGRTMIN+2, SIGRTMIN+3, SIGUSR2) >= 0);
         assert_se(sd_event_add_signal(e, &u, SIGRTMIN+2, rtqueue_handler, NULL) >= 0);
         assert_se(sd_event_add_signal(e, &v, SIGRTMIN+3, rtqueue_handler, NULL) >= 0);
         assert_se(sd_event_add_signal(e, &s, SIGUSR2, rtqueue_handler, NULL) >= 0);
@@ -396,6 +399,7 @@ struct inotify_context {
         unsigned create_called[CREATE_EVENTS_MAX];
         unsigned create_overflow;
         unsigned n_create_events;
+        const char *path;
 };
 
 static void maybe_exit(sd_event_source *s, struct inotify_context *c) {
@@ -422,9 +426,11 @@ static void maybe_exit(sd_event_source *s, struct inotify_context *c) {
 }
 
 static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, void *userdata) {
-        struct inotify_context *c = userdata;
-        const char *description;
+        struct inotify_context *c = ASSERT_PTR(userdata);
+        const char *path, *description;
         unsigned bit, n;
+
+        assert_se(sd_event_source_get_inotify_path(s, &path) >= 0);
 
         assert_se(sd_event_source_get_description(s, &description) >= 0);
         assert_se(safe_atou(description, &n) >= 0);
@@ -433,11 +439,12 @@ static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, v
         bit = 1U << n;
 
         if (ev->mask & IN_Q_OVERFLOW) {
-                log_info("inotify-handler <%s>: overflow", description);
+                log_info("inotify-handler for %s <%s>: overflow", path, description);
                 c->create_overflow |= bit;
         } else if (ev->mask & IN_CREATE) {
+                assert_se(path_equal_or_inode_same(path, c->path, 0));
                 if (streq(ev->name, "sub"))
-                        log_debug("inotify-handler <%s>: create on %s", description, ev->name);
+                        log_debug("inotify-handler for %s <%s>: create on %s", path, description, ev->name);
                 else {
                         unsigned i;
 
@@ -446,7 +453,7 @@ static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, v
                         c->create_called[i] |= bit;
                 }
         } else if (ev->mask & IN_DELETE) {
-                log_info("inotify-handler <%s>: delete of %s", description, ev->name);
+                log_info("inotify-handler for %s <%s>: delete of %s", path, description, ev->name);
                 assert_se(streq(ev->name, "sub"));
         } else
                 assert_not_reached();
@@ -456,16 +463,19 @@ static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, v
 }
 
 static int delete_self_handler(sd_event_source *s, const struct inotify_event *ev, void *userdata) {
-        struct inotify_context *c = userdata;
+        struct inotify_context *c = ASSERT_PTR(userdata);
+        const char *path;
+
+        assert_se(sd_event_source_get_inotify_path(s, &path) >= 0);
 
         if (ev->mask & IN_Q_OVERFLOW) {
-                log_info("delete-self-handler: overflow");
+                log_info("delete-self-handler for %s: overflow", path);
                 c->delete_self_handler_called = true;
         } else if (ev->mask & IN_DELETE_SELF) {
-                log_info("delete-self-handler: delete-self");
+                log_info("delete-self-handler for %s: delete-self", path);
                 c->delete_self_handler_called = true;
         } else if (ev->mask & IN_IGNORED) {
-                log_info("delete-self-handler: ignore");
+                log_info("delete-self-handler for %s: ignore", path);
         } else
                 assert_not_reached();
 
@@ -480,7 +490,7 @@ static void test_inotify_one(unsigned n_create_events) {
                 .n_create_events = n_create_events,
         };
         sd_event *e = NULL;
-        const char *q;
+        const char *q, *pp;
         unsigned i;
 
         log_info("/* %s(%u) */", __func__, n_create_events);
@@ -488,6 +498,7 @@ static void test_inotify_one(unsigned n_create_events) {
         assert_se(sd_event_default(&e) >= 0);
 
         assert_se(mkdtemp_malloc("/tmp/test-inotify-XXXXXX", &p) >= 0);
+        context.path = p;
 
         assert_se(sd_event_add_inotify(e, &a, p, IN_CREATE|IN_ONLYDIR, inotify_handler, &context) >= 0);
         assert_se(sd_event_add_inotify(e, &b, p, IN_CREATE|IN_DELETE|IN_DONT_FOLLOW, inotify_handler, &context) >= 0);
@@ -499,6 +510,13 @@ static void test_inotify_one(unsigned n_create_events) {
         assert_se(sd_event_source_set_description(a, "0") >= 0);
         assert_se(sd_event_source_set_description(b, "1") >= 0);
         assert_se(sd_event_source_set_description(c, "2") >= 0);
+
+        assert_se(sd_event_source_get_inotify_path(a, &pp) >= 0);
+        assert_se(path_equal_or_inode_same(pp, p, 0));
+        assert_se(sd_event_source_get_inotify_path(b, &pp) >= 0);
+        assert_se(path_equal_or_inode_same(pp, p, 0));
+        assert_se(sd_event_source_get_inotify_path(b, &pp) >= 0);
+        assert_se(path_equal_or_inode_same(pp, p, 0));
 
         q = strjoina(p, "/sub");
         assert_se(touch(q) >= 0);
@@ -556,7 +574,7 @@ TEST(pidfd) {
         int pidfd;
         pid_t pid, pid2;
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD, -1) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGCHLD) >= 0);
 
         pid = fork();
         if (pid == 0)
@@ -629,7 +647,7 @@ static int ratelimit_expired(sd_event_source *s, void *userdata) {
 }
 
 TEST(ratelimit) {
-        _cleanup_close_pair_ int p[2] = {-1, -1};
+        _cleanup_close_pair_ int p[2] = EBADF_PAIR;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
         uint64_t interval;
@@ -650,7 +668,7 @@ TEST(ratelimit) {
         for (unsigned i = 0; i < 10; i++) {
                 log_debug("slow loop iteration %u", i);
                 assert_se(sd_event_run(e, UINT64_MAX) >= 0);
-                assert_se(usleep(250 * USEC_PER_MSEC) >= 0);
+                assert_se(usleep_safe(250 * USEC_PER_MSEC) >= 0);
         }
 
         assert_se(sd_event_source_is_ratelimited(s) == 0);
@@ -664,7 +682,7 @@ TEST(ratelimit) {
         for (unsigned i = 0; i < 10; i++) {
                 log_debug("fast event loop iteration %u", i);
                 assert_se(sd_event_run(e, UINT64_MAX) >= 0);
-                assert_se(usleep(10) >= 0);
+                assert_se(usleep_safe(10) >= 0);
         }
         log_info("ratelimit_io_handler: called %u times, event source got ratelimited", count);
         assert_se(count < 10);
@@ -743,7 +761,7 @@ TEST(inotify_self_destroy) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
         char path[] = "/tmp/inotifyXXXXXX";
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         /* Tests that destroying an inotify event source from its own handler is safe */
 
@@ -809,10 +827,29 @@ TEST(inotify_process_buffered_data) {
         assert_se(sd_event_wait(e, 0) == 0);
 }
 
+TEST(fork) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        int r;
+
+        assert_se(sd_event_default(&e) >= 0);
+        assert_se(sd_event_prepare(e) == 0);
+
+        /* Check that after a fork the cleanup functions return NULL */
+        r = safe_fork("(bus-fork-test)", FORK_WAIT|FORK_LOG, NULL);
+        if (r == 0) {
+                assert_se(e);
+                assert_se(sd_event_ref(e) == NULL);
+                assert_se(sd_event_unref(e) == NULL);
+                _exit(EXIT_SUCCESS);
+        }
+
+        assert_se(r >= 0);
+}
+
 TEST(sd_event_source_set_io_fd) {
         _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
         _cleanup_(sd_event_unrefp) sd_event *e = NULL;
-        _cleanup_close_pair_ int pfd_a[2] = { -EBADF, -EBADF }, pfd_b[2] = { -EBADF, -EBADF };
+        _cleanup_close_pair_ int pfd_a[2] = EBADF_PAIR, pfd_b[2] = EBADF_PAIR;
 
         assert_se(sd_event_default(&e) >= 0);
 
@@ -825,6 +862,77 @@ TEST(sd_event_source_set_io_fd) {
 
         assert_se(sd_event_source_set_io_fd(s, pfd_b[0]) >= 0);
         TAKE_FD(pfd_b[0]);
+}
+
+static int hup_callback(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        unsigned *c = userdata;
+
+        assert_se(revents == EPOLLHUP);
+
+        (*c)++;
+        return 0;
+}
+
+TEST(leave_ratelimit) {
+        bool expect_ratelimit = false, manually_left_ratelimit = false;
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_close_pair_ int pfd[2] = EBADF_PAIR;
+        unsigned c = 0;
+        int r;
+
+        assert_se(sd_event_default(&e) >= 0);
+
+        /* Create an event source that will continuously fire by creating a pipe whose write side is closed,
+         * and which hence will only see EOF and constant EPOLLHUP */
+        assert_se(pipe2(pfd, O_CLOEXEC) >= 0);
+        assert_se(sd_event_add_io(e, &s, pfd[0], EPOLLIN, hup_callback, &c) >= 0);
+        assert_se(sd_event_source_set_io_fd_own(s, true) >= 0);
+        assert_se(sd_event_source_set_ratelimit(s, 5*USEC_PER_MINUTE, 5) >= 0);
+
+        pfd[0] = -EBADF;
+        pfd[1] = safe_close(pfd[1]); /* Trigger continuous EOF */
+
+        for (;;) {
+                r = sd_event_prepare(e);
+                assert_se(r >= 0);
+
+                if (r == 0) {
+                        r = sd_event_wait(e, UINT64_MAX);
+                        assert_se(r > 0);
+                }
+
+                r = sd_event_dispatch(e);
+                assert_se(r > 0);
+
+                r = sd_event_source_is_ratelimited(s);
+                assert_se(r >= 0);
+
+                if (c < 5)
+                        /* First four dispatches should just work */
+                        assert_se(!r);
+                else if (c == 5) {
+                        /* The fifth dispatch should still work, but we now expect the ratelimit to be hit subsequently */
+                        if (!expect_ratelimit) {
+                                assert_se(!r);
+                                assert_se(sd_event_source_leave_ratelimit(s) == 0); /* this should be a NOP, and return 0 hence */
+                                expect_ratelimit = true;
+                        } else {
+                                /* We expected the ratelimit, let's leave it manually, and verify it */
+                                assert_se(r);
+                                assert_se(sd_event_source_leave_ratelimit(s) > 0); /* we are ratelimited, hence should return > 0 */
+                                assert_se(sd_event_source_is_ratelimited(s) == 0);
+
+                                manually_left_ratelimit = true;
+                        }
+
+                } else if (c == 6)
+                        /* On the sixth iteration let's just exit */
+                        break;
+        }
+
+        /* Verify we definitely hit the ratelimit and left it manually again */
+        assert_se(manually_left_ratelimit);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

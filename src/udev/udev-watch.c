@@ -17,6 +17,7 @@
 #include "rm-rf.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "udev-util.h"
 #include "udev-watch.h"
 
 int device_new_from_watch_handle_at(sd_device **ret, int dirfd, int wd) {
@@ -50,7 +51,7 @@ int udev_watch_restore(int inotify_fd) {
 
         assert(inotify_fd >= 0);
 
-        rm_rf("/run/udev/watch.old", REMOVE_ROOT);
+        (void) rm_rf("/run/udev/watch.old", REMOVE_ROOT);
 
         if (rename("/run/udev/watch", "/run/udev/watch.old") < 0) {
                 if (errno == ENOENT)
@@ -110,7 +111,7 @@ static int udev_watch_clear(sd_device *dev, int dirfd, int *ret_wd) {
         assert(dev);
         assert(dirfd >= 0);
 
-        r = device_get_device_id(dev, &id);
+        r = sd_device_get_device_id(dev, &id);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to get device ID: %m");
 
@@ -173,22 +174,28 @@ finalize:
 
 int udev_watch_begin(int inotify_fd, sd_device *dev) {
         char wd_str[DECIMAL_STR_MAX(int)];
-        _cleanup_close_ int dirfd = -1;
+        _cleanup_close_ int dirfd = -EBADF;
         const char *devnode, *id;
         int wd, r;
 
         assert(inotify_fd >= 0);
         assert(dev);
 
+        /* Ignore the request of watching the device node on remove event, as the device node specified by
+         * DEVNAME= has already been removed, and may already be assigned to another device. Consider the
+         * case e.g. a USB stick memory was unplugged and then another one is plugged. */
+        if (device_for_action(dev, SD_DEVICE_REMOVE))
+                return 0;
+
         r = sd_device_get_devname(dev, &devnode);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to get device node: %m");
 
-        r = device_get_device_id(dev, &id);
+        r = sd_device_get_device_id(dev, &id);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to get device ID: %m");
 
-        r = dirfd = open_mkdir_at(AT_FDCWD, "/run/udev/watch", O_CLOEXEC | O_RDONLY, 0755);
+        r = dirfd = open_mkdir("/run/udev/watch", O_CLOEXEC | O_RDONLY, 0755);
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to create and open '/run/udev/watch/': %m");
 
@@ -225,14 +232,11 @@ on_failure:
 }
 
 int udev_watch_end(int inotify_fd, sd_device *dev) {
-        _cleanup_close_ int dirfd = -1;
+        _cleanup_close_ int dirfd = -EBADF;
         int wd, r;
 
+        assert(inotify_fd >= 0);
         assert(dev);
-
-        /* This may be called by 'udevadm test'. In that case, inotify_fd is not initialized. */
-        if (inotify_fd < 0)
-                return 0;
 
         if (sd_device_get_devname(dev, NULL) < 0)
                 return 0;
