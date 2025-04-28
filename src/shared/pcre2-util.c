@@ -7,17 +7,31 @@
 #if HAVE_PCRE2
 static void *pcre2_dl = NULL;
 
-pcre2_match_data* (*sym_pcre2_match_data_create)(uint32_t, pcre2_general_context *);
-void (*sym_pcre2_match_data_free)(pcre2_match_data *);
-void (*sym_pcre2_code_free)(pcre2_code *);
-pcre2_code* (*sym_pcre2_compile)(PCRE2_SPTR, PCRE2_SIZE, uint32_t, int *, PCRE2_SIZE *, pcre2_compile_context *);
-int (*sym_pcre2_get_error_message)(int, PCRE2_UCHAR *, PCRE2_SIZE);
-int (*sym_pcre2_match)(const pcre2_code *, PCRE2_SPTR, PCRE2_SIZE, PCRE2_SIZE, uint32_t, pcre2_match_data *, pcre2_match_context *);
-PCRE2_SIZE* (*sym_pcre2_get_ovector_pointer)(pcre2_match_data *);
+DLSYM_PROTOTYPE(pcre2_match_data_create) = NULL;
+DLSYM_PROTOTYPE(pcre2_match_data_free) = NULL;
+DLSYM_PROTOTYPE(pcre2_code_free) = NULL;
+DLSYM_PROTOTYPE(pcre2_compile) = NULL;
+DLSYM_PROTOTYPE(pcre2_get_error_message) = NULL;
+DLSYM_PROTOTYPE(pcre2_match) = NULL;
+DLSYM_PROTOTYPE(pcre2_get_ovector_pointer) = NULL;
+
+DEFINE_HASH_OPS_WITH_KEY_DESTRUCTOR(
+        pcre2_code_hash_ops_free,
+        pcre2_code,
+        (void (*)(const pcre2_code *, struct siphash*))trivial_hash_func,
+        (int (*)(const pcre2_code *, const pcre2_code*))trivial_compare_func,
+        sym_pcre2_code_free);
+#else
+const struct hash_ops pcre2_code_hash_ops_free = {};
 #endif
 
 int dlopen_pcre2(void) {
 #if HAVE_PCRE2
+        ELF_NOTE_DLOPEN("pcre2",
+                        "Support for regular expressions",
+                        ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
+                        "libpcre2-8.so.0");
+
         /* So here's something weird: PCRE2 actually renames the symbols exported by the library via C
          * macros, so that the exported symbols carry a suffix "_8" but when used from C the suffix is
          * gone. In the argument list below we ignore this mangling. Surprisingly (at least to me), we
@@ -43,7 +57,7 @@ int dlopen_pcre2(void) {
 int pattern_compile_and_log(const char *pattern, PatternCompileCase case_, pcre2_code **ret) {
 #if HAVE_PCRE2
         PCRE2_SIZE erroroffset;
-        pcre2_code *p;
+        _cleanup_(sym_pcre2_code_freep) pcre2_code *p = NULL;
         unsigned flags = 0;
         int errorcode, r;
 
@@ -91,7 +105,7 @@ int pattern_compile_and_log(const char *pattern, PatternCompileCase case_, pcre2
         }
 
         if (ret)
-                *ret = p;
+                *ret = TAKE_PTR(p);
 
         return 0;
 #else

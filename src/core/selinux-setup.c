@@ -8,13 +8,15 @@
 #include <selinux/selinux.h>
 #endif
 
+#include "sd-messages.h"
+
+#include "initrd-util.h"
 #include "log.h"
 #include "macro.h"
 #include "selinux-setup.h"
 #include "selinux-util.h"
 #include "string-util.h"
 #include "time-util.h"
-#include "util.h"
 
 #if HAVE_SELINUX
 _printf_(2,3)
@@ -30,30 +32,28 @@ int mac_selinux_setup(bool *loaded_policy) {
         usec_t before_load, after_load;
         char *con;
         int r;
-        bool initialized = false;
+        bool initialized;
 
         assert(loaded_policy);
 
         /* Turn off all of SELinux' own logging, we want to do that */
-        selinux_set_callback(SELINUX_CB_LOG, (union selinux_callback) { .func_log = null_log });
+        selinux_set_callback(SELINUX_CB_LOG, (const union selinux_callback) { .func_log = null_log });
 
-        /* Don't load policy in the initrd if we don't appear to have
-         * it.  For the real root, we check below if we've already
-         * loaded policy, and return gracefully.
-         */
+        /* Don't load policy in the initrd if we don't appear to have it.  For the real root, we check below
+         * if we've already loaded policy, and return gracefully. */
         if (in_initrd() && access(selinux_path(), F_OK) < 0)
                 return 0;
 
         /* Already initialized by somebody else? */
         r = getcon_raw(&con);
-        /* getcon_raw can return 0, and still give us a NULL pointer if
-         * /proc/self/attr/current is empty. SELinux guarantees this won't
-         * happen, but that file isn't specific to SELinux, and may be provided
-         * by some other arbitrary LSM with different semantics. */
+        /* getcon_raw can return 0, and still give us a NULL pointer if /proc/self/attr/current is
+         * empty. SELinux guarantees this won't happen, but that file isn't specific to SELinux, and may be
+         * provided by some other arbitrary LSM with different semantics. */
         if (r == 0 && con) {
                 initialized = !streq(con, "kernel");
                 freecon(con);
-        }
+        } else
+                initialized = false;
 
         /* Make sure we have no fds open while loading the policy and
          * transitioning */
@@ -63,7 +63,7 @@ int mac_selinux_setup(bool *loaded_policy) {
         before_load = now(CLOCK_MONOTONIC);
         r = selinux_init_load_policy(&enforce);
         if (r == 0) {
-                _cleanup_(mac_selinux_freep) char *label = NULL;
+                _cleanup_freecon_ char *label = NULL;
 
                 mac_selinux_retest();
 
@@ -92,8 +92,9 @@ int mac_selinux_setup(bool *loaded_policy) {
 
                 if (enforce > 0) {
                         if (!initialized)
-                                return log_emergency_errno(SYNTHETIC_ERRNO(EIO),
-                                                           "Failed to load SELinux policy.");
+                                return log_struct_errno(LOG_EMERG, SYNTHETIC_ERRNO(EIO),
+                                                        LOG_MESSAGE("Failed to load SELinux policy :%m"),
+                                                        "MESSAGE_ID=" SD_MESSAGE_SELINUX_FAILED_STR);
 
                         log_warning("Failed to load new SELinux policy. Continuing with old policy.");
                 } else

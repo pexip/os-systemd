@@ -15,8 +15,7 @@ compiler you want to use and which part of the test suite you want to run.
 
 ## mkosi
 
-To build with sanitizers in mkosi, create a file 20-local.conf in mkosi.default.d/ and add the following
-contents:
+To build with sanitizers in mkosi, create a file `mkosi/mkosi.local.conf` and add the following contents:
 
 ```
 [Content]
@@ -31,11 +30,11 @@ Note that this will only work with a recent version of mkosi (>= 14 or by runnin
 
 ## gcc
 gcc compiles in sanitizer libraries dynamically by default, so you need to get
-the shared libraries first - on Fedora these are shipped as a separate packages
+the shared libraries first - on Fedora these are shipped as separate packages
 (`libasan` for Address Sanitizer and `libubsan` for Undefined Behavior Sanitizer).
 
 The compilation itself is then a matter of simply adding `-Db_sanitize=address,undefined`
-to `meson`. That's it - following executions of `meson test` and integrations tests
+to `meson`. That's it - following executions of `meson test` and integration tests
 under `test/` subdirectory will run with sanitizers enabled. However, to get
 truly useful results, you should tweak the runtime configuration of respective
 sanitizers; e.g. in systemd we set the following environment variables:
@@ -103,5 +102,4 @@ make things work as expected in most cases. This will, obviously, not work with
 statically linked sanitizer libraries.
 
 These shenanigans are performed automatically when running the integration test
-suite (i.e. `test/TEST-??-*`) and are located in `test/test-functions` (mainly,
-but not only, in the `create_asan_wrapper` function).
+suite.

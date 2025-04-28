@@ -16,7 +16,6 @@
 #include "string-util.h"
 #include "strv.h"
 #include "user-util.h"
-#include "util.h"
 
 Settings *settings_new(void) {
         Settings *s;
@@ -98,29 +97,25 @@ int settings_load(FILE *f, const char *path, Settings **ret) {
         return 0;
 }
 
-static void free_oci_hooks(OciHook *h, size_t n) {
-        size_t i;
+static void free_oci_hooks(OciHook *hooks, size_t n) {
+        assert(hooks || n == 0);
 
-        assert(h || n == 0);
-
-        for (i = 0; i < n; i++) {
-                free(h[i].path);
-                strv_free(h[i].args);
-                strv_free(h[i].env);
+        FOREACH_ARRAY(hook, hooks, n) {
+                free(hook->path);
+                strv_free(hook->args);
+                strv_free(hook->env);
         }
 
-        free(h);
+        free(hooks);
 }
 
-void device_node_array_free(DeviceNode *node, size_t n) {
-        size_t i;
+void device_node_array_free(DeviceNode *nodes, size_t n) {
+        assert(nodes || n == 0);
 
-        assert(node || n == 0);
+        FOREACH_ARRAY(node, nodes, n)
+                free(node->path);
 
-        for (i = 0; i < n; i++)
-                free(node[i].path);
-
-        free(node);
+        free(nodes);
 }
 
 Settings* settings_free(Settings *s) {
@@ -237,7 +232,7 @@ int settings_allocate_properties(Settings *s) {
         return 0;
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_volatile_mode, volatile_mode, VolatileMode, "Failed to parse volatile mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_volatile_mode, volatile_mode, VolatileMode);
 
 int config_parse_expose_port(
                 const char *unit,
@@ -470,6 +465,69 @@ int config_parse_veth_extra(
                 log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid extra virtual Ethernet link specification %s: %m", rvalue);
 
         return 0;
+}
+
+int config_parse_network_iface_pair(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char*** l = data;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        return interface_pair_parse(l, rvalue);
+}
+
+int config_parse_macvlan_iface_pair(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char*** l = data;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        return macvlan_pair_parse(l, rvalue);
+}
+
+int config_parse_ipvlan_iface_pair(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        char*** l = data;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        return ipvlan_pair_parse(l, rvalue);
 }
 
 int config_parse_network_zone(
@@ -774,24 +832,24 @@ int config_parse_cpu_affinity(
         return parse_cpu_set_extend(rvalue, &settings->cpu_set, true, unit, filename, line, lvalue);
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_resolv_conf, resolv_conf_mode, ResolvConfMode, "Failed to parse resolv.conf mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_resolv_conf, resolv_conf_mode, ResolvConfMode);
 
 static const char *const resolv_conf_mode_table[_RESOLV_CONF_MODE_MAX] = {
-        [RESOLV_CONF_OFF] = "off",
-        [RESOLV_CONF_COPY_HOST] = "copy-host",
-        [RESOLV_CONF_COPY_STATIC] = "copy-static",
-        [RESOLV_CONF_COPY_UPLINK] = "copy-uplink",
-        [RESOLV_CONF_COPY_STUB] = "copy-stub",
-        [RESOLV_CONF_REPLACE_HOST] = "replace-host",
+        [RESOLV_CONF_OFF]            = "off",
+        [RESOLV_CONF_COPY_HOST]      = "copy-host",
+        [RESOLV_CONF_COPY_STATIC]    = "copy-static",
+        [RESOLV_CONF_COPY_UPLINK]    = "copy-uplink",
+        [RESOLV_CONF_COPY_STUB]      = "copy-stub",
+        [RESOLV_CONF_REPLACE_HOST]   = "replace-host",
         [RESOLV_CONF_REPLACE_STATIC] = "replace-static",
         [RESOLV_CONF_REPLACE_UPLINK] = "replace-uplink",
-        [RESOLV_CONF_REPLACE_STUB] = "replace-stub",
-        [RESOLV_CONF_BIND_HOST] = "bind-host",
-        [RESOLV_CONF_BIND_STATIC] = "bind-static",
-        [RESOLV_CONF_BIND_UPLINK] = "bind-uplink",
-        [RESOLV_CONF_BIND_STUB] = "bind-stub",
-        [RESOLV_CONF_DELETE] = "delete",
-        [RESOLV_CONF_AUTO] = "auto",
+        [RESOLV_CONF_REPLACE_STUB]   = "replace-stub",
+        [RESOLV_CONF_BIND_HOST]      = "bind-host",
+        [RESOLV_CONF_BIND_STATIC]    = "bind-static",
+        [RESOLV_CONF_BIND_UPLINK]    = "bind-uplink",
+        [RESOLV_CONF_BIND_STUB]      = "bind-stub",
+        [RESOLV_CONF_DELETE]         = "delete",
+        [RESOLV_CONF_AUTO]           = "auto",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(resolv_conf_mode, ResolvConfMode, RESOLV_CONF_AUTO);
@@ -856,26 +914,26 @@ int config_parse_link_journal(
         return 0;
 }
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_timezone, timezone_mode, TimezoneMode, "Failed to parse timezone mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_timezone_mode, timezone_mode, TimezoneMode);
 
 static const char *const timezone_mode_table[_TIMEZONE_MODE_MAX] = {
-        [TIMEZONE_OFF] = "off",
-        [TIMEZONE_COPY] = "copy",
-        [TIMEZONE_BIND] = "bind",
+        [TIMEZONE_OFF]     = "off",
+        [TIMEZONE_COPY]    = "copy",
+        [TIMEZONE_BIND]    = "bind",
         [TIMEZONE_SYMLINK] = "symlink",
-        [TIMEZONE_DELETE] = "delete",
-        [TIMEZONE_AUTO] = "auto",
+        [TIMEZONE_DELETE]  = "delete",
+        [TIMEZONE_AUTO]    = "auto",
 };
 
 DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(timezone_mode, TimezoneMode, TIMEZONE_AUTO);
 
-DEFINE_CONFIG_PARSE_ENUM(config_parse_userns_ownership, user_namespace_ownership, UserNamespaceOwnership, "Failed to parse user namespace ownership mode");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_userns_ownership, user_namespace_ownership, UserNamespaceOwnership);
 
 static const char *const user_namespace_ownership_table[_USER_NAMESPACE_OWNERSHIP_MAX] = {
-        [USER_NAMESPACE_OWNERSHIP_OFF] = "off",
+        [USER_NAMESPACE_OWNERSHIP_OFF]   = "off",
         [USER_NAMESPACE_OWNERSHIP_CHOWN] = "chown",
-        [USER_NAMESPACE_OWNERSHIP_MAP] = "map",
-        [USER_NAMESPACE_OWNERSHIP_AUTO] = "auto",
+        [USER_NAMESPACE_OWNERSHIP_MAP]   = "map",
+        [USER_NAMESPACE_OWNERSHIP_AUTO]  = "auto",
 };
 
 /* Note: while "yes" maps to "auto" here, we don't really document that, in order to make things clearer and less confusing to users. */

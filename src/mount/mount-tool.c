@@ -5,11 +5,12 @@
 #include "sd-bus.h"
 #include "sd-device.h"
 
+#include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-unit-util.h"
 #include "bus-wait-for-jobs.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "device-util.h"
 #include "dirent-util.h"
 #include "escape.h"
@@ -27,13 +28,15 @@
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "sort-util.h"
-#include "spawn-polkit-agent.h"
 #include "stat-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "udev-util.h"
+#include "umask-util.h"
 #include "unit-def.h"
 #include "unit-name.h"
 #include "user-util.h"
@@ -53,7 +56,7 @@ static bool arg_full = false;
 static bool arg_ask_password = true;
 static bool arg_quiet = false;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
-static bool arg_user = false;
+static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 static const char *arg_host = NULL;
 static bool arg_discover = false;
 static char *arg_mount_what = NULL;
@@ -70,6 +73,8 @@ static uid_t arg_uid = UID_INVALID;
 static gid_t arg_gid = GID_INVALID;
 static bool arg_fsck = true;
 static bool arg_aggressive_gc = false;
+static bool arg_tmpfs = false;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 
 STATIC_DESTRUCTOR_REGISTER(arg_mount_what, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_mount_where, freep);
@@ -78,6 +83,30 @@ STATIC_DESTRUCTOR_REGISTER(arg_mount_options, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_description, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_property, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_automount_property, strv_freep);
+
+static int parse_where(const char *input, char **ret_where) {
+        int r;
+
+        assert(input);
+        assert(ret_where);
+
+        if (arg_transport == BUS_TRANSPORT_LOCAL) {
+                r = chase(input, NULL, CHASE_NONEXISTENT, ret_where, NULL);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to make path %s absolute: %m", input);
+        } else {
+                if (!path_is_absolute(input))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Path must be absolute when operating remotely: %s",
+                                               input);
+
+                r = path_simplify_alloc(input, ret_where);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to simplify path %s: %m", input);
+        }
+
+        return 0;
+}
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
@@ -88,9 +117,10 @@ static int help(void) {
                 return log_oom();
 
         printf("systemd-mount [OPTIONS...] WHAT [WHERE]\n"
+               "systemd-mount [OPTIONS...] --tmpfs [NAME] WHERE\n"
                "systemd-mount [OPTIONS...] --list\n"
                "%s [OPTIONS...] %sWHAT|WHERE...\n\n"
-               "Establish a mount or auto-mount point transiently.\n\n"
+               "%sEstablish a mount or auto-mount point transiently.%s\n\n"
                "  -h --help                       Show this help\n"
                "     --version                    Show package version\n"
                "     --no-block                   Do not wait until operation finished\n"
@@ -99,6 +129,7 @@ static int help(void) {
                "  -l --full                       Do not ellipsize output\n"
                "     --no-ask-password            Do not prompt for password\n"
                "  -q --quiet                      Suppress information messages during runtime\n"
+               "     --json=pretty|short|off      Generate JSON output\n"
                "     --user                       Run as user unit\n"
                "  -H --host=[USER@]HOST           Operate on remote host\n"
                "  -M --machine=CONTAINER          Operate on local container\n"
@@ -117,9 +148,12 @@ static int help(void) {
                "     --list                       List mountable block devices\n"
                "  -u --umount                     Unmount mount points\n"
                "  -G --collect                    Unload unit after it stopped, even when failed\n"
+               "  -T --tmpfs                      Create a new tmpfs on the mount point\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                streq(program_invocation_short_name, "systemd-umount") ? "" : "--umount ",
+               ansi_highlight(),
+               ansi_normal(),
                link);
 
         return 0;
@@ -146,6 +180,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_AUTOMOUNT_PROPERTY,
                 ARG_BIND_DEVICE,
                 ARG_LIST,
+                ARG_JSON,
         };
 
         static const struct option options[] = {
@@ -174,8 +209,10 @@ static int parse_argv(int argc, char *argv[]) {
                 { "bind-device",        no_argument,       NULL, ARG_BIND_DEVICE        },
                 { "list",               no_argument,       NULL, ARG_LIST               },
                 { "umount",             no_argument,       NULL, 'u'                    },
-                { "unmount",            no_argument,       NULL, 'u'                    },
+                { "unmount",            no_argument,       NULL, 'u'                    }, /* Compat spelling */
                 { "collect",            no_argument,       NULL, 'G'                    },
+                { "tmpfs",              no_argument,       NULL, 'T'                    },
+                { "json",               required_argument, NULL, ARG_JSON               },
                 {},
         };
 
@@ -187,7 +224,7 @@ static int parse_argv(int argc, char *argv[]) {
         if (invoked_as(argv, "systemd-umount"))
                 arg_action = ACTION_UMOUNT;
 
-        while ((c = getopt_long(argc, argv, "hqH:M:t:o:p:AuGl", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hqH:M:t:o:p:AuGlT", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -222,11 +259,11 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_USER:
-                        arg_user = true;
+                        arg_runtime_scope = RUNTIME_SCOPE_USER;
                         break;
 
                 case ARG_SYSTEM:
-                        arg_user = false;
+                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
                         break;
 
                 case 'H':
@@ -326,6 +363,17 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_aggressive_gc = true;
                         break;
 
+                case 'T':
+                        arg_tmpfs = true;
+                        break;
+
+                case ARG_JSON:
+                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                        if (r <= 0)
+                                return r;
+
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -333,12 +381,13 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached();
                 }
 
-        if (arg_user)
+        if (arg_runtime_scope == RUNTIME_SCOPE_USER) {
                 arg_ask_password = false;
 
-        if (arg_user && arg_transport != BUS_TRANSPORT_LOCAL)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Execution in user context is not supported on non-local systems.");
+                if (arg_transport != BUS_TRANSPORT_LOCAL)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Execution in user context is not supported on non-local systems.");
+        }
 
         if (arg_action == ACTION_LIST) {
                 if (optind < argc)
@@ -353,14 +402,12 @@ static int parse_argv(int argc, char *argv[]) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "At least one argument required.");
 
-                if (arg_transport != BUS_TRANSPORT_LOCAL) {
-                        int i;
-
-                        for (i = optind; i < argc; i++)
-                                if (!path_is_absolute(argv[i]) )
+                if (arg_transport != BUS_TRANSPORT_LOCAL)
+                        for (int i = optind; i < argc; i++)
+                                if (!path_is_absolute(argv[i]))
                                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                               "Only absolute path is supported: %s", argv[i]);
-                }
+                                                               "Path must be absolute when operating remotely: %s",
+                                                               argv[i]);
         } else {
                 if (optind >= argc)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -368,52 +415,60 @@ static int parse_argv(int argc, char *argv[]) {
 
                 if (argc > optind+2)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "At most two arguments required.");
+                                               "More than two arguments are not allowed.");
 
-                if (arg_mount_type && !fstype_is_blockdev_backed(arg_mount_type)) {
-                        arg_mount_what = strdup(argv[optind]);
-                        if (!arg_mount_what)
+                if (arg_tmpfs) {
+                        if (argc <= optind+1) {
+                                arg_mount_what = strdup("tmpfs");
+                                if (!arg_mount_what)
+                                        return log_oom();
+
+                                r = parse_where(argv[optind], &arg_mount_where);
+                                if (r < 0)
+                                        return r;
+                        } else {
+                                arg_mount_what = strdup(argv[optind]);
+                                if (!arg_mount_what)
+                                        return log_oom();
+                        }
+
+                        if (!strv_contains(arg_property, "Type=tmpfs") &&
+                            strv_extend(&arg_property, "Type=tmpfs") < 0)
                                 return log_oom();
-
-                } else if (arg_transport == BUS_TRANSPORT_LOCAL) {
-                        _cleanup_free_ char *u = NULL;
-
-                        u = fstab_node_to_udev_node(argv[optind]);
-                        if (!u)
-                                return log_oom();
-
-                        r = chase_symlinks(u, NULL, 0, &arg_mount_what, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to make path %s absolute: %m", u);
                 } else {
-                        arg_mount_what = strdup(argv[optind]);
-                        if (!arg_mount_what)
-                                return log_oom();
+                        if (arg_mount_type && !fstype_is_blockdev_backed(arg_mount_type)) {
+                                arg_mount_what = strdup(argv[optind]);
+                                if (!arg_mount_what)
+                                        return log_oom();
 
-                        path_simplify(arg_mount_what);
+                        } else if (arg_transport == BUS_TRANSPORT_LOCAL) {
+                                _cleanup_free_ char *u = NULL;
 
-                        if (!path_is_absolute(arg_mount_what))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Only absolute path is supported: %s", arg_mount_what);
+                                u = fstab_node_to_udev_node(argv[optind]);
+                                if (!u)
+                                        return log_oom();
+
+                                r = chase(u, NULL, 0, &arg_mount_what, NULL);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to make path %s absolute: %m", u);
+
+                        } else {
+                                if (!path_is_absolute(argv[optind]))
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                               "Path must be absolute when operating remotely: %s",
+                                                               argv[optind]);
+
+                                r = path_simplify_alloc(argv[optind], &arg_mount_what);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to simplify path: %m");
+                        }
                 }
 
                 if (argc > optind+1) {
-                        if (arg_transport == BUS_TRANSPORT_LOCAL) {
-                                r = chase_symlinks(argv[optind+1], NULL, CHASE_NONEXISTENT, &arg_mount_where, NULL);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to make path %s absolute: %m", argv[optind+1]);
-                        } else {
-                                arg_mount_where = strdup(argv[optind+1]);
-                                if (!arg_mount_where)
-                                        return log_oom();
-
-                                path_simplify(arg_mount_where);
-
-                                if (!path_is_absolute(arg_mount_where))
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                               "Only absolute path is supported: %s", arg_mount_where);
-                        }
-                } else
+                        r = parse_where(argv[optind+1], &arg_mount_where);
+                        if (r < 0)
+                                return r;
+                } else if (!arg_tmpfs)
                         arg_discover = true;
 
                 if (arg_discover && arg_transport != BUS_TRANSPORT_LOCAL)
@@ -461,7 +516,6 @@ static int transient_unit_set_properties(sd_bus_message *m, UnitType t, char **p
 }
 
 static int transient_mount_set_properties(sd_bus_message *m) {
-        _cleanup_free_ char *options = NULL;
         int r;
 
         assert(m);
@@ -482,20 +536,43 @@ static int transient_mount_set_properties(sd_bus_message *m) {
                         return r;
         }
 
+        _cleanup_free_ char *options = NULL;
+
         /* Prepend uid=…,gid=… if arg_uid is set */
         if (arg_uid != UID_INVALID) {
-                r = asprintf(&options,
-                             "uid=" UID_FMT ",gid=" GID_FMT "%s%s",
-                             arg_uid, arg_gid,
-                             arg_mount_options ? "," : "", strempty(arg_mount_options));
+                r = strextendf_with_separator(&options, ",",
+                                              "uid="UID_FMT",gid="GID_FMT, arg_uid, arg_gid);
                 if (r < 0)
-                        return -ENOMEM;
+                        return r;
         }
 
-        if (options || arg_mount_options) {
-                log_debug("Using mount options: %s", options ?: arg_mount_options);
+        /* Override the default for tmpfs mounts. The kernel sets the sticky bit on the root directory by
+         * default. This makes sense for the case when the user does 'mount -t tmpfs tmpfs /tmp', but less so
+         * for other directories.
+         *
+         * Let's also set some reasonable limits. We use the current umask, to match what a command to create
+         * directory would use, e.g. mkdir. */
+        if (arg_tmpfs) {
+                mode_t mask;
 
-                r = sd_bus_message_append(m, "(sv)", "Options", "s", options ?: arg_mount_options);
+                r = get_process_umask(0, &mask);
+                if (r < 0)
+                        return r;
+
+                assert((mask & ~0777) == 0);
+                r = strextendf_with_separator(&options, ",",
+                                              "mode=0%o,nodev,nosuid%s", 0777 & ~mask, NESTED_TMPFS_LIMITS);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_mount_options)
+                if (!strextend_with_separator(&options, ",", arg_mount_options))
+                        return -ENOMEM;
+
+        if (options) {
+                log_debug("Using mount options: %s", options);
+                r = sd_bus_message_append(m, "(sv)", "Options", "s", options);
                 if (r < 0)
                         return r;
         } else
@@ -561,10 +638,6 @@ static int start_transient_mount(
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = sd_bus_message_set_allow_interactive_authorization(m, arg_ask_password);
-        if (r < 0)
-                return bus_log_create_error(r);
-
         /* Name and mode */
         r = sd_bus_message_append(m, "ss", mount_unit, "fail");
         if (r < 0)
@@ -588,7 +661,7 @@ static int start_transient_mount(
         if (r < 0)
                 return bus_log_create_error(r);
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
@@ -601,7 +674,7 @@ static int start_transient_mount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet ? 0 : BUS_WAIT_JOBS_LOG_ERROR, NULL);
                 if (r < 0)
                         return r;
         }
@@ -639,10 +712,6 @@ static int start_transient_automount(
                 return log_error_errno(r, "Failed to make mount unit name: %m");
 
         r = bus_message_new_method_call(bus, &m, bus_systemd_mgr, "StartTransientUnit");
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        r = sd_bus_message_set_allow_interactive_authorization(m, arg_ask_password);
         if (r < 0)
                 return bus_log_create_error(r);
 
@@ -697,7 +766,7 @@ static int start_transient_automount(
         if (r < 0)
                 return bus_log_create_error(r);
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0)
@@ -710,7 +779,7 @@ static int start_transient_automount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet ? 0 : BUS_WAIT_JOBS_LOG_ERROR, NULL);
                 if (r < 0)
                         return r;
         }
@@ -775,53 +844,50 @@ static int find_mount_points(const char *what, char ***list) {
         return n;
 }
 
-static int find_loop_device(const char *backing_file, char **loop_dev) {
-        _cleanup_closedir_ DIR *d = NULL;
-        _cleanup_free_ char *l = NULL;
+static int find_loop_device(const char *backing_file, sd_device **ret) {
+        _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
+        int r;
 
         assert(backing_file);
-        assert(loop_dev);
+        assert(ret);
 
-        d = opendir("/sys/devices/virtual/block");
-        if (!d)
-                return -errno;
+        r = sd_device_enumerator_new(&e);
+        if (r < 0)
+                return log_oom();
 
-        FOREACH_DIRENT(de, d, return -errno) {
-                _cleanup_free_ char *sys = NULL, *fname = NULL;
-                int r;
+        r = sd_device_enumerator_add_match_subsystem(e, "block", /* match = */ true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add subsystem match: %m");
 
-                if (de->d_type != DT_DIR)
-                        continue;
+        r = sd_device_enumerator_add_match_property(e, "ID_FS_USAGE", "filesystem");
+        if (r < 0)
+                return log_error_errno(r, "Failed to add property match: %m");
 
-                if (!startswith(de->d_name, "loop"))
-                        continue;
+        r = sd_device_enumerator_add_match_sysname(e, "loop*");
+        if (r < 0)
+                return log_error_errno(r, "Failed to add sysname match: %m");
 
-                sys = path_join("/sys/devices/virtual/block", de->d_name, "loop/backing_file");
-                if (!sys)
-                        return -ENOMEM;
+        r = sd_device_enumerator_add_match_sysattr(e, "loop/backing_file", /* value = */ NULL, /* match = */ true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add sysattr match: %m");
 
-                r = read_one_line_file(sys, &fname);
+        FOREACH_DEVICE(e, dev) {
+                const char *s;
+
+                r = sd_device_get_sysattr_value(dev, "loop/backing_file", &s);
                 if (r < 0) {
-                        log_debug_errno(r, "Failed to read %s, ignoring: %m", sys);
+                        log_device_debug_errno(dev, r, "Failed to read \"loop/backing_file\" sysattr, ignoring: %m");
                         continue;
                 }
 
-                if (files_same(fname, backing_file, 0) <= 0)
+                if (inode_same(s, backing_file, 0) <= 0)
                         continue;
 
-                l = path_join("/dev", de->d_name);
-                if (!l)
-                        return -ENOMEM;
-
-                break;
+                *ret = sd_device_ref(dev);
+                return 0;
         }
 
-        if (!l)
-                return -ENXIO;
-
-        *loop_dev = TAKE_PTR(l);
-
-        return 0;
+        return -ENXIO;
 }
 
 static int stop_mount(
@@ -849,16 +915,12 @@ static int stop_mount(
         if (r < 0)
                 return bus_log_create_error(r);
 
-        r = sd_bus_message_set_allow_interactive_authorization(m, arg_ask_password);
-        if (r < 0)
-                return bus_log_create_error(r);
-
         /* Name and mode */
         r = sd_bus_message_append(m, "ss", mount_unit, "fail");
         if (r < 0)
                 return bus_log_create_error(r);
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_bus_call(bus, m, 0, &error, &reply);
         if (r < 0) {
@@ -875,7 +937,7 @@ static int stop_mount(
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = bus_wait_for_jobs_one(w, object, arg_quiet, NULL);
+                r = bus_wait_for_jobs_one(w, object, arg_quiet ? 0 : BUS_WAIT_JOBS_LOG_ERROR, NULL);
                 if (r < 0)
                         return r;
         }
@@ -913,62 +975,68 @@ static int stop_mounts(
         return 0;
 }
 
-static int umount_by_device(sd_bus *bus, const char *what) {
-        _cleanup_(sd_device_unrefp) sd_device *d = NULL;
+static int umount_by_device(sd_bus *bus, sd_device *dev) {
         _cleanup_strv_free_ char **list = NULL;
-        struct stat st;
         const char *v;
-        char **l;
-        int r, r2 = 0;
+        int r, ret = 0;
 
-        assert(what);
+        assert(bus);
+        assert(dev);
 
-        if (stat(what, &st) < 0)
-                return log_error_errno(errno, "Can't stat %s: %m", what);
+        if (sd_device_get_property_value(dev, "SYSTEMD_MOUNT_WHERE", &v) >= 0)
+                ret = stop_mounts(bus, v);
 
-        if (!S_ISBLK(st.st_mode))
-                return log_error_errno(SYNTHETIC_ERRNO(ENOTBLK),
-                                       "Not a block device: %s", what);
-
-        r = sd_device_new_from_stat_rdev(&d, &st);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get device from device number: %m");
-
-        r = sd_device_get_property_value(d, "ID_FS_USAGE", &v);
-        if (r < 0)
-                return log_device_error_errno(d, r, "Failed to get device property: %m");
-
-        if (!streq(v, "filesystem"))
-                return log_device_error_errno(d, SYNTHETIC_ERRNO(EINVAL),
-                                              "%s does not contain a known file system.", what);
-
-        if (sd_device_get_property_value(d, "SYSTEMD_MOUNT_WHERE", &v) >= 0)
-                r2 = stop_mounts(bus, v);
-
-        r = find_mount_points(what, &list);
+        r = sd_device_get_devname(dev, &v);
         if (r < 0)
                 return r;
 
-        for (l = list; *l; l++) {
+        r = find_mount_points(v, &list);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(l, list) {
                 r = stop_mounts(bus, *l);
                 if (r < 0)
-                        r2 = r;
+                        ret = r;
         }
 
-        return r2;
+        return ret;
+}
+
+static int umount_by_device_node(sd_bus *bus, const char *node) {
+        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+        const char *v;
+        int r;
+
+        assert(bus);
+        assert(node);
+
+        r = sd_device_new_from_devname(&dev, node);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get device from %s: %m", node);
+
+        r = sd_device_get_property_value(dev, "ID_FS_USAGE", &v);
+        if (r < 0)
+                return log_device_error_errno(dev, r, "Failed to get \"ID_FS_USAGE\" device property: %m");
+
+        if (!streq(v, "filesystem"))
+                return log_device_error_errno(dev, SYNTHETIC_ERRNO(EINVAL),
+                                              "%s does not contain a known file system.", node);
+
+        return umount_by_device(bus, dev);
 }
 
 static int umount_loop(sd_bus *bus, const char *backing_file) {
-        _cleanup_free_ char *loop_dev = NULL;
+        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         int r;
 
         assert(backing_file);
 
-        r = find_loop_device(backing_file, &loop_dev);
+        r = find_loop_device(backing_file, &dev);
         if (r < 0)
                 return log_error_errno(r, r == -ENXIO ? "File %s is not mounted." : "Can't get loop device for %s: %m", backing_file);
 
-        return umount_by_device(bus, loop_dev);
+        return umount_by_device(bus, dev);
 }
 
 static int action_umount(
@@ -976,17 +1044,15 @@ static int action_umount(
                 int argc,
                 char **argv) {
 
-        int i, r, r2 = 0;
+        int r, r2 = 0;
 
         if (arg_transport != BUS_TRANSPORT_LOCAL) {
-                for (i = optind; i < argc; i++) {
+                for (int i = optind; i < argc; i++) {
                         _cleanup_free_ char *p = NULL;
 
-                        p = strdup(argv[i]);
-                        if (!p)
-                                return log_oom();
-
-                        path_simplify(p);
+                        r = path_simplify_alloc(argv[i], &p);
+                        if (r < 0)
+                                return r;
 
                         r = stop_mounts(bus, p);
                         if (r < 0)
@@ -995,7 +1061,7 @@ static int action_umount(
                 return r2;
         }
 
-        for (i = optind; i < argc; i++) {
+        for (int i = optind; i < argc; i++) {
                 _cleanup_free_ char *u = NULL, *p = NULL;
                 struct stat st;
 
@@ -1003,7 +1069,7 @@ static int action_umount(
                 if (!u)
                         return log_oom();
 
-                r = chase_symlinks(u, NULL, 0, &p, NULL);
+                r = chase(u, NULL, 0, &p, NULL);
                 if (r < 0) {
                         r2 = log_error_errno(r, "Failed to make path %s absolute: %m", argv[i]);
                         continue;
@@ -1013,7 +1079,7 @@ static int action_umount(
                         return log_error_errno(errno, "Can't stat %s (from %s): %m", p, argv[i]);
 
                 if (S_ISBLK(st.st_mode))
-                        r = umount_by_device(bus, p);
+                        r = umount_by_device_node(bus, p);
                 else if (S_ISREG(st.st_mode))
                         r = umount_loop(bus, p);
                 else if (S_ISDIR(st.st_mode))
@@ -1068,20 +1134,6 @@ static int acquire_mount_options(sd_device *d) {
         return 1;
 }
 
-static const char *get_model(sd_device *d) {
-        const char *model;
-
-        assert(d);
-
-        if (sd_device_get_property_value(d, "ID_MODEL_FROM_DATABASE", &model) >= 0)
-                return model;
-
-        if (sd_device_get_property_value(d, "ID_MODEL", &model) >= 0)
-                return model;
-
-        return NULL;
-}
-
 static const char* get_label(sd_device *d) {
         const char *label;
 
@@ -1098,24 +1150,29 @@ static const char* get_label(sd_device *d) {
 
 static int acquire_mount_where(sd_device *d) {
         const char *v;
+        int r;
 
         if (arg_mount_where)
                 return 0;
 
         if (sd_device_get_property_value(d, "SYSTEMD_MOUNT_WHERE", &v) < 0) {
-                _cleanup_free_ char *escaped = NULL;
+                _cleanup_free_ char *escaped = NULL, *devname_bn = NULL;
                 const char *name;
 
                 name = get_label(d);
                 if (!name)
-                        name = get_model(d);
+                        (void) device_get_model_string(d, &name);
                 if (!name) {
                         const char *dn;
 
                         if (sd_device_get_devname(d, &dn) < 0)
                                 return 0;
 
-                        name = basename(dn);
+                        r = path_extract_filename(dn, &devname_bn);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to extract file name from '%s': %m", dn);
+
+                        name = devname_bn;
                 }
 
                 escaped = xescape(name, "\\");
@@ -1135,24 +1192,31 @@ static int acquire_mount_where(sd_device *d) {
         return 1;
 }
 
-static int acquire_mount_where_for_loop_dev(const char *loop_dev) {
+static int acquire_mount_where_for_loop_dev(sd_device *dev) {
         _cleanup_strv_free_ char **list = NULL;
+        const char *node;
         int r;
+
+        assert(dev);
 
         if (arg_mount_where)
                 return 0;
 
-        r = find_mount_points(loop_dev, &list);
+        r = sd_device_get_devname(dev, &node);
         if (r < 0)
                 return r;
-        else if (r == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Can't find mount point of %s. It is expected that %s is already mounted on a place.",
-                                       loop_dev, loop_dev);
-        else if (r >= 2)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "%s is mounted on %d places. It is expected that %s is mounted on a place.",
-                                       loop_dev, r, loop_dev);
+
+        r = find_mount_points(node, &list);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return log_device_error_errno(dev, SYNTHETIC_ERRNO(EINVAL),
+                                              "Can't find mount point of %s. It is expected that %s is already mounted on a place.",
+                                              node, node);
+        if (r >= 2)
+                return log_device_error_errno(dev, SYNTHETIC_ERRNO(EINVAL),
+                                              "%s is mounted on %d places. It is expected that %s is mounted on a place.",
+                                              node, r, node);
 
         arg_mount_where = strdup(list[0]);
         if (!arg_mount_where)
@@ -1163,12 +1227,12 @@ static int acquire_mount_where_for_loop_dev(const char *loop_dev) {
 }
 
 static int acquire_description(sd_device *d) {
-        const char *model, *label;
+        const char *model = NULL, *label;
 
         if (arg_description)
                 return 0;
 
-        model = get_model(d);
+        (void) device_get_model_string(d, &model);
 
         label = get_label(d);
         if (!label)
@@ -1204,7 +1268,7 @@ static int acquire_removable(sd_device *d) {
                 if (sd_device_get_parent(d, &d) < 0)
                         return 0;
 
-                if (sd_device_get_subsystem(d, &v) < 0 || !streq(v, "block"))
+                if (!device_in_subsystem(d, "block"))
                         return 0;
         }
 
@@ -1233,22 +1297,23 @@ static int acquire_removable(sd_device *d) {
 
 static int discover_loop_backing_file(void) {
         _cleanup_(sd_device_unrefp) sd_device *d = NULL;
-        _cleanup_free_ char *loop_dev = NULL;
-        struct stat st;
-        const char *v;
         int r;
 
-        r = find_loop_device(arg_mount_what, &loop_dev);
+        r = find_loop_device(arg_mount_what, &d);
         if (r < 0 && r != -ENXIO)
                 return log_error_errno(errno, "Can't get loop device for %s: %m", arg_mount_what);
 
         if (r == -ENXIO) {
-                _cleanup_free_ char *escaped = NULL;
+                _cleanup_free_ char *escaped = NULL, *bn = NULL;
 
                 if (arg_mount_where)
                         return 0;
 
-                escaped = xescape(basename(arg_mount_what), "\\");
+                r = path_extract_filename(arg_mount_what, &bn);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to extract file name from backing file path '%s': %m", arg_mount_what);
+
+                escaped = xescape(bn, "\\");
                 if (!escaped)
                         return log_oom();
                 if (!filename_is_valid(escaped))
@@ -1264,21 +1329,6 @@ static int discover_loop_backing_file(void) {
                 return 0;
         }
 
-        if (stat(loop_dev, &st) < 0)
-                return log_error_errno(errno, "Can't stat %s: %m", loop_dev);
-
-        if (!S_ISBLK(st.st_mode))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Invalid file type: %s", loop_dev);
-
-        r = sd_device_new_from_stat_rdev(&d, &st);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get device from device number: %m");
-
-        if (sd_device_get_property_value(d, "ID_FS_USAGE", &v) < 0 || !streq(v, "filesystem"))
-                return log_device_error_errno(d, SYNTHETIC_ERRNO(EINVAL),
-                                              "%s does not contain a known file system.", arg_mount_what);
-
         r = acquire_mount_type(d);
         if (r < 0)
                 return r;
@@ -1287,7 +1337,7 @@ static int discover_loop_backing_file(void) {
         if (r < 0)
                 return r;
 
-        r = acquire_mount_where_for_loop_dev(loop_dev);
+        r = acquire_mount_where_for_loop_dev(d);
         if (r < 0)
                 return r;
 
@@ -1347,22 +1397,21 @@ static int discover_device(void) {
         return 0;
 }
 
-enum {
-        COLUMN_NODE,
-        COLUMN_PATH,
-        COLUMN_MODEL,
-        COLUMN_WWN,
-        COLUMN_FSTYPE,
-        COLUMN_LABEL,
-        COLUMN_UUID,
-        _COLUMN_MAX,
-};
-
 static int list_devices(void) {
+        enum {
+                COLUMN_NODE,
+                COLUMN_DISKSEQ,
+                COLUMN_PATH,
+                COLUMN_MODEL,
+                COLUMN_WWN,
+                COLUMN_FSTYPE,
+                COLUMN_LABEL,
+                COLUMN_UUID,
+                _COLUMN_MAX,
+        };
+
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
         _cleanup_(table_unrefp) Table *table = NULL;
-        sd_device *d;
-        unsigned c;
         int r;
 
         r = sd_device_enumerator_new(&e);
@@ -1377,7 +1426,7 @@ static int list_devices(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to add property match: %m");
 
-        table = table_new("NODE", "PATH", "MODEL", "WWN", "TYPE", "LABEL", "UUID");
+        table = table_new("node", "diskseq", "path", "model", "wwn", "fstype", "label", "uuid");
         if (!table)
                 return log_oom();
 
@@ -1388,10 +1437,10 @@ static int list_devices(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to set sort index: %m");
 
-        table_set_header(table, arg_legend);
+        table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 
         FOREACH_DEVICE(e, d) {
-                for (c = 0; c < _COLUMN_MAX; c++) {
+                for (unsigned c = 0; c < _COLUMN_MAX; c++) {
                         const char *x = NULL;
 
                         switch (c) {
@@ -1400,12 +1449,27 @@ static int list_devices(void) {
                                 (void) sd_device_get_devname(d, &x);
                                 break;
 
+                        case COLUMN_DISKSEQ: {
+                                uint64_t ds;
+
+                                r = sd_device_get_diskseq(d, &ds);
+                                if (r < 0) {
+                                        log_debug_errno(r, "Failed to get diskseq of block device, ignoring: %m");
+                                        r = table_add_cell(table, NULL, TABLE_EMPTY, NULL);
+                                } else
+                                        r = table_add_cell(table, NULL, TABLE_UINT64, &ds);
+                                if (r < 0)
+                                        return table_log_add_error(r);
+
+                                continue;
+                        }
+
                         case COLUMN_PATH:
                                 (void) sd_device_get_property_value(d, "ID_PATH", &x);
                                 break;
 
                         case COLUMN_MODEL:
-                                x = get_model(d);
+                                (void) device_get_model_string(d, &x);
                                 break;
 
                         case COLUMN_WWN:
@@ -1425,28 +1489,20 @@ static int list_devices(void) {
                                 break;
                         }
 
-                        r = table_add_cell(table, NULL, c == COLUMN_NODE ? TABLE_PATH : TABLE_STRING, strna(x));
+                        r = table_add_cell(table, NULL, c == COLUMN_NODE ? TABLE_PATH : TABLE_STRING, x);
                         if (r < 0)
                                 return table_log_add_error(r);
                 }
         }
 
-        pager_open(arg_pager_flags);
-
-        r = table_print(table, NULL);
-        if (r < 0)
-                return table_log_print_error(r);
-
-        return 0;
+        return table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
 }
 
 static int run(int argc, char* argv[]) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
-        log_show_color(true);
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -1455,9 +1511,11 @@ static int run(int argc, char* argv[]) {
         if (arg_action == ACTION_LIST)
                 return list_devices();
 
-        r = bus_connect_transport_systemd(arg_transport, arg_host, arg_user, &bus);
+        r = bus_connect_transport_systemd(arg_transport, arg_host, arg_runtime_scope, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
+
+        (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
 
         if (arg_action == ACTION_UMOUNT)
                 return action_umount(bus, argc, argv);

@@ -4,9 +4,8 @@
 #include <stdbool.h>
 
 #include "time-util.h"
-#include "util.h"
 
-const char *watchdog_get_device(void);
+const char* watchdog_get_device(void);
 usec_t watchdog_get_last_ping(clockid_t clock);
 
 int watchdog_set_device(const char *path);

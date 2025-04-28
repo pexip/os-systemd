@@ -6,10 +6,12 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "compress.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "gcrypt-util.h"
 #include "journal-authenticate.h"
 #include "journal-def.h"
 #include "journal-file.h"
@@ -18,7 +20,6 @@
 #include "macro.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
 static void draw_progress(uint64_t p, usec_t *last_usec) {
         unsigned n, i, j, k;
@@ -817,7 +818,7 @@ int journal_file_verify(
                 bool show_progress) {
         int r;
         Object *o;
-        uint64_t p = 0, last_epoch = 0, last_tag_realtime = 0, last_sealed_realtime = 0;
+        uint64_t p = 0, last_epoch = 0, last_tag_realtime = 0;
 
         uint64_t entry_seqnum = 0, entry_monotonic = 0, entry_realtime = 0;
         usec_t min_entry_realtime = USEC_INFINITY, max_entry_realtime = 0;
@@ -825,7 +826,7 @@ int journal_file_verify(
         bool entry_seqnum_set = false, entry_monotonic_set = false, entry_realtime_set = false, found_main_entry_array = false;
         uint64_t n_objects = 0, n_entries = 0, n_data = 0, n_fields = 0, n_data_hash_tables = 0, n_field_hash_tables = 0, n_entry_arrays = 0, n_tags = 0;
         usec_t last_usec = 0;
-        _cleanup_close_ int data_fd = -1, entry_fd = -1, entry_array_fd = -1;
+        _cleanup_close_ int data_fd = -EBADF, entry_fd = -EBADF, entry_array_fd = -EBADF;
         _cleanup_fclose_ FILE *data_fp = NULL, *entry_fp = NULL, *entry_array_fp = NULL;
         MMapFileDescriptor *cache_data_fd = NULL, *cache_entry_fd = NULL, *cache_entry_array_fd = NULL;
         unsigned i;
@@ -877,21 +878,21 @@ int journal_file_verify(
         }
 
         m = mmap_cache_fd_cache(f->cache_fd);
-        cache_data_fd = mmap_cache_add_fd(m, data_fd, PROT_READ|PROT_WRITE);
-        if (!cache_data_fd) {
-                r = log_oom();
+        r = mmap_cache_add_fd(m, data_fd, PROT_READ|PROT_WRITE, &cache_data_fd);
+        if (r < 0) {
+                log_error_errno(r, "Failed to cache data file: %m");
                 goto fail;
         }
 
-        cache_entry_fd = mmap_cache_add_fd(m, entry_fd, PROT_READ|PROT_WRITE);
-        if (!cache_entry_fd) {
-                r = log_oom();
+        r = mmap_cache_add_fd(m, entry_fd, PROT_READ|PROT_WRITE, &cache_entry_fd);
+        if (r < 0) {
+                log_error_errno(r, "Failed to cache entry file: %m");
                 goto fail;
         }
 
-        cache_entry_array_fd = mmap_cache_add_fd(m, entry_array_fd, PROT_READ|PROT_WRITE);
-        if (!cache_entry_array_fd) {
-                r = log_oom();
+        r = mmap_cache_add_fd(m, entry_array_fd, PROT_READ|PROT_WRITE, &cache_entry_array_fd);
+        if (r < 0) {
+                log_error_errno(r, "Failed to cache entry array file: %m");
                 goto fail;
         }
 
@@ -925,6 +926,10 @@ int journal_file_verify(
                         r = -EBADMSG;
                         goto fail;
                 }
+
+        if (JOURNAL_HEADER_SEALED(f->header) && !JOURNAL_HEADER_SEALED_CONTINUOUS(f->header))
+                warning(p,
+                        "This log file was sealed with an old journald version where the sequence of seals might not be continuous. We cannot guarantee completeness.");
 
         /* First iteration: we go through all objects, verify the
          * superficial structure, headers, hashes. */
@@ -1129,13 +1134,25 @@ int journal_file_verify(
                                 goto fail;
                         }
 
-                        if (le64toh(o->tag.epoch) < last_epoch) {
-                                error(p,
-                                      "Epoch sequence out of synchronization (%"PRIu64" < %"PRIu64")",
-                                      le64toh(o->tag.epoch),
-                                      last_epoch);
-                                r = -EBADMSG;
-                                goto fail;
+                        if (JOURNAL_HEADER_SEALED_CONTINUOUS(f->header)) {
+                                if (!(n_tags == 0 || (n_tags == 1 && le64toh(o->tag.epoch) == last_epoch)
+                                      || le64toh(o->tag.epoch) == last_epoch + 1)) {
+                                        error(p,
+                                              "Epoch sequence not continuous (%"PRIu64" vs %"PRIu64")",
+                                              le64toh(o->tag.epoch),
+                                              last_epoch);
+                                        r = -EBADMSG;
+                                        goto fail;
+                                }
+                        } else {
+                                if (le64toh(o->tag.epoch) < last_epoch) {
+                                        error(p,
+                                              "Epoch sequence out of synchronization (%"PRIu64" < %"PRIu64")",
+                                              le64toh(o->tag.epoch),
+                                              last_epoch);
+                                        r = -EBADMSG;
+                                        goto fail;
+                                }
                         }
 
 #if HAVE_GCRYPT
@@ -1209,7 +1226,7 @@ int journal_file_verify(
                                 if (r < 0)
                                         goto fail;
 
-                                if (memcmp(o->tag.tag, gcry_md_read(f->hmac, 0), TAG_LENGTH) != 0) {
+                                if (memcmp(o->tag.tag, sym_gcry_md_read(f->hmac, 0), TAG_LENGTH) != 0) {
                                         error(p, "Tag failed verification");
                                         r = -EBADMSG;
                                         goto fail;
@@ -1217,7 +1234,6 @@ int journal_file_verify(
 
                                 f->hmac_running = false;
                                 last_tag_realtime = rt;
-                                last_sealed_realtime = entry_realtime;
                         }
 
                         last_tag = p + ALIGN64(le64toh(o->object.size));
@@ -1320,7 +1336,8 @@ int journal_file_verify(
         }
 
         if (entry_monotonic_set &&
-            (sd_id128_equal(entry_boot_id, f->header->boot_id) &&
+            (sd_id128_equal(entry_boot_id, f->header->tail_entry_boot_id) &&
+             JOURNAL_HEADER_TAIL_ENTRY_BOOT_ID(f->header) &&
              entry_monotonic != le64toh(f->header->tail_entry_monotonic))) {
                 error(0,
                       "Invalid tail monotonic timestamp (%"PRIu64" != %"PRIu64")",
@@ -1389,8 +1406,10 @@ int journal_file_verify(
 
         if (first_contained)
                 *first_contained = le64toh(f->header->head_entry_realtime);
+#if HAVE_GCRYPT
         if (last_validated)
-                *last_validated = last_sealed_realtime;
+                *last_validated = last_tag_realtime + f->fss_interval_usec;
+#endif
         if (last_contained)
                 *last_contained = le64toh(f->header->tail_entry_realtime);
 
@@ -1400,11 +1419,11 @@ fail:
         if (show_progress)
                 flush_progress();
 
-        log_error("File corruption detected at %s:"OFSfmt" (of %llu bytes, %"PRIu64"%%).",
+        log_error("File corruption detected at %s:%"PRIu64" (of %"PRIu64" bytes, %"PRIu64"%%).",
                   f->path,
                   p,
-                  (unsigned long long) f->last_stat.st_size,
-                  100 * p / f->last_stat.st_size);
+                  (uint64_t) f->last_stat.st_size,
+                  100U * p / (uint64_t) f->last_stat.st_size);
 
         if (cache_data_fd)
                 mmap_cache_fd_free(cache_data_fd);

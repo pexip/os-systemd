@@ -24,7 +24,6 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "udev-util.h"
-#include "util.h"
 
 /* Note that any write is delayed until exit and the rfkill state will not be
  * stored for rfkill indices that disappear after a change. */
@@ -141,7 +140,7 @@ static int load_state(Context *c, const struct rfkill_event *event) {
         assert(c->rfkill_fd >= 0);
         assert(event);
 
-        if (shall_restore_state() == 0)
+        if (!shall_restore_state())
                 return 0;
 
         r = determine_state_file(event, &state_file);
@@ -258,8 +257,7 @@ static void context_save_and_clear(Context *c) {
 
         assert(c);
 
-        while ((i = c->write_queue)) {
-                LIST_REMOVE(queue, c->write_queue, i);
+        while ((i = LIST_POP(queue, c->write_queue))) {
                 (void) save_state_write_one(i);
                 write_queue_item_free(i);
         }
@@ -268,7 +266,7 @@ static void context_save_and_clear(Context *c) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(context_save_and_clear) Context c = { .rfkill_fd = -1 };
+        _cleanup_(context_save_and_clear) Context c = { .rfkill_fd = -EBADF };
         bool ready = false;
         int r, n;
 

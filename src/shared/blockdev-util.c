@@ -18,6 +18,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "missing_magic.h"
 #include "parse-util.h"
 
@@ -44,23 +45,7 @@ static int fd_get_devnum(int fd, BlockDeviceLookupFlag flags, dev_t *ret) {
                 /* If major(st.st_dev) is zero, this might mean we are backed by btrfs, which needs special
                  * handing, to get the backing device node. */
 
-                r = fcntl(fd, F_GETFL);
-                if (r < 0)
-                        return -errno;
-
-                if (FLAGS_SET(r, O_PATH)) {
-                        _cleanup_close_ int regfd = -1;
-
-                        /* The fstat() above we can execute on an O_PATH fd. But the btrfs ioctl we cannot.
-                         * Hence acquire a "real" fd first, without the O_PATH flag. */
-
-                        regfd = fd_reopen(fd, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
-                        if (regfd < 0)
-                                return regfd;
-
-                        r = btrfs_get_block_device_fd(regfd, &devnum);
-                } else
-                        r = btrfs_get_block_device_fd(fd, &devnum);
+                r = btrfs_get_block_device_fd(fd, &devnum);
                 if (r == -ENOTTY) /* not btrfs */
                         return -ENOTBLK;
                 if (r < 0)
@@ -72,23 +57,12 @@ static int fd_get_devnum(int fd, BlockDeviceLookupFlag flags, dev_t *ret) {
 }
 
 int block_device_is_whole_disk(sd_device *dev) {
-        const char *s;
-        int r;
-
         assert(dev);
 
-        r = sd_device_get_subsystem(dev, &s);
-        if (r < 0)
-                return r;
-
-        if (!streq(s, "block"))
+        if (!device_in_subsystem(dev, "block"))
                 return -ENOTBLK;
 
-        r = sd_device_get_devtype(dev, &s);
-        if (r < 0)
-                return r;
-
-        return streq(s, "disk");
+        return device_is_devtype(dev, "disk");
 }
 
 int block_device_get_whole_disk(sd_device *dev, sd_device **ret) {
@@ -120,10 +94,9 @@ int block_device_get_whole_disk(sd_device *dev, sd_device **ret) {
         return 0;
 }
 
-static int block_device_get_originating(sd_device *dev, sd_device **ret) {
+int block_device_get_originating(sd_device *dev, sd_device **ret) {
         _cleanup_(sd_device_unrefp) sd_device *first_found = NULL;
         const char *suffix;
-        sd_device *child;
         dev_t devnum = 0;  /* avoid false maybe-uninitialized warning */
 
         /* For the specified block device tries to chase it through the layers, in case LUKS-style DM
@@ -215,7 +188,7 @@ int block_device_new_from_fd(int fd, BlockDeviceLookupFlag flags, sd_device **re
 }
 
 int block_device_new_from_path(const char *path, BlockDeviceLookupFlag flags, sd_device **ret) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         assert(path);
         assert(ret);
@@ -289,21 +262,7 @@ int get_block_device_fd(int fd, dev_t *ret) {
                 return 1;
         }
 
-        r = fcntl(fd, F_GETFL);
-        if (r < 0)
-                return -errno;
-        if (FLAGS_SET(r, O_PATH) && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
-                _cleanup_close_ int real_fd = -1;
-
-                /* The fstat() above we can execute on an O_PATH fd. But the btrfs ioctl we cannot. Hence
-                 * acquire a "real" fd first, without the O_PATH flag. */
-
-                real_fd = fd_reopen(fd, O_RDONLY|O_CLOEXEC);
-                if (real_fd < 0)
-                        return real_fd;
-                r = btrfs_get_block_device_fd(real_fd, ret);
-        } else
-                r = btrfs_get_block_device_fd(fd, ret);
+        r = btrfs_get_block_device_fd(fd, ret);
         if (r > 0)
                 return 1;
         if (r != -ENOTTY) /* not btrfs */
@@ -314,7 +273,7 @@ int get_block_device_fd(int fd, dev_t *ret) {
 }
 
 int get_block_device(const char *path, dev_t *ret) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         assert(path);
         assert(ret);
@@ -364,7 +323,7 @@ int get_block_device_harder_fd(int fd, dev_t *ret) {
 }
 
 int get_block_device_harder(const char *path, dev_t *ret) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         assert(path);
         assert(ret);
@@ -377,7 +336,7 @@ int get_block_device_harder(const char *path, dev_t *ret) {
 }
 
 int lock_whole_block_device(dev_t devt, int operation) {
-        _cleanup_close_ int lock_fd = -1;
+        _cleanup_close_ int lock_fd = -EBADF;
         dev_t whole_devt;
         int r;
 
@@ -397,8 +356,7 @@ int lock_whole_block_device(dev_t devt, int operation) {
         return TAKE_FD(lock_fd);
 }
 
-int blockdev_partscan_enabled(int fd) {
-        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+int blockdev_partscan_enabled(sd_device *dev) {
         unsigned capability;
         int r, ext_range;
 
@@ -439,25 +397,27 @@ int blockdev_partscan_enabled(int fd) {
          * the 'capability' sysfs attribute is deprecated, hence we cannot check flags from it. 💣💣💣
          *
          * With https://github.com/torvalds/linux/commit/a4217c6740dc64a3eb6815868a9260825e8c68c6 (v6.10,
-         * backported to v6.9), the partscan status is directly exposed as 'partscan' sysattr.
+         * backported to v6.6+), the partscan status is directly exposed as 'partscan' sysattr.
          *
          * To support both old and new kernels, we need to do the following:
          * 1) check 'partscan' sysfs attribute where the information is made directly available,
-         * 2) check 'loop/partscan' sysfs attribute for loopback block devices, and if '0' we can conclude
+         * 2) check if the blockdev refers to a partition, where partscan is not supported,
+         * 3) check 'loop/partscan' sysfs attribute for loopback block devices, and if '0' we can conclude
          *    partition scanning is disabled,
-         * 3) check 'ext_range' sysfs attribute, and if '1' we can conclude partition scanning is disabled,
-         * 4) otherwise check 'capability' sysfs attribute for ancient version. */
+         * 4) check 'ext_range' sysfs attribute, and if '1' we can conclude partition scanning is disabled,
+         * 5) otherwise check 'capability' sysfs attribute for ancient version. */
 
-        assert(fd >= 0);
-
-        r = block_device_new_from_fd(fd, 0, &dev);
-        if (r < 0)
-                return r;
+        assert(dev);
 
         /* For v6.10 or newer. */
         r = device_get_sysattr_bool(dev, "partscan");
         if (r != -ENOENT)
                 return r;
+
+        /* Partition block devices never have partition scanning on, there's no concept of sub-partitions for
+         * partitions. */
+        if (device_is_devtype(dev, "partition"))
+                return false;
 
         /* For loopback block device, especially for v5.19 or newer. Even if this is enabled, we also need to
          * check GENHD_FL_NO_PART flag through 'ext_range' and 'capability' sysfs attributes below. */
@@ -473,7 +433,7 @@ int blockdev_partscan_enabled(int fd) {
         if (r < 0)
                 return r;
 
-        if (ext_range <= 1) /* The valus should be always positive, but the kernel uses '%d' for the
+        if (ext_range <= 1) /* The value should be always positive, but the kernel uses '%d' for the
                              * attribute. Let's gracefully handle zero or negative. */
                 return false;
 
@@ -491,6 +451,19 @@ int blockdev_partscan_enabled(int fd) {
 
         /* Otherwise, assume part scanning is on, we have no further checks available. Assume the best. */
         return true;
+}
+
+int blockdev_partscan_enabled_fd(int fd) {
+        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+        int r;
+
+        assert(fd >= 0);
+
+        r = block_device_new_from_fd(fd, 0, &dev);
+        if (r < 0)
+                return r;
+
+        return blockdev_partscan_enabled(dev);
 }
 
 static int blockdev_is_encrypted(const char *sysfs_path, unsigned depth_left) {
@@ -609,7 +582,7 @@ int fd_get_whole_disk(int fd, bool backing, dev_t *ret) {
 }
 
 int path_get_whole_disk(const char *path, bool backing, dev_t *ret) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         fd = open(path, O_CLOEXEC|O_PATH);
         if (fd < 0)
@@ -752,9 +725,8 @@ int partition_enumerator_new(sd_device *dev, sd_device_enumerator **ret) {
 int block_device_remove_all_partitions(sd_device *dev, int fd) {
         _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
         _cleanup_(sd_device_unrefp) sd_device *dev_unref = NULL;
-        _cleanup_close_ int fd_close = -1;
+        _cleanup_close_ int fd_close = -EBADF;
         bool has_partitions = false;
-        sd_device *part;
         int r, k = 0;
 
         assert(dev || fd >= 0);
@@ -797,6 +769,10 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
                 if (r < 0)
                         return r;
 
+                r = btrfs_forget_device(devname);
+                if (r < 0 && r != -ENOENT)
+                        log_debug_errno(r, "Failed to forget btrfs device %s, ignoring: %m", devname);
+
                 r = block_device_remove_partition(fd, devname, nr);
                 if (r == -ENODEV) {
                         log_debug("Kernel removed partition %s before us, ignoring", devname);
@@ -830,7 +806,7 @@ int block_device_has_partitions(sd_device *dev) {
 }
 
 int blockdev_reread_partition_table(sd_device *dev) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         assert(dev);
 
@@ -847,4 +823,84 @@ int blockdev_reread_partition_table(sd_device *dev) {
                 return -errno;
 
         return 0;
+}
+
+int blockdev_get_sector_size(int fd, uint32_t *ret) {
+        int ssz = 0;
+
+        assert(fd >= 0);
+        assert(ret);
+
+        if (ioctl(fd, BLKSSZGET, &ssz) < 0)
+                return -errno;
+        if (ssz <= 0) /* make sure the field is initialized */
+                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Block device reported invalid sector size %i.", ssz);
+
+        *ret = ssz;
+        return 0;
+}
+
+int blockdev_get_device_size(int fd, uint64_t *ret) {
+        uint64_t sz = 0;
+
+        assert(fd >= 0);
+        assert(ret);
+
+        /* This is just a type-safe wrapper around BLKGETSIZE64 that gets us around having to include messy linux/fs.h in various clients */
+
+        if (ioctl(fd, BLKGETSIZE64, &sz) < 0)
+                return -errno;
+
+        *ret = sz;
+        return 0;
+}
+
+int blockdev_get_root(int level, dev_t *ret) {
+        _cleanup_free_ char *p = NULL;
+        dev_t devno;
+        int r;
+
+        /* Returns the device node backing the root file system. Traces through
+         * dm-crypt/dm-verity/... Returns > 0 and the devno of the device on success. If there's no block
+         * device (or multiple) returns 0 and a devno of 0. Failure otherwise.
+         *
+         * If the root mount has been replaced by some form of volatile file system (overlayfs), the original
+         * root block device node is symlinked in /run/systemd/volatile-root. Let's read that here. */
+        r = readlink_malloc("/run/systemd/volatile-root", &p);
+        if (r == -ENOENT) { /* volatile-root not found */
+                r = get_block_device_harder("/", &devno);
+                if (r == -EUCLEAN)
+                        return btrfs_log_dev_root(level, r, "root file system");
+                if (r < 0)
+                        return log_full_errno(level, r, "Failed to determine block device of root file system: %m");
+                if (r == 0) { /* Not backed by a single block device. (Could be NFS or so, or could be multi-device RAID or so) */
+                        r = get_block_device_harder("/usr", &devno);
+                        if (r == -EUCLEAN)
+                                return btrfs_log_dev_root(level, r, "/usr");
+                        if (r < 0)
+                                return log_full_errno(level, r, "Failed to determine block device of /usr/ file system: %m");
+                        if (r == 0) { /* /usr/ not backed by single block device, either. */
+                                log_debug("Neither root nor /usr/ file system are on a (single) block device.");
+
+                                if (ret)
+                                        *ret = 0;
+
+                                return 0;
+                        }
+                }
+        } else if (r < 0)
+                return log_full_errno(level, r, "Failed to read symlink /run/systemd/volatile-root: %m");
+        else {
+                mode_t m;
+                r = device_path_parse_major_minor(p, &m, &devno);
+                if (r < 0)
+                        return log_full_errno(level, r, "Failed to parse major/minor device node: %m");
+                if (!S_ISBLK(m))
+                        return log_full_errno(level, SYNTHETIC_ERRNO(ENOTBLK), "Volatile root device is of wrong type.");
+        }
+
+        if (ret)
+                *ret = devno;
+
+        return 1;
 }

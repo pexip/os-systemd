@@ -10,7 +10,7 @@
 
 #include "alloc-util.h"
 #include "architecture.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
@@ -78,8 +78,7 @@ int specifier_printf(const char *text, size_t max_length, const Specifier table[
 
                                         if (!GREEDY_REALLOC(result, j + k + l + 1))
                                                 return -ENOMEM;
-                                        memcpy(result + j, w, k);
-                                        t = result + j + k;
+                                        t = mempcpy(result + j, w, k);
                                 } else if (strchr(POSSIBLE_SPECIFIERS, *f))
                                         /* Oops, an unknown specifier. */
                                         return -EBADSLT;
@@ -112,18 +111,7 @@ int specifier_printf(const char *text, size_t max_length, const Specifier table[
 /* Generic handler for simple string replacements */
 
 int specifier_string(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
-        char *n = NULL;
-
-        assert(ret);
-
-        if (!isempty(data)) {
-                n = strdup(data);
-                if (!n)
-                        return -ENOMEM;
-        }
-
-        *ret = n;
-        return 0;
+        return strdup_to(ASSERT_PTR(ret), empty_to_null(data));
 }
 
 int specifier_real_path(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
@@ -134,7 +122,7 @@ int specifier_real_path(char specifier, const void *data, const char *root, cons
         if (!path)
                 return -ENOENT;
 
-        return chase_symlinks(path, root, 0, ret, NULL);
+        return chase(path, root, 0, ret, NULL);
 }
 
 int specifier_real_directory(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
@@ -187,19 +175,9 @@ int specifier_machine_id(char specifier, const void *data, const char *root, con
 
         assert(ret);
 
-        if (root) {
-                _cleanup_close_ int fd = -1;
-
-                fd = chase_symlinks_and_open("/etc/machine-id", root, CHASE_PREFIX_ROOT, O_RDONLY|O_CLOEXEC|O_NOCTTY, NULL);
-                if (fd < 0)
-                        /* Translate error for missing os-release file to EUNATCH. */
-                        return fd == -ENOENT ? -EUNATCH : fd;
-
-                r = id128_read_fd(fd, ID128_FORMAT_PLAIN, &id);
-        } else
-                r = sd_id128_get_machine(&id);
-        if (r < 0)
-                return r;
+        r = id128_get_machine(root, &id);
+        if (r < 0) /* Translate error for missing /etc/machine-id file to EUNATCH. */
+                return r == -ENOENT ? -EUNATCH : r;
 
         return specifier_id128(specifier, &id, root, userdata, ret);
 }
@@ -260,32 +238,18 @@ int specifier_pretty_hostname(char specifier, const void *data, const char *root
 
 int specifier_kernel_release(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
         struct utsname uts;
-        char *n;
 
         assert(ret);
 
         if (uname(&uts) < 0)
                 return -errno;
 
-        n = strdup(uts.release);
-        if (!n)
-                return -ENOMEM;
-
-        *ret = n;
-        return 0;
+        return strdup_to(ret, uts.release);
 }
 
 int specifier_architecture(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
-        char *t;
-
-        assert(ret);
-
-        t = strdup(architecture_to_string(uname_architecture()));
-        if (!t)
-                return -ENOMEM;
-
-        *ret = t;
-        return 0;
+        return strdup_to(ASSERT_PTR(ret),
+                         architecture_to_string(uname_architecture()));
 }
 
 /* Note: fields in /etc/os-release might quite possibly be missing, even if everything is entirely valid
@@ -334,15 +298,15 @@ int specifier_os_image_version(char specifier, const void *data, const char *roo
 }
 
 int specifier_group_name(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
-        LookupScope scope = PTR_TO_INT(data);
+        RuntimeScope scope = PTR_TO_INT(data);
         char *t;
 
         assert(ret);
 
-        if (scope == LOOKUP_SCOPE_GLOBAL)
+        if (scope == RUNTIME_SCOPE_GLOBAL)
                 return -EINVAL;
 
-        t = gid_to_name(scope == LOOKUP_SCOPE_USER ? getgid() : 0);
+        t = gid_to_name(scope == RUNTIME_SCOPE_USER ? getgid() : 0);
         if (!t)
                 return -ENOMEM;
 
@@ -351,15 +315,15 @@ int specifier_group_name(char specifier, const void *data, const char *root, con
 }
 
 int specifier_group_id(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
-        LookupScope scope = PTR_TO_INT(data);
+        RuntimeScope scope = PTR_TO_INT(data);
         gid_t gid;
 
         assert(ret);
 
-        if (scope == LOOKUP_SCOPE_GLOBAL)
+        if (scope == RUNTIME_SCOPE_GLOBAL)
                 return -EINVAL;
 
-        gid = scope == LOOKUP_SCOPE_USER ? getgid() : 0;
+        gid = scope == RUNTIME_SCOPE_USER ? getgid() : 0;
 
         if (asprintf(ret, UID_FMT, gid) < 0)
                 return -ENOMEM;
@@ -368,16 +332,16 @@ int specifier_group_id(char specifier, const void *data, const char *root, const
 }
 
 int specifier_user_name(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
-        LookupScope scope = PTR_TO_INT(data);
+        RuntimeScope scope = PTR_TO_INT(data);
         uid_t uid;
         char *t;
 
         assert(ret);
 
-        if (scope == LOOKUP_SCOPE_GLOBAL)
+        if (scope == RUNTIME_SCOPE_GLOBAL)
                 return -EINVAL;
 
-        uid = scope == LOOKUP_SCOPE_USER ? getuid() : 0;
+        uid = scope == RUNTIME_SCOPE_USER ? getuid() : 0;
 
         /* If we are UID 0 (root), this will not result in NSS, otherwise it might. This is good, as we want
          * to be able to run this in PID 1, where our user ID is 0, but where NSS lookups are not allowed.
@@ -395,15 +359,15 @@ int specifier_user_name(char specifier, const void *data, const char *root, cons
 }
 
 int specifier_user_id(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
-        LookupScope scope = PTR_TO_INT(data);
+        RuntimeScope scope = PTR_TO_INT(data);
         uid_t uid;
 
         assert(ret);
 
-        if (scope == LOOKUP_SCOPE_GLOBAL)
+        if (scope == RUNTIME_SCOPE_GLOBAL)
                 return -EINVAL;
 
-        uid = scope == LOOKUP_SCOPE_USER ? getuid() : 0;
+        uid = scope == RUNTIME_SCOPE_USER ? getuid() : 0;
 
         if (asprintf(ret, UID_FMT, uid) < 0)
                 return -ENOMEM;
@@ -431,7 +395,6 @@ int specifier_user_shell(char specifier, const void *data, const char *root, con
 
 int specifier_tmp_dir(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
         const char *p;
-        char *copy;
         int r;
 
         assert(ret);
@@ -443,17 +406,12 @@ int specifier_tmp_dir(char specifier, const void *data, const char *root, const 
                 if (r < 0)
                         return r;
         }
-        copy = strdup(p);
-        if (!copy)
-                return -ENOMEM;
 
-        *ret = copy;
-        return 0;
+        return strdup_to(ret, p);
 }
 
 int specifier_var_tmp_dir(char specifier, const void *data, const char *root, const void *userdata, char **ret) {
         const char *p;
-        char *copy;
         int r;
 
         assert(ret);
@@ -465,16 +423,13 @@ int specifier_var_tmp_dir(char specifier, const void *data, const char *root, co
                 if (r < 0)
                         return r;
         }
-        copy = strdup(p);
-        if (!copy)
-                return -ENOMEM;
 
-        *ret = copy;
-        return 0;
+        return strdup_to(ret, p);
 }
 
 int specifier_escape_strv(char **l, char ***ret) {
-        char **z, **p, **q;
+        _cleanup_strv_free_ char **z = NULL;
+        char **p, **q;
 
         assert(ret);
 
@@ -490,14 +445,12 @@ int specifier_escape_strv(char **l, char ***ret) {
         for (p = l, q = z; *p; p++, q++) {
 
                 *q = specifier_escape(*p);
-                if (!*q) {
-                        strv_free(z);
+                if (!*q)
                         return -ENOMEM;
-                }
         }
 
         *q = NULL;
-        *ret = z;
+        *ret = TAKE_PTR(z);
 
         return 0;
 }

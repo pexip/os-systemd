@@ -26,10 +26,9 @@
 #include "nulstr-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "portable-util.h"
 #include "pretty-print.h"
-#if HAVE_SECCOMP
-#  include "seccomp-util.h"
-#endif
+#include "seccomp-util.h"
 #include "service.h"
 #include "set.h"
 #include "stdio-util.h"
@@ -217,20 +216,21 @@ static int assess_user(
                 uint64_t *ret_badness,
                 char **ret_description) {
 
-        _cleanup_free_ char *d = NULL;
+        const char *d;
         uint64_t b;
+        int r;
 
         assert(ret_badness);
         assert(ret_description);
 
         if (streq_ptr(info->user, NOBODY_USER_NAME)) {
-                d = strdup("Service runs under as '" NOBODY_USER_NAME "' user, which should not be used for services");
+                d = "Service runs under as '" NOBODY_USER_NAME "' user, which should not be used for services";
                 b = 9;
         } else if (info->dynamic_user && !STR_IN_SET(info->user, "0", "root")) {
-                d = strdup("Service runs under a transient non-root user identity");
+                d = "Service runs under a transient non-root user identity";
                 b = 0;
         } else if (info->user && !STR_IN_SET(info->user, "0", "root", "")) {
-                d = strdup("Service runs under a static non-root user identity");
+                d = "Service runs under a static non-root user identity";
                 b = 0;
         } else {
                 *ret_badness = 10;
@@ -238,12 +238,11 @@ static int assess_user(
                 return 0;
         }
 
-        if (!d)
-                return log_oom();
+        r = strdup_to(ret_description, d);
+        if (r < 0)
+                return r;
 
         *ret_badness = b;
-        *ret_description = TAKE_PTR(d);
-
         return 0;
 }
 
@@ -256,7 +255,6 @@ static int assess_protect_home(
 
         const char *description;
         uint64_t badness;
-        char *copy;
         int r;
 
         assert(ret_badness);
@@ -279,13 +277,11 @@ static int assess_protect_home(
                 description = "Service has no access to home directories";
         }
 
-        copy = strdup(description);
-        if (!copy)
-                return log_oom();
+        r = strdup_to(ret_description, description);
+        if (r < 0)
+                return r;
 
         *ret_badness = badness;
-        *ret_description = copy;
-
         return 0;
 }
 
@@ -298,7 +294,6 @@ static int assess_protect_system(
 
         const char *description;
         uint64_t badness;
-        char *copy;
         int r;
 
         assert(ret_badness);
@@ -321,13 +316,11 @@ static int assess_protect_system(
                 description = "Service has limited write access to the OS file hierarchy";
         }
 
-        copy = strdup(description);
-        if (!copy)
-                return log_oom();
+        r = strdup_to(ret_description, description);
+        if (r < 0)
+                return r;
 
         *ret_badness = badness;
-        *ret_description = copy;
-
         return 0;
 }
 
@@ -372,9 +365,9 @@ static int assess_umask(
                 uint64_t *ret_badness,
                 char **ret_description) {
 
-        char *copy = NULL;
         const char *d;
         uint64_t b;
+        int r;
 
         assert(ret_badness);
         assert(ret_description);
@@ -396,13 +389,11 @@ static int assess_umask(
                 b = 0;
         }
 
-        copy = strdup(d);
-        if (!copy)
-                return log_oom();
+        r = strdup_to(ret_description, d);
+        if (r < 0)
+                return r;
 
         *ret_badness = b;
-        *ret_description = copy;
-
         return 0;
 }
 
@@ -539,36 +530,34 @@ static int assess_system_call_architectures(
                 uint64_t *ret_badness,
                 char **ret_description) {
 
-        char *d;
+        const char *d;
         uint64_t b;
+        int r;
 
         assert(ret_badness);
         assert(ret_description);
 
         if (set_isempty(info->system_call_architectures)) {
                 b = 10;
-                d = strdup("Service may execute system calls with all ABIs");
+                d = "Service may execute system calls with all ABIs";
         } else if (set_contains(info->system_call_architectures, "native") &&
                    set_size(info->system_call_architectures) == 1) {
                 b = 0;
-                d = strdup("Service may execute system calls only with native ABI");
+                d = "Service may execute system calls only with native ABI";
         } else {
                 b = 8;
-                d = strdup("Service may execute system calls with multiple ABIs");
+                d = "Service may execute system calls with multiple ABIs";
         }
 
-        if (!d)
-                return log_oom();
+        r = strdup_to(ret_description, d);
+        if (r < 0)
+                return r;
 
         *ret_badness = b;
-        *ret_description = d;
-
         return 0;
 }
 
 static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilterSet *f, const char **ret_offending_syscall) {
-        const char *syscall;
-
         NULSTR_FOREACH(syscall, f->value) {
                 if (syscall[0] == '@') {
                         const SyscallFilterSet *g;
@@ -611,12 +600,12 @@ static int assess_system_call_filter(
         assert(a->parameter < _SYSCALL_FILTER_SET_MAX);
         const SyscallFilterSet *f = syscall_filter_sets + a->parameter;
 
-        _cleanup_free_ char *d = NULL;
+        char *d;
         uint64_t b;
         int r;
 
         if (!info->system_call_filter_allow_list && set_isempty(info->system_call_filter)) {
-                r = free_and_strdup(&d, "Service does not filter system calls");
+                r = strdup_to(&d, "Service does not filter system calls");
                 b = 10;
         } else {
                 bool bad;
@@ -653,8 +642,8 @@ static int assess_system_call_filter(
         if (r < 0)
                 return log_oom();
 
+        *ret_description = d;
         *ret_badness = b;
-        *ret_description = TAKE_PTR(d);
 
         return 0;
 }
@@ -668,36 +657,36 @@ static int assess_ip_address_allow(
                 uint64_t *ret_badness,
                 char **ret_description) {
 
-        char *d = NULL;
+        const char *d;
         uint64_t b;
+        int r;
 
         assert(info);
         assert(ret_badness);
         assert(ret_description);
 
         if (info->ip_filters_custom_ingress || info->ip_filters_custom_egress) {
-                d = strdup("Service defines custom ingress/egress IP filters with BPF programs");
+                d = "Service defines custom ingress/egress IP filters with BPF programs";
                 b = 0;
         } else if (!info->ip_address_deny_all) {
-                d = strdup("Service does not define an IP address allow list");
+                d = "Service does not define an IP address allow list";
                 b = 10;
         } else if (info->ip_address_allow_other) {
-                d = strdup("Service defines IP address allow list with non-localhost entries");
+                d = "Service defines IP address allow list with non-localhost entries";
                 b = 5;
         } else if (info->ip_address_allow_localhost) {
-                d = strdup("Service defines IP address allow list with only localhost entries");
+                d = "Service defines IP address allow list with only localhost entries";
                 b = 2;
         } else {
-                d = strdup("Service blocks all IP address ranges");
+                d = "Service blocks all IP address ranges";
                 b = 0;
         }
 
-        if (!d)
-                return log_oom();
+        r = strdup_to(ret_description, d);
+        if (r < 0)
+                return r;
 
         *ret_badness = b;
-        *ret_description = d;
-
         return 0;
 }
 
@@ -708,7 +697,7 @@ static int assess_device_allow(
                 uint64_t *ret_badness,
                 char **ret_description) {
 
-        char *d = NULL;
+        char *d;
         uint64_t b;
 
         assert(info);
@@ -1627,97 +1616,97 @@ static const struct security_assessor security_assessor_table[] = {
         },
 };
 
-static JsonVariant* security_assessor_find_in_policy(const struct security_assessor *a, JsonVariant *policy, const char *name) {
-        JsonVariant *item;
+static sd_json_variant* security_assessor_find_in_policy(const struct security_assessor *a, sd_json_variant *policy, const char *name) {
+        sd_json_variant *item;
         assert(a);
 
         if (!policy)
                 return NULL;
-        if (!json_variant_is_object(policy)) {
+        if (!sd_json_variant_is_object(policy)) {
                 log_debug("Specified policy is not a JSON object, ignoring.");
                 return NULL;
         }
 
-        item = json_variant_by_key(policy, a->json_field);
+        item = sd_json_variant_by_key(policy, a->json_field);
         if (!item)
                 return NULL;
-        if (!json_variant_is_object(item)) {
+        if (!sd_json_variant_is_object(item)) {
                 log_debug("Item for '%s' in policy JSON object is not an object, ignoring.", a->id);
                 return NULL;
         }
 
-        return name ? json_variant_by_key(item, name) : item;
+        return name ? sd_json_variant_by_key(item, name) : item;
 }
 
-static uint64_t access_weight(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static uint64_t access_weight(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "weight");
-        if  (val) {
-                if (json_variant_is_unsigned(val))
-                        return json_variant_unsigned(val);
+        if (val) {
+                if (sd_json_variant_is_unsigned(val))
+                        return sd_json_variant_unsigned(val);
                 log_debug("JSON field 'weight' of policy for %s is not an unsigned integer, ignoring.", a->id);
         }
 
         return a->weight;
 }
 
-static uint64_t access_range(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static uint64_t access_range(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "range");
-        if  (val) {
-                if (json_variant_is_unsigned(val))
-                        return json_variant_unsigned(val);
+        if (val) {
+                if (sd_json_variant_is_unsigned(val))
+                        return sd_json_variant_unsigned(val);
                 log_debug("JSON field 'range' of policy for %s is not an unsigned integer, ignoring.", a->id);
         }
 
         return a->range;
 }
 
-static const char *access_description_na(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static const char *access_description_na(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "description_na");
-        if  (val) {
-                if (json_variant_is_string(val))
-                        return json_variant_string(val);
+        if (val) {
+                if (sd_json_variant_is_string(val))
+                        return sd_json_variant_string(val);
                 log_debug("JSON field 'description_na' of policy for %s is not a string, ignoring.", a->id);
         }
 
         return a->description_na;
 }
 
-static const char *access_description_good(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static const char *access_description_good(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "description_good");
-        if  (val) {
-                if (json_variant_is_string(val))
-                        return json_variant_string(val);
+        if (val) {
+                if (sd_json_variant_is_string(val))
+                        return sd_json_variant_string(val);
                 log_debug("JSON field 'description_good' of policy for %s is not a string, ignoring.", a->id);
         }
 
         return a->description_good;
 }
 
-static const char *access_description_bad(const struct security_assessor *a, JsonVariant *policy) {
-        JsonVariant *val;
+static const char *access_description_bad(const struct security_assessor *a, sd_json_variant *policy) {
+        sd_json_variant *val;
 
         assert(a);
 
         val = security_assessor_find_in_policy(a, policy, "description_bad");
-        if  (val) {
-                if (json_variant_is_string(val))
-                        return json_variant_string(val);
+        if (val) {
+                if (sd_json_variant_is_string(val))
+                        return sd_json_variant_string(val);
                 log_debug("JSON field 'description_bad' of policy for %s is not a string, ignoring.", a->id);
         }
 
@@ -1728,9 +1717,9 @@ static int assess(const SecurityInfo *info,
                   Table *overview_table,
                   AnalyzeSecurityFlags flags,
                   unsigned threshold,
-                  JsonVariant *policy,
+                  sd_json_variant *policy,
                   PagerFlags pager_flags,
-                  JsonFormatFlags json_format_flags) {
+                  sd_json_format_flags_t json_format_flags) {
 
         static const struct {
                 uint64_t exposure;
@@ -1768,15 +1757,14 @@ static int assess(const SecurityInfo *info,
                         (void) table_set_display(details_table, (size_t) 0, (size_t) 1, (size_t) 2, (size_t) 3, (size_t) 7);
         }
 
-        for (i = 0; i < ELEMENTSOF(security_assessor_table); i++) {
-                const struct security_assessor *a = security_assessor_table + i;
+        FOREACH_ELEMENT(a, security_assessor_table) {
                 _cleanup_free_ char *d = NULL;
                 uint64_t badness;
                 void *data;
                 uint64_t weight = access_weight(a, policy);
                 uint64_t range = access_range(a, policy);
 
-                data = (uint8_t *) info + a->offset;
+                data = (uint8_t*) info + a->offset;
 
                 if (a->default_dependencies_only && !info->default_dependencies) {
                         badness = UINT64_MAX;
@@ -1884,7 +1872,7 @@ static int assess(const SecurityInfo *info,
                                 return log_error_errno(r, "Failed to update cell in table: %m");
                 }
 
-                if (json_format_flags & JSON_FORMAT_OFF) {
+                if (!sd_json_format_enabled(json_format_flags)) {
                         r = table_hide_column_from_display(details_table, (size_t) 2);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set columns to display: %m");
@@ -1903,7 +1891,7 @@ static int assess(const SecurityInfo *info,
 
         assert(i < ELEMENTSOF(badness_table));
 
-        if (details_table && (json_format_flags & JSON_FORMAT_OFF)) {
+        if (details_table && !sd_json_format_enabled(json_format_flags)) {
                 _cleanup_free_ char *clickable = NULL;
                 const char *name;
 
@@ -2242,7 +2230,7 @@ static int property_read_ip_filters(
                 void *userdata) {
 
         SecurityInfo *info = userdata;
-        _cleanup_(strv_freep) char **l = NULL;
+        _cleanup_strv_free_ char **l = NULL;
         int r;
 
         assert(bus);
@@ -2425,9 +2413,9 @@ static int analyze_security_one(sd_bus *bus,
                                 Table *overview_table,
                                 AnalyzeSecurityFlags flags,
                                 unsigned threshold,
-                                JsonVariant *policy,
+                                sd_json_variant *policy,
                                 PagerFlags pager_flags,
-                                JsonFormatFlags json_format_flags) {
+                                sd_json_format_flags_t json_format_flags) {
 
         _cleanup_(security_info_freep) SecurityInfo *info = security_info_new();
         if (!info)
@@ -2644,9 +2632,9 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
 
                 LIST_FOREACH(device_allow, a, g->device_allow)
                         if (strv_extendf(&info->device_allow,
-                                         "%s:%s%s%s",
+                                         "%s:%s",
                                          a->path,
-                                         a->r ? "r" : "", a->w ? "w" : "", a->m ? "m" : "") < 0)
+                                         cgroup_device_permissions_to_string(a->permissions)) < 0)
                                 return log_oom();
         }
 
@@ -2657,9 +2645,9 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
 
 static int offline_security_check(Unit *u,
                                   unsigned threshold,
-                                  JsonVariant *policy,
+                                  sd_json_variant *policy,
                                   PagerFlags pager_flags,
-                                  JsonFormatFlags json_format_flags) {
+                                  sd_json_format_flags_t json_format_flags) {
 
         _cleanup_(table_unrefp) Table *overview_table = NULL;
         AnalyzeSecurityFlags flags = 0;
@@ -2678,21 +2666,23 @@ static int offline_security_check(Unit *u,
         return assess(info, overview_table, flags, threshold, policy, pager_flags, json_format_flags);
 }
 
-static int offline_security_checks(char **filenames,
-                                   JsonVariant *policy,
-                                   LookupScope scope,
-                                   bool check_man,
-                                   bool run_generators,
-                                   unsigned threshold,
-                                   const char *root,
-                                   const char *profile,
-                                   PagerFlags pager_flags,
-                                   JsonFormatFlags json_format_flags) {
+static int offline_security_checks(
+                char **filenames,
+                sd_json_variant *policy,
+                RuntimeScope scope,
+                bool check_man,
+                bool run_generators,
+                unsigned threshold,
+                const char *root,
+                const char *profile,
+                PagerFlags pager_flags,
+                sd_json_format_flags_t json_format_flags) {
 
         const ManagerTestRunFlags flags =
                 MANAGER_TEST_RUN_MINIMAL |
                 MANAGER_TEST_RUN_ENV_GENERATORS |
                 MANAGER_TEST_RUN_IGNORE_DEPENDENCIES |
+                MANAGER_TEST_DONT_OPEN_EXECUTOR |
                 run_generators * MANAGER_TEST_RUN_GENERATORS;
 
         _cleanup_(manager_freep) Manager *m = NULL;
@@ -2734,14 +2724,13 @@ static int offline_security_checks(char **filenames,
                 k = verify_prepare_filename(*filename, &prepared);
                 if (k < 0) {
                         log_warning_errno(k, "Failed to prepare filename %s: %m", *filename);
-                        if (r == 0)
-                                r = k;
+                        RET_GATHER(r, k);
                         continue;
                 }
 
                 /* When a portable image is analyzed, the profile is what provides a good chunk of
                  * the security-related settings, but they are obviously not shipped with the image.
-                 * This allows to take them in consideration. */
+                 * This allows them to be taken into consideration. */
                 if (profile) {
                         _cleanup_free_ char *unit_name = NULL, *dropin = NULL, *profile_path = NULL;
 
@@ -2761,41 +2750,37 @@ static int offline_security_checks(char **filenames,
                                 profile = profile_path;
                         }
 
-                        r = copy_file(profile, dropin, 0, 0644, 0, 0, 0);
+                        r = copy_file(profile, dropin, 0, 0644, 0);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy: %m");
                 }
 
                 k = manager_load_startable_unit_or_warn(m, NULL, prepared, &units[count]);
                 if (k < 0) {
-                        if (r == 0)
-                                r = k;
+                        RET_GATHER(r, k);
                         continue;
                 }
 
                 count++;
         }
 
-        for (size_t i = 0; i < count; i++) {
-                k = offline_security_check(units[i], threshold, policy, pager_flags, json_format_flags);
-                if (k < 0 && r == 0)
-                        r = k;
-        }
+        for (size_t i = 0; i < count; i++)
+                RET_GATHER(r, offline_security_check(units[i], threshold, policy, pager_flags, json_format_flags));
 
         return r;
 }
 
 static int analyze_security(sd_bus *bus,
                      char **units,
-                     JsonVariant *policy,
-                     LookupScope scope,
+                     sd_json_variant *policy,
+                     RuntimeScope scope,
                      bool check_man,
                      bool run_generators,
                      bool offline,
                      unsigned threshold,
                      const char *root,
                      const char *profile,
-                     JsonFormatFlags json_format_flags,
+                     sd_json_format_flags_t json_format_flags,
                      PagerFlags pager_flags,
                      AnalyzeSecurityFlags flags) {
 
@@ -2835,7 +2820,6 @@ static int analyze_security(sd_bus *bus,
 
                 for (;;) {
                         UnitInfo info;
-                        char *copy = NULL;
 
                         r = bus_parse_unit_info(reply, &info);
                         if (r < 0)
@@ -2849,12 +2833,11 @@ static int analyze_security(sd_bus *bus,
                         if (!GREEDY_REALLOC(list, n + 2))
                                 return log_oom();
 
-                        copy = strdup(info.id);
-                        if (!copy)
-                                return log_oom();
+                        r = strdup_to(&list[n], info.id);
+                        if (r < 0)
+                                return r;
 
-                        list[n++] = copy;
-                        list[n] = NULL;
+                        list[++n] = NULL;
                 }
 
                 strv_sort(list);
@@ -2887,7 +2870,7 @@ static int analyze_security(sd_bus *bus,
                                                        *i);
 
                         if (unit_name_is_valid(mangled, UNIT_NAME_TEMPLATE)) {
-                                r = unit_name_replace_instance(mangled, "test-instance", &instance);
+                                r = unit_name_replace_instance(mangled, arg_instance, &instance);
                                 if (r < 0)
                                         return log_oom();
 
@@ -2915,20 +2898,20 @@ static int analyze_security(sd_bus *bus,
 
 int verb_security(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *policy = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *policy = NULL;
         int r;
         unsigned line, column;
 
         if (!arg_offline) {
                 r = acquire_bus(&bus, NULL);
                 if (r < 0)
-                        return bus_log_connect_error(r, arg_transport);
+                        return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
         }
 
         pager_open(arg_pager_flags);
 
         if (arg_security_policy) {
-                r = json_parse_file(/*f=*/ NULL, arg_security_policy, /*flags=*/ 0, &policy, &line, &column);
+                r = sd_json_parse_file(/*f=*/ NULL, arg_security_policy, /*flags=*/ 0, &policy, &line, &column);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse '%s' at %u:%u: %m", arg_security_policy, line, column);
         } else {
@@ -2940,23 +2923,24 @@ int verb_security(int argc, char *argv[], void *userdata) {
                         return r;
 
                 if (f) {
-                        r = json_parse_file(f, pp, /*flags=*/ 0, &policy, &line, &column);
+                        r = sd_json_parse_file(f, pp, /*flags=*/ 0, &policy, &line, &column);
                         if (r < 0)
                                 return log_error_errno(r, "[%s:%u:%u] Failed to parse JSON policy: %m", pp, line, column);
                 }
         }
 
-        return analyze_security(bus,
-                                strv_skip(argv, 1),
-                                policy,
-                                arg_scope,
-                                arg_man,
-                                arg_generators,
-                                arg_offline,
-                                arg_threshold,
-                                arg_root,
-                                arg_profile,
-                                arg_json_format_flags,
-                                arg_pager_flags,
-                                /*flags=*/ 0);
+        return analyze_security(
+                        bus,
+                        strv_skip(argv, 1),
+                        policy,
+                        arg_runtime_scope,
+                        arg_man,
+                        arg_generators,
+                        arg_offline,
+                        arg_threshold,
+                        arg_root,
+                        arg_profile,
+                        arg_json_format_flags,
+                        arg_pager_flags,
+                        /*flags=*/ 0);
 }

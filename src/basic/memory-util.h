@@ -9,14 +9,18 @@
 
 #include "alloc-util.h"
 #include "macro.h"
+#include "memory-util-fundamental.h"
 
 size_t page_size(void) _pure_;
-#define PAGE_ALIGN(l) ALIGN_TO((l), page_size())
-#define PAGE_ALIGN_DOWN(l) ((l) & ~(page_size() - 1))
-#define PAGE_OFFSET(l) ((l) & (page_size() - 1))
+#define PAGE_ALIGN(l)          ALIGN_TO(l, page_size())
+#define PAGE_ALIGN_U64(l)      ALIGN_TO_U64(l, page_size())
+#define PAGE_ALIGN_DOWN(l)     ALIGN_DOWN(l, page_size())
+#define PAGE_ALIGN_DOWN_U64(l) ALIGN_DOWN_U64(l, page_size())
+#define PAGE_OFFSET(l)         ALIGN_OFFSET(l, page_size())
+#define PAGE_OFFSET_U64(l)     ALIGN_OFFSET_U64(l, page_size())
 
 /* Normal memcpy() requires src to be nonnull. We do nothing if n is 0. */
-static inline void *memcpy_safe(void *dst, const void *src, size_t n) {
+static inline void* memcpy_safe(void *dst, const void *src, size_t n) {
         if (n == 0)
                 return dst;
         assert(src);
@@ -24,12 +28,22 @@ static inline void *memcpy_safe(void *dst, const void *src, size_t n) {
 }
 
 /* Normal mempcpy() requires src to be nonnull. We do nothing if n is 0. */
-static inline void *mempcpy_safe(void *dst, const void *src, size_t n) {
+static inline void* mempcpy_safe(void *dst, const void *src, size_t n) {
         if (n == 0)
                 return dst;
         assert(src);
         return mempcpy(dst, src, n);
 }
+
+#define _mempcpy_typesafe(dst, src, n, sz)                              \
+        ({                                                              \
+                size_t sz;                                              \
+                assert_se(MUL_SAFE(&sz, sizeof((dst)[0]), n));          \
+                (typeof((dst)[0])*) mempcpy_safe(dst, src, sz);         \
+        })
+
+#define mempcpy_typesafe(dst, src, n)                                   \
+        _mempcpy_typesafe(dst, src, n, UNIQ_T(sz, UNIQ))
 
 /* Normal memcmp() requires s1 and s2 to be nonnull. We do nothing if n is 0. */
 static inline int memcmp_safe(const void *s1, const void *s2, size_t n) {
@@ -45,13 +59,6 @@ static inline int memcmp_nn(const void *s1, size_t n1, const void *s2, size_t n2
         return memcmp_safe(s1, s2, MIN(n1, n2))
             ?: CMP(n1, n2);
 }
-
-#define memzero(x,l)                                            \
-        ({                                                      \
-                size_t _l_ = (l);                               \
-                if (_l_ > 0)                                    \
-                        memset(x, 0, _l_);                      \
-        })
 
 #define zero(x) (memzero(&(x), sizeof(x)))
 
@@ -91,17 +98,6 @@ static inline void *mempmem_safe(const void *haystack, size_t haystacklen, const
         return (uint8_t*) p + needlelen;
 }
 
-#if HAVE_EXPLICIT_BZERO
-static inline void* explicit_bzero_safe(void *p, size_t l) {
-        if (l > 0)
-                explicit_bzero(p, l);
-
-        return p;
-}
-#else
-void *explicit_bzero_safe(void *p, size_t l);
-#endif
-
 static inline void* erase_and_free(void *p) {
         size_t l;
 
@@ -121,3 +117,6 @@ static inline void erase_and_freep(void *p) {
 static inline void erase_char(char *p) {
         explicit_bzero_safe(p, sizeof(char));
 }
+
+/* Makes a copy of the buffer with reversed order of bytes */
+void *memdup_reverse(const void *mem, size_t size);

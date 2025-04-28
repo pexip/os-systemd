@@ -90,8 +90,9 @@ __extension__ enum {
         SD_BUS_CREDS_UNIQUE_NAME        = 1ULL << 31,
         SD_BUS_CREDS_WELL_KNOWN_NAMES   = 1ULL << 32,
         SD_BUS_CREDS_DESCRIPTION        = 1ULL << 33,
+        SD_BUS_CREDS_PIDFD              = 1ULL << 34,
         SD_BUS_CREDS_AUGMENT            = 1ULL << 63, /* special flag, if on sd-bus will augment creds struct, in a potentially race-full way. */
-        _SD_BUS_CREDS_ALL               = (1ULL << 34) -1
+        _SD_BUS_CREDS_ALL               = (1ULL << 35) -1
 };
 
 __extension__ enum {
@@ -237,6 +238,8 @@ int sd_bus_add_fallback_vtable(sd_bus *bus, sd_bus_slot **slot, const char *pref
 int sd_bus_add_node_enumerator(sd_bus *bus, sd_bus_slot **slot, const char *path, sd_bus_node_enumerator_t callback, void *userdata);
 int sd_bus_add_object_manager(sd_bus *bus, sd_bus_slot **slot, const char *path);
 
+int sd_bus_pending_method_calls(sd_bus *bus);
+
 /* Slot object */
 
 sd_bus_slot* sd_bus_slot_ref(sd_bus_slot *slot);
@@ -260,6 +263,7 @@ void* sd_bus_slot_get_current_userdata(sd_bus_slot *slot);
 
 int sd_bus_message_new(sd_bus *bus, sd_bus_message **m, uint8_t type);
 int sd_bus_message_new_signal(sd_bus *bus, sd_bus_message **m, const char *path, const char *interface, const char *member);
+int sd_bus_message_new_signal_to(sd_bus *bus, sd_bus_message **m, const char *destination, const char *path, const char *interface, const char *member);
 int sd_bus_message_new_method_call(sd_bus *bus, sd_bus_message **m, const char *destination, const char *path, const char *interface, const char *member);
 int sd_bus_message_new_method_return(sd_bus_message *call, sd_bus_message **m);
 int sd_bus_message_new_method_error(sd_bus_message *call, sd_bus_message **m, const sd_bus_error *e);
@@ -379,6 +383,8 @@ int sd_bus_reply_method_errnof(sd_bus_message *call, int error, const char *form
 
 int sd_bus_emit_signalv(sd_bus *bus, const char *path, const char *interface, const char *member, const char *types, va_list ap);
 int sd_bus_emit_signal(sd_bus *bus, const char *path, const char *interface, const char *member, const char *types, ...);
+int sd_bus_emit_signal_tov(sd_bus *bus, const char *destination, const char *path, const char *interface, const char *member, const char *types, va_list ap);
+int sd_bus_emit_signal_to(sd_bus *bus, const char *destination, const char *path, const char *interface, const char *member, const char *types, ...);
 
 int sd_bus_emit_properties_changed_strv(sd_bus *bus, const char *path, const char *interface, char **names);
 int sd_bus_emit_properties_changed(sd_bus *bus, const char *path, const char *interface, const char *name, ...) _sd_sentinel_;
@@ -399,12 +405,14 @@ int sd_bus_match_signal_async(sd_bus *bus, sd_bus_slot **ret, const char *sender
 /* Credential handling */
 
 int sd_bus_creds_new_from_pid(sd_bus_creds **ret, pid_t pid, uint64_t creds_mask);
+int sd_bus_creds_new_from_pidfd(sd_bus_creds **ret, int pidfd, uint64_t creds_mask);
 sd_bus_creds* sd_bus_creds_ref(sd_bus_creds *c);
 sd_bus_creds* sd_bus_creds_unref(sd_bus_creds *c);
 uint64_t sd_bus_creds_get_mask(const sd_bus_creds *c);
 uint64_t sd_bus_creds_get_augmented_mask(const sd_bus_creds *c);
 
 int sd_bus_creds_get_pid(sd_bus_creds *c, pid_t *pid);
+int sd_bus_creds_get_pidfd_dup(sd_bus_creds *c, int *ret_fd);
 int sd_bus_creds_get_ppid(sd_bus_creds *c, pid_t *ppid);
 int sd_bus_creds_get_tid(sd_bus_creds *c, pid_t *tid);
 int sd_bus_creds_get_uid(sd_bus_creds *c, uid_t *uid);

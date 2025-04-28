@@ -5,6 +5,7 @@
 #include <stdlib.h>
 
 #include "alloc-util.h"
+#include "build.h"
 #include "log.h"
 #include "main-func.h"
 #include "path-util.h"
@@ -193,7 +194,7 @@ static int run(int argc, char *argv[]) {
                                  * it. Because that means escaping is not necessarily reversible. */
 
                                 if (!path_is_valid(*i))
-                                        log_warning("Input '%s' is not a valid file system path, escaping is likely not going be reversible.", *i);
+                                        log_warning("Input '%s' is not a valid file system path, escaping is likely not going to be reversible.", *i);
                                 else if (!path_is_absolute(*i))
                                         log_warning("Input '%s' is not an absolute file system path, escaping is likely not going to be reversible.", *i);
 

@@ -11,6 +11,9 @@
 
 #include "errno-util.h"
 #include "macro.h"
+#include "pidref.h"
+#include "runtime-scope.h"
+#include "set.h"
 #include "string-util.h"
 #include "time-util.h"
 
@@ -18,6 +21,7 @@ typedef enum BusTransport {
         BUS_TRANSPORT_LOCAL,
         BUS_TRANSPORT_REMOTE,
         BUS_TRANSPORT_MACHINE,
+        BUS_TRANSPORT_CAPSULE,
         _BUS_TRANSPORT_MAX,
         _BUS_TRANSPORT_INVALID = -EINVAL,
 } BusTransport;
@@ -33,17 +37,24 @@ bool bus_error_is_unknown_service(const sd_bus_error *error);
 
 int bus_check_peercred(sd_bus *c);
 
+int bus_set_address_capsule_bus(sd_bus *bus, const char *capsule, int *ret_pin_fd);
+
 int bus_connect_system_systemd(sd_bus **ret_bus);
 int bus_connect_user_systemd(sd_bus **ret_bus);
+int bus_connect_capsule_systemd(const char *capsule, sd_bus **ret_bus);
+int bus_connect_capsule_bus(const char *capsule, sd_bus **ret_bus);
 
-int bus_connect_transport(BusTransport transport, const char *host, bool user, sd_bus **bus);
-int bus_connect_transport_systemd(BusTransport transport, const char *host, bool user, sd_bus **bus);
+int bus_connect_transport(BusTransport transport, const char *host, RuntimeScope runtime_scope, sd_bus **bus);
+int bus_connect_transport_systemd(BusTransport transport, const char *host, RuntimeScope runtime_scope, sd_bus **bus);
 
 int bus_log_address_error(int r, BusTransport transport);
-int bus_log_connect_error(int r, BusTransport transport);
+int bus_log_connect_error(int r, BusTransport transport, RuntimeScope scope);
 
 #define bus_log_parse_error(r)                                  \
         log_error_errno(r, "Failed to parse bus message: %m")
+
+#define bus_log_parse_error_debug(r)                            \
+        log_debug_errno(r, "Failed to parse bus message: %m")
 
 #define bus_log_create_error(r)                                 \
         log_error_errno(r, "Failed to create bus message: %m")
@@ -60,4 +71,18 @@ static inline int bus_open_system_watch_bind(sd_bus **ret) {
 
 int bus_reply_pair_array(sd_bus_message *m, char **l);
 
+/* Listen to GetMallocInfo() calls to 'destination' and return malloc_info() via FD */
+int bus_register_malloc_status(sd_bus *bus, const char *destination);
+
 extern const struct hash_ops bus_message_hash_ops;
+
+int bus_message_append_string_set(sd_bus_message *m, Set *s);
+
+int bus_property_get_string_set(sd_bus *bus, const char *path, const char *interface, const char *property, sd_bus_message *reply, void *userdata, sd_bus_error *error);
+
+int bus_creds_get_pidref(sd_bus_creds *c, PidRef *ret);
+int bus_query_sender_pidref(sd_bus_message *m, PidRef *ret);
+
+int bus_message_read_id128(sd_bus_message *m, sd_id128_t *ret);
+
+const char* bus_transport_to_string(BusTransport transport) _const_;

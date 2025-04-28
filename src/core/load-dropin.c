@@ -88,7 +88,7 @@ int unit_load_dropin(Unit *u) {
 
         assert(u);
 
-        /* Load dependencies from .wants and .requires directories */
+        /* Load dependencies from .wants, .requires and .upholds directories */
         r = process_deps(u, UNIT_WANTS, ".wants");
         if (r < 0)
                 return r;
@@ -97,18 +97,18 @@ int unit_load_dropin(Unit *u) {
         if (r < 0)
                 return r;
 
+        r = process_deps(u, UNIT_UPHOLDS, ".upholds");
+        if (r < 0)
+                return r;
+
         /* Load .conf dropins */
-        r = unit_find_dropin_paths(u, &l);
+        r = unit_find_dropin_paths(u, /* use_unit_path_cache = */ true, &l);
         if (r <= 0)
                 return 0;
 
-        if (!u->dropin_paths)
-                u->dropin_paths = TAKE_PTR(l);
-        else {
-                r = strv_extend_strv(&u->dropin_paths, l, true);
-                if (r < 0)
-                        return log_oom();
-        }
+        r = strv_extend_strv_consume(&u->dropin_paths, TAKE_PTR(l), /* filter_duplicates = */ true);
+        if (r < 0)
+                return log_oom();
 
         u->dropin_mtime = 0;
         STRV_FOREACH(f, u->dropin_paths) {

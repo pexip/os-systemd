@@ -8,6 +8,7 @@
 #include "sd-device.h"
 
 #include "device-util.h"
+#include "tests.h"
 
 #define handle_error_errno(error, msg)                          \
         ({                                                      \
@@ -27,10 +28,11 @@ static void* thread(void *p) {
 int main(int argc, char *argv[]) {
         sd_device *loopback;
         pthread_t t;
-        const char *key, *value;
         int r;
 
         r = sd_device_new_from_syspath(&loopback, "/sys/class/net/lo");
+        if (r == -ENODEV)
+                return log_tests_skipped("Loopback device not found");
         if (r < 0)
                 return handle_error_errno(r, "Failed to create loopback device object");
 

@@ -4,17 +4,18 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "chase-symlinks.h"
 #include "copy.h"
+#include "dirent-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
-#include "id128-util.h"
 #include "macro.h"
 #include "mkdir.h"
 #include "path-util.h"
+#include "process-util.h"
 #include "random-util.h"
 #include "rm-rf.h"
+#include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -23,417 +24,9 @@
 #include "tmpfile-util.h"
 #include "umask-util.h"
 #include "user-util.h"
-#include "util.h"
 #include "virt.h"
 
 static const char *arg_test_dir = NULL;
-
-TEST(chase_symlinks) {
-        _cleanup_free_ char *result = NULL, *pwd = NULL;
-        _cleanup_close_ int pfd = -1;
-        char *temp;
-        const char *top, *p, *pslash, *q, *qslash;
-        struct stat st;
-        int r;
-
-        temp = strjoina(arg_test_dir ?: "/tmp", "/test-chase.XXXXXX");
-        assert_se(mkdtemp(temp));
-
-        top = strjoina(temp, "/top");
-        assert_se(mkdir(top, 0700) >= 0);
-
-        p = strjoina(top, "/dot");
-        if (symlink(".", p) < 0) {
-                assert_se(IN_SET(errno, EINVAL, ENOSYS, ENOTTY, EPERM));
-                log_tests_skipped_errno(errno, "symlink() not possible");
-                goto cleanup;
-        };
-
-        p = strjoina(top, "/dotdot");
-        assert_se(symlink("..", p) >= 0);
-
-        p = strjoina(top, "/dotdota");
-        assert_se(symlink("../a", p) >= 0);
-
-        p = strjoina(temp, "/a");
-        assert_se(symlink("b", p) >= 0);
-
-        p = strjoina(temp, "/b");
-        assert_se(symlink("/usr", p) >= 0);
-
-        p = strjoina(temp, "/start");
-        assert_se(symlink("top/dot/dotdota", p) >= 0);
-
-        /* Paths that use symlinks underneath the "root" */
-
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, "/usr"));
-        result = mfree(result);
-
-        pslash = strjoina(p, "/");
-        r = chase_symlinks(pslash, NULL, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, "/usr/"));
-        result = mfree(result);
-
-        r = chase_symlinks(p, temp, 0, &result, NULL);
-        assert_se(r == -ENOENT);
-
-        r = chase_symlinks(pslash, temp, 0, &result, NULL);
-        assert_se(r == -ENOENT);
-
-        q = strjoina(temp, "/usr");
-
-        r = chase_symlinks(p, temp, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-        assert_se(path_equal(result, q));
-        result = mfree(result);
-
-        qslash = strjoina(q, "/");
-
-        r = chase_symlinks(pslash, temp, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-        assert_se(path_equal(result, qslash));
-        result = mfree(result);
-
-        assert_se(mkdir(q, 0700) >= 0);
-
-        r = chase_symlinks(p, temp, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, q));
-        result = mfree(result);
-
-        r = chase_symlinks(pslash, temp, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, qslash));
-        result = mfree(result);
-
-        p = strjoina(temp, "/slash");
-        assert_se(symlink("/", p) >= 0);
-
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, "/"));
-        result = mfree(result);
-
-        r = chase_symlinks(p, temp, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, temp));
-        result = mfree(result);
-
-        /* Paths that would "escape" outside of the "root" */
-
-        p = strjoina(temp, "/6dots");
-        assert_se(symlink("../../..", p) >= 0);
-
-        r = chase_symlinks(p, temp, 0, &result, NULL);
-        assert_se(r > 0 && path_equal(result, temp));
-        result = mfree(result);
-
-        p = strjoina(temp, "/6dotsusr");
-        assert_se(symlink("../../../usr", p) >= 0);
-
-        r = chase_symlinks(p, temp, 0, &result, NULL);
-        assert_se(r > 0 && path_equal(result, q));
-        result = mfree(result);
-
-        p = strjoina(temp, "/top/8dotsusr");
-        assert_se(symlink("../../../../usr", p) >= 0);
-
-        r = chase_symlinks(p, temp, 0, &result, NULL);
-        assert_se(r > 0 && path_equal(result, q));
-        result = mfree(result);
-
-        /* Paths that contain repeated slashes */
-
-        p = strjoina(temp, "/slashslash");
-        assert_se(symlink("///usr///", p) >= 0);
-
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, "/usr"));
-        assert_se(streq(result, "/usr")); /* we guarantee that we drop redundant slashes */
-        result = mfree(result);
-
-        r = chase_symlinks(p, temp, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, q));
-        result = mfree(result);
-
-        /* Paths underneath the "root" with different UIDs while using CHASE_SAFE */
-
-        if (geteuid() == 0) {
-                p = strjoina(temp, "/user");
-                assert_se(mkdir(p, 0755) >= 0);
-                assert_se(chown(p, UID_NOBODY, GID_NOBODY) >= 0);
-
-                q = strjoina(temp, "/user/root");
-                assert_se(mkdir(q, 0755) >= 0);
-
-                p = strjoina(q, "/link");
-                assert_se(symlink("/", p) >= 0);
-
-                /* Fail when user-owned directories contain root-owned subdirectories. */
-                r = chase_symlinks(p, temp, CHASE_SAFE, &result, NULL);
-                assert_se(r == -ENOLINK);
-                result = mfree(result);
-
-                /* Allow this when the user-owned directories are all in the "root". */
-                r = chase_symlinks(p, q, CHASE_SAFE, &result, NULL);
-                assert_se(r > 0);
-                result = mfree(result);
-        }
-
-        /* Paths using . */
-
-        r = chase_symlinks("/etc/./.././", NULL, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(result, "/"));
-        result = mfree(result);
-
-        r = chase_symlinks("/etc/./.././", "/etc", 0, &result, NULL);
-        assert_se(r > 0 && path_equal(result, "/etc"));
-        result = mfree(result);
-
-        r = chase_symlinks("/../.././//../../etc", NULL, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(streq(result, "/etc"));
-        result = mfree(result);
-
-        r = chase_symlinks("/../.././//../../test-chase.fsldajfl", NULL, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-        assert_se(streq(result, "/test-chase.fsldajfl"));
-        result = mfree(result);
-
-        r = chase_symlinks("/../.././//../../etc", "/", CHASE_PREFIX_ROOT, &result, NULL);
-        assert_se(r > 0);
-        assert_se(streq(result, "/etc"));
-        result = mfree(result);
-
-        r = chase_symlinks("/../.././//../../test-chase.fsldajfl", "/", CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-        assert_se(streq(result, "/test-chase.fsldajfl"));
-        result = mfree(result);
-
-        r = chase_symlinks("/etc/machine-id/foo", NULL, 0, &result, NULL);
-        assert_se(IN_SET(r, -ENOTDIR, -ENOENT));
-        result = mfree(result);
-
-        /* Path that loops back to self */
-
-        p = strjoina(temp, "/recursive-symlink");
-        assert_se(symlink("recursive-symlink", p) >= 0);
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r == -ELOOP);
-
-        /* Path which doesn't exist */
-
-        p = strjoina(temp, "/idontexist");
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r == -ENOENT);
-
-        r = chase_symlinks(p, NULL, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-        assert_se(path_equal(result, p));
-        result = mfree(result);
-
-        p = strjoina(temp, "/idontexist/meneither");
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r == -ENOENT);
-
-        r = chase_symlinks(p, NULL, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-        assert_se(path_equal(result, p));
-        result = mfree(result);
-
-        /* Relative paths */
-
-        assert_se(safe_getcwd(&pwd) >= 0);
-
-        assert_se(chdir(temp) >= 0);
-
-        p = "this/is/a/relative/path";
-        r = chase_symlinks(p, NULL, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-
-        p = strjoina(temp, "/", p);
-        assert_se(path_equal(result, p));
-        result = mfree(result);
-
-        p = "this/is/a/relative/path";
-        r = chase_symlinks(p, temp, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == 0);
-
-        p = strjoina(temp, "/", p);
-        assert_se(path_equal(result, p));
-        result = mfree(result);
-
-        assert_se(chdir(pwd) >= 0);
-
-        /* Path which doesn't exist, but contains weird stuff */
-
-        p = strjoina(temp, "/idontexist/..");
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r == -ENOENT);
-
-        r = chase_symlinks(p, NULL, CHASE_NONEXISTENT, &result, NULL);
-        assert_se(r == -ENOENT);
-
-        p = strjoina(temp, "/target");
-        q = strjoina(temp, "/top");
-        assert_se(symlink(q, p) >= 0);
-        p = strjoina(temp, "/target/idontexist");
-        r = chase_symlinks(p, NULL, 0, &result, NULL);
-        assert_se(r == -ENOENT);
-
-        if (geteuid() == 0) {
-                p = strjoina(temp, "/priv1");
-                assert_se(mkdir(p, 0755) >= 0);
-
-                q = strjoina(p, "/priv2");
-                assert_se(mkdir(q, 0755) >= 0);
-
-                assert_se(chase_symlinks(q, NULL, CHASE_SAFE, NULL, NULL) >= 0);
-
-                assert_se(chown(q, UID_NOBODY, GID_NOBODY) >= 0);
-                assert_se(chase_symlinks(q, NULL, CHASE_SAFE, NULL, NULL) >= 0);
-
-                assert_se(chown(p, UID_NOBODY, GID_NOBODY) >= 0);
-                assert_se(chase_symlinks(q, NULL, CHASE_SAFE, NULL, NULL) >= 0);
-
-                assert_se(chown(q, 0, 0) >= 0);
-                assert_se(chase_symlinks(q, NULL, CHASE_SAFE, NULL, NULL) == -ENOLINK);
-
-                assert_se(rmdir(q) >= 0);
-                assert_se(symlink("/etc/passwd", q) >= 0);
-                assert_se(chase_symlinks(q, NULL, CHASE_SAFE, NULL, NULL) == -ENOLINK);
-
-                assert_se(chown(p, 0, 0) >= 0);
-                assert_se(chase_symlinks(q, NULL, CHASE_SAFE, NULL, NULL) >= 0);
-        }
-
-        p = strjoina(temp, "/machine-id-test");
-        assert_se(symlink("/usr/../etc/./machine-id", p) >= 0);
-
-        r = chase_symlinks(p, NULL, 0, NULL, &pfd);
-        if (r != -ENOENT) {
-                _cleanup_close_ int fd = -1;
-                sd_id128_t a, b;
-
-                assert_se(pfd >= 0);
-
-                fd = fd_reopen(pfd, O_RDONLY|O_CLOEXEC);
-                assert_se(fd >= 0);
-                safe_close(pfd);
-
-                assert_se(id128_read_fd(fd, ID128_FORMAT_PLAIN, &a) >= 0);
-                assert_se(sd_id128_get_machine(&b) >= 0);
-                assert_se(sd_id128_equal(a, b));
-        }
-
-        /* Test CHASE_NOFOLLOW */
-
-        p = strjoina(temp, "/target");
-        q = strjoina(temp, "/symlink");
-        assert_se(symlink(p, q) >= 0);
-        r = chase_symlinks(q, NULL, CHASE_NOFOLLOW, &result, &pfd);
-        assert_se(r >= 0);
-        assert_se(pfd >= 0);
-        assert_se(path_equal(result, q));
-        assert_se(fstat(pfd, &st) >= 0);
-        assert_se(S_ISLNK(st.st_mode));
-        result = mfree(result);
-        pfd = safe_close(pfd);
-
-        /* s1 -> s2 -> nonexistent */
-        q = strjoina(temp, "/s1");
-        assert_se(symlink("s2", q) >= 0);
-        p = strjoina(temp, "/s2");
-        assert_se(symlink("nonexistent", p) >= 0);
-        r = chase_symlinks(q, NULL, CHASE_NOFOLLOW, &result, &pfd);
-        assert_se(r >= 0);
-        assert_se(pfd >= 0);
-        assert_se(path_equal(result, q));
-        assert_se(fstat(pfd, &st) >= 0);
-        assert_se(S_ISLNK(st.st_mode));
-        result = mfree(result);
-        pfd = safe_close(pfd);
-
-        /* Test CHASE_STEP */
-
-        p = strjoina(temp, "/start");
-        r = chase_symlinks(p, NULL, CHASE_STEP, &result, NULL);
-        assert_se(r == 0);
-        p = strjoina(temp, "/top/dot/dotdota");
-        assert_se(streq(p, result));
-        result = mfree(result);
-
-        r = chase_symlinks(p, NULL, CHASE_STEP, &result, NULL);
-        assert_se(r == 0);
-        p = strjoina(temp, "/top/dotdota");
-        assert_se(streq(p, result));
-        result = mfree(result);
-
-        r = chase_symlinks(p, NULL, CHASE_STEP, &result, NULL);
-        assert_se(r == 0);
-        p = strjoina(temp, "/top/../a");
-        assert_se(streq(p, result));
-        result = mfree(result);
-
-        r = chase_symlinks(p, NULL, CHASE_STEP, &result, NULL);
-        assert_se(r == 0);
-        p = strjoina(temp, "/a");
-        assert_se(streq(p, result));
-        result = mfree(result);
-
-        r = chase_symlinks(p, NULL, CHASE_STEP, &result, NULL);
-        assert_se(r == 0);
-        p = strjoina(temp, "/b");
-        assert_se(streq(p, result));
-        result = mfree(result);
-
-        r = chase_symlinks(p, NULL, CHASE_STEP, &result, NULL);
-        assert_se(r == 0);
-        assert_se(streq("/usr", result));
-        result = mfree(result);
-
-        r = chase_symlinks("/usr", NULL, CHASE_STEP, &result, NULL);
-        assert_se(r > 0);
-        assert_se(streq("/usr", result));
-        result = mfree(result);
-
-        /* Make sure that symlinks in the "root" path are not resolved, but those below are */
-        p = strjoina("/etc/..", temp, "/self");
-        assert_se(symlink(".", p) >= 0);
-        q = strjoina(p, "/top/dot/dotdota");
-        r = chase_symlinks(q, p, 0, &result, NULL);
-        assert_se(r > 0);
-        assert_se(path_equal(path_startswith(result, p), "usr"));
-        result = mfree(result);
-
- cleanup:
-        assert_se(rm_rf(temp, REMOVE_ROOT|REMOVE_PHYSICAL) >= 0);
-}
-
-TEST(unlink_noerrno) {
-        char *name;
-        int fd;
-
-        name = strjoina(arg_test_dir ?: "/tmp", "/test-close_nointr.XXXXXX");
-        fd = mkostemp_safe(name);
-        assert_se(fd >= 0);
-        assert_se(close_nointr(fd) >= 0);
-
-        {
-                PROTECT_ERRNO;
-                errno = 42;
-                assert_se(unlink_noerrno(name) >= 0);
-                assert_se(errno == 42);
-                assert_se(unlink_noerrno(name) < 0);
-                assert_se(errno == 42);
-        }
-}
 
 TEST(readlink_and_make_absolute) {
         const char *tempdir, *name, *name2, *name_alias;
@@ -452,7 +45,7 @@ TEST(readlink_and_make_absolute) {
                 log_tests_skipped_errno(errno, "symlink() not possible");
         } else {
                 assert_se(readlink_and_make_absolute(name_alias, &r1) >= 0);
-                assert_se(streq(r1, name));
+                ASSERT_STREQ(r1, name);
                 assert_se(unlink(name_alias) >= 0);
 
                 assert_se(safe_getcwd(&pwd) >= 0);
@@ -460,7 +53,7 @@ TEST(readlink_and_make_absolute) {
                 assert_se(chdir(tempdir) >= 0);
                 assert_se(symlink(name2, name_alias) >= 0);
                 assert_se(readlink_and_make_absolute(name_alias, &r2) >= 0);
-                assert_se(streq(r2, name));
+                ASSERT_STREQ(r2, name);
                 assert_se(unlink(name_alias) >= 0);
 
                 assert_se(chdir(pwd) >= 0);
@@ -504,33 +97,33 @@ TEST(var_tmp) {
         assert_se(unsetenv("TMP") >= 0);
 
         assert_se(var_tmp_dir(&tmp_dir) >= 0);
-        assert_se(streq(tmp_dir, "/var/tmp"));
+        ASSERT_STREQ(tmp_dir, "/var/tmp");
 
         assert_se(setenv("TMPDIR", "/tmp", true) >= 0);
-        assert_se(streq(getenv("TMPDIR"), "/tmp"));
+        ASSERT_STREQ(getenv("TMPDIR"), "/tmp");
 
         assert_se(var_tmp_dir(&tmp_dir) >= 0);
-        assert_se(streq(tmp_dir, "/tmp"));
+        ASSERT_STREQ(tmp_dir, "/tmp");
 
         assert_se(setenv("TMPDIR", "/88_does_not_exist_88", true) >= 0);
-        assert_se(streq(getenv("TMPDIR"), "/88_does_not_exist_88"));
+        ASSERT_STREQ(getenv("TMPDIR"), "/88_does_not_exist_88");
 
         assert_se(var_tmp_dir(&tmp_dir) >= 0);
-        assert_se(streq(tmp_dir, "/var/tmp"));
+        ASSERT_STREQ(tmp_dir, "/var/tmp");
 
         if (tmpdir_backup)  {
                 assert_se(setenv("TMPDIR", tmpdir_backup, true) >= 0);
-                assert_se(streq(getenv("TMPDIR"), tmpdir_backup));
+                ASSERT_STREQ(getenv("TMPDIR"), tmpdir_backup);
         }
 
         if (temp_backup)  {
                 assert_se(setenv("TEMP", temp_backup, true) >= 0);
-                assert_se(streq(getenv("TEMP"), temp_backup));
+                ASSERT_STREQ(getenv("TEMP"), temp_backup);
         }
 
         if (tmp_backup)  {
                 assert_se(setenv("TMP", tmp_backup, true) >= 0);
-                assert_se(streq(getenv("TMP"), tmp_backup));
+                ASSERT_STREQ(getenv("TMP"), tmp_backup);
         }
 }
 
@@ -546,7 +139,7 @@ TEST(dot_or_dot_dot) {
 
 TEST(access_fd) {
         _cleanup_(rmdir_and_freep) char *p = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         const char *a;
 
         a = strjoina(arg_test_dir ?: "/tmp", "/access-fd.XXXXXX");
@@ -672,7 +265,7 @@ TEST(touch_file) {
 
 TEST(unlinkat_deallocate) {
         _cleanup_free_ char *p = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
         struct stat st;
 
         assert_se(tempfn_random_child(arg_test_dir, "unlink-deallocation", &p) >= 0);
@@ -682,14 +275,14 @@ TEST(unlinkat_deallocate) {
 
         assert_se(write(fd, "hallo\n", 6) == 6);
 
-        assert_se(fstat(fd, &st) >= 0);
+        ASSERT_OK_ERRNO(fstat(fd, &st));
         assert_se(st.st_size == 6);
         assert_se(st.st_blocks > 0);
         assert_se(st.st_nlink == 1);
 
         assert_se(unlinkat_deallocate(AT_FDCWD, p, UNLINK_ERASE) >= 0);
 
-        assert_se(fstat(fd, &st) >= 0);
+        ASSERT_OK_ERRNO(fstat(fd, &st));
         assert_se(IN_SET(st.st_size, 0, 6)); /* depending on whether hole punching worked the size will be 6
                                                 (it worked) or 0 (we had to resort to truncation) */
         assert_se(st.st_blocks == 0);
@@ -697,7 +290,7 @@ TEST(unlinkat_deallocate) {
 }
 
 TEST(fsync_directory_of_file) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         fd = open_tmpfile_unlinkable(arg_test_dir, O_RDWR);
         assert_se(fd >= 0);
@@ -814,7 +407,7 @@ TEST(chmod_and_chown) {
 }
 
 static void create_binary_file(const char *p, const void *data, size_t l) {
-        _cleanup_close_ int fd = -1;
+        _cleanup_close_ int fd = -EBADF;
 
         fd = open(p, O_CREAT|O_WRONLY|O_EXCL|O_CLOEXEC, 0600);
         assert_se(fd >= 0);
@@ -840,7 +433,7 @@ TEST(conservative_rename) {
         assert_se(access(q, F_OK) < 0 && errno == ENOENT);
 
         /* Check that a manual copy is detected */
-        assert_se(copy_file(p, q, 0, MODE_INVALID, 0, 0, COPY_REFLINK) >= 0);
+        assert_se(copy_file(p, q, 0, MODE_INVALID, COPY_REFLINK) >= 0);
         assert_se(conservative_renameat(AT_FDCWD, q, AT_FDCWD, p) == 0);
         assert_se(access(q, F_OK) < 0 && errno == ENOENT);
 
@@ -929,9 +522,9 @@ static void test_parse_cifs_service_one(const char *f, const char *h, const char
         _cleanup_free_ char *a = NULL, *b = NULL, *c = NULL;
 
         assert_se(parse_cifs_service(f, &a, &b, &c) == ret);
-        assert_se(streq_ptr(a, h));
-        assert_se(streq_ptr(b, s));
-        assert_se(streq_ptr(c, d));
+        ASSERT_STREQ(a, h);
+        ASSERT_STREQ(b, s);
+        ASSERT_STREQ(c, d);
 }
 
 TEST(parse_cifs_service) {
@@ -954,8 +547,25 @@ TEST(parse_cifs_service) {
 }
 
 TEST(open_mkdir_at) {
-        _cleanup_close_ int fd = -1, subdir_fd = -1, subsubdir_fd = -1;
+        _cleanup_close_ int fd = -EBADF, subdir_fd = -EBADF, subsubdir_fd = -EBADF;
         _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        struct stat sta, stb;
+
+        assert_se(open_mkdir_at(AT_FDCWD, "/", O_EXCL|O_CLOEXEC, 0) == -EEXIST);
+        assert_se(open_mkdir_at(AT_FDCWD, ".", O_EXCL|O_CLOEXEC, 0) == -EEXIST);
+
+        fd = open_mkdir_at(AT_FDCWD, "/", O_CLOEXEC, 0);
+        assert_se(fd >= 0);
+        assert_se(stat("/", &sta) >= 0);
+        ASSERT_OK_ERRNO(fstat(fd, &stb));
+        assert_se(stat_inode_same(&sta, &stb));
+        fd = safe_close(fd);
+
+        fd = open_mkdir_at(AT_FDCWD, ".", O_CLOEXEC, 0);
+        assert_se(stat(".", &sta) >= 0);
+        ASSERT_OK_ERRNO(fstat(fd, &stb));
+        assert_se(stat_inode_same(&sta, &stb));
+        fd = safe_close(fd);
 
         assert_se(open_mkdir_at(AT_FDCWD, "/proc", O_EXCL|O_CLOEXEC, 0) == -EEXIST);
 
@@ -996,71 +606,191 @@ TEST(open_mkdir_at) {
 }
 
 TEST(openat_report_new) {
-        _cleanup_free_ char *j = NULL;
-        _cleanup_(rm_rf_physical_and_freep) char *d = NULL;
-        _cleanup_close_ int fd = -1;
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF, fd = -EBADF;
         bool b;
 
-        assert_se(mkdtemp_malloc(NULL, &d) >= 0);
+        ASSERT_OK((tfd = mkdtemp_open(NULL, 0, &t)));
 
-        j = path_join(d, "test");
-        assert_se(j);
-
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(b);
+        ASSERT_TRUE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        assert_se(unlink(j) >= 0);
+        ASSERT_OK_ERRNO(unlinkat(tfd, "test", 0));
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(b);
+        ASSERT_TRUE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        assert_se(unlink(j) >= 0);
+        ASSERT_OK_ERRNO(unlinkat(tfd, "test", 0));
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, NULL);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, NULL);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(!b);
+        ASSERT_FALSE(b);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT|O_EXCL, 0666, &b);
-        assert_se(fd == -EEXIST);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT|O_EXCL, 0666, &b);
+        ASSERT_ERROR(fd, EEXIST);
 
-        assert_se(unlink(j) >= 0);
+        ASSERT_OK_ERRNO(unlinkat(tfd, "test", 0));
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR, 0666, &b);
-        assert_se(fd == -ENOENT);
+        fd = openat_report_new(tfd, "test", O_RDWR, 0666, &b);
+        ASSERT_ERROR(fd, ENOENT);
 
-        fd = openat_report_new(AT_FDCWD, j, O_RDWR|O_CREAT|O_EXCL, 0666, &b);
-        assert_se(fd >= 0);
+        fd = openat_report_new(tfd, "test", O_RDWR|O_CREAT|O_EXCL, 0666, &b);
+        ASSERT_OK(fd);
         fd = safe_close(fd);
-        assert_se(b);
+        ASSERT_TRUE(b);
+
+        ASSERT_OK_ERRNO(symlinkat("target", tfd, "link"));
+        fd = openat_report_new(tfd, "link", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_ERROR(fd, EEXIST);
+
+        fd = openat_report_new(tfd, "target", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
+        fd = safe_close(fd);
+        ASSERT_TRUE(b);
+
+        fd = openat_report_new(tfd, "link", O_RDWR|O_CREAT, 0666, &b);
+        ASSERT_OK(fd);
+        fd = safe_close(fd);
+        ASSERT_FALSE(b);
+}
+
+TEST(xopenat_full) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF, fd = -EBADF, fd2 = -EBADF;
+
+        assert_se((tfd = mkdtemp_open(NULL, 0, &t)) >= 0);
+
+        /* Test that xopenat_full() creates directories if O_DIRECTORY is specified. */
+
+        assert_se((fd = xopenat_full(tfd, "abc", O_DIRECTORY|O_CREAT|O_EXCL|O_CLOEXEC, 0, 0755)) >= 0);
+        assert_se((fd_verify_directory(fd) >= 0));
+        fd = safe_close(fd);
+
+        assert_se(xopenat_full(tfd, "abc", O_DIRECTORY|O_CREAT|O_EXCL|O_CLOEXEC, 0, 0755) == -EEXIST);
+
+        assert_se((fd = xopenat_full(tfd, "abc", O_DIRECTORY|O_CREAT|O_CLOEXEC, 0, 0755)) >= 0);
+        assert_se((fd_verify_directory(fd) >= 0));
+        fd = safe_close(fd);
+
+        /* Test that xopenat_full() creates regular files if O_DIRECTORY is not specified. */
+
+        assert_se((fd = xopenat_full(tfd, "def", O_CREAT|O_EXCL|O_CLOEXEC, 0, 0644)) >= 0);
+        assert_se(fd_verify_regular(fd) >= 0);
+        fd = safe_close(fd);
+
+        /* Test that we can reopen an existing fd with xopenat_full() by specifying an empty path. */
+
+        assert_se((fd = xopenat_full(tfd, "def", O_PATH|O_CLOEXEC, 0, 0)) >= 0);
+        assert_se((fd2 = xopenat_full(fd, "", O_RDWR|O_CLOEXEC, 0, 0644)) >= 0);
+}
+
+TEST(xopenat_lock_full) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF, fd = -EBADF;
+        siginfo_t si;
+
+        assert_se((tfd = mkdtemp_open(NULL, 0, &t)) >= 0);
+
+        /* Test that we can acquire an exclusive lock on a directory in one process, remove the directory,
+         * and close the file descriptor and still properly create the directory and acquire the lock in
+         * another process.  */
+
+        fd = xopenat_lock_full(tfd, "abc", O_CREAT|O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX);
+        assert_se(fd >= 0);
+        assert_se(faccessat(tfd, "abc", F_OK, 0) >= 0);
+        assert_se(fd_verify_directory(fd) >= 0);
+        assert_se(xopenat_lock_full(tfd, "abc", O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX|LOCK_NB) == -EAGAIN);
+
+        pid_t pid = fork();
+        assert_se(pid >= 0);
+
+        if (pid == 0) {
+                safe_close(fd);
+
+                fd = xopenat_lock_full(tfd, "abc", O_CREAT|O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX);
+                assert_se(fd >= 0);
+                assert_se(faccessat(tfd, "abc", F_OK, 0) >= 0);
+                assert_se(fd_verify_directory(fd) >= 0);
+                assert_se(xopenat_lock_full(tfd, "abc", O_DIRECTORY|O_CLOEXEC, 0, 0755, LOCK_BSD, LOCK_EX|LOCK_NB) == -EAGAIN);
+
+                _exit(EXIT_SUCCESS);
+        }
+
+        /* We need to give the child process some time to get past the xopenat() call in xopenat_lock_full()
+         * and block in the call to lock_generic() waiting for the lock to become free. We can't modify
+         * xopenat_lock_full() to signal an eventfd to let us know when that has happened, so we just sleep
+         * for a little and assume that's enough time for the child process to get along far enough. It
+         * doesn't matter if it doesn't get far enough, in that case we just won't trigger the fallback logic
+         * in xopenat_lock_full(), but the test will still succeed. */
+        assert_se(usleep_safe(20 * USEC_PER_MSEC) >= 0);
+
+        assert_se(unlinkat(tfd, "abc", AT_REMOVEDIR) >= 0);
+        fd = safe_close(fd);
+
+        assert_se(wait_for_terminate(pid, &si) >= 0);
+        assert_se(si.si_code == CLD_EXITED);
+
+        assert_se(xopenat_lock_full(tfd, "abc", 0, 0, 0755, LOCK_POSIX, LOCK_EX) == -EBADF);
+        assert_se(xopenat_lock_full(tfd, "def", O_DIRECTORY, 0, 0755, LOCK_POSIX, LOCK_EX) == -EBADF);
+}
+
+TEST(linkat_replace) {
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        _cleanup_close_ int tfd = -EBADF;
+
+        assert_se((tfd = mkdtemp_open(NULL, 0, &t)) >= 0);
+
+        _cleanup_close_ int fd1 = openat(tfd, "foo", O_CREAT|O_RDWR|O_CLOEXEC, 0600);
+        assert_se(fd1 >= 0);
+
+        assert_se(linkat_replace(tfd, "foo", tfd, "bar") >= 0);
+        assert_se(linkat_replace(tfd, "foo", tfd, "bar") >= 0);
+
+        _cleanup_close_ int fd1_check = openat(tfd, "bar", O_RDWR|O_CLOEXEC);
+        assert_se(fd1_check >= 0);
+
+        assert_se(inode_same_at(fd1, NULL, fd1_check, NULL, AT_EMPTY_PATH) > 0);
+
+        _cleanup_close_ int fd2 = openat(tfd, "baz", O_CREAT|O_RDWR|O_CLOEXEC, 0600);
+        assert_se(fd2 >= 0);
+
+        assert_se(inode_same_at(fd1, NULL, fd2, NULL, AT_EMPTY_PATH) == 0);
+
+        assert_se(linkat_replace(tfd, "foo", tfd, "baz") >= 0);
+
+        _cleanup_close_ int fd2_check = openat(tfd, "baz", O_RDWR|O_CLOEXEC);
+
+        assert_se(inode_same_at(fd2, NULL, fd2_check, NULL, AT_EMPTY_PATH) == 0);
+        assert_se(inode_same_at(fd1, NULL, fd2_check, NULL, AT_EMPTY_PATH) > 0);
 }
 
 static int intro(void) {
@@ -1072,36 +802,33 @@ TEST(readlinkat_malloc) {
         _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
         _cleanup_close_ int tfd = -EBADF, fd = -EBADF;
         _cleanup_free_ char *p = NULL, *q = NULL;
-        const char *expect = "hgoehogefoobar", *a;
+        const char *expect = "hgoehogefoobar";
 
-        a = strjoina(arg_test_dir ?: "/tmp", "/readlinkat-malloc.XXXXXX");
-        assert_se(mkdtemp_malloc(a, &t) >= 0);
-
-        tfd = open(t, O_PATH|O_DIRECTORY|O_CLOEXEC);
+        tfd = mkdtemp_open(NULL, O_PATH, &t);
         assert_se(tfd >= 0);
 
         assert_se(symlinkat(expect, tfd, "linkname") >= 0);
 
         assert_se(readlinkat_malloc(tfd, "linkname", &p) >= 0);
-        assert_se(streq(p, expect));
+        ASSERT_STREQ(p, expect);
         p = mfree(p);
 
         fd = openat(tfd, "linkname", O_PATH | O_NOFOLLOW | O_CLOEXEC);
         assert_se(fd >= 0);
         assert_se(readlinkat_malloc(fd, NULL, &p) >= 0);
-        assert_se(streq(p, expect));
+        ASSERT_STREQ(p, expect);
         p = mfree(p);
         assert_se(readlinkat_malloc(fd, "", &p) >= 0);
-        assert_se(streq(p, expect));
+        ASSERT_STREQ(p, expect);
         p = mfree(p);
         fd = safe_close(fd);
 
         assert_se(q = path_join(t, "linkname"));
         assert_se(readlinkat_malloc(AT_FDCWD, q, &p) >= 0);
-        assert_se(streq(p, expect));
+        ASSERT_STREQ(p, expect);
         p = mfree(p);
         assert_se(readlinkat_malloc(INT_MAX, q, &p) >= 0);
-        assert_se(streq(p, expect));
+        ASSERT_STREQ(p, expect);
         p = mfree(p);
         q = mfree(q);
 }

@@ -177,26 +177,20 @@ static int clock_state_update(
 static int run(int argc, char * argv[]) {
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(clock_state_release) ClockState state = {
-                .timerfd_fd = -1,
-                .inotify_fd = -1,
+                .timerfd_fd = -EBADF,
+                .inotify_fd = -EBADF,
                 .run_systemd_wd = -1,
                 .run_systemd_timesync_wd = -1,
         };
         int r;
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT, -1) >= 0);
-
         r = sd_event_default(&event);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate event loop: %m");
 
-        r = sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to create sigterm event source: %m");
-
-        r = sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to create sigint event source: %m");
+                return log_error_errno(r, "Failed to enable SIGTERM/SIGINT handling: %m");
 
         r = sd_event_set_watchdog(event, true);
         if (r < 0)

@@ -2,89 +2,81 @@
 
 systemctl_sources = files(
         'systemctl-add-dependency.c',
-        'systemctl-add-dependency.h',
         'systemctl-cancel-job.c',
-        'systemctl-cancel-job.h',
         'systemctl-clean-or-freeze.c',
-        'systemctl-clean-or-freeze.h',
         'systemctl-compat-halt.c',
-        'systemctl-compat-halt.h',
         'systemctl-compat-runlevel.c',
-        'systemctl-compat-runlevel.h',
         'systemctl-compat-shutdown.c',
-        'systemctl-compat-shutdown.h',
         'systemctl-compat-telinit.c',
-        'systemctl-compat-telinit.h',
         'systemctl-daemon-reload.c',
-        'systemctl-daemon-reload.h',
         'systemctl-edit.c',
-        'systemctl-edit.h',
         'systemctl-enable.c',
-        'systemctl-enable.h',
         'systemctl-is-active.c',
-        'systemctl-is-active.h',
         'systemctl-is-enabled.c',
-        'systemctl-is-enabled.h',
         'systemctl-is-system-running.c',
-        'systemctl-is-system-running.h',
         'systemctl-kill.c',
-        'systemctl-kill.h',
         'systemctl-list-dependencies.c',
-        'systemctl-list-dependencies.h',
         'systemctl-list-jobs.c',
-        'systemctl-list-jobs.h',
         'systemctl-list-machines.c',
-        'systemctl-list-machines.h',
         'systemctl-list-unit-files.c',
-        'systemctl-list-unit-files.h',
         'systemctl-list-units.c',
-        'systemctl-list-units.h',
         'systemctl-log-setting.c',
-        'systemctl-log-setting.h',
         'systemctl-logind.c',
-        'systemctl-logind.h',
         'systemctl-mount.c',
-        'systemctl-mount.h',
         'systemctl-preset-all.c',
-        'systemctl-preset-all.h',
         'systemctl-reset-failed.c',
-        'systemctl-reset-failed.h',
         'systemctl-service-watchdogs.c',
-        'systemctl-service-watchdogs.h',
         'systemctl-set-default.c',
-        'systemctl-set-default.h',
         'systemctl-set-environment.c',
-        'systemctl-set-environment.h',
         'systemctl-set-property.c',
-        'systemctl-set-property.h',
         'systemctl-show.c',
-        'systemctl-show.h',
         'systemctl-start-special.c',
-        'systemctl-start-special.h',
         'systemctl-start-unit.c',
-        'systemctl-start-unit.h',
         'systemctl-switch-root.c',
-        'systemctl-switch-root.h',
         'systemctl-sysv-compat.c',
-        'systemctl-sysv-compat.h',
         'systemctl-trivial-method.c',
-        'systemctl-trivial-method.h',
         'systemctl-util.c',
-        'systemctl-util.h',
+        'systemctl-whoami.c',
         'systemctl.c',
-        'systemctl.h')
+)
 
 if get_option('link-systemctl-shared')
         systemctl_link_with = [libshared]
 else
         systemctl_link_with = [libsystemd_static,
-                               libshared_static,
-                               libbasic_gcrypt]
+                               libshared_static]
 endif
 
-fuzzers += [
-        [files('fuzz-systemctl-parse-argv.c') +
-         systemctl_sources,
-         systemctl_link_with,
-         [], [], ['-DFUZZ_SYSTEMCTL_PARSE_ARGV']]
+executables += [
+        executable_template + {
+                'name' : 'systemctl',
+                'public' : true,
+                'sources' : systemctl_sources,
+                'link_with' : systemctl_link_with,
+                'dependencies' : [
+                        libcap,
+                        liblz4_cflags,
+                        libselinux,
+                        libxz_cflags,
+                        libzstd_cflags,
+                        threads,
+                ],
+                'install_tag' : 'systemctl',
+        },
+        fuzz_template + {
+                'sources' : [
+                        files('fuzz-systemctl-parse-argv.c'),
+                        systemctl_sources,
+                ],
+                'link_with' : systemctl_link_with,
+                'c_args' : ['-DFUZZ_SYSTEMCTL_PARSE_ARGV'],
+        },
 ]
+
+foreach alias : (['halt', 'poweroff', 'reboot', 'shutdown'] +
+                 (conf.get('HAVE_SYSV_COMPAT') == 1 ? ['runlevel', 'telinit'] : []))
+        install_emptydir(sbindir)
+        meson.add_install_script(sh, '-c',
+                                 ln_s.format(bindir / 'systemctl',
+                                             sbindir / alias))
+endforeach

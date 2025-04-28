@@ -35,7 +35,8 @@ int dns_cache_put(
                 DnssecResult dnssec_result,
                 uint32_t nsec_ttl,
                 int owner_family,
-                const union in_addr_union *owner_address);
+                const union in_addr_union *owner_address,
+                usec_t stale_retention_usec);
 
 int dns_cache_lookup(
                 DnsCache *c,
@@ -50,8 +51,12 @@ int dns_cache_lookup(
 int dns_cache_check_conflicts(DnsCache *cache, DnsResourceRecord *rr, int owner_family, const union in_addr_union *owner_address);
 
 void dns_cache_dump(DnsCache *cache, FILE *f);
+int dns_cache_dump_to_json(DnsCache *cache, sd_json_variant **ret);
+
 bool dns_cache_is_empty(DnsCache *cache);
 
 unsigned dns_cache_size(DnsCache *cache);
 
 int dns_cache_export_shared_to_packet(DnsCache *cache, DnsPacket *p, usec_t ts, unsigned max_rr);
+
+bool dns_cache_expiry_in_one_second(DnsCache *c, usec_t t);

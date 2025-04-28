@@ -18,7 +18,7 @@
 #include "socket-util.h"
 #include "string-table.h"
 #include "string-util.h"
-#include "util.h"
+#include "unaligned.h"
 
 static void security_association_clear(SecurityAssociation *sa) {
         if (!sa)
@@ -224,6 +224,7 @@ static int netdev_macsec_create_message(NetDev *netdev, int command, sd_netlink_
 
         assert(netdev);
         assert(netdev->ifindex > 0);
+        assert(netdev->manager);
 
         r = sd_genl_message_new(netdev->manager->genl, MACSEC_GENL_NAME, command, &m);
         if (r < 0)
@@ -334,6 +335,9 @@ static int netdev_macsec_configure_receive_association(NetDev *netdev, ReceiveAs
         assert(netdev);
         assert(a);
 
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
+
         r = netdev_macsec_create_message(netdev, MACSEC_CMD_ADD_RXSA, &m);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r, "Failed to create netlink message: %m");
@@ -357,13 +361,11 @@ static int netdev_macsec_configure_receive_association(NetDev *netdev, ReceiveAs
 }
 
 static int macsec_receive_channel_handler(sd_netlink *rtnl, sd_netlink_message *m, ReceiveChannel *c) {
-        NetDev *netdev;
-        int r;
-
         assert(c);
         assert(c->macsec);
 
-        netdev = NETDEV(c->macsec);
+        NetDev *netdev = ASSERT_PTR(NETDEV(c->macsec));
+        int r;
 
         assert(netdev->state != _NETDEV_STATE_INVALID);
 
@@ -407,6 +409,9 @@ static int netdev_macsec_configure_receive_channel(NetDev *netdev, ReceiveChanne
 
         assert(netdev);
         assert(c);
+
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
 
         r = netdev_macsec_create_message(netdev, MACSEC_CMD_ADD_RXSC, &m);
         if (r < 0)
@@ -456,6 +461,9 @@ static int netdev_macsec_configure_transmit_association(NetDev *netdev, Transmit
         assert(netdev);
         assert(a);
 
+        if (!netdev_is_managed(netdev))
+                return 0; /* Already detached, due to e.g. reloading .netdev files. */
+
         r = netdev_macsec_create_message(netdev, MACSEC_CMD_ADD_TXSA, &m);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r, "Failed to create netlink message: %m");
@@ -475,14 +483,10 @@ static int netdev_macsec_configure_transmit_association(NetDev *netdev, Transmit
 }
 
 static int netdev_macsec_configure(NetDev *netdev, Link *link) {
+        MACsec *s = MACSEC(netdev);
         TransmitAssociation *a;
         ReceiveChannel *c;
-        MACsec *s;
         int r;
-
-        assert(netdev);
-        s = MACSEC(netdev);
-        assert(s);
 
         ORDERED_HASHMAP_FOREACH(a, s->transmit_associations_by_section) {
                 r = netdev_macsec_configure_transmit_association(netdev, a);
@@ -500,21 +504,10 @@ static int netdev_macsec_configure(NetDev *netdev, Link *link) {
 }
 
 static int netdev_macsec_fill_message_create(NetDev *netdev, Link *link, sd_netlink_message *m) {
-        MACsec *v;
-        int r;
-
-        assert(netdev);
         assert(m);
 
-        v = MACSEC(netdev);
-
-        assert(v);
-
-        if (v->port > 0) {
-                r = sd_netlink_message_append_u16(m, IFLA_MACSEC_PORT, v->port);
-                if (r < 0)
-                        return r;
-        }
+        MACsec *v = MACSEC(netdev);
+        int r;
 
         if (v->encrypt >= 0) {
                 r = sd_netlink_message_append_u8(m, IFLA_MACSEC_ENCRYPT, v->encrypt);
@@ -525,6 +518,20 @@ static int netdev_macsec_fill_message_create(NetDev *netdev, Link *link, sd_netl
         r = sd_netlink_message_append_u8(m, IFLA_MACSEC_ENCODING_SA, v->encoding_an);
         if (r < 0)
                 return r;
+
+        /* The properties below cannot be updated, and the kernel refuses the whole request if one of the
+         * following attributes is set for an existing interface. */
+        if (netdev->ifindex > 0)
+                return 0;
+
+        if (v->port > 0) {
+                r = sd_netlink_message_append_u16(m, IFLA_MACSEC_PORT, v->port);
+                if (r < 0)
+                        return r;
+        }
+
+        /* Currently not supported by networkd, but IFLA_MACSEC_CIPHER_SUITE, IFLA_MACSEC_ICV_LEN, and
+         * IFLA_MACSEC_SCI can neither set for an existing interface. */
 
         return 0;
 }
@@ -541,18 +548,18 @@ int config_parse_macsec_port(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
-        _cleanup_(macsec_receive_channel_free_or_set_invalidp) ReceiveChannel *c = NULL;
-        MACsec *s = userdata;
-        uint16_t port;
-        void *dest;
-        int r;
-
         assert(filename);
         assert(section);
         assert(lvalue);
         assert(rvalue);
         assert(data);
+
+        MACsec *s = ASSERT_PTR(userdata);
+        _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
+        _cleanup_(macsec_receive_channel_free_or_set_invalidp) ReceiveChannel *c = NULL;
+        uint16_t port;
+        void *dest;
+        int r;
 
         /* This parses port used to make Secure Channel Identifier (SCI) */
 
@@ -602,16 +609,16 @@ int config_parse_macsec_hw_address(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
-        _cleanup_(macsec_receive_channel_free_or_set_invalidp) ReceiveChannel *c = NULL;
-        MACsec *s = userdata;
-        int r;
-
         assert(filename);
         assert(section);
         assert(lvalue);
         assert(rvalue);
         assert(data);
+
+        MACsec *s = ASSERT_PTR(userdata);
+        _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
+        _cleanup_(macsec_receive_channel_free_or_set_invalidp) ReceiveChannel *c = NULL;
+        int r;
 
         if (streq(section, "MACsecReceiveChannel"))
                 r = macsec_receive_channel_new_static(s, filename, section_line, &c);
@@ -646,17 +653,17 @@ int config_parse_macsec_packet_number(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(macsec_transmit_association_free_or_set_invalidp) TransmitAssociation *a = NULL;
-        _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
-        MACsec *s = userdata;
-        uint32_t val, *dest;
-        int r;
-
         assert(filename);
         assert(section);
         assert(lvalue);
         assert(rvalue);
         assert(data);
+
+        MACsec *s = ASSERT_PTR(userdata);
+        _cleanup_(macsec_transmit_association_free_or_set_invalidp) TransmitAssociation *a = NULL;
+        _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
+        uint32_t val, *dest;
+        int r;
 
         if (streq(section, "MACsecTransmitAssociation"))
                 r = macsec_transmit_association_new_static(s, filename, section_line, &a);
@@ -723,7 +730,7 @@ int config_parse_macsec_key(
 
         dest = a ? &a->sa : &b->sa;
 
-        r = unhexmem_full(rvalue, strlen(rvalue), true, &p, &l);
+        r = unhexmem_full(rvalue, SIZE_MAX, /* secure = */ true, &p, &l);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r, "Failed to parse key. Ignoring assignment: %m");
                 return 0;
@@ -788,7 +795,7 @@ int config_parse_macsec_key_file(
         if (!path)
                 return log_oom();
 
-        if (path_simplify_and_warn(path, PATH_CHECK_ABSOLUTE, unit, filename, line, lvalue) < 0)
+        if (path_simplify_and_warn(path, PATH_CHECK_ABSOLUTE|PATH_CHECK_NON_API_VFS, unit, filename, line, lvalue) < 0)
                 return 0;
 
         free_and_replace(*dest, path);
@@ -831,7 +838,7 @@ int config_parse_macsec_key_id(
         if (r < 0)
                 return log_oom();
 
-        r = unhexmem(rvalue, strlen(rvalue), &p, &l);
+        r = unhexmem(rvalue, &p, &l);
         if (r == -ENOMEM)
                 return log_oom();
         if (r < 0) {
@@ -871,8 +878,7 @@ int config_parse_macsec_sa_activate(
         _cleanup_(macsec_transmit_association_free_or_set_invalidp) TransmitAssociation *a = NULL;
         _cleanup_(macsec_receive_association_free_or_set_invalidp) ReceiveAssociation *b = NULL;
         MACsec *s = userdata;
-        int *dest;
-        int r;
+        int *dest, r;
 
         assert(filename);
         assert(section);
@@ -889,21 +895,16 @@ int config_parse_macsec_sa_activate(
 
         dest = a ? &a->sa.activate : &b->sa.activate;
 
-        if (isempty(rvalue))
-                r = -1;
-        else {
-                r = parse_boolean(rvalue);
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse activation mode of %s security association. "
-                                   "Ignoring assignment: %s",
-                                   streq(section, "MACsecTransmitAssociation") ? "transmit" : "receive",
-                                   rvalue);
-                        return 0;
-                }
+        r = parse_tristate(rvalue, dest);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Failed to parse activation mode of %s security association. "
+                           "Ignoring assignment: %s",
+                           streq(section, "MACsecTransmitAssociation") ? "transmit" : "receive",
+                           rvalue);
+                return 0;
         }
 
-        *dest = r;
         TAKE_PTR(a);
         TAKE_PTR(b);
 
@@ -942,7 +943,7 @@ int config_parse_macsec_use_for_encoding(
                 return 0;
         }
 
-        r = parse_boolean(rvalue);
+        r = parse_tristate(rvalue, &a->sa.use_for_encoding);
         if (r < 0) {
                 log_syntax(unit, LOG_WARNING, filename, line, r,
                            "Failed to parse %s= setting. Ignoring assignment: %s",
@@ -950,7 +951,6 @@ int config_parse_macsec_use_for_encoding(
                 return 0;
         }
 
-        a->sa.use_for_encoding = r;
         if (a->sa.use_for_encoding > 0)
                 a->sa.activate = true;
 
@@ -971,15 +971,19 @@ static int macsec_read_key_file(NetDev *netdev, SecurityAssociation *sa) {
                 return 0;
 
         r = read_full_file_full(
-                        AT_FDCWD, sa->key_file, UINT64_MAX, SIZE_MAX,
-                        READ_FULL_FILE_SECURE | READ_FULL_FILE_UNHEX | READ_FULL_FILE_WARN_WORLD_READABLE | READ_FULL_FILE_CONNECT_SOCKET,
+                        AT_FDCWD, sa->key_file, UINT64_MAX, MACSEC_KEYID_LEN,
+                        READ_FULL_FILE_SECURE |
+                        READ_FULL_FILE_UNHEX |
+                        READ_FULL_FILE_WARN_WORLD_READABLE |
+                        READ_FULL_FILE_CONNECT_SOCKET |
+                        READ_FULL_FILE_FAIL_WHEN_LARGER,
                         NULL, (char **) &key, &key_len);
         if (r < 0)
                 return log_netdev_error_errno(netdev, r,
                                               "Failed to read key from '%s', ignoring: %m",
                                               sa->key_file);
 
-        if (key_len != 16)
+        if (key_len != MACSEC_KEYID_LEN)
                 return log_netdev_error_errno(netdev, SYNTHETIC_ERRNO(EINVAL),
                                               "Invalid key length (%zu bytes), ignoring: %m", key_len);
 
@@ -1127,6 +1131,8 @@ static int macsec_receive_association_verify(ReceiveAssociation *a) {
 }
 
 static int netdev_macsec_verify(NetDev *netdev, const char *filename) {
+        assert(filename);
+
         MACsec *v = MACSEC(netdev);
         TransmitAssociation *a;
         ReceiveAssociation *n;
@@ -1134,10 +1140,6 @@ static int netdev_macsec_verify(NetDev *netdev, const char *filename) {
         uint8_t an, encoding_an;
         bool use_for_encoding;
         int r;
-
-        assert(netdev);
-        assert(v);
-        assert(filename);
 
         ORDERED_HASHMAP_FOREACH(c, v->receive_channels_by_section) {
                 r = macsec_receive_channel_verify(c);
@@ -1193,30 +1195,18 @@ static int netdev_macsec_verify(NetDev *netdev, const char *filename) {
 }
 
 static void macsec_init(NetDev *netdev) {
-        MACsec *v;
-
-        assert(netdev);
-
-        v = MACSEC(netdev);
-
-        assert(v);
+        MACsec *v = MACSEC(netdev);
 
         v->encrypt = -1;
 }
 
 static void macsec_done(NetDev *netdev) {
-        MACsec *t;
+        MACsec *v = MACSEC(netdev);
 
-        assert(netdev);
-
-        t = MACSEC(netdev);
-
-        assert(t);
-
-        ordered_hashmap_free_with_destructor(t->receive_channels, macsec_receive_channel_free);
-        ordered_hashmap_free_with_destructor(t->receive_channels_by_section, macsec_receive_channel_free);
-        ordered_hashmap_free_with_destructor(t->transmit_associations_by_section, macsec_transmit_association_free);
-        ordered_hashmap_free_with_destructor(t->receive_associations_by_section, macsec_receive_association_free);
+        ordered_hashmap_free_with_destructor(v->receive_channels, macsec_receive_channel_free);
+        ordered_hashmap_free_with_destructor(v->receive_channels_by_section, macsec_receive_channel_free);
+        ordered_hashmap_free_with_destructor(v->transmit_associations_by_section, macsec_transmit_association_free);
+        ordered_hashmap_free_with_destructor(v->receive_associations_by_section, macsec_receive_association_free);
 }
 
 const NetDevVTable macsec_vtable = {

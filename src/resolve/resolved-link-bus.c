@@ -14,6 +14,8 @@
 #include "resolve-util.h"
 #include "resolved-bus.h"
 #include "resolved-link-bus.h"
+#include "resolved-llmnr.h"
+#include "resolved-mdns.h"
 #include "resolved-resolv-conf.h"
 #include "socket-netlink.h"
 #include "stdio-util.h"
@@ -22,6 +24,8 @@
 
 static BUS_DEFINE_PROPERTY_GET(property_get_dnssec_supported, "b", Link, link_dnssec_supported);
 static BUS_DEFINE_PROPERTY_GET2(property_get_dnssec_mode, "s", Link, link_get_dnssec_mode, dnssec_mode_to_string);
+static BUS_DEFINE_PROPERTY_GET2(property_get_llmnr_support, "s", Link, link_get_llmnr_support, resolve_support_to_string);
+static BUS_DEFINE_PROPERTY_GET2(property_get_mdns_support, "s", Link, link_get_mdns_support, resolve_support_to_string);
 
 static int property_get_dns_over_tls_mode(
                 sd_bus *bus,
@@ -205,34 +209,6 @@ static int property_get_scopes_mask(
         return sd_bus_message_append(reply, "t", mask);
 }
 
-static int property_get_ntas(
-                sd_bus *bus,
-                const char *path,
-                const char *interface,
-                const char *property,
-                sd_bus_message *reply,
-                void *userdata,
-                sd_bus_error *error) {
-
-        Link *l = ASSERT_PTR(userdata);
-        const char *name;
-        int r;
-
-        assert(reply);
-
-        r = sd_bus_message_open_container(reply, 'a', "s");
-        if (r < 0)
-                return r;
-
-        SET_FOREACH(name, l->dnssec_negative_trust_anchors) {
-                r = sd_bus_message_append(reply, "s", name);
-                if (r < 0)
-                        return r;
-        }
-
-        return sd_bus_message_close_container(reply);
-}
-
 static int verify_unmanaged_link(Link *l, sd_bus_error *error) {
         assert(l);
 
@@ -262,10 +238,11 @@ static int bus_link_method_set_dns_servers_internal(sd_bus_message *message, voi
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-dns-servers",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-dns-servers",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry, error);
         if (r < 0)
                 goto finalize;
         if (r == 0) {
@@ -299,7 +276,7 @@ static int bus_link_method_set_dns_servers_internal(sd_bus_message *message, voi
                 if (s)
                         dns_server_move_back_and_unmark(s);
                 else {
-                        r = dns_server_new(l->manager, NULL, DNS_SERVER_LINK, l, dns[i]->family, &dns[i]->address, dns[i]->port, 0, dns[i]->server_name);
+                        r = dns_server_new(l->manager, NULL, DNS_SERVER_LINK, l, dns[i]->family, &dns[i]->address, dns[i]->port, 0, dns[i]->server_name, RESOLVE_CONFIG_SOURCE_DBUS);
                         if (r < 0) {
                                 dns_server_unlink_all(l->dns_servers);
                                 goto finalize;
@@ -394,10 +371,12 @@ int bus_link_method_set_domains(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-domains",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-domains",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -472,10 +451,12 @@ int bus_link_method_set_default_route(sd_bus_message *message, void *userdata, s
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-default-route",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-default-route",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -484,8 +465,7 @@ int bus_link_method_set_default_route(sd_bus_message *message, void *userdata, s
         bus_client_log(message, "dns default route change");
 
         if (l->default_route != b) {
-                l->default_route = b;
-
+                link_set_default_route(l, b);
                 (void) link_save_user(l);
                 (void) manager_write_resolv_conf(l->manager);
 
@@ -519,10 +499,12 @@ int bus_link_method_set_llmnr(sd_bus_message *message, void *userdata, sd_bus_er
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid LLMNR setting: %s", llmnr);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-llmnr",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-llmnr",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -536,6 +518,8 @@ int bus_link_method_set_llmnr(sd_bus_message *message, void *userdata, sd_bus_er
                 link_add_rrs(l, false);
 
                 (void) link_save_user(l);
+
+                manager_llmnr_maybe_stop(l->manager);
 
                 log_link_info(l, "Bus client set LLMNR setting: %s", resolve_support_to_string(mode));
         }
@@ -560,17 +544,19 @@ int bus_link_method_set_mdns(sd_bus_message *message, void *userdata, sd_bus_err
                 return r;
 
         if (isempty(mdns))
-                mode = RESOLVE_SUPPORT_NO;
+                mode = RESOLVE_SUPPORT_YES;
         else {
                 mode = resolve_support_from_string(mdns);
                 if (mode < 0)
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid MulticastDNS setting: %s", mdns);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-mdns",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-mdns",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -584,6 +570,8 @@ int bus_link_method_set_mdns(sd_bus_message *message, void *userdata, sd_bus_err
                 link_add_rrs(l, false);
 
                 (void) link_save_user(l);
+
+                manager_mdns_maybe_stop(l->manager);
 
                 log_link_info(l, "Bus client set MulticastDNS setting: %s", resolve_support_to_string(mode));
         }
@@ -615,10 +603,12 @@ int bus_link_method_set_dns_over_tls(sd_bus_message *message, void *userdata, sd
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid DNSOverTLS setting: %s", dns_over_tls);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-dns-over-tls",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-dns-over-tls",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -663,10 +653,12 @@ int bus_link_method_set_dnssec(sd_bus_message *message, void *userdata, sd_bus_e
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid DNSSEC setting: %s", dnssec);
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-dnssec",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-dnssec",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -724,10 +716,12 @@ int bus_link_method_set_dnssec_negative_trust_anchors(sd_bus_message *message, v
                         return -ENOMEM;
         }
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.set-dnssec-negative-trust-anchors",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.set-dnssec-negative-trust-anchors",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -760,10 +754,12 @@ int bus_link_method_revert(sd_bus_message *message, void *userdata, sd_bus_error
         if (r < 0)
                 return r;
 
-        r = bus_verify_polkit_async(message, CAP_NET_ADMIN,
-                                    "org.freedesktop.resolve1.revert",
-                                    NULL, true, UID_INVALID,
-                                    &l->manager->polkit_registry, error);
+        r = bus_verify_polkit_async(
+                        message,
+                        "org.freedesktop.resolve1.revert",
+                        (const char**) STRV_MAKE("interface", l->ifname),
+                        &l->manager->polkit_registry,
+                        error);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -778,6 +774,9 @@ int bus_link_method_revert(sd_bus_message *message, void *userdata, sd_bus_error
         (void) link_save_user(l);
         (void) manager_write_resolv_conf(l->manager);
         (void) manager_send_changed(l->manager, "DNS");
+
+        manager_llmnr_maybe_stop(l->manager);
+        manager_mdns_maybe_stop(l->manager);
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -809,7 +808,7 @@ static int link_object_find(sd_bus *bus, const char *path, const char *interface
         return 1;
 }
 
-char *link_bus_path(const Link *link) {
+char* link_bus_path(const Link *link) {
         char *p, ifindex[DECIMAL_STR_MAX(link->ifindex)];
         int r;
 
@@ -864,11 +863,11 @@ static const sd_bus_vtable link_vtable[] = {
         SD_BUS_PROPERTY("CurrentDNSServerEx", "(iayqs)", property_get_current_dns_server_ex, offsetof(Link, current_dns_server), 0),
         SD_BUS_PROPERTY("Domains", "a(sb)", property_get_domains, 0, 0),
         SD_BUS_PROPERTY("DefaultRoute", "b", property_get_default_route, 0, 0),
-        SD_BUS_PROPERTY("LLMNR", "s", bus_property_get_resolve_support, offsetof(Link, llmnr_support), 0),
-        SD_BUS_PROPERTY("MulticastDNS", "s", bus_property_get_resolve_support, offsetof(Link, mdns_support), 0),
+        SD_BUS_PROPERTY("LLMNR", "s", property_get_llmnr_support, 0, 0),
+        SD_BUS_PROPERTY("MulticastDNS", "s", property_get_mdns_support, 0, 0),
         SD_BUS_PROPERTY("DNSOverTLS", "s", property_get_dns_over_tls_mode, 0, 0),
         SD_BUS_PROPERTY("DNSSEC", "s", property_get_dnssec_mode, 0, 0),
-        SD_BUS_PROPERTY("DNSSECNegativeTrustAnchors", "as", property_get_ntas, 0, 0),
+        SD_BUS_PROPERTY("DNSSECNegativeTrustAnchors", "as", bus_property_get_string_set, offsetof(Link, dnssec_negative_trust_anchors), 0),
         SD_BUS_PROPERTY("DNSSECSupported", "b", property_get_dnssec_supported, 0, 0),
 
         SD_BUS_METHOD_WITH_ARGS("SetDNS",

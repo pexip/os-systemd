@@ -3,7 +3,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "devnum-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -58,21 +58,18 @@ int device_path_make_major_minor(mode_t mode, dev_t devnum, char **ret) {
 }
 
 int device_path_make_inaccessible(mode_t mode, char **ret) {
-        char *s;
+        const char *s;
 
         assert(ret);
 
         if (S_ISCHR(mode))
-                s = strdup("/run/systemd/inaccessible/chr");
+                s = "/run/systemd/inaccessible/chr";
         else if (S_ISBLK(mode))
-                s = strdup("/run/systemd/inaccessible/blk");
+                s = "/run/systemd/inaccessible/blk";
         else
                 return -ENODEV;
-        if (!s)
-                return -ENOMEM;
 
-        *ret = s;
-        return 0;
+        return strdup_to(ret, s);
 }
 
 int device_path_make_canonical(mode_t mode, dev_t devnum, char **ret) {
@@ -83,7 +80,7 @@ int device_path_make_canonical(mode_t mode, dev_t devnum, char **ret) {
 
         assert(ret);
 
-        if (major(devnum) == 0 && minor(devnum) == 0)
+        if (devnum_is_zero(devnum))
                 /* A special hack to make sure our 'inaccessible' device nodes work. They won't have symlinks in
                  * /dev/block/ and /dev/char/, hence we handle them specially here. */
                 return device_path_make_inaccessible(mode, ret);
@@ -92,7 +89,7 @@ int device_path_make_canonical(mode_t mode, dev_t devnum, char **ret) {
         if (r < 0)
                 return r;
 
-        return chase_symlinks(p, NULL, 0, ret, NULL);
+        return chase(p, NULL, 0, ret, NULL);
 }
 
 int device_path_parse_major_minor(const char *path, mode_t *ret_mode, dev_t *ret_devnum) {

@@ -92,7 +92,6 @@
  */
 int barrier_create(Barrier *b) {
         _unused_ _cleanup_(barrier_destroyp) Barrier *staging = b;
-        int r;
 
         assert(b);
 
@@ -104,8 +103,7 @@ int barrier_create(Barrier *b) {
         if (b->them < 0)
                 return -errno;
 
-        r = pipe2(b->pipe, O_CLOEXEC | O_NONBLOCK);
-        if (r < 0)
+        if (pipe2(b->pipe, O_CLOEXEC | O_NONBLOCK) < 0)
                 return -errno;
 
         staging = NULL;
@@ -177,9 +175,9 @@ static bool barrier_write(Barrier *b, uint64_t buf) {
                 return false;
 
         assert(b->me >= 0);
-        do {
+        do
                 len = write(b->me, &buf, sizeof(buf));
-        } while (len < 0 && ERRNO_IS_TRANSIENT(errno));
+        while (len < 0 && ERRNO_IS_TRANSIENT(errno));
 
         if (len != sizeof(buf))
                 goto error;

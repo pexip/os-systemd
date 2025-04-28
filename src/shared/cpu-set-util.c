@@ -11,6 +11,7 @@
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
+#include "hexdecoct.h"
 #include "log.h"
 #include "macro.h"
 #include "memory-util.h"
@@ -18,7 +19,6 @@
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
-#include "util.h"
 
 char* cpu_set_to_string(const CPUSet *a) {
         _cleanup_free_ char *str = NULL;
@@ -40,7 +40,7 @@ char* cpu_set_to_string(const CPUSet *a) {
         return TAKE_PTR(str) ?: strdup("");
 }
 
-char *cpu_set_to_range_string(const CPUSet *set) {
+char* cpu_set_to_range_string(const CPUSet *set) {
         unsigned range_start = 0, range_end;
         _cleanup_free_ char *str = NULL;
         bool in_range = false;
@@ -81,6 +81,63 @@ char *cpu_set_to_range_string(const CPUSet *set) {
         }
 
         return TAKE_PTR(str) ?: strdup("");
+}
+
+char* cpu_set_to_mask_string(const CPUSet *a) {
+        _cleanup_free_ char *str = NULL;
+        size_t len = 0;
+        bool found_nonzero = false;
+
+        assert(a);
+
+        /* Return CPU set in hexadecimal bitmap mask, e.g.
+         *   CPU   0 ->  "1"
+         *   CPU   1 ->  "2"
+         *   CPU 0,1 ->  "3"
+         *   CPU 0-3 ->  "f"
+         *   CPU 0-7 -> "ff"
+         *   CPU 4-7 -> "f0"
+         *   CPU   7 -> "80"
+         *   None    ->  "0"
+         *
+         * When there are more than 32 CPUs, separate every 32 CPUs by comma, e.g.
+         *  CPU 0-47 -> "ffff,ffffffff"
+         *  CPU 0-63 -> "ffffffff,ffffffff"
+         *  CPU 0-71 -> "ff,ffffffff,ffffffff" */
+
+        for (ssize_t i = a->allocated * 8; i >= 0; i -= 4) {
+                uint8_t m = 0;
+
+                for (size_t j = 0; j < 4; j++)
+                        if (CPU_ISSET_S(i + j, a->allocated, a->set))
+                                m |= 1U << j;
+
+                if (!found_nonzero)
+                        found_nonzero = m > 0;
+
+                if (!found_nonzero && m == 0)
+                        /* Skip leading zeros */
+                        continue;
+
+                if (!GREEDY_REALLOC(str, len + 3))
+                        return NULL;
+
+                str[len++] = hexchar(m);
+                if (i >= 4 && i % 32 == 0)
+                        /* Separate by comma for each 32 CPUs. */
+                        str[len++] = ',';
+                str[len] = 0;
+        }
+
+        return TAKE_PTR(str) ?: strdup("0");
+}
+
+CPUSet* cpu_set_free(CPUSet *c) {
+        if (!c)
+                return c;
+
+        cpu_set_reset(c);
+        return mfree(c);
 }
 
 int cpu_set_realloc(CPUSet *cpu_set, unsigned ncpus) {
@@ -146,6 +203,8 @@ int parse_cpu_set_full(
         _cleanup_(cpu_set_reset) CPUSet c = {};
         const char *p = ASSERT_PTR(rvalue);
 
+        assert(cpu_set);
+
         for (;;) {
                 _cleanup_free_ char *word = NULL;
                 unsigned cpu_lower, cpu_upper;
@@ -182,9 +241,7 @@ int parse_cpu_set_full(
                 }
         }
 
-        /* On success, transfer ownership to the output variable */
-        *cpu_set = c;
-        c = (CPUSet) {};
+        *cpu_set = TAKE_STRUCT(c);
 
         return 0;
 }
@@ -201,6 +258,8 @@ int parse_cpu_set_extend(
         _cleanup_(cpu_set_reset) CPUSet cpuset = {};
         int r;
 
+        assert(old);
+
         r = parse_cpu_set_full(rvalue, &cpuset, true, unit, filename, line, lvalue);
         if (r < 0)
                 return r;
@@ -212,8 +271,7 @@ int parse_cpu_set_extend(
         }
 
         if (!old->set) {
-                *old = cpuset;
-                cpuset = (CPUSet) {};
+                *old = TAKE_STRUCT(cpuset);
                 return 1;
         }
 
@@ -287,7 +345,25 @@ int cpu_set_from_dbus(const uint8_t *bits, size_t size, CPUSet *set) {
                                 return r;
                 }
 
-        *set = s;
-        s = (CPUSet) {};
+        *set = TAKE_STRUCT(s);
+        return 0;
+}
+
+int cpu_mask_add_all(CPUSet *mask) {
+        long m;
+        int r;
+
+        assert(mask);
+
+        m = sysconf(_SC_NPROCESSORS_ONLN);
+        if (m < 0)
+                return -errno;
+
+        for (unsigned i = 0; i < (unsigned) m; i++) {
+                r = cpu_set_add(mask, i);
+                if (r < 0)
+                        return r;
+        }
+
         return 0;
 }

@@ -1,6 +1,6 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
-  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!--
   SPDX-License-Identifier: LGPL-2.1-or-later
 
@@ -21,22 +21,25 @@
 
   <refnamediv>
     <refname>tmpfiles.d</refname>
-    <refpurpose>Configuration for creation, deletion and cleaning of
-    volatile and temporary files</refpurpose>
+    <refpurpose>Configuration for creation, deletion, and cleaning of files and directories</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
-    <para><literallayout><filename>/etc/tmpfiles.d/*.conf</filename>
-<filename>/run/tmpfiles.d/*.conf</filename>
-<filename>/usr/lib/tmpfiles.d/*.conf</filename>
-    </literallayout></para>
+    <para><simplelist>
+      <member><filename>/etc/tmpfiles.d/*.conf</filename></member>
+      <member><filename>/run/tmpfiles.d/*.conf</filename></member>
+      <member><filename>/usr/local/lib/tmpfiles.d/*.conf</filename></member>
+      <member><filename>/usr/lib/tmpfiles.d/*.conf</filename></member>
+    </simplelist></para>
 
-    <para><literallayout><filename>~/.config/user-tmpfiles.d/*.conf</filename>
-<filename>$XDG_RUNTIME_DIR/user-tmpfiles.d/*.conf</filename>
-<filename>~/.local/share/user-tmpfiles.d/*.conf</filename>
-<filename index='false'>…</filename>
-<filename>/usr/share/user-tmpfiles.d/*.conf</filename>
-    </literallayout></para>
+    <para><simplelist>
+      <member><filename>~/.config/user-tmpfiles.d/*.conf</filename></member>
+      <member><filename>$XDG_RUNTIME_DIR/user-tmpfiles.d/*.conf</filename></member>
+      <member><filename>~/.local/share/user-tmpfiles.d/*.conf</filename></member>
+      <member><filename index='false'>…</filename></member>
+      <member><filename>/usr/local/share/user-tmpfiles.d/*.conf</filename></member>
+      <member><filename>/usr/share/user-tmpfiles.d/*.conf</filename></member>
+    </simplelist></para>
 
     <programlisting>#Type Path                                     Mode User Group Age         Argument
 f     /file/to/create                          mode user group -           content
@@ -58,6 +61,7 @@ c+    /dev/char-device-to-[re]create           mode user group -           major
 b     /dev/block-device-to-create              mode user group -           major:minor
 b+    /dev/block-device-to-[re]create          mode user group -           major:minor
 C     /target/to/create                        -    -    -     cleanup-age /source/to/copy
+C+    /target/to/create                        -    -    -     cleanup-age /source/to/copy
 x     /path-or-glob/to/ignore/recursively      -    -    -     cleanup-age -
 X     /path-or-glob/to/ignore                  -    -    -     cleanup-age -
 r     /path-or-glob/to/remove                  -    -    -     -           -
@@ -88,8 +92,9 @@ A+    /path-or-glob/to/append/acls/recursively -    -    -     -           POSIX
     <filename>/sys/</filename> or <filename>/proc/</filename>, as well as some other directories below
     <filename>/var/</filename>).</para>
 
-    <para><command>systemd-tmpfiles</command> uses this configuration to create volatile files and
-    directories during boot and to do periodic cleanup afterwards. See
+    <para><citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    uses this configuration to create volatile files and directories during boot and to do periodic cleanup
+    afterwards. See
     <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry> for
     the description of <filename>systemd-tmpfiles-setup.service</filename>,
     <filename>systemd-tmpfiles-clean.service</filename>, and associated units.</para>
@@ -160,7 +165,7 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
     <refsect2>
       <title>Type</title>
 
-      <para>The type consists of a single letter and optionally one or emore modifier characters: a plus sign
+      <para>The type consists of a single letter and optionally one or more modifier characters: a plus sign
       (<literal>+</literal>), exclamation mark (<literal>!</literal>), minus sign (<literal>-</literal>),
       equals sign (<literal>=</literal>), tilde character (<literal>~</literal>) and/or caret
       (<literal>^</literal>).</para>
@@ -204,15 +209,17 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
         <varlistentry>
           <term><varname>e</varname></term>
           <listitem><para>Adjust the mode and ownership of existing directories and remove their contents
-          based on age.
-          Lines of this type accept shell-style globs in place of normal path names. Contents of the
-          directories are subject to time-based cleanup if the age argument is specified. If the age argument
-          is <literal>0</literal>, contents will be unconditionally deleted every time
-          <command>systemd-tmpfiles --clean</command> is run.</para>
+          based on age. Lines of this type accept shell-style globs in place of normal path names. Contents
+          of the directories are subject to time-based cleanup if the age argument is specified. If the age
+          argument is <literal>0</literal>, contents will be unconditionally deleted every time
+          <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          <option>--clean</option> is run.</para>
 
           <para>For this entry to be useful, at least one of the mode, user, group, or age arguments must be
           specified, since otherwise this entry has no effect. As an exception, an entry with no effect may
-          be useful when combined with <varname>!</varname>, see the examples.</para></listitem>
+          be useful when combined with <varname>!</varname>, see the examples.</para>
+
+          <xi:include href="version-info.xml" xpointer="v230"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -224,7 +231,9 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
 
           <para>A subvolume created with this line type is not assigned to any higher-level quota group. For
           that, use <varname>q</varname> or <varname>Q</varname>, which allow creating simple quota group
-          hierarchies, see below.</para></listitem>
+          hierarchies, see below.</para>
+
+          <xi:include href="version-info.xml" xpointer="v219"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -235,9 +244,11 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
           non-btrfs file systems, this line type is identical to <varname>d</varname>.</para>
 
           <para>If the subvolume already exists, no change to the quota hierarchy is made, regardless of whether the
-          subvolume is already attached to a quota group or not. Also see <varname>Q</varname> below. See <citerefentry
-          project='die-net'><refentrytitle>btrfs-qgroup</refentrytitle><manvolnum>8</manvolnum></citerefentry> for
-          details about the btrfs quota group concept.</para></listitem>
+          subvolume is already attached to a quota group or not. Also see <varname>Q</varname> below. See
+          <citerefentry project='url'><refentrytitle url='https://btrfs.readthedocs.io/en/latest/btrfs-qgroup.html'>btrfs-qgroup</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          for details about the btrfs quota group concept.</para>
+
+          <xi:include href="version-info.xml" xpointer="v228"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -271,7 +282,9 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
 
           <para>As with <varname>q</varname>, <varname>Q</varname> has no effect on the quota group hierarchy if the
           subvolume already exists, regardless of whether the subvolume already belong to a quota group or not.
-          </para></listitem>
+          </para>
+
+          <xi:include href="version-info.xml" xpointer="v228"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -286,15 +299,13 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
         <varlistentry>
           <term><varname>L</varname></term>
           <term><varname>L+</varname></term>
-          <listitem><para>Create a symlink if it does not exist
-          yet. If suffixed with <varname>+</varname> and a file or
-          directory already exists where the symlink is to be created,
-          it will be removed and be replaced by the symlink. If the
-          argument is omitted, symlinks to files with the same name
-          residing in the directory
-          <filename>/usr/share/factory/</filename> are created. Note
-          that permissions and ownership on symlinks are ignored.
-          </para></listitem>
+          <term><varname>L?</varname></term>
+          <listitem><para>Create a symlink if it does not exist yet. If suffixed with <varname>+</varname>
+          and a file or directory already exists where the symlink is to be created, it will be removed and
+          be replaced by the symlink. If suffixed with <varname>?</varname> and the source path does not
+          exist, the symlink is not created. If the argument is omitted, symlinks to files with the same name
+          residing in the directory <filename>/usr/share/factory/</filename> are created. Note that
+          permissions on symlinks are ignored.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -325,25 +336,24 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
 
         <varlistentry>
           <term><varname>C</varname></term>
-          <listitem><para>Recursively copy a file or directory, if the
-          destination files or directories do not exist yet or the
-          destination directory is empty. Note that this command will not
-          descend into subdirectories if the destination directory already
-          exists and is not empty. Instead, the entire copy operation is
-          skipped. If the argument is omitted, files from the source directory
-          <filename>/usr/share/factory/</filename> with the same name
-          are copied. Does not follow symlinks. Contents of the directories
-          are subject to time-based cleanup if the age argument is specified.
-          </para></listitem>
+          <term><varname>C+</varname></term>
+          <listitem><para>Recursively copy a file or directory, if the destination files or directories do
+          not exist yet or the destination directory is empty. Note that this command will not descend into
+          subdirectories if the destination directory already exists and is not empty, unless the action is
+          suffixed with <varname>+</varname>. Instead, the entire copy operation is skipped. If the argument
+          is omitted, files from the source directory <filename>/usr/share/factory/</filename> with the same
+          name are copied. Does not follow symlinks. Contents of the directories are subject to time-based
+          cleanup if the age argument is specified.
+          </para>
+
+          <xi:include href="version-info.xml" xpointer="v214"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><varname>x</varname></term>
           <listitem><para>Ignore a path during cleaning. Use this type
           to exclude paths from clean-up as controlled with the Age
-          parameter. Note that lines of this type do not influence the
-          effect of <varname>r</varname> or <varname>R</varname>
-          lines. Lines of this type accept shell-style globs in place
+          parameter. Lines of this type accept shell-style globs in place
           of normal path names.  </para></listitem>
         </varlistentry>
 
@@ -353,11 +363,11 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
           to exclude paths from clean-up as controlled with the Age
           parameter. Unlike <varname>x</varname>, this parameter will
           not exclude the content if path is a directory, but only
-          directory itself. Note that lines of this type do not
-          influence the effect of <varname>r</varname> or
-          <varname>R</varname> lines. Lines of this type accept
+          directory itself. Lines of this type accept
           shell-style globs in place of normal path names.
-          </para></listitem>
+          </para>
+
+          <xi:include href="version-info.xml" xpointer="v198"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -404,12 +414,16 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
 
           <para>Please note that extended attributes settable with this line type are a different concept
           from the Linux file attributes settable with <varname>h</varname>/<varname>H</varname>, see
-          below.</para></listitem>
+          below.</para>
+
+          <xi:include href="version-info.xml" xpointer="v218"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><varname>T</varname></term>
-          <listitem><para>Same as <varname>t</varname>, but operates recursively.</para></listitem>
+          <listitem><para>Same as <varname>t</varname>, but operates recursively.</para>
+
+          <xi:include href="version-info.xml" xpointer="v219"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -437,21 +451,28 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
 
         <varlistentry>
           <term><varname>H</varname></term>
-          <listitem><para>Sames as <varname>h</varname>, but operates recursively.</para></listitem>
+          <listitem><para>Sames as <varname>h</varname>, but operates recursively.</para>
+
+          <xi:include href="version-info.xml" xpointer="v220"/></listitem>
         </varlistentry>
 
         <varlistentry>
           <term><varname>a</varname></term>
           <term><varname>a+</varname></term>
-          <listitem><para>Set POSIX ACLs (access control lists), see <citerefentry
-          project='man-pages'><refentrytitle>acl</refentrytitle>
-          <manvolnum>5</manvolnum></citerefentry>. If suffixed with <varname>+</varname>, the specified
-          entries will be added to the existing set. <command>systemd-tmpfiles</command> will automatically
-          add the required base entries for user and group based on the access mode of the file, unless base
-          entries already exist or are explicitly specified. The mask will be added if not specified
-          explicitly or already present. Lines of this type accept shell-style globs in place of normal path
-          names. This can be useful for allowing additional access to certain files. Does not follow
-          symlinks.</para></listitem>
+          <listitem><para>Set POSIX ACLs (access control lists), see
+          <citerefentry project='man-pages'><refentrytitle>acl</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
+          Additionally, if 'X' is used, the execute bit is set only if the file is a directory or already has
+          execute permission for some user, as mentioned in
+          <citerefentry project='man-pages'><refentrytitle>setfacl</refentrytitle><manvolnum>1</manvolnum></citerefentry>.
+          If suffixed with <varname>+</varname>, the specified entries will be added to the existing set.
+          <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          will automatically add the required base entries for user and group based on the access mode of the
+          file, unless base entries already exist or are explicitly specified. The mask will be added if not
+          specified explicitly or already present. Lines of this type accept shell-style globs in place of
+          normal path names. This can be useful for allowing additional access to certain files. Does not
+          follow symlinks.</para>
+
+          <xi:include href="version-info.xml" xpointer="v219"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -459,7 +480,9 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
           <term><varname>A+</varname></term>
           <listitem><para>Same as <varname>a</varname> and
           <varname>a+</varname>, but recursive. Does not follow
-          symlinks.</para></listitem>
+          symlinks.</para>
+
+          <xi:include href="version-info.xml" xpointer="v219"/></listitem>
         </varlistentry>
       </variablelist>
     </refsect2>
@@ -469,8 +492,10 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
 
       <para>If the exclamation mark (<literal>!</literal>) is used, this line is only safe to execute during
       boot, and can break a running system. Lines without the exclamation mark are presumed to be safe to
-      execute at any time, e.g. on package upgrades. <command>systemd-tmpfiles</command> will take lines with
-      an exclamation mark only into consideration, if the <option>--boot</option> option is given.</para>
+      execute at any time, e.g. on package upgrades.
+      <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+      will take lines with an exclamation mark only into consideration, if the <option>--boot</option> option
+      is given.</para>
 
       <para>For example:
       <programlisting># Make sure these are created by default so that nobody else can
@@ -512,8 +537,12 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
       service, the line is silently skipped. If <literal>^</literal> and <literal>~</literal> are combined
       Base64 decoding is applied to the credential contents.</para>
 
+      <para>If the dollar sign (<literal>$</literal>) is used, the file becomes subject to removal when
+      <command>systemd-tmpfiles</command> is invoked with the <option>--purge</option> switch. Lines without
+      this character are unaffected by that switch.</para>
+
       <para>Note that for all line types that result in creation of any kind of file node
-      (i.e. <varname>f</varname>/<varname>F</varname>,
+      (i.e. <varname>f</varname>,
       <varname>d</varname>/<varname>D</varname>/<varname>v</varname>/<varname>q</varname>/<varname>Q</varname>,
       <varname>p</varname>, <varname>L</varname>, <varname>c</varname>/<varname>b</varname> and <varname>C</varname>)
       leading directories are implicitly created if needed, owned by root with an access mode of 0755. In order to
@@ -532,7 +561,7 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
       <title>Mode</title>
 
       <para>The file access mode to use when creating this file or directory. If omitted or when set to
-      <literal>-</literal>, the default is used: 0755 for directories, 0644 for all other file objects.  For
+      <literal>-</literal>, the default is used: 0755 for directories, 0644 for all other file objects. For
       <varname>z</varname>, <varname>Z</varname> lines, if omitted or when set to <literal>-</literal>, the
       file access mode will not be modified. This parameter is ignored for <varname>x</varname>,
       <varname>r</varname>, <varname>R</varname>, <varname>L</varname>, <varname>t</varname>, and
@@ -557,10 +586,12 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
 
       <para>The user and group to use for this file or directory. This may either be a numeric ID or a
       user/group name. If omitted or when set to <literal>-</literal>, the user and group of the user who
-      invokes <command>systemd-tmpfiles</command> is used. For <varname>z</varname> and <varname>Z</varname>
-      lines, when omitted or when set to <literal>-</literal>, the file ownership will not be modified. These
-      parameters are ignored for <varname>x</varname>, <varname>r</varname>, <varname>R</varname>,
-      <varname>L</varname>, <varname>t</varname>, and <varname>a</varname> lines.</para>
+      invokes
+      <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry> is
+      used. For <varname>z</varname> and <varname>Z</varname> lines, when omitted or when set to
+      <literal>-</literal>, the file ownership will not be modified. These parameters are ignored for
+      <varname>x</varname>, <varname>r</varname>, <varname>R</varname>, <varname>t</varname>,
+      and <varname>a</varname> lines.</para>
 
       <para>This field should generally only reference system users/groups, i.e. users/groups that are
       guaranteed to be resolvable during early boot. If this field references users/groups that only become
@@ -648,13 +679,21 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
 # an hour ago in "/tmp/foo/bar", are subject to time-based cleanup.
 d /tmp/foo/bar - - - bmA:1h -</programlisting></para>
 
-      <para>Note that while the aging algorithm is run a 'shared' BSD file lock (see <citerefentry
+      <para>Note that while the aging algorithm is run an exclusive BSD file lock (see <citerefentry
       project='man-pages'><refentrytitle>flock</refentrytitle><manvolnum>2</manvolnum></citerefentry>) is
-      taken on each directory the algorithm descends into (and each directory below that, and so on). If the
-      aging algorithm finds a lock is already taken on some directory, it (and everything below it) is
-      skipped. Applications may use this to temporarily exclude certain directory subtrees from the aging
-      algorithm: the applications can take a BSD file lock themselves, and as long as they keep it aging of
-      the directory and everything below it is disabled.</para>
+      taken on each directory/file the algorithm decides to remove. If the aging algorithm finds a lock
+      (shared or exclusive) is already taken on some directory/file, it (and everything below it) is skipped.
+      Applications may use this to temporarily exclude certain directory subtrees from the aging algorithm:
+      the applications can take a BSD file lock themselves, and as long as they keep it aging of the
+      directory/file and everything below it is disabled.</para>
+
+      <para>This behavior can be used to ensure guaranteed cleanup of files or directories whose lifetime
+      should be aligned with the process that created them by having that process create them in a location
+      monitored by <command>systemd-tmpfiles</command> with an age of <literal>0</literal>, and having the
+      process immediately lock the directory or file before using it. Because the BSD lock is process
+      specific, the file is guaranteed to be unlocked as soon as the process exits, meaning that even if the
+      process crashes, those files and directories will be unlocked and cleaned up by
+      <command>systemd-tmpfiles</command>.</para>
     </refsect2>
 
     <refsect2>
@@ -662,7 +701,7 @@ d /tmp/foo/bar - - - bmA:1h -</programlisting></para>
 
       <para>For <varname>L</varname> lines determines the destination path of the symlink. For <varname>c</varname> and
       <varname>b</varname>, determines the major/minor of the device node, with major and minor formatted as integers,
-      separated by <literal>:</literal>, e.g.  <literal>1:3</literal>. For <varname>f</varname>, <varname>F</varname>,
+      separated by <literal>:</literal>, e.g. <literal>1:3</literal>. For <varname>f</varname>
       and <varname>w</varname>, the argument may be used to specify a short string that is written to the file,
       suffixed by a newline. For <varname>C</varname>, specifies the source file or directory. For <varname>t</varname>
       and <varname>T</varname>, determines extended attributes to be set. For <varname>a</varname> and
@@ -722,15 +761,16 @@ d /tmp/foo/bar - - - bmA:1h -</programlisting></para>
             <row>
               <entry><literal>%L</literal></entry>
               <entry>System or user log directory</entry>
-              <entry>In <option>--user</option> mode, this is the same as <varname>$XDG_CONFIG_HOME</varname> with <filename index="false">/log</filename> appended, and <filename>/var/log</filename> otherwise.</entry>
+              <entry>In <option>--user</option> mode, this is the same as <varname>$XDG_STATE_HOME</varname> with <filename index="false">/log</filename> appended, and <filename>/var/log</filename> otherwise.</entry>
             </row>
             <xi:include href="standard-specifiers.xml" xpointer="m"/>
             <xi:include href="standard-specifiers.xml" xpointer="M"/>
             <xi:include href="standard-specifiers.xml" xpointer="o"/>
+            <xi:include href="standard-specifiers.xml" xpointer="q"/>
             <row>
               <entry><literal>%S</literal></entry>
               <entry>System or user state directory</entry>
-              <entry>In <option>--user</option> mode, this is the same as <varname>$XDG_CONFIG_HOME</varname>, and <filename>/var/lib</filename> otherwise.</entry>
+              <entry>In <option>--user</option> mode, this is the same as <varname>$XDG_STATE_HOME</varname>, and <filename>/var/lib</filename> otherwise.</entry>
             </row>
             <row>
               <entry><literal>%t</literal></entry>
@@ -779,7 +819,7 @@ d /run/uscreens 0755 root screen 10d12h
       <title>Create a directory with a SMACK attribute</title>
       <programlisting>D /run/cups - - - -
 t /run/cups - - - - security.SMACK64=printing user.attr-with-spaces="foo bar"
-      </programlisting>
+</programlisting>
 
       <para>The directory will be owned by root and have default mode. Its contents are
       not subject to time-based cleanup, but will be obliterated when
@@ -833,13 +873,13 @@ e! /var/cache/krb5rcache - - - 0
     <example>
       <title>Provision SSH public key access for root user via Credentials in QEMU</title>
 
-      <programlisting>-smbios type=11,value=io.systemd.credential.binary:tmpfiles.extra=$(echo "f~ /root/.ssh/authorized_keys 700 root root - $(ssh-add -L | base64 -w 0)" | base64 -w 0)
+      <programlisting>-smbios type=11,value=io.systemd.credential.binary:tmpfiles.extra=$(echo -e "d /root/.ssh 0750 root root -\nf~ /root/.ssh/authorized_keys 0600 root root - $(ssh-add -L | base64 -w 0)" | base64 -w 0)
 </programlisting>
 
-      <para>By passing this line to QEMU, the public key of the current user will be encoded in
-      base64, added to a tmpfiles.d line that tells systemd-tmpfiles to decode it into
-      <filename>/root/.ssh/authorized_keys</filename>, encode that line itself in base64 and
-      pass it as a Credential that will be picked up by systemd from SMBIOS on boot.
+      <para>By passing this line to QEMU, the public key of the current user will be encoded in base64, added
+      to a tmpfiles.d line that tells <command>systemd-tmpfiles</command> to decode it into
+      <filename>/root/.ssh/authorized_keys</filename>, encode that line itself in base64 and pass it as a
+      Credential that will be picked up by systemd from SMBIOS on boot.
       </para>
     </example>
   </refsect1>
@@ -853,20 +893,20 @@ e! /var/cache/krb5rcache - - - 0
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-delta</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>attr</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>getfattr</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>setfattr</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>setfacl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>getfacl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>chattr</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='die-net'><refentrytitle>btrfs-subvolume</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
-      <citerefentry project='die-net'><refentrytitle>btrfs-qgroup</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-delta</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>attr</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>getfattr</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>setfattr</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>setfacl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>getfacl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>chattr</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='url'><refentrytitle url='https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html'>btrfs-subvolume</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='url'><refentrytitle url='https://btrfs.readthedocs.io/en/latest/btrfs-qgroup.html'>btrfs-qgroup</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 
 </refentry>

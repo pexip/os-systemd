@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "sd-messages.h"
+
 #include "alloc-util.h"
 #include "dirent-util.h"
 #include "exit-status.h"
@@ -12,6 +14,7 @@
 #include "generator.h"
 #include "hashmap.h"
 #include "hexdecoct.h"
+#include "initrd-util.h"
 #include "install.h"
 #include "log.h"
 #include "main-func.h"
@@ -25,7 +28,9 @@
 #include "string-util.h"
 #include "strv.h"
 #include "unit-name.h"
-#include "util.h"
+
+/* 🚨 Note: this generator is deprecated! Please do not add new features! Instead, please port remaining SysV
+ * scripts over to native unit files! Thank you! 🚨 */
 
 static const struct {
         const char *path;
@@ -245,21 +250,22 @@ static int sysv_translate_facility(SysvStub *s, unsigned line, const char *name,
                 "time",                 SPECIAL_TIME_SYNC_TARGET,
         };
 
-        const char *filename;
-        char *filename_no_sh, *e, *m;
+        _cleanup_free_ char *filename = NULL;
         const char *n;
-        unsigned i;
+        char *e, *m;
         int r;
 
         assert(name);
         assert(s);
         assert(ret);
 
-        filename = basename(s->path);
+        r = path_extract_filename(s->path, &filename);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract file name from path '%s': %m", s->path);
 
         n = *name == '$' ? name + 1 : name;
 
-        for (i = 0; i < ELEMENTSOF(table); i += 2) {
+        for (size_t i = 0; i < ELEMENTSOF(table); i += 2) {
                 if (!streq(table[i], n))
                         continue;
 
@@ -289,12 +295,9 @@ static int sysv_translate_facility(SysvStub *s, unsigned line, const char *name,
         }
 
         /* Strip ".sh" suffix from file name for comparison */
-        filename_no_sh = strdupa_safe(filename);
-        e = endswith(filename_no_sh, ".sh");
-        if (e) {
+        e = endswith(filename, ".sh");
+        if (e)
                 *e = '\0';
-                filename = filename_no_sh;
-        }
 
         /* Names equaling the file name of the services are redundant */
         if (streq_ptr(n, filename)) {
@@ -447,9 +450,8 @@ static int load_sysv(SysvStub *s) {
 
         for (;;) {
                 _cleanup_free_ char *l = NULL;
-                char *t;
 
-                r = read_line(f, LONG_LINE_MAX, &l);
+                r = read_stripped_line(f, LONG_LINE_MAX, &l);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read configuration file '%s': %m", s->path);
                 if (r == 0)
@@ -457,17 +459,16 @@ static int load_sysv(SysvStub *s) {
 
                 line++;
 
-                t = strstrip(l);
-                if (*t != '#') {
+                if (l[0] != '#') {
                         /* Try to figure out whether this init script supports
                          * the reload operation. This heuristic looks for
                          * "Usage" lines which include the reload option. */
                         if (state == USAGE_CONTINUATION ||
-                            (state == NORMAL && strcasestr(t, "usage"))) {
-                                if (usage_contains_reload(t)) {
+                            (state == NORMAL && strcasestr(l, "usage"))) {
+                                if (usage_contains_reload(l)) {
                                         supports_reload = true;
                                         state = NORMAL;
-                                } else if (t[strlen(t)-1] == '\\')
+                                } else if (endswith(l, "\\"))
                                         state = USAGE_CONTINUATION;
                                 else
                                         state = NORMAL;
@@ -476,18 +477,18 @@ static int load_sysv(SysvStub *s) {
                         continue;
                 }
 
-                if (state == NORMAL && streq(t, "### BEGIN INIT INFO")) {
+                if (state == NORMAL && streq(l, "### BEGIN INIT INFO")) {
                         state = LSB;
                         s->has_lsb = true;
                         continue;
                 }
 
-                if (IN_SET(state, LSB_DESCRIPTION, LSB) && streq(t, "### END INIT INFO")) {
+                if (IN_SET(state, LSB_DESCRIPTION, LSB) && streq(l, "### END INIT INFO")) {
                         state = NORMAL;
                         continue;
                 }
 
-                t++;
+                char *t = l + 1;
                 t += strspn(t, WHITESPACE);
 
                 if (state == NORMAL) {
@@ -748,7 +749,7 @@ static int enumerate_sysv(const LookupPaths *lp, Hashmap *all_services) {
                         if (hashmap_contains(all_services, name))
                                 continue;
 
-                        r = unit_file_exists(LOOKUP_SCOPE_SYSTEM, lp, name);
+                        r = unit_file_exists(RUNTIME_SCOPE_SYSTEM, lp, name);
                         if (r < 0 && !IN_SET(r, -ELOOP, -ERFKILL, -EADDRNOTAVAIL)) {
                                 log_debug_errno(r, "Failed to detect whether %s exists, skipping: %m", name);
                                 continue;
@@ -761,9 +762,17 @@ static int enumerate_sysv(const LookupPaths *lp, Hashmap *all_services) {
                         if (!fpath)
                                 return log_oom();
 
-                        log_warning("SysV service '%s' lacks a native systemd unit file. "
-                                    "Automatically generating a unit file for compatibility. "
-                                    "Please update package to include a native systemd unit file, in order to make it more safe and robust.", fpath);
+                        log_struct(LOG_WARNING,
+                                   LOG_MESSAGE("SysV service '%s' lacks a native systemd unit file, "
+                                               "automatically generating a unit file for compatibility.\n"
+                                               "Please update package to include a native systemd unit file.\n"
+                                               "%s This compatibility logic is deprecated, expect removal soon. %s",
+                                               fpath,
+                                               special_glyph(SPECIAL_GLYPH_WARNING_SIGN),
+                                               special_glyph(SPECIAL_GLYPH_WARNING_SIGN)),
+                                   "MESSAGE_ID=" SD_MESSAGE_SYSV_GENERATOR_DEPRECATED_STR,
+                                   "SYSVSCRIPT=%s", fpath,
+                                   "UNIT=%s", name);
 
                         service = new(SysvStub, 1);
                         if (!service)
@@ -799,7 +808,7 @@ static int set_dependencies_from_rcnd(const LookupPaths *lp, Hashmap *all_servic
                 return r;
 
         STRV_FOREACH(p, sysvrcnd_path)
-                for (unsigned i = 0; i < ELEMENTSOF(rcnd_table); i ++) {
+                for (unsigned i = 0; i < ELEMENTSOF(rcnd_table); i++) {
                         _cleanup_closedir_ DIR *d = NULL;
                         _cleanup_free_ char *path = NULL;
 
@@ -886,13 +895,18 @@ finish:
 
 static int run(const char *dest, const char *dest_early, const char *dest_late) {
         _cleanup_(free_sysvstub_hashmapp) Hashmap *all_services = NULL;
-        _cleanup_(lookup_paths_free) LookupPaths lp = {};
+        _cleanup_(lookup_paths_done) LookupPaths lp = {};
         SysvStub *service;
         int r;
 
+        if (in_initrd()) {
+                log_debug("Skipping generator, running in the initrd.");
+                return EXIT_SUCCESS;
+        }
+
         assert_se(arg_dest = dest_late);
 
-        r = lookup_paths_init_or_warn(&lp, LOOKUP_SCOPE_SYSTEM, LOOKUP_PATHS_EXCLUDE_GENERATED, NULL);
+        r = lookup_paths_init_or_warn(&lp, RUNTIME_SCOPE_SYSTEM, LOOKUP_PATHS_EXCLUDE_GENERATED, NULL);
         if (r < 0)
                 return r;
 

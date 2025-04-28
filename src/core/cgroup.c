@@ -10,6 +10,7 @@
 #include "bpf-devices.h"
 #include "bpf-firewall.h"
 #include "bpf-foreign.h"
+#include "bpf-restrict-ifaces.h"
 #include "bpf-socket-bind.h"
 #include "btrfs-util.h"
 #include "bus-error.h"
@@ -20,6 +21,7 @@
 #include "devnum-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "firewall-util.h"
 #include "in-addr-prefix-util.h"
 #include "inotify-util.h"
 #include "io-util.h"
@@ -31,7 +33,8 @@
 #include "percent-util.h"
 #include "process-util.h"
 #include "procfs-util.h"
-#include "restrict-ifaces.h"
+#include "set.h"
+#include "serialize.h"
 #include "special.h"
 #include "stdio-util.h"
 #include "string-table.h"
@@ -51,7 +54,9 @@
  * out specific attributes from us. */
 #define LOG_LEVEL_CGROUP_WRITE(r) (IN_SET(abs(r), ENOENT, EROFS, EACCES, EPERM) ? LOG_DEBUG : LOG_WARNING)
 
-uint64_t tasks_max_resolve(const TasksMax *tasks_max) {
+static void unit_remove_from_cgroup_empty_queue(Unit *u);
+
+uint64_t cgroup_tasks_max_resolve(const CGroupTasksMax *tasks_max) {
         if (tasks_max->scale == 0)
                 return tasks_max->value;
 
@@ -91,11 +96,17 @@ bool unit_has_startup_cgroup_constraints(Unit *u) {
                c->startup_io_weight != CGROUP_WEIGHT_INVALID ||
                c->startup_blockio_weight != CGROUP_BLKIO_WEIGHT_INVALID ||
                c->startup_cpuset_cpus.set ||
-               c->startup_cpuset_mems.set;
+               c->startup_cpuset_mems.set ||
+               c->startup_memory_high_set ||
+               c->startup_memory_max_set ||
+               c->startup_memory_swap_max_set||
+               c->startup_memory_zswap_max_set ||
+               c->startup_memory_low_set;
 }
 
-bool unit_has_host_root_cgroup(Unit *u) {
+bool unit_has_host_root_cgroup(const Unit *u) {
         assert(u);
+        assert(u->manager);
 
         /* Returns whether this unit manages the root cgroup. This will return true if this unit is the root slice and
          * the manager manages the root cgroup. */
@@ -109,10 +120,16 @@ bool unit_has_host_root_cgroup(Unit *u) {
 static int set_attribute_and_warn(Unit *u, const char *controller, const char *attribute, const char *value) {
         int r;
 
-        r = cg_set_attribute(controller, u->cgroup_path, attribute, value);
+        assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return -EOWNERDEAD;
+
+        r = cg_set_attribute(controller, crt->cgroup_path, attribute, value);
         if (r < 0)
                 log_unit_full_errno(u, LOG_LEVEL_CGROUP_WRITE(r), r, "Failed to set '%s' attribute on '%s' to '%.*s': %m",
-                                    strna(attribute), empty_to_root(u->cgroup_path), (int) strcspn(value, NEWLINE), value);
+                                    strna(attribute), empty_to_root(crt->cgroup_path), (int) strcspn(value, NEWLINE), value);
 
         return r;
 }
@@ -137,7 +154,14 @@ static void cgroup_compat_warn(void) {
 void cgroup_context_init(CGroupContext *c) {
         assert(c);
 
-        /* Initialize everything to the kernel defaults. */
+        /* Initialize everything to the kernel defaults. When initializing a bool member to 'true', make
+         * sure to serialize in execute-serialize.c using serialize_bool() instead of
+         * serialize_bool_elide(), as sd-executor will initialize here to 'true', but serialize_bool_elide()
+         * skips serialization if the value is 'false' (as that's the common default), so if the value at
+         * runtime is zero it would be lost after deserialization. Same when initializing uint64_t and other
+         * values, update/add a conditional serialization check. This is to minimize the amount of
+         * serialized data that is sent to the sd-executor, so that there is less work to do on the default
+         * cases. */
 
         *c = (CGroupContext) {
                 .cpu_weight = CGROUP_WEIGHT_INVALID,
@@ -149,10 +173,17 @@ void cgroup_context_init(CGroupContext *c) {
                 .startup_cpu_shares = CGROUP_CPU_SHARES_INVALID,
 
                 .memory_high = CGROUP_LIMIT_MAX,
+                .startup_memory_high = CGROUP_LIMIT_MAX,
                 .memory_max = CGROUP_LIMIT_MAX,
+                .startup_memory_max = CGROUP_LIMIT_MAX,
                 .memory_swap_max = CGROUP_LIMIT_MAX,
+                .startup_memory_swap_max = CGROUP_LIMIT_MAX,
+                .memory_zswap_max = CGROUP_LIMIT_MAX,
+                .startup_memory_zswap_max = CGROUP_LIMIT_MAX,
 
                 .memory_limit = CGROUP_LIMIT_MAX,
+
+                .memory_zswap_writeback = true,
 
                 .io_weight = CGROUP_WEIGHT_INVALID,
                 .startup_io_weight = CGROUP_WEIGHT_INVALID,
@@ -160,12 +191,331 @@ void cgroup_context_init(CGroupContext *c) {
                 .blockio_weight = CGROUP_BLKIO_WEIGHT_INVALID,
                 .startup_blockio_weight = CGROUP_BLKIO_WEIGHT_INVALID,
 
-                .tasks_max = TASKS_MAX_UNSET,
+                .tasks_max = CGROUP_TASKS_MAX_UNSET,
 
                 .moom_swap = MANAGED_OOM_AUTO,
                 .moom_mem_pressure = MANAGED_OOM_AUTO,
                 .moom_preference = MANAGED_OOM_PREFERENCE_NONE,
+                /* The default duration value in oomd.conf will be used when
+                 * moom_mem_pressure_duration_usec is set to infinity. */
+                .moom_mem_pressure_duration_usec = USEC_INFINITY,
+
+                .memory_pressure_watch = _CGROUP_PRESSURE_WATCH_INVALID,
+                .memory_pressure_threshold_usec = USEC_INFINITY,
         };
+}
+
+int cgroup_context_add_io_device_weight_dup(CGroupContext *c, const CGroupIODeviceWeight *w) {
+        _cleanup_free_ CGroupIODeviceWeight *n = NULL;
+
+        assert(c);
+        assert(w);
+
+        n = new(CGroupIODeviceWeight, 1);
+        if (!n)
+                return -ENOMEM;
+
+        *n = (CGroupIODeviceWeight) {
+                .path = strdup(w->path),
+                .weight = w->weight,
+        };
+        if (!n->path)
+                return -ENOMEM;
+
+        LIST_PREPEND(device_weights, c->io_device_weights, TAKE_PTR(n));
+        return 0;
+}
+
+int cgroup_context_add_io_device_limit_dup(CGroupContext *c, const CGroupIODeviceLimit *l) {
+        _cleanup_free_ CGroupIODeviceLimit *n = NULL;
+
+        assert(c);
+        assert(l);
+
+        n = new0(CGroupIODeviceLimit, 1);
+        if (!n)
+                return -ENOMEM;
+
+        n->path = strdup(l->path);
+        if (!n->path)
+                return -ENOMEM;
+
+        for (CGroupIOLimitType type = 0; type < _CGROUP_IO_LIMIT_TYPE_MAX; type++)
+                n->limits[type] = l->limits[type];
+
+        LIST_PREPEND(device_limits, c->io_device_limits, TAKE_PTR(n));
+        return 0;
+}
+
+int cgroup_context_add_io_device_latency_dup(CGroupContext *c, const CGroupIODeviceLatency *l) {
+        _cleanup_free_ CGroupIODeviceLatency *n = NULL;
+
+        assert(c);
+        assert(l);
+
+        n = new(CGroupIODeviceLatency, 1);
+        if (!n)
+                return -ENOMEM;
+
+        *n = (CGroupIODeviceLatency) {
+                .path = strdup(l->path),
+                .target_usec = l->target_usec,
+        };
+        if (!n->path)
+                return -ENOMEM;
+
+        LIST_PREPEND(device_latencies, c->io_device_latencies, TAKE_PTR(n));
+        return 0;
+}
+
+int cgroup_context_add_block_io_device_weight_dup(CGroupContext *c, const CGroupBlockIODeviceWeight *w) {
+        _cleanup_free_ CGroupBlockIODeviceWeight *n = NULL;
+
+        assert(c);
+        assert(w);
+
+        n = new(CGroupBlockIODeviceWeight, 1);
+        if (!n)
+                return -ENOMEM;
+
+        *n = (CGroupBlockIODeviceWeight) {
+                .path = strdup(w->path),
+                .weight = w->weight,
+        };
+        if (!n->path)
+                return -ENOMEM;
+
+        LIST_PREPEND(device_weights, c->blockio_device_weights, TAKE_PTR(n));
+        return 0;
+}
+
+int cgroup_context_add_block_io_device_bandwidth_dup(CGroupContext *c, const CGroupBlockIODeviceBandwidth *b) {
+        _cleanup_free_ CGroupBlockIODeviceBandwidth *n = NULL;
+
+        assert(c);
+        assert(b);
+
+        n = new(CGroupBlockIODeviceBandwidth, 1);
+        if (!n)
+                return -ENOMEM;
+
+        *n = (CGroupBlockIODeviceBandwidth) {
+                .rbps = b->rbps,
+                .wbps = b->wbps,
+        };
+
+        LIST_PREPEND(device_bandwidths, c->blockio_device_bandwidths, TAKE_PTR(n));
+        return 0;
+}
+
+int cgroup_context_add_device_allow_dup(CGroupContext *c, const CGroupDeviceAllow *a) {
+        _cleanup_free_ CGroupDeviceAllow *n = NULL;
+
+        assert(c);
+        assert(a);
+
+        n = new(CGroupDeviceAllow, 1);
+        if (!n)
+                return -ENOMEM;
+
+        *n = (CGroupDeviceAllow) {
+                .path = strdup(a->path),
+                .permissions = a->permissions,
+        };
+        if (!n->path)
+                return -ENOMEM;
+
+        LIST_PREPEND(device_allow, c->device_allow, TAKE_PTR(n));
+        return 0;
+}
+
+static int cgroup_context_add_socket_bind_item_dup(CGroupContext *c, const CGroupSocketBindItem *i, CGroupSocketBindItem *h) {
+        _cleanup_free_ CGroupSocketBindItem *n = NULL;
+
+        assert(c);
+        assert(i);
+
+        n = new(CGroupSocketBindItem, 1);
+        if (!n)
+                return -ENOMEM;
+
+        *n = (CGroupSocketBindItem) {
+                .address_family = i->address_family,
+                .ip_protocol    = i->ip_protocol,
+                .nr_ports       = i->nr_ports,
+                .port_min       = i->port_min,
+        };
+
+        LIST_PREPEND(socket_bind_items, h, TAKE_PTR(n));
+        return 0;
+}
+
+int cgroup_context_add_socket_bind_item_allow_dup(CGroupContext *c, const CGroupSocketBindItem *i) {
+        return cgroup_context_add_socket_bind_item_dup(c, i, c->socket_bind_allow);
+}
+
+int cgroup_context_add_socket_bind_item_deny_dup(CGroupContext *c, const CGroupSocketBindItem *i) {
+        return cgroup_context_add_socket_bind_item_dup(c, i, c->socket_bind_deny);
+}
+
+int cgroup_context_copy(CGroupContext *dst, const CGroupContext *src) {
+        struct in_addr_prefix *i;
+        char *iface;
+        int r;
+
+        assert(src);
+        assert(dst);
+
+        dst->cpu_accounting = src->cpu_accounting;
+        dst->io_accounting = src->io_accounting;
+        dst->blockio_accounting = src->blockio_accounting;
+        dst->memory_accounting = src->memory_accounting;
+        dst->tasks_accounting = src->tasks_accounting;
+        dst->ip_accounting = src->ip_accounting;
+
+        dst->memory_oom_group = src->memory_oom_group;
+
+        dst->cpu_weight = src->cpu_weight;
+        dst->startup_cpu_weight = src->startup_cpu_weight;
+        dst->cpu_quota_per_sec_usec = src->cpu_quota_per_sec_usec;
+        dst->cpu_quota_period_usec = src->cpu_quota_period_usec;
+
+        dst->cpuset_cpus = src->cpuset_cpus;
+        dst->startup_cpuset_cpus = src->startup_cpuset_cpus;
+        dst->cpuset_mems = src->cpuset_mems;
+        dst->startup_cpuset_mems = src->startup_cpuset_mems;
+
+        dst->io_weight = src->io_weight;
+        dst->startup_io_weight = src->startup_io_weight;
+
+        LIST_FOREACH_BACKWARDS(device_weights, w, LIST_FIND_TAIL(device_weights, src->io_device_weights)) {
+                r = cgroup_context_add_io_device_weight_dup(dst, w);
+                if (r < 0)
+                        return r;
+        }
+
+        LIST_FOREACH_BACKWARDS(device_limits, l, LIST_FIND_TAIL(device_limits, src->io_device_limits)) {
+                r = cgroup_context_add_io_device_limit_dup(dst, l);
+                if (r < 0)
+                        return r;
+        }
+
+        LIST_FOREACH_BACKWARDS(device_latencies, l, LIST_FIND_TAIL(device_latencies, src->io_device_latencies)) {
+                r = cgroup_context_add_io_device_latency_dup(dst, l);
+                if (r < 0)
+                        return r;
+        }
+
+        dst->default_memory_min = src->default_memory_min;
+        dst->default_memory_low = src->default_memory_low;
+        dst->default_startup_memory_low = src->default_startup_memory_low;
+        dst->memory_min = src->memory_min;
+        dst->memory_low = src->memory_low;
+        dst->startup_memory_low = src->startup_memory_low;
+        dst->memory_high = src->memory_high;
+        dst->startup_memory_high = src->startup_memory_high;
+        dst->memory_max = src->memory_max;
+        dst->startup_memory_max = src->startup_memory_max;
+        dst->memory_swap_max = src->memory_swap_max;
+        dst->startup_memory_swap_max = src->startup_memory_swap_max;
+        dst->memory_zswap_max = src->memory_zswap_max;
+        dst->startup_memory_zswap_max = src->startup_memory_zswap_max;
+
+        dst->default_memory_min_set = src->default_memory_min_set;
+        dst->default_memory_low_set = src->default_memory_low_set;
+        dst->default_startup_memory_low_set = src->default_startup_memory_low_set;
+        dst->memory_min_set = src->memory_min_set;
+        dst->memory_low_set = src->memory_low_set;
+        dst->startup_memory_low_set = src->startup_memory_low_set;
+        dst->startup_memory_high_set = src->startup_memory_high_set;
+        dst->startup_memory_max_set = src->startup_memory_max_set;
+        dst->startup_memory_swap_max_set = src->startup_memory_swap_max_set;
+        dst->startup_memory_zswap_max_set = src->startup_memory_zswap_max_set;
+        dst->memory_zswap_writeback = src->memory_zswap_writeback;
+
+        SET_FOREACH(i, src->ip_address_allow) {
+                r = in_addr_prefix_add(&dst->ip_address_allow, i);
+                if (r < 0)
+                        return r;
+        }
+
+        SET_FOREACH(i, src->ip_address_deny) {
+                r = in_addr_prefix_add(&dst->ip_address_deny, i);
+                if (r < 0)
+                        return r;
+        }
+
+        dst->ip_address_allow_reduced = src->ip_address_allow_reduced;
+        dst->ip_address_deny_reduced = src->ip_address_deny_reduced;
+
+        if (!strv_isempty(src->ip_filters_ingress)) {
+                dst->ip_filters_ingress = strv_copy(src->ip_filters_ingress);
+                if (!dst->ip_filters_ingress)
+                        return -ENOMEM;
+        }
+
+        if (!strv_isempty(src->ip_filters_egress)) {
+                dst->ip_filters_egress = strv_copy(src->ip_filters_egress);
+                if (!dst->ip_filters_egress)
+                        return -ENOMEM;
+        }
+
+        LIST_FOREACH_BACKWARDS(programs, l, LIST_FIND_TAIL(programs, src->bpf_foreign_programs)) {
+                r = cgroup_context_add_bpf_foreign_program_dup(dst, l);
+                if (r < 0)
+                        return r;
+        }
+
+        SET_FOREACH(iface, src->restrict_network_interfaces) {
+                r = set_put_strdup(&dst->restrict_network_interfaces, iface);
+                if (r < 0)
+                        return r;
+        }
+        dst->restrict_network_interfaces_is_allow_list = src->restrict_network_interfaces_is_allow_list;
+
+        dst->cpu_shares = src->cpu_shares;
+        dst->startup_cpu_shares = src->startup_cpu_shares;
+
+        dst->blockio_weight = src->blockio_weight;
+        dst->startup_blockio_weight = src->startup_blockio_weight;
+
+        LIST_FOREACH_BACKWARDS(device_weights, l, LIST_FIND_TAIL(device_weights, src->blockio_device_weights)) {
+                r = cgroup_context_add_block_io_device_weight_dup(dst, l);
+                if (r < 0)
+                        return r;
+        }
+
+        LIST_FOREACH_BACKWARDS(device_bandwidths, l, LIST_FIND_TAIL(device_bandwidths, src->blockio_device_bandwidths)) {
+                r = cgroup_context_add_block_io_device_bandwidth_dup(dst, l);
+                if (r < 0)
+                        return r;
+        }
+
+        dst->memory_limit = src->memory_limit;
+
+        dst->device_policy = src->device_policy;
+        LIST_FOREACH_BACKWARDS(device_allow, l, LIST_FIND_TAIL(device_allow, src->device_allow)) {
+                r = cgroup_context_add_device_allow_dup(dst, l);
+                if (r < 0)
+                        return r;
+        }
+
+        LIST_FOREACH_BACKWARDS(socket_bind_items, l, LIST_FIND_TAIL(socket_bind_items, src->socket_bind_allow)) {
+                r = cgroup_context_add_socket_bind_item_allow_dup(dst, l);
+                if (r < 0)
+                        return r;
+
+        }
+
+        LIST_FOREACH_BACKWARDS(socket_bind_items, l, LIST_FIND_TAIL(socket_bind_items, src->socket_bind_deny)) {
+                r = cgroup_context_add_socket_bind_item_deny_dup(dst, l);
+                if (r < 0)
+                        return r;
+        }
+
+        dst->tasks_max = src->tasks_max;
+
+        return 0;
 }
 
 void cgroup_context_free_device_allow(CGroupContext *c, CGroupDeviceAllow *a) {
@@ -234,11 +584,7 @@ void cgroup_context_remove_bpf_foreign_program(CGroupContext *c, CGroupBPFForeig
 void cgroup_context_remove_socket_bind(CGroupSocketBindItem **head) {
         assert(head);
 
-        while (*head) {
-                CGroupSocketBindItem *h = *head;
-                LIST_REMOVE(socket_bind_items, *head, h);
-                free(h);
-        }
+        LIST_CLEAR(socket_bind_items, *head, free);
 }
 
 void cgroup_context_done(CGroupContext *c) {
@@ -280,15 +626,20 @@ void cgroup_context_done(CGroupContext *c) {
         cpu_set_reset(&c->startup_cpuset_cpus);
         cpu_set_reset(&c->cpuset_mems);
         cpu_set_reset(&c->startup_cpuset_mems);
+
+        c->delegate_subgroup = mfree(c->delegate_subgroup);
+
+        nft_set_context_clear(&c->nft_set_context);
 }
 
 static int unit_get_kernel_memory_limit(Unit *u, const char *file, uint64_t *ret) {
         assert(u);
 
-        if (!u->cgroup_realized)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return -EOWNERDEAD;
 
-        return cg_get_attribute_as_uint64("memory", u->cgroup_path, file, ret);
+        return cg_get_attribute_as_uint64("memory", crt->cgroup_path, file, ret);
 }
 
 static int unit_compare_memory_limit(Unit *u, const char *property_name, uint64_t *ret_unit_value, uint64_t *ret_kernel_value) {
@@ -339,8 +690,13 @@ static int unit_compare_memory_limit(Unit *u, const char *property_name, uint64_
 
         assert_se(c = unit_get_cgroup_context(u));
 
+        bool startup = u->manager && IN_SET(manager_state(u->manager), MANAGER_STARTING, MANAGER_INITIALIZING, MANAGER_STOPPING);
+
         if (streq(property_name, "MemoryLow")) {
                 unit_value = unit_get_ancestor_memory_low(u);
+                file = "memory.low";
+        } else if (startup && streq(property_name, "StartupMemoryLow")) {
+                unit_value = unit_get_ancestor_startup_memory_low(u);
                 file = "memory.low";
         } else if (streq(property_name, "MemoryMin")) {
                 unit_value = unit_get_ancestor_memory_min(u);
@@ -348,12 +704,27 @@ static int unit_compare_memory_limit(Unit *u, const char *property_name, uint64_
         } else if (streq(property_name, "MemoryHigh")) {
                 unit_value = c->memory_high;
                 file = "memory.high";
+        } else if (startup && streq(property_name, "StartupMemoryHigh")) {
+                unit_value = c->startup_memory_high;
+                file = "memory.high";
         } else if (streq(property_name, "MemoryMax")) {
                 unit_value = c->memory_max;
+                file = "memory.max";
+        } else if (startup && streq(property_name, "StartupMemoryMax")) {
+                unit_value = c->startup_memory_max;
                 file = "memory.max";
         } else if (streq(property_name, "MemorySwapMax")) {
                 unit_value = c->memory_swap_max;
                 file = "memory.swap.max";
+        } else if (startup && streq(property_name, "StartupMemorySwapMax")) {
+                unit_value = c->startup_memory_swap_max;
+                file = "memory.swap.max";
+        } else if (streq(property_name, "MemoryZSwapMax")) {
+                unit_value = c->memory_zswap_max;
+                file = "memory.zswap.max";
+        } else if (startup && streq(property_name, "StartupMemoryZSwapMax")) {
+                unit_value = c->startup_memory_zswap_max;
+                file = "memory.zswap.max";
         } else
                 return -EINVAL;
 
@@ -384,11 +755,12 @@ static int unit_compare_memory_limit(Unit *u, const char *property_name, uint64_
 
 #define FORMAT_CGROUP_DIFF_MAX 128
 
-static char *format_cgroup_memory_limit_comparison(char *buf, size_t l, Unit *u, const char *property_name) {
+static char *format_cgroup_memory_limit_comparison(Unit *u, const char *property_name, char *buf, size_t l) {
         uint64_t kval, sval;
         int r;
 
         assert(u);
+        assert(property_name);
         assert(buf);
         assert(l > 0);
 
@@ -396,9 +768,14 @@ static char *format_cgroup_memory_limit_comparison(char *buf, size_t l, Unit *u,
 
         /* memory.swap.max is special in that it relies on CONFIG_MEMCG_SWAP (and the default swapaccount=1).
          * In the absence of reliably being able to detect whether memcg swap support is available or not,
-         * only complain if the error is not ENOENT. */
+         * only complain if the error is not ENOENT. This is similarly the case for memory.zswap.max relying
+         * on CONFIG_ZSWAP. */
         if (r > 0 || IN_SET(r, -ENODATA, -EOWNERDEAD) ||
-            (r == -ENOENT && streq(property_name, "MemorySwapMax")))
+            (r == -ENOENT && STR_IN_SET(property_name,
+                                        "MemorySwapMax",
+                                        "StartupMemorySwapMax",
+                                        "MemoryZSwapMax",
+                                        "StartupMemoryZSwapMax")))
                 buf[0] = 0;
         else if (r < 0) {
                 errno = -r;
@@ -409,16 +786,53 @@ static char *format_cgroup_memory_limit_comparison(char *buf, size_t l, Unit *u,
         return buf;
 }
 
+const char* cgroup_device_permissions_to_string(CGroupDevicePermissions p) {
+        static const char *table[_CGROUP_DEVICE_PERMISSIONS_MAX] = {
+                /* Lets simply define a table with every possible combination. As long as those are just 8 we
+                 * can get away with it. If this ever grows to more we need to revisit this logic though. */
+                [0]                                                          = "",
+                [CGROUP_DEVICE_READ]                                         = "r",
+                [CGROUP_DEVICE_WRITE]                                        = "w",
+                [CGROUP_DEVICE_MKNOD]                                        = "m",
+                [CGROUP_DEVICE_READ|CGROUP_DEVICE_WRITE]                     = "rw",
+                [CGROUP_DEVICE_READ|CGROUP_DEVICE_MKNOD]                     = "rm",
+                [CGROUP_DEVICE_WRITE|CGROUP_DEVICE_MKNOD]                    = "wm",
+                [CGROUP_DEVICE_READ|CGROUP_DEVICE_WRITE|CGROUP_DEVICE_MKNOD] = "rwm",
+        };
+
+        if (p < 0 || p >= _CGROUP_DEVICE_PERMISSIONS_MAX)
+                return NULL;
+
+        return table[p];
+}
+
+CGroupDevicePermissions cgroup_device_permissions_from_string(const char *s) {
+        CGroupDevicePermissions p = 0;
+
+        if (!s)
+                return _CGROUP_DEVICE_PERMISSIONS_INVALID;
+
+        for (const char *c = s; *c; c++) {
+                if (*c == 'r')
+                        p |= CGROUP_DEVICE_READ;
+                else if (*c == 'w')
+                        p |= CGROUP_DEVICE_WRITE;
+                else if (*c == 'm')
+                        p |= CGROUP_DEVICE_MKNOD;
+                else
+                        return _CGROUP_DEVICE_PERMISSIONS_INVALID;
+        }
+
+        return p;
+}
+
 void cgroup_context_dump(Unit *u, FILE* f, const char *prefix) {
-        _cleanup_free_ char *disable_controllers_str = NULL, *cpuset_cpus = NULL, *cpuset_mems = NULL, *startup_cpuset_cpus = NULL, *startup_cpuset_mems = NULL;
+        _cleanup_free_ char *disable_controllers_str = NULL, *delegate_controllers_str = NULL, *cpuset_cpus = NULL, *cpuset_mems = NULL, *startup_cpuset_cpus = NULL, *startup_cpuset_mems = NULL;
         CGroupContext *c;
         struct in_addr_prefix *iaai;
-
-        char cda[FORMAT_CGROUP_DIFF_MAX];
-        char cdb[FORMAT_CGROUP_DIFF_MAX];
-        char cdc[FORMAT_CGROUP_DIFF_MAX];
-        char cdd[FORMAT_CGROUP_DIFF_MAX];
-        char cde[FORMAT_CGROUP_DIFF_MAX];
+        char cda[FORMAT_CGROUP_DIFF_MAX], cdb[FORMAT_CGROUP_DIFF_MAX], cdc[FORMAT_CGROUP_DIFF_MAX], cdd[FORMAT_CGROUP_DIFF_MAX],
+                cde[FORMAT_CGROUP_DIFF_MAX], cdf[FORMAT_CGROUP_DIFF_MAX], cdg[FORMAT_CGROUP_DIFF_MAX], cdh[FORMAT_CGROUP_DIFF_MAX],
+                cdi[FORMAT_CGROUP_DIFF_MAX], cdj[FORMAT_CGROUP_DIFF_MAX], cdk[FORMAT_CGROUP_DIFF_MAX];
 
         assert(u);
         assert(f);
@@ -428,6 +842,10 @@ void cgroup_context_dump(Unit *u, FILE* f, const char *prefix) {
         prefix = strempty(prefix);
 
         (void) cg_mask_to_string(c->disable_controllers, &disable_controllers_str);
+        (void) cg_mask_to_string(c->delegate_controllers, &delegate_controllers_str);
+
+        /* "Delegate=" means "yes, but no controllers". Show this as "(none)". */
+        const char *delegate_str = delegate_controllers_str ?: c->delegate ? "(none)" : "no";
 
         cpuset_cpus = cpu_set_to_range_string(&c->cpuset_cpus);
         startup_cpuset_cpus = cpu_set_to_range_string(&c->startup_cpuset_cpus);
@@ -459,9 +877,16 @@ void cgroup_context_dump(Unit *u, FILE* f, const char *prefix) {
                 "%sDefaultMemoryLow: %" PRIu64 "\n"
                 "%sMemoryMin: %" PRIu64 "%s\n"
                 "%sMemoryLow: %" PRIu64 "%s\n"
+                "%sStartupMemoryLow: %" PRIu64 "%s\n"
                 "%sMemoryHigh: %" PRIu64 "%s\n"
+                "%sStartupMemoryHigh: %" PRIu64 "%s\n"
                 "%sMemoryMax: %" PRIu64 "%s\n"
+                "%sStartupMemoryMax: %" PRIu64 "%s\n"
                 "%sMemorySwapMax: %" PRIu64 "%s\n"
+                "%sStartupMemorySwapMax: %" PRIu64 "%s\n"
+                "%sMemoryZSwapMax: %" PRIu64 "%s\n"
+                "%sStartupMemoryZSwapMax: %" PRIu64 "%s\n"
+                "%sMemoryZSwapWriteback: %s\n"
                 "%sMemoryLimit: %" PRIu64 "\n"
                 "%sTasksMax: %" PRIu64 "\n"
                 "%sDevicePolicy: %s\n"
@@ -470,7 +895,9 @@ void cgroup_context_dump(Unit *u, FILE* f, const char *prefix) {
                 "%sManagedOOMSwap: %s\n"
                 "%sManagedOOMMemoryPressure: %s\n"
                 "%sManagedOOMMemoryPressureLimit: " PERMYRIAD_AS_PERCENT_FORMAT_STR "\n"
-                "%sManagedOOMPreference: %s\n",
+                "%sManagedOOMPreference: %s\n"
+                "%sMemoryPressureWatch: %s\n"
+                "%sCoredumpReceive: %s\n",
                 prefix, yes_no(c->cpu_accounting),
                 prefix, yes_no(c->io_accounting),
                 prefix, yes_no(c->blockio_accounting),
@@ -493,37 +920,49 @@ void cgroup_context_dump(Unit *u, FILE* f, const char *prefix) {
                 prefix, c->startup_blockio_weight,
                 prefix, c->default_memory_min,
                 prefix, c->default_memory_low,
-                prefix, c->memory_min, format_cgroup_memory_limit_comparison(cda, sizeof(cda), u, "MemoryMin"),
-                prefix, c->memory_low, format_cgroup_memory_limit_comparison(cdb, sizeof(cdb), u, "MemoryLow"),
-                prefix, c->memory_high, format_cgroup_memory_limit_comparison(cdc, sizeof(cdc), u, "MemoryHigh"),
-                prefix, c->memory_max, format_cgroup_memory_limit_comparison(cdd, sizeof(cdd), u, "MemoryMax"),
-                prefix, c->memory_swap_max, format_cgroup_memory_limit_comparison(cde, sizeof(cde), u, "MemorySwapMax"),
+                prefix, c->memory_min, format_cgroup_memory_limit_comparison(u, "MemoryMin", cda, sizeof(cda)),
+                prefix, c->memory_low, format_cgroup_memory_limit_comparison(u, "MemoryLow", cdb, sizeof(cdb)),
+                prefix, c->startup_memory_low, format_cgroup_memory_limit_comparison(u, "StartupMemoryLow", cdc, sizeof(cdc)),
+                prefix, c->memory_high, format_cgroup_memory_limit_comparison(u, "MemoryHigh", cdd, sizeof(cdd)),
+                prefix, c->startup_memory_high, format_cgroup_memory_limit_comparison(u, "StartupMemoryHigh", cde, sizeof(cde)),
+                prefix, c->memory_max, format_cgroup_memory_limit_comparison(u, "MemoryMax", cdf, sizeof(cdf)),
+                prefix, c->startup_memory_max, format_cgroup_memory_limit_comparison(u, "StartupMemoryMax", cdg, sizeof(cdg)),
+                prefix, c->memory_swap_max, format_cgroup_memory_limit_comparison(u, "MemorySwapMax", cdh, sizeof(cdh)),
+                prefix, c->startup_memory_swap_max, format_cgroup_memory_limit_comparison(u, "StartupMemorySwapMax", cdi, sizeof(cdi)),
+                prefix, c->memory_zswap_max, format_cgroup_memory_limit_comparison(u, "MemoryZSwapMax", cdj, sizeof(cdj)),
+                prefix, c->startup_memory_zswap_max, format_cgroup_memory_limit_comparison(u, "StartupMemoryZSwapMax", cdk, sizeof(cdk)),
+                prefix, yes_no(c->memory_zswap_writeback),
                 prefix, c->memory_limit,
-                prefix, tasks_max_resolve(&c->tasks_max),
+                prefix, cgroup_tasks_max_resolve(&c->tasks_max),
                 prefix, cgroup_device_policy_to_string(c->device_policy),
                 prefix, strempty(disable_controllers_str),
-                prefix, yes_no(c->delegate),
+                prefix, delegate_str,
                 prefix, managed_oom_mode_to_string(c->moom_swap),
                 prefix, managed_oom_mode_to_string(c->moom_mem_pressure),
                 prefix, PERMYRIAD_AS_PERCENT_FORMAT_VAL(UINT32_SCALE_TO_PERMYRIAD(c->moom_mem_pressure_limit)),
-                prefix, managed_oom_preference_to_string(c->moom_preference));
+                prefix, managed_oom_preference_to_string(c->moom_preference),
+                prefix, cgroup_pressure_watch_to_string(c->memory_pressure_watch),
+                prefix, yes_no(c->coredump_receive));
 
-        if (c->delegate) {
-                _cleanup_free_ char *t = NULL;
+        if (c->delegate_subgroup)
+                fprintf(f, "%sDelegateSubgroup: %s\n",
+                        prefix, c->delegate_subgroup);
 
-                (void) cg_mask_to_string(c->delegate_controllers, &t);
+        if (c->memory_pressure_threshold_usec != USEC_INFINITY)
+                fprintf(f, "%sMemoryPressureThresholdSec: %s\n",
+                        prefix, FORMAT_TIMESPAN(c->memory_pressure_threshold_usec, 1));
 
-                fprintf(f, "%sDelegateControllers: %s\n",
-                        prefix,
-                        strempty(t));
-        }
+        if (c->moom_mem_pressure_duration_usec != USEC_INFINITY)
+                fprintf(f, "%sManagedOOMMemoryPressureDurationSec: %s\n",
+                        prefix, FORMAT_TIMESPAN(c->moom_mem_pressure_duration_usec, 1));
 
         LIST_FOREACH(device_allow, a, c->device_allow)
+                /* strna() below should be redundant, for avoiding -Werror=format-overflow= error. See #30223. */
                 fprintf(f,
-                        "%sDeviceAllow: %s %s%s%s\n",
+                        "%sDeviceAllow: %s %s\n",
                         prefix,
                         a->path,
-                        a->r ? "r" : "", a->w ? "w" : "", a->m ? "m" : "");
+                        strna(cgroup_device_permissions_to_string(a->permissions)));
 
         LIST_FOREACH(device_weights, iw, c->io_device_weights)
                 fprintf(f,
@@ -604,6 +1043,10 @@ void cgroup_context_dump(Unit *u, FILE* f, const char *prefix) {
                 SET_FOREACH(iface, c->restrict_network_interfaces)
                         fprintf(f, "%sRestrictNetworkInterfaces: %s\n", prefix, iface);
         }
+
+        FOREACH_ARRAY(nft_set, c->nft_set_context.sets, c->nft_set_context.n_sets)
+                fprintf(f, "%sNFTSet: %s:%s:%s:%s\n", prefix, nft_set_source_to_string(nft_set->source),
+                        nfproto_to_string(nft_set->nfproto), nft_set->table, nft_set->set);
 }
 
 void cgroup_context_dump_socket_bind_item(const CGroupSocketBindItem *item, FILE *f) {
@@ -641,13 +1084,16 @@ void cgroup_context_dump_socket_bind_items(const CGroupSocketBindItem *items, FI
         }
 }
 
-int cgroup_add_device_allow(CGroupContext *c, const char *dev, const char *mode) {
+int cgroup_context_add_device_allow(CGroupContext *c, const char *dev, CGroupDevicePermissions p) {
         _cleanup_free_ CGroupDeviceAllow *a = NULL;
         _cleanup_free_ char *d = NULL;
 
         assert(c);
         assert(dev);
-        assert(isempty(mode) || in_charset(mode, "rwm"));
+        assert(p >= 0 && p < _CGROUP_DEVICE_PERMISSIONS_MAX);
+
+        if (p == 0)
+                p = _CGROUP_DEVICE_PERMISSIONS_ALL;
 
         a = new(CGroupDeviceAllow, 1);
         if (!a)
@@ -659,9 +1105,7 @@ int cgroup_add_device_allow(CGroupContext *c, const char *dev, const char *mode)
 
         *a = (CGroupDeviceAllow) {
                 .path = TAKE_PTR(d),
-                .r = isempty(mode) || strchr(mode, 'r'),
-                .w = isempty(mode) || strchr(mode, 'w'),
-                .m = isempty(mode) || strchr(mode, 'm'),
+                .permissions = p,
         };
 
         LIST_PREPEND(device_allow, c->device_allow, a);
@@ -670,7 +1114,24 @@ int cgroup_add_device_allow(CGroupContext *c, const char *dev, const char *mode)
         return 0;
 }
 
-int cgroup_add_bpf_foreign_program(CGroupContext *c, uint32_t attach_type, const char *bpffs_path) {
+int cgroup_context_add_or_update_device_allow(CGroupContext *c, const char *dev, CGroupDevicePermissions p) {
+        assert(c);
+        assert(dev);
+        assert(p >= 0 && p < _CGROUP_DEVICE_PERMISSIONS_MAX);
+
+        if (p == 0)
+                p = _CGROUP_DEVICE_PERMISSIONS_ALL;
+
+        LIST_FOREACH(device_allow, b, c->device_allow)
+                if (path_equal(b->path, dev)) {
+                        b->permissions = p;
+                        return 0;
+                }
+
+        return cgroup_context_add_device_allow(c, dev, p);
+}
+
+int cgroup_context_add_bpf_foreign_program(CGroupContext *c, uint32_t attach_type, const char *bpffs_path) {
         CGroupBPFForeignProgram *p;
         _cleanup_free_ char *d = NULL;
 
@@ -678,7 +1139,7 @@ int cgroup_add_bpf_foreign_program(CGroupContext *c, uint32_t attach_type, const
         assert(bpffs_path);
 
         if (!path_is_normalized(bpffs_path) || !path_is_absolute(bpffs_path))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Path is not normalized: %m");
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Path is not normalized.");
 
         d = strdup(bpffs_path);
         if (!d)
@@ -725,45 +1186,40 @@ int cgroup_add_bpf_foreign_program(CGroupContext *c, uint32_t attach_type, const
 }
 
 UNIT_DEFINE_ANCESTOR_MEMORY_LOOKUP(memory_low);
+UNIT_DEFINE_ANCESTOR_MEMORY_LOOKUP(startup_memory_low);
 UNIT_DEFINE_ANCESTOR_MEMORY_LOOKUP(memory_min);
 
-static void unit_set_xattr_graceful(Unit *u, const char *cgroup_path, const char *name, const void *data, size_t size) {
+static void unit_set_xattr_graceful(Unit *u, const char *name, const void *data, size_t size) {
         int r;
 
         assert(u);
         assert(name);
 
-        if (!cgroup_path) {
-                if (!u->cgroup_path)
-                        return;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return;
 
-                cgroup_path = u->cgroup_path;
-        }
-
-        r = cg_set_xattr(SYSTEMD_CGROUP_CONTROLLER, cgroup_path, name, data, size, 0);
+        r = cg_set_xattr(crt->cgroup_path, name, data, size, 0);
         if (r < 0)
-                log_unit_debug_errno(u, r, "Failed to set '%s' xattr on control group %s, ignoring: %m", name, empty_to_root(cgroup_path));
+                log_unit_debug_errno(u, r, "Failed to set '%s' xattr on control group %s, ignoring: %m", name, empty_to_root(crt->cgroup_path));
 }
 
-static void unit_remove_xattr_graceful(Unit *u, const char *cgroup_path, const char *name) {
+static void unit_remove_xattr_graceful(Unit *u, const char *name) {
         int r;
 
         assert(u);
         assert(name);
 
-        if (!cgroup_path) {
-                if (!u->cgroup_path)
-                        return;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return;
 
-                cgroup_path = u->cgroup_path;
-        }
-
-        r = cg_remove_xattr(SYSTEMD_CGROUP_CONTROLLER, cgroup_path, name);
+        r = cg_remove_xattr(crt->cgroup_path, name);
         if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
-                log_unit_debug_errno(u, r, "Failed to remove '%s' xattr flag on control group %s, ignoring: %m", name, empty_to_root(cgroup_path));
+                log_unit_debug_errno(u, r, "Failed to remove '%s' xattr flag on control group %s, ignoring: %m", name, empty_to_root(crt->cgroup_path));
 }
 
-void cgroup_oomd_xattr_apply(Unit *u, const char *cgroup_path) {
+static void cgroup_oomd_xattr_apply(Unit *u) {
         CGroupContext *c;
 
         assert(u);
@@ -773,36 +1229,97 @@ void cgroup_oomd_xattr_apply(Unit *u, const char *cgroup_path) {
                 return;
 
         if (c->moom_preference == MANAGED_OOM_PREFERENCE_OMIT)
-                unit_set_xattr_graceful(u, cgroup_path, "user.oomd_omit", "1", 1);
+                unit_set_xattr_graceful(u, "user.oomd_omit", "1", 1);
 
         if (c->moom_preference == MANAGED_OOM_PREFERENCE_AVOID)
-                unit_set_xattr_graceful(u, cgroup_path, "user.oomd_avoid", "1", 1);
+                unit_set_xattr_graceful(u, "user.oomd_avoid", "1", 1);
 
         if (c->moom_preference != MANAGED_OOM_PREFERENCE_AVOID)
-                unit_remove_xattr_graceful(u, cgroup_path, "user.oomd_avoid");
+                unit_remove_xattr_graceful(u, "user.oomd_avoid");
 
         if (c->moom_preference != MANAGED_OOM_PREFERENCE_OMIT)
-                unit_remove_xattr_graceful(u, cgroup_path, "user.oomd_omit");
+                unit_remove_xattr_graceful(u, "user.oomd_omit");
 }
 
-static void cgroup_xattr_apply(Unit *u) {
+static int cgroup_log_xattr_apply(Unit *u) {
+        ExecContext *c;
+        size_t len, allowed_patterns_len, denied_patterns_len;
+        _cleanup_free_ char *patterns = NULL, *allowed_patterns = NULL, *denied_patterns = NULL;
+        char *last;
+        int r;
+
+        assert(u);
+
+        c = unit_get_exec_context(u);
+        if (!c)
+                /* Some unit types have a cgroup context but no exec context, so we do not log
+                 * any error here to avoid confusion. */
+                return 0;
+
+        if (set_isempty(c->log_filter_allowed_patterns) && set_isempty(c->log_filter_denied_patterns)) {
+                unit_remove_xattr_graceful(u, "user.journald_log_filter_patterns");
+                return 0;
+        }
+
+        r = set_make_nulstr(c->log_filter_allowed_patterns, &allowed_patterns, &allowed_patterns_len);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to make nulstr from set: %m");
+
+        r = set_make_nulstr(c->log_filter_denied_patterns, &denied_patterns, &denied_patterns_len);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to make nulstr from set: %m");
+
+        /* Use nul character separated strings without trailing nul */
+        allowed_patterns_len = LESS_BY(allowed_patterns_len, 1u);
+        denied_patterns_len = LESS_BY(denied_patterns_len, 1u);
+
+        len = allowed_patterns_len + 1 + denied_patterns_len;
+        patterns = new(char, len);
+        if (!patterns)
+                return log_oom_debug();
+
+        last = mempcpy_safe(patterns, allowed_patterns, allowed_patterns_len);
+        *(last++) = '\xff';
+        memcpy_safe(last, denied_patterns, denied_patterns_len);
+
+        unit_set_xattr_graceful(u, "user.journald_log_filter_patterns", patterns, len);
+
+        return 0;
+}
+
+static void cgroup_invocation_id_xattr_apply(Unit *u) {
         bool b;
 
         assert(u);
 
-        /* The 'user.*' xattrs can be set from a user manager. */
-        cgroup_oomd_xattr_apply(u, u->cgroup_path);
-
-        if (!MANAGER_IS_SYSTEM(u->manager))
-                return;
-
         b = !sd_id128_is_null(u->invocation_id);
         FOREACH_STRING(xn, "trusted.invocation_id", "user.invocation_id") {
                 if (b)
-                        unit_set_xattr_graceful(u, NULL, xn, SD_ID128_TO_STRING(u->invocation_id), 32);
+                        unit_set_xattr_graceful(u, xn, SD_ID128_TO_STRING(u->invocation_id), 32);
                 else
-                        unit_remove_xattr_graceful(u, NULL, xn);
+                        unit_remove_xattr_graceful(u, xn);
         }
+}
+
+static void cgroup_coredump_xattr_apply(Unit *u) {
+        CGroupContext *c;
+
+        assert(u);
+
+        c = unit_get_cgroup_context(u);
+        if (!c)
+                return;
+
+        if (unit_cgroup_delegate(u) && c->coredump_receive)
+                unit_set_xattr_graceful(u, "user.coredump_receive", "1", 1);
+        else
+                unit_remove_xattr_graceful(u, "user.coredump_receive");
+}
+
+static void cgroup_delegate_xattr_apply(Unit *u) {
+        bool b;
+
+        assert(u);
 
         /* Indicate on the cgroup whether delegation is on, via an xattr. This is best-effort, as old kernels
          * didn't support xattrs on cgroups at all. Later they got support for setting 'trusted.*' xattrs,
@@ -815,10 +1332,62 @@ static void cgroup_xattr_apply(Unit *u) {
         b = unit_cgroup_delegate(u);
         FOREACH_STRING(xn, "trusted.delegate", "user.delegate") {
                 if (b)
-                        unit_set_xattr_graceful(u, NULL, xn, "1", 1);
+                        unit_set_xattr_graceful(u, xn, "1", 1);
                 else
-                        unit_remove_xattr_graceful(u, NULL, xn);
+                        unit_remove_xattr_graceful(u, xn);
         }
+}
+
+static void cgroup_survive_xattr_apply(Unit *u) {
+        int r;
+
+        assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return;
+
+        if (u->survive_final_kill_signal) {
+                r = cg_set_xattr(
+                                crt->cgroup_path,
+                                "user.survive_final_kill_signal",
+                                "1",
+                                1,
+                                /* flags= */ 0);
+                /* user xattr support was added in kernel v5.7 */
+                if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                        r = cg_set_xattr(
+                                        crt->cgroup_path,
+                                        "trusted.survive_final_kill_signal",
+                                        "1",
+                                        1,
+                                        /* flags= */ 0);
+                if (r < 0)
+                        log_unit_debug_errno(u,
+                                             r,
+                                             "Failed to set 'survive_final_kill_signal' xattr on control "
+                                             "group %s, ignoring: %m",
+                                             empty_to_root(crt->cgroup_path));
+        } else {
+                unit_remove_xattr_graceful(u, "user.survive_final_kill_signal");
+                unit_remove_xattr_graceful(u, "trusted.survive_final_kill_signal");
+        }
+}
+
+static void cgroup_xattr_apply(Unit *u) {
+        assert(u);
+
+        /* The 'user.*' xattrs can be set from a user manager. */
+        cgroup_oomd_xattr_apply(u);
+        cgroup_log_xattr_apply(u);
+        cgroup_coredump_xattr_apply(u);
+
+        if (!MANAGER_IS_SYSTEM(u->manager))
+                return;
+
+        cgroup_invocation_id_xattr_apply(u);
+        cgroup_delegate_xattr_apply(u);
+        cgroup_survive_xattr_apply(u);
 }
 
 static int lookup_block_device(const char *p, dev_t *ret) {
@@ -885,7 +1454,9 @@ static bool cgroup_context_has_allowed_mems(CGroupContext *c) {
         return c->cpuset_mems.set || c->startup_cpuset_mems.set;
 }
 
-static uint64_t cgroup_context_cpu_weight(CGroupContext *c, ManagerState state) {
+uint64_t cgroup_context_cpu_weight(CGroupContext *c, ManagerState state) {
+        assert(c);
+
         if (IN_SET(state, MANAGER_STARTING, MANAGER_INITIALIZING, MANAGER_STOPPING) &&
             c->startup_cpu_weight != CGROUP_WEIGHT_INVALID)
                 return c->startup_cpu_weight;
@@ -933,6 +1504,12 @@ usec_t cgroup_cpu_adjust_period(usec_t period, usec_t quota, usec_t resolution, 
 static usec_t cgroup_cpu_adjust_period_and_log(Unit *u, usec_t period, usec_t quota) {
         usec_t new_period;
 
+        assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return USEC_INFINITY;
+
         if (quota == USEC_INFINITY)
                 /* Always use default period for infinity quota. */
                 return CGROUP_CPU_QUOTA_DEFAULT_PERIOD_USEC;
@@ -945,10 +1522,10 @@ static usec_t cgroup_cpu_adjust_period_and_log(Unit *u, usec_t period, usec_t qu
         new_period = cgroup_cpu_adjust_period(period, quota, USEC_PER_MSEC, USEC_PER_SEC);
 
         if (new_period != period) {
-                log_unit_full(u, u->warned_clamping_cpu_quota_period ? LOG_DEBUG : LOG_WARNING,
+                log_unit_full(u, crt->warned_clamping_cpu_quota_period ? LOG_DEBUG : LOG_WARNING,
                               "Clamping CPU interval for cpu.max: period is now %s",
                               FORMAT_TIMESPAN(new_period, 1));
-                u->warned_clamping_cpu_quota_period = true;
+                crt->warned_clamping_cpu_quota_period = true;
         }
 
         return new_period;
@@ -968,16 +1545,24 @@ static void cgroup_apply_unified_cpu_idle(Unit *u, uint64_t weight) {
         bool is_idle;
         const char *idle_val;
 
+        assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return;
+
         is_idle = weight == CGROUP_WEIGHT_IDLE;
         idle_val = one_zero(is_idle);
-        r = cg_set_attribute("cpu", u->cgroup_path, "cpu.idle", idle_val);
+        r = cg_set_attribute("cpu", crt->cgroup_path, "cpu.idle", idle_val);
         if (r < 0 && (r != -ENOENT || is_idle))
                 log_unit_full_errno(u, LOG_LEVEL_CGROUP_WRITE(r), r, "Failed to set '%s' attribute on '%s' to '%s': %m",
-                                    "cpu.idle", empty_to_root(u->cgroup_path), idle_val);
+                                    "cpu.idle", empty_to_root(crt->cgroup_path), idle_val);
 }
 
 static void cgroup_apply_unified_cpu_quota(Unit *u, usec_t quota, usec_t period) {
         char buf[(DECIMAL_STR_MAX(usec_t) + 1) * 2 + 1];
+
+        assert(u);
 
         period = cgroup_cpu_adjust_period_and_log(u, period, quota);
         if (quota != USEC_INFINITY)
@@ -1094,6 +1679,12 @@ static int set_bfq_weight(Unit *u, const char *controller, dev_t dev, uint64_t i
         uint64_t bfq_weight;
         int r;
 
+        assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return -EOWNERDEAD;
+
         /* FIXME: drop this function when distro kernels properly support BFQ through "io.weight"
          * See also: https://github.com/systemd/systemd/pull/13335 and
          * https://github.com/torvalds/linux/commit/65752aef0a407e1ef17ec78a7fc31ba4e0b360f9. */
@@ -1106,7 +1697,7 @@ static int set_bfq_weight(Unit *u, const char *controller, dev_t dev, uint64_t i
         else
                 xsprintf(buf, "%" PRIu64 "\n", bfq_weight);
 
-        r = cg_set_attribute(controller, u->cgroup_path, p, buf);
+        r = cg_set_attribute(controller, crt->cgroup_path, p, buf);
 
         /* FIXME: drop this when kernels prior
          * 795fe54c2a82 ("bfq: Add per-device weight") v5.4
@@ -1130,13 +1721,19 @@ static void cgroup_apply_io_device_weight(Unit *u, const char *dev_path, uint64_
         dev_t dev;
         int r, r1, r2;
 
+        assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return;
+
         if (lookup_block_device(dev_path, &dev) < 0)
                 return;
 
         r1 = set_bfq_weight(u, "io", dev, io_weight);
 
         xsprintf(buf, DEVNUM_FORMAT_STR " %" PRIu64 "\n", DEVNUM_FORMAT_VAL(dev), io_weight);
-        r2 = cg_set_attribute("io", u->cgroup_path, "io.weight", buf);
+        r2 = cg_set_attribute("io", crt->cgroup_path, "io.weight", buf);
 
         /* Look at the configured device, when both fail, prefer io.weight errno. */
         r = r2 == -EOPNOTSUPP ? r1 : r2;
@@ -1144,7 +1741,7 @@ static void cgroup_apply_io_device_weight(Unit *u, const char *dev_path, uint64_
         if (r < 0)
                 log_unit_full_errno(u, LOG_LEVEL_CGROUP_WRITE(r),
                                     r, "Failed to set 'io[.bfq].weight' attribute on '%s' to '%.*s': %m",
-                                    empty_to_root(u->cgroup_path), (int) strcspn(buf, NEWLINE), buf);
+                                    empty_to_root(crt->cgroup_path), (int) strcspn(buf, NEWLINE), buf);
 }
 
 static void cgroup_apply_blkio_device_weight(Unit *u, const char *dev_path, uint64_t blkio_weight) {
@@ -1218,9 +1815,12 @@ static bool unit_has_unified_memory_config(Unit *u) {
 
         assert_se(c = unit_get_cgroup_context(u));
 
-        return unit_get_ancestor_memory_min(u) > 0 || unit_get_ancestor_memory_low(u) > 0 ||
-               c->memory_high != CGROUP_LIMIT_MAX || c->memory_max != CGROUP_LIMIT_MAX ||
-               c->memory_swap_max != CGROUP_LIMIT_MAX;
+        return unit_get_ancestor_memory_min(u) > 0 ||
+               unit_get_ancestor_memory_low(u) > 0 || unit_get_ancestor_startup_memory_low(u) > 0 ||
+               c->memory_high != CGROUP_LIMIT_MAX || c->startup_memory_high_set ||
+               c->memory_max != CGROUP_LIMIT_MAX || c->startup_memory_max_set ||
+               c->memory_swap_max != CGROUP_LIMIT_MAX || c->startup_memory_swap_max_set ||
+               c->memory_zswap_max != CGROUP_LIMIT_MAX || c->startup_memory_zswap_max_set;
 }
 
 static void cgroup_apply_unified_memory_limit(Unit *u, const char *file, uint64_t v) {
@@ -1244,6 +1844,50 @@ static void cgroup_apply_firewall(Unit *u) {
         (void) bpf_firewall_install(u);
 }
 
+void unit_modify_nft_set(Unit *u, bool add) {
+        int r;
+
+        assert(u);
+
+        if (!MANAGER_IS_SYSTEM(u->manager))
+                return;
+
+        if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return;
+
+        if (cg_all_unified() <= 0)
+                return;
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || crt->cgroup_id == 0)
+                return;
+
+        if (!u->manager->fw_ctx) {
+                r = fw_ctx_new_full(&u->manager->fw_ctx, /* init_tables= */ false);
+                if (r < 0)
+                        return;
+
+                assert(u->manager->fw_ctx);
+        }
+
+        CGroupContext *c = ASSERT_PTR(unit_get_cgroup_context(u));
+
+        FOREACH_ARRAY(nft_set, c->nft_set_context.sets, c->nft_set_context.n_sets) {
+                if (nft_set->source != NFT_SET_SOURCE_CGROUP)
+                        continue;
+
+                uint64_t element = crt->cgroup_id;
+
+                r = nft_set_element_modify_any(u->manager->fw_ctx, add, nft_set->nfproto, nft_set->table, nft_set->set, &element, sizeof(element));
+                if (r < 0)
+                        log_warning_errno(r, "Failed to %s NFT set: family %s, table %s, set %s, cgroup %" PRIu64 ", ignoring: %m",
+                                          add? "add" : "delete", nfproto_to_string(nft_set->nfproto), nft_set->table, nft_set->set, crt->cgroup_id);
+                else
+                        log_debug("%s NFT set: family %s, table %s, set %s, cgroup %" PRIu64,
+                                  add? "Added" : "Deleted", nfproto_to_string(nft_set->nfproto), nft_set->table, nft_set->set, crt->cgroup_id);
+        }
+}
+
 static void cgroup_apply_socket_bind(Unit *u) {
         assert(u);
 
@@ -1253,18 +1897,20 @@ static void cgroup_apply_socket_bind(Unit *u) {
 static void cgroup_apply_restrict_network_interfaces(Unit *u) {
         assert(u);
 
-        (void) restrict_network_interfaces_install(u);
+        (void) bpf_restrict_ifaces_install(u);
 }
 
 static int cgroup_apply_devices(Unit *u) {
         _cleanup_(bpf_program_freep) BPFProgram *prog = NULL;
-        const char *path;
         CGroupContext *c;
         CGroupDevicePolicy policy;
         int r;
 
         assert_se(c = unit_get_cgroup_context(u));
-        assert_se(path = u->cgroup_path);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return -EOWNERDEAD;
 
         policy = c->device_policy;
 
@@ -1278,9 +1924,9 @@ static int cgroup_apply_devices(Unit *u) {
                  * EINVAL here. */
 
                 if (c->device_allow || policy != CGROUP_DEVICE_POLICY_AUTO)
-                        r = cg_set_attribute("devices", path, "devices.deny", "a");
+                        r = cg_set_attribute("devices", crt->cgroup_path, "devices.deny", "a");
                 else
-                        r = cg_set_attribute("devices", path, "devices.allow", "a");
+                        r = cg_set_attribute("devices", crt->cgroup_path, "devices.allow", "a");
                 if (r < 0)
                         log_unit_full_errno(u, IN_SET(r, -ENOENT, -EROFS, -EINVAL, -EACCES, -EPERM) ? LOG_DEBUG : LOG_WARNING, r,
                                             "Failed to reset devices.allow/devices.deny: %m");
@@ -1288,41 +1934,37 @@ static int cgroup_apply_devices(Unit *u) {
 
         bool allow_list_static = policy == CGROUP_DEVICE_POLICY_CLOSED ||
                 (policy == CGROUP_DEVICE_POLICY_AUTO && c->device_allow);
-        if (allow_list_static)
-                (void) bpf_devices_allow_list_static(prog, path);
 
-        bool any = allow_list_static;
+        bool any = false;
+        if (allow_list_static) {
+                r = bpf_devices_allow_list_static(prog, crt->cgroup_path);
+                if (r > 0)
+                        any = true;
+        }
+
         LIST_FOREACH(device_allow, a, c->device_allow) {
-                char acc[4], *val;
-                unsigned k = 0;
+                const char *val;
 
-                if (a->r)
-                        acc[k++] = 'r';
-                if (a->w)
-                        acc[k++] = 'w';
-                if (a->m)
-                        acc[k++] = 'm';
-                if (k == 0)
+                if (a->permissions == 0)
                         continue;
-                acc[k++] = 0;
 
                 if (path_startswith(a->path, "/dev/"))
-                        r = bpf_devices_allow_list_device(prog, path, a->path, acc);
+                        r = bpf_devices_allow_list_device(prog, crt->cgroup_path, a->path, a->permissions);
                 else if ((val = startswith(a->path, "block-")))
-                        r = bpf_devices_allow_list_major(prog, path, val, 'b', acc);
+                        r = bpf_devices_allow_list_major(prog, crt->cgroup_path, val, 'b', a->permissions);
                 else if ((val = startswith(a->path, "char-")))
-                        r = bpf_devices_allow_list_major(prog, path, val, 'c', acc);
+                        r = bpf_devices_allow_list_major(prog, crt->cgroup_path, val, 'c', a->permissions);
                 else {
                         log_unit_debug(u, "Ignoring device '%s' while writing cgroup attribute.", a->path);
                         continue;
                 }
 
-                if (r >= 0)
+                if (r > 0)
                         any = true;
         }
 
         if (prog && !any) {
-                log_unit_warning_errno(u, SYNTHETIC_ERRNO(ENODEV), "No devices matched by device filter.");
+                log_unit_warning(u, "No devices matched by device filter.");
 
                 /* The kernel verifier would reject a program we would build with the normal intro and outro
                    but no allow-listing rules (outro would contain an unreachable instruction for successful
@@ -1330,7 +1972,7 @@ static int cgroup_apply_devices(Unit *u) {
                 policy = CGROUP_DEVICE_POLICY_STRICT;
         }
 
-        r = bpf_devices_apply_policy(&prog, policy, any, path, &u->bpf_device_control_installed);
+        r = bpf_devices_apply_policy(&prog, policy, any, crt->cgroup_path, &crt->bpf_device_control_installed);
         if (r < 0) {
                 static bool warned = false;
 
@@ -1377,9 +2019,9 @@ static void cgroup_context_apply(
                 CGroupMask apply_mask,
                 ManagerState state) {
 
+        bool is_host_root, is_local_root;
         const char *path;
         CGroupContext *c;
-        bool is_host_root, is_local_root;
         int r;
 
         assert(u);
@@ -1394,7 +2036,12 @@ static void cgroup_context_apply(
         is_host_root = unit_has_host_root_cgroup(u);
 
         assert_se(c = unit_get_cgroup_context(u));
-        assert_se(path = u->cgroup_path);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return;
+
+        path = crt->cgroup_path;
 
         if (is_local_root) /* Make sure we don't try to display messages with an empty path. */
                 path = "/";
@@ -1580,11 +2227,15 @@ static void cgroup_context_apply(
         if ((apply_mask & CGROUP_MASK_MEMORY) && !is_local_root) {
 
                 if (cg_all_unified() > 0) {
-                        uint64_t max, swap_max = CGROUP_LIMIT_MAX;
+                        uint64_t max, swap_max = CGROUP_LIMIT_MAX, zswap_max = CGROUP_LIMIT_MAX, high = CGROUP_LIMIT_MAX;
 
                         if (unit_has_unified_memory_config(u)) {
-                                max = c->memory_max;
-                                swap_max = c->memory_swap_max;
+                                bool startup = IN_SET(state, MANAGER_STARTING, MANAGER_INITIALIZING, MANAGER_STOPPING);
+
+                                high = startup && c->startup_memory_high_set ? c->startup_memory_high : c->memory_high;
+                                max = startup && c->startup_memory_max_set ? c->startup_memory_max : c->memory_max;
+                                swap_max = startup && c->startup_memory_swap_max_set ? c->startup_memory_swap_max : c->memory_swap_max;
+                                zswap_max = startup && c->startup_memory_zswap_max_set ? c->startup_memory_zswap_max : c->memory_zswap_max;
                         } else {
                                 max = c->memory_limit;
 
@@ -1594,11 +2245,13 @@ static void cgroup_context_apply(
 
                         cgroup_apply_unified_memory_limit(u, "memory.min", unit_get_ancestor_memory_min(u));
                         cgroup_apply_unified_memory_limit(u, "memory.low", unit_get_ancestor_memory_low(u));
-                        cgroup_apply_unified_memory_limit(u, "memory.high", c->memory_high);
+                        cgroup_apply_unified_memory_limit(u, "memory.high", high);
                         cgroup_apply_unified_memory_limit(u, "memory.max", max);
                         cgroup_apply_unified_memory_limit(u, "memory.swap.max", swap_max);
+                        cgroup_apply_unified_memory_limit(u, "memory.zswap.max", zswap_max);
 
                         (void) set_attribute_and_warn(u, "memory", "memory.oom.group", one_zero(c->memory_oom_group));
+                        (void) set_attribute_and_warn(u, "memory", "memory.zswap.writeback", one_zero(c->memory_zswap_writeback));
 
                 } else {
                         char buf[DECIMAL_STR_MAX(uint64_t) + 1];
@@ -1606,7 +2259,8 @@ static void cgroup_context_apply(
 
                         if (unit_has_unified_memory_config(u)) {
                                 val = c->memory_max;
-                                log_cgroup_compat(u, "Applying MemoryMax=%" PRIu64 " as MemoryLimit=", val);
+                                if (val != CGROUP_LIMIT_MAX)
+                                        log_cgroup_compat(u, "Applying MemoryMax=%" PRIu64 " as MemoryLimit=", val);
                         } else
                                 val = c->memory_limit;
 
@@ -1641,9 +2295,9 @@ static void cgroup_context_apply(
                          * which is desirable so that there's an official way to release control of the sysctl from
                          * systemd: set the limit to unbounded and reload. */
 
-                        if (tasks_max_isset(&c->tasks_max)) {
+                        if (cgroup_tasks_max_isset(&c->tasks_max)) {
                                 u->manager->sysctl_pid_max_changed = true;
-                                r = procfs_tasks_set_limit(tasks_max_resolve(&c->tasks_max));
+                                r = procfs_tasks_set_limit(cgroup_tasks_max_resolve(&c->tasks_max));
                         } else if (u->manager->sysctl_pid_max_changed)
                                 r = procfs_tasks_set_limit(TASKS_MAX);
                         else
@@ -1656,10 +2310,10 @@ static void cgroup_context_apply(
                 /* The attribute itself is not available on the host root cgroup, and in the container case we want to
                  * leave it for the container manager. */
                 if (!is_local_root) {
-                        if (tasks_max_isset(&c->tasks_max)) {
+                        if (cgroup_tasks_max_isset(&c->tasks_max)) {
                                 char buf[DECIMAL_STR_MAX(uint64_t) + 1];
 
-                                xsprintf(buf, "%" PRIu64 "\n", tasks_max_resolve(&c->tasks_max));
+                                xsprintf(buf, "%" PRIu64 "\n", cgroup_tasks_max_resolve(&c->tasks_max));
                                 (void) set_attribute_and_warn(u, "pids", "pids.max", buf);
                         } else
                                 (void) set_attribute_and_warn(u, "pids", "pids.max", "max\n");
@@ -1677,6 +2331,8 @@ static void cgroup_context_apply(
 
         if (apply_mask & CGROUP_MASK_BPF_RESTRICT_NETWORK_INTERFACES)
                 cgroup_apply_restrict_network_interfaces(u);
+
+        unit_modify_nft_set(u, /* add = */ true);
 }
 
 static bool unit_get_needs_bpf_firewall(Unit *u) {
@@ -1775,7 +2431,7 @@ static CGroupMask unit_get_cgroup_mask(Unit *u) {
                 mask |= CGROUP_MASK_DEVICES | CGROUP_MASK_BPF_DEVICES;
 
         if (c->tasks_accounting ||
-            tasks_max_isset(&c->tasks_max))
+            cgroup_tasks_max_isset(&c->tasks_max))
                 mask |= CGROUP_MASK_PIDS;
 
         return CGROUP_MASK_EXTEND_JOINED(mask);
@@ -1854,20 +2510,24 @@ CGroupMask unit_get_members_mask(Unit *u) {
 
         /* Returns the mask of controllers all of the unit's children require, merged */
 
-        if (u->cgroup_members_mask_valid)
-                return u->cgroup_members_mask; /* Use cached value if possible */
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (crt && crt->cgroup_members_mask_valid)
+                return crt->cgroup_members_mask; /* Use cached value if possible */
 
-        u->cgroup_members_mask = 0;
-
+        CGroupMask m = 0;
         if (u->type == UNIT_SLICE) {
                 Unit *member;
 
                 UNIT_FOREACH_DEPENDENCY(member, u, UNIT_ATOM_SLICE_OF)
-                        u->cgroup_members_mask |= unit_get_subtree_mask(member); /* note that this calls ourselves again, for the children */
+                        m |= unit_get_subtree_mask(member); /* note that this calls ourselves again, for the children */
         }
 
-        u->cgroup_members_mask_valid = true;
-        return u->cgroup_members_mask;
+        if (crt) {
+                crt->cgroup_members_mask = m;
+                crt->cgroup_members_mask_valid = true;
+        }
+
+        return m;
 }
 
 CGroupMask unit_get_siblings_mask(Unit *u) {
@@ -1953,24 +2613,29 @@ void unit_invalidate_cgroup_members_masks(Unit *u) {
 
         assert(u);
 
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return;
+
         /* Recurse invalidate the member masks cache all the way up the tree */
-        u->cgroup_members_mask_valid = false;
+        crt->cgroup_members_mask_valid = false;
 
         slice = UNIT_GET_SLICE(u);
         if (slice)
                 unit_invalidate_cgroup_members_masks(slice);
 }
 
-const char *unit_get_realized_cgroup_path(Unit *u, CGroupMask mask) {
+const char* unit_get_realized_cgroup_path(Unit *u, CGroupMask mask) {
 
         /* Returns the realized cgroup path of the specified unit where all specified controllers are available. */
 
         while (u) {
-
-                if (u->cgroup_path &&
-                    u->cgroup_realized &&
-                    FLAGS_SET(u->cgroup_realized_mask, mask))
-                        return u->cgroup_path;
+                CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+                if (crt &&
+                    crt->cgroup_path &&
+                    crt->cgroup_realized &&
+                    FLAGS_SET(crt->cgroup_realized_mask, mask))
+                        return crt->cgroup_path;
 
                 u = UNIT_GET_SLICE(u);
         }
@@ -1985,53 +2650,69 @@ static const char *migrate_callback(CGroupMask mask, void *userdata) {
         return strempty(unit_get_realized_cgroup_path(userdata, mask));
 }
 
-char *unit_default_cgroup_path(const Unit *u) {
-        _cleanup_free_ char *escaped = NULL, *slice_path = NULL;
-        Unit *slice;
-        int r;
-
-        assert(u);
-
-        if (unit_has_name(u, SPECIAL_ROOT_SLICE))
-                return strdup(u->manager->cgroup_root);
-
-        slice = UNIT_GET_SLICE(u);
-        if (slice && !unit_has_name(slice, SPECIAL_ROOT_SLICE)) {
-                r = cg_slice_to_path(slice->id, &slice_path);
-                if (r < 0)
-                        return NULL;
-        }
-
-        escaped = cg_escape(u->id);
-        if (!escaped)
-                return NULL;
-
-        return path_join(empty_to_root(u->manager->cgroup_root), slice_path, escaped);
-}
-
-int unit_set_cgroup_path(Unit *u, const char *path) {
+int unit_default_cgroup_path(const Unit *u, char **ret) {
         _cleanup_free_ char *p = NULL;
         int r;
 
         assert(u);
+        assert(ret);
 
-        if (streq_ptr(u->cgroup_path, path))
+        if (unit_has_name(u, SPECIAL_ROOT_SLICE))
+                p = strdup(u->manager->cgroup_root);
+        else {
+                _cleanup_free_ char *escaped = NULL, *slice_path = NULL;
+                Unit *slice;
+
+                slice = UNIT_GET_SLICE(u);
+                if (slice && !unit_has_name(slice, SPECIAL_ROOT_SLICE)) {
+                        r = cg_slice_to_path(slice->id, &slice_path);
+                        if (r < 0)
+                                return r;
+                }
+
+                r = cg_escape(u->id, &escaped);
+                if (r < 0)
+                        return r;
+
+                p = path_join(empty_to_root(u->manager->cgroup_root), slice_path, escaped);
+        }
+        if (!p)
+                return -ENOMEM;
+
+        *ret = TAKE_PTR(p);
+        return 0;
+}
+
+int unit_set_cgroup_path(Unit *u, const char *path) {
+        _cleanup_free_ char *p = NULL;
+        CGroupRuntime *crt;
+        int r;
+
+        assert(u);
+
+        crt = unit_get_cgroup_runtime(u);
+
+        if (crt && streq_ptr(crt->cgroup_path, path))
                 return 0;
+
+        unit_release_cgroup(u, /* drop_cgroup_runtime = */ true);
+
+        crt = unit_setup_cgroup_runtime(u);
+        if (!crt)
+                return -ENOMEM;
 
         if (path) {
                 p = strdup(path);
                 if (!p)
                         return -ENOMEM;
-        }
 
-        if (p) {
                 r = hashmap_put(u->manager->cgroup_unit, p, u);
                 if (r < 0)
                         return r;
         }
 
-        unit_release_cgroup(u);
-        u->cgroup_path = TAKE_PTR(p);
+        assert(!crt->cgroup_path);
+        crt->cgroup_path = TAKE_PTR(p);
 
         return 1;
 }
@@ -2045,10 +2726,11 @@ int unit_watch_cgroup(Unit *u) {
         /* Watches the "cgroups.events" attribute of this unit's cgroup for "empty" events, but only if
          * cgroupv2 is available. */
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return 0;
 
-        if (u->cgroup_control_inotify_wd >= 0)
+        if (crt->cgroup_control_inotify_wd >= 0)
                 return 0;
 
         /* Only applies to the unified hierarchy */
@@ -2066,30 +2748,29 @@ int unit_watch_cgroup(Unit *u) {
         if (r < 0)
                 return log_oom();
 
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "cgroup.events", &events);
+        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, "cgroup.events", &events);
         if (r < 0)
                 return log_oom();
 
-        u->cgroup_control_inotify_wd = inotify_add_watch(u->manager->cgroup_inotify_fd, events, IN_MODIFY);
-        if (u->cgroup_control_inotify_wd < 0) {
+        crt->cgroup_control_inotify_wd = inotify_add_watch(u->manager->cgroup_inotify_fd, events, IN_MODIFY);
+        if (crt->cgroup_control_inotify_wd < 0) {
 
                 if (errno == ENOENT) /* If the directory is already gone we don't need to track it, so this
                                       * is not an error */
                         return 0;
 
-                return log_unit_error_errno(u, errno, "Failed to add control inotify watch descriptor for control group %s: %m", empty_to_root(u->cgroup_path));
+                return log_unit_error_errno(u, errno, "Failed to add control inotify watch descriptor for control group %s: %m", empty_to_root(crt->cgroup_path));
         }
 
-        r = hashmap_put(u->manager->cgroup_control_inotify_wd_unit, INT_TO_PTR(u->cgroup_control_inotify_wd), u);
+        r = hashmap_put(u->manager->cgroup_control_inotify_wd_unit, INT_TO_PTR(crt->cgroup_control_inotify_wd), u);
         if (r < 0)
-                return log_unit_error_errno(u, r, "Failed to add control inotify watch descriptor for control group %s to hash map: %m", empty_to_root(u->cgroup_path));
+                return log_unit_error_errno(u, r, "Failed to add control inotify watch descriptor for control group %s to hash map: %m", empty_to_root(crt->cgroup_path));
 
         return 0;
 }
 
 int unit_watch_cgroup_memory(Unit *u) {
         _cleanup_free_ char *events = NULL;
-        CGroupContext *c;
         int r;
 
         assert(u);
@@ -2097,10 +2778,11 @@ int unit_watch_cgroup_memory(Unit *u) {
         /* Watches the "memory.events" attribute of this unit's cgroup for "oom_kill" events, but only if
          * cgroupv2 is available. */
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return 0;
 
-        c = unit_get_cgroup_context(u);
+        CGroupContext *c = unit_get_cgroup_context(u);
         if (!c)
                 return 0;
 
@@ -2115,7 +2797,7 @@ int unit_watch_cgroup_memory(Unit *u) {
         if (u->type == UNIT_SLICE)
                 return 0;
 
-        if (u->cgroup_memory_inotify_wd >= 0)
+        if (crt->cgroup_memory_inotify_wd >= 0)
                 return 0;
 
         /* Only applies to the unified hierarchy */
@@ -2129,23 +2811,23 @@ int unit_watch_cgroup_memory(Unit *u) {
         if (r < 0)
                 return log_oom();
 
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "memory.events", &events);
+        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, "memory.events", &events);
         if (r < 0)
                 return log_oom();
 
-        u->cgroup_memory_inotify_wd = inotify_add_watch(u->manager->cgroup_inotify_fd, events, IN_MODIFY);
-        if (u->cgroup_memory_inotify_wd < 0) {
+        crt->cgroup_memory_inotify_wd = inotify_add_watch(u->manager->cgroup_inotify_fd, events, IN_MODIFY);
+        if (crt->cgroup_memory_inotify_wd < 0) {
 
                 if (errno == ENOENT) /* If the directory is already gone we don't need to track it, so this
                                       * is not an error */
                         return 0;
 
-                return log_unit_error_errno(u, errno, "Failed to add memory inotify watch descriptor for control group %s: %m", empty_to_root(u->cgroup_path));
+                return log_unit_error_errno(u, errno, "Failed to add memory inotify watch descriptor for control group %s: %m", empty_to_root(crt->cgroup_path));
         }
 
-        r = hashmap_put(u->manager->cgroup_memory_inotify_wd_unit, INT_TO_PTR(u->cgroup_memory_inotify_wd), u);
+        r = hashmap_put(u->manager->cgroup_memory_inotify_wd_unit, INT_TO_PTR(crt->cgroup_memory_inotify_wd), u);
         if (r < 0)
-                return log_unit_error_errno(u, r, "Failed to add memory inotify watch descriptor for control group %s to hash map: %m", empty_to_root(u->cgroup_path));
+                return log_unit_error_errno(u, r, "Failed to add memory inotify watch descriptor for control group %s to hash map: %m", empty_to_root(crt->cgroup_path));
 
         return 0;
 }
@@ -2156,15 +2838,18 @@ int unit_pick_cgroup_path(Unit *u) {
 
         assert(u);
 
-        if (u->cgroup_path)
-                return 0;
-
         if (!UNIT_HAS_CGROUP_CONTEXT(u))
                 return -EINVAL;
 
-        path = unit_default_cgroup_path(u);
-        if (!path)
-                return log_oom();
+        CGroupRuntime *crt = unit_setup_cgroup_runtime(u);
+        if (!crt)
+                return -ENOMEM;
+        if (crt->cgroup_path)
+                return 0;
+
+        r = unit_default_cgroup_path(u, &path);
+        if (r < 0)
+                return log_unit_error_errno(u, r, "Failed to generate default cgroup path: %m");
 
         r = unit_set_cgroup_path(u, path);
         if (r == -EEXIST)
@@ -2191,30 +2876,35 @@ static int unit_update_cgroup(
         if (!UNIT_HAS_CGROUP_CONTEXT(u))
                 return 0;
 
+        if (u->freezer_state != FREEZER_RUNNING)
+                return log_unit_error_errno(u, SYNTHETIC_ERRNO(EBUSY), "Cannot realize cgroup for frozen unit.");
+
         /* Figure out our cgroup path */
         r = unit_pick_cgroup_path(u);
         if (r < 0)
                 return r;
 
+        CGroupRuntime *crt = ASSERT_PTR(unit_get_cgroup_runtime(u));
+
         /* First, create our own group */
-        r = cg_create_everywhere(u->manager->cgroup_supported, target_mask, u->cgroup_path);
+        r = cg_create_everywhere(u->manager->cgroup_supported, target_mask, crt->cgroup_path);
         if (r < 0)
-                return log_unit_error_errno(u, r, "Failed to create cgroup %s: %m", empty_to_root(u->cgroup_path));
+                return log_unit_error_errno(u, r, "Failed to create cgroup %s: %m", empty_to_root(crt->cgroup_path));
         created = r;
 
         if (cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER) > 0) {
                 uint64_t cgroup_id = 0;
 
-                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, NULL, &cgroup_full_path);
+                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, NULL, &cgroup_full_path);
                 if (r == 0) {
                         r = cg_path_get_cgroupid(cgroup_full_path, &cgroup_id);
                         if (r < 0)
                                 log_unit_full_errno(u, ERRNO_IS_NOT_SUPPORTED(r) ? LOG_DEBUG : LOG_WARNING, r,
                                                     "Failed to get cgroup ID of cgroup %s, ignoring: %m", cgroup_full_path);
                 } else
-                        log_unit_warning_errno(u, r, "Failed to get full cgroup path on cgroup %s, ignoring: %m", empty_to_root(u->cgroup_path));
+                        log_unit_warning_errno(u, r, "Failed to get full cgroup path on cgroup %s, ignoring: %m", empty_to_root(crt->cgroup_path));
 
-                u->cgroup_id = cgroup_id;
+                crt->cgroup_id = cgroup_id;
         }
 
         /* Start watching it */
@@ -2223,23 +2913,23 @@ static int unit_update_cgroup(
 
         /* For v2 we preserve enabled controllers in delegated units, adjust others,
          * for v1 we figure out which controller hierarchies need migration. */
-        if (created || !u->cgroup_realized || !unit_cgroup_delegate(u)) {
+        if (created || !crt->cgroup_realized || !unit_cgroup_delegate(u)) {
                 CGroupMask result_mask = 0;
 
                 /* Enable all controllers we need */
-                r = cg_enable_everywhere(u->manager->cgroup_supported, enable_mask, u->cgroup_path, &result_mask);
+                r = cg_enable_everywhere(u->manager->cgroup_supported, enable_mask, crt->cgroup_path, &result_mask);
                 if (r < 0)
-                        log_unit_warning_errno(u, r, "Failed to enable/disable controllers on cgroup %s, ignoring: %m", empty_to_root(u->cgroup_path));
+                        log_unit_warning_errno(u, r, "Failed to enable/disable controllers on cgroup %s, ignoring: %m", empty_to_root(crt->cgroup_path));
 
                 /* Remember what's actually enabled now */
-                u->cgroup_enabled_mask = result_mask;
+                crt->cgroup_enabled_mask = result_mask;
 
-                migrate_mask = u->cgroup_realized_mask ^ target_mask;
+                migrate_mask = crt->cgroup_realized_mask ^ target_mask;
         }
 
         /* Keep track that this is now realized */
-        u->cgroup_realized = true;
-        u->cgroup_realized_mask = target_mask;
+        crt->cgroup_realized = true;
+        crt->cgroup_realized_mask = target_mask;
 
         /* Migrate processes in controller hierarchies both downwards (enabling) and upwards (disabling).
          *
@@ -2249,19 +2939,26 @@ static int unit_update_cgroup(
          * delegated units.
          */
         if (cg_all_unified() == 0) {
-                r = cg_migrate_v1_controllers(u->manager->cgroup_supported, migrate_mask, u->cgroup_path, migrate_callback, u);
+                r = cg_migrate_v1_controllers(u->manager->cgroup_supported, migrate_mask, crt->cgroup_path, migrate_callback, u);
                 if (r < 0)
-                        log_unit_warning_errno(u, r, "Failed to migrate controller cgroups from %s, ignoring: %m", empty_to_root(u->cgroup_path));
+                        log_unit_warning_errno(u, r, "Failed to migrate controller cgroups from %s, ignoring: %m", empty_to_root(crt->cgroup_path));
 
                 is_root_slice = unit_has_name(u, SPECIAL_ROOT_SLICE);
-                r = cg_trim_v1_controllers(u->manager->cgroup_supported, ~target_mask, u->cgroup_path, !is_root_slice);
+                r = cg_trim_v1_controllers(u->manager->cgroup_supported, ~target_mask, crt->cgroup_path, !is_root_slice);
                 if (r < 0)
-                        log_unit_warning_errno(u, r, "Failed to delete controller cgroups %s, ignoring: %m", empty_to_root(u->cgroup_path));
+                        log_unit_warning_errno(u, r, "Failed to delete controller cgroups %s, ignoring: %m", empty_to_root(crt->cgroup_path));
         }
 
         /* Set attributes */
         cgroup_context_apply(u, target_mask, state);
         cgroup_xattr_apply(u);
+
+        /* For most units we expect that memory monitoring is set up before the unit is started and we won't
+         * touch it after. For PID 1 this is different though, because we couldn't possibly do that given
+         * that PID 1 runs before init.scope is even set up. Hence, whenever init.scope is realized, let's
+         * try to open the memory pressure interface anew. */
+        if (unit_has_name(u, SPECIAL_INIT_SCOPE))
+                (void) manager_setup_memory_pressure_event_source(u->manager);
 
         return 0;
 }
@@ -2279,11 +2976,12 @@ static int unit_attach_pid_to_cgroup_via_bus(Unit *u, pid_t pid, const char *suf
         if (!u->manager->system_bus)
                 return -EIO;
 
-        if (!u->cgroup_path)
-                return -EINVAL;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return -EOWNERDEAD;
 
         /* Determine this unit's cgroup path relative to our cgroup root */
-        pp = path_startswith(u->cgroup_path, u->manager->cgroup_root);
+        pp = path_startswith(crt->cgroup_path, u->manager->cgroup_root);
         if (!pp)
                 return -EINVAL;
 
@@ -2306,7 +3004,7 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
         _cleanup_free_ char *joined = NULL;
         CGroupMask delegated_mask;
         const char *p;
-        void *pidp;
+        PidRef *pid;
         int ret, r;
 
         assert(u);
@@ -2327,10 +3025,12 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
         if (r < 0)
                 return r;
 
+        CGroupRuntime *crt = ASSERT_PTR(unit_get_cgroup_runtime(u));
+
         if (isempty(suffix_path))
-                p = u->cgroup_path;
+                p = crt->cgroup_path;
         else {
-                joined = path_join(u->cgroup_path, suffix_path);
+                joined = path_join(crt->cgroup_path, suffix_path);
                 if (!joined)
                         return -ENOMEM;
 
@@ -2340,17 +3040,25 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
         delegated_mask = unit_get_delegate_mask(u);
 
         ret = 0;
-        SET_FOREACH(pidp, pids) {
-                pid_t pid = PTR_TO_PID(pidp);
+        SET_FOREACH(pid, pids) {
+
+                /* Unfortunately we cannot add pids by pidfd to a cgroup. Hence we have to use PIDs instead,
+                 * which of course is racy. Let's shorten the race a bit though, and re-validate the PID
+                 * before we use it */
+                r = pidref_verify(pid);
+                if (r < 0) {
+                        log_unit_info_errno(u, r, "PID " PID_FMT " vanished before we could move it to target cgroup '%s', skipping: %m", pid->pid, empty_to_root(p));
+                        continue;
+                }
 
                 /* First, attach the PID to the main cgroup hierarchy */
-                r = cg_attach(SYSTEMD_CGROUP_CONTROLLER, p, pid);
+                r = cg_attach(SYSTEMD_CGROUP_CONTROLLER, p, pid->pid);
                 if (r < 0) {
                         bool again = MANAGER_IS_USER(u->manager) && ERRNO_IS_PRIVILEGE(r);
 
                         log_unit_full_errno(u, again ? LOG_DEBUG : LOG_INFO,  r,
                                             "Couldn't move process "PID_FMT" to%s requested cgroup '%s': %m",
-                                            pid, again ? " directly" : "", empty_to_root(p));
+                                            pid->pid, again ? " directly" : "", empty_to_root(p));
 
                         if (again) {
                                 int z;
@@ -2360,12 +3068,16 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
                                  * Since it's more privileged it might be able to move the process across the
                                  * leaves of a subtree whose top node is not owned by us. */
 
-                                z = unit_attach_pid_to_cgroup_via_bus(u, pid, suffix_path);
+                                z = unit_attach_pid_to_cgroup_via_bus(u, pid->pid, suffix_path);
                                 if (z < 0)
-                                        log_unit_info_errno(u, z, "Couldn't move process "PID_FMT" to requested cgroup '%s' (directly or via the system bus): %m", pid, empty_to_root(p));
+                                        log_unit_info_errno(u, z, "Couldn't move process "PID_FMT" to requested cgroup '%s' (directly or via the system bus): %m", pid->pid, empty_to_root(p));
                                 else {
                                         if (ret >= 0)
                                                 ret++; /* Count successful additions */
+
+                                        /* the cgroup is definitely not empty now, in case the unit was in
+                                         * the cgroup empty queue, drop it from there */
+                                        unit_remove_from_cgroup_empty_queue(u);
                                         continue; /* When the bus thing worked via the bus we are fully done for this PID. */
                                 }
                         }
@@ -2374,8 +3086,10 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
                                 ret = r; /* Remember first error */
 
                         continue;
-                } else if (ret >= 0)
+                } else if (ret >= 0) {
+                        unit_remove_from_cgroup_empty_queue(u);
                         ret++; /* Count successful additions */
+                }
 
                 r = cg_all_unified();
                 if (r < 0)
@@ -2394,13 +3108,13 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
                                 continue;
 
                         /* If this controller is delegated and realized, honour the caller's request for the cgroup suffix. */
-                        if (delegated_mask & u->cgroup_realized_mask & bit) {
-                                r = cg_attach(cgroup_controller_to_string(c), p, pid);
+                        if (delegated_mask & crt->cgroup_realized_mask & bit) {
+                                r = cg_attach(cgroup_controller_to_string(c), p, pid->pid);
                                 if (r >= 0)
                                         continue; /* Success! */
 
                                 log_unit_debug_errno(u, r, "Failed to attach PID " PID_FMT " to requested cgroup %s in controller %s, falling back to unit's cgroup: %m",
-                                                     pid, empty_to_root(p), cgroup_controller_to_string(c));
+                                                     pid->pid, empty_to_root(p), cgroup_controller_to_string(c));
                         }
 
                         /* So this controller is either not delegate or realized, or something else weird happened. In
@@ -2410,10 +3124,10 @@ int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path) {
                         if (!realized)
                                 continue; /* Not even realized in the root slice? Then let's not bother */
 
-                        r = cg_attach(cgroup_controller_to_string(c), realized, pid);
+                        r = cg_attach(cgroup_controller_to_string(c), realized, pid->pid);
                         if (r < 0)
                                 log_unit_debug_errno(u, r, "Failed to attach PID " PID_FMT " to realized cgroup %s in controller %s, ignoring: %m",
-                                                     pid, realized, cgroup_controller_to_string(c));
+                                                     pid->pid, realized, cgroup_controller_to_string(c));
                 }
         }
 
@@ -2426,6 +3140,10 @@ static bool unit_has_mask_realized(
                 CGroupMask enable_mask) {
 
         assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return false;
 
         /* Returns true if this unit is fully realized. We check four things:
          *
@@ -2442,10 +3160,10 @@ static bool unit_has_mask_realized(
          * enabled through cgroup.subtree_control, and since the BPF pseudo-controllers don't show up there, they
          * simply don't matter. */
 
-        return u->cgroup_realized &&
-                ((u->cgroup_realized_mask ^ target_mask) & CGROUP_MASK_V1) == 0 &&
-                ((u->cgroup_enabled_mask ^ enable_mask) & CGROUP_MASK_V2) == 0 &&
-                u->cgroup_invalidated_mask == 0;
+        return crt->cgroup_realized &&
+                ((crt->cgroup_realized_mask ^ target_mask) & CGROUP_MASK_V1) == 0 &&
+                ((crt->cgroup_enabled_mask ^ enable_mask) & CGROUP_MASK_V2) == 0 &&
+                crt->cgroup_invalidated_mask == 0;
 }
 
 static bool unit_has_mask_disables_realized(
@@ -2455,14 +3173,18 @@ static bool unit_has_mask_disables_realized(
 
         assert(u);
 
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return true;
+
         /* Returns true if all controllers which should be disabled are indeed disabled.
          *
          * Unlike unit_has_mask_realized, we don't care what was enabled, only that anything we want to remove is
          * already removed. */
 
-        return !u->cgroup_realized ||
-                (FLAGS_SET(u->cgroup_realized_mask, target_mask & CGROUP_MASK_V1) &&
-                 FLAGS_SET(u->cgroup_enabled_mask, enable_mask & CGROUP_MASK_V2));
+        return !crt->cgroup_realized ||
+                (FLAGS_SET(crt->cgroup_realized_mask, target_mask & CGROUP_MASK_V1) &&
+                 FLAGS_SET(crt->cgroup_enabled_mask, enable_mask & CGROUP_MASK_V2));
 }
 
 static bool unit_has_mask_enables_realized(
@@ -2472,14 +3194,18 @@ static bool unit_has_mask_enables_realized(
 
         assert(u);
 
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return false;
+
         /* Returns true if all controllers which should be enabled are indeed enabled.
          *
          * Unlike unit_has_mask_realized, we don't care about the controllers that are not present, only that anything
          * we want to add is already added. */
 
-        return u->cgroup_realized &&
-                ((u->cgroup_realized_mask | target_mask) & CGROUP_MASK_V1) == (u->cgroup_realized_mask & CGROUP_MASK_V1) &&
-                ((u->cgroup_enabled_mask | enable_mask) & CGROUP_MASK_V2) == (u->cgroup_enabled_mask & CGROUP_MASK_V2);
+        return crt->cgroup_realized &&
+                ((crt->cgroup_realized_mask | target_mask) & CGROUP_MASK_V1) == (crt->cgroup_realized_mask & CGROUP_MASK_V1) &&
+                ((crt->cgroup_enabled_mask | enable_mask) & CGROUP_MASK_V2) == (crt->cgroup_enabled_mask & CGROUP_MASK_V2);
 }
 
 void unit_add_to_cgroup_realize_queue(Unit *u) {
@@ -2528,8 +3254,10 @@ static int unit_realize_cgroup_now_enable(Unit *u, ManagerState state) {
         if (unit_has_mask_enables_realized(u, target_mask, enable_mask))
                 return 0;
 
-        new_target_mask = u->cgroup_realized_mask | target_mask;
-        new_enable_mask = u->cgroup_enabled_mask | enable_mask;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+
+        new_target_mask = (crt ? crt->cgroup_realized_mask : 0) | target_mask;
+        new_enable_mask = (crt ? crt->cgroup_enabled_mask : 0) | enable_mask;
 
         return unit_update_cgroup(u, new_target_mask, new_enable_mask, state);
 }
@@ -2548,9 +3276,13 @@ static int unit_realize_cgroup_now_disable(Unit *u, ManagerState state) {
                 CGroupMask target_mask, enable_mask, new_target_mask, new_enable_mask;
                 int r;
 
+                CGroupRuntime *rt = unit_get_cgroup_runtime(m);
+                if (!rt)
+                        continue;
+
                 /* The cgroup for this unit might not actually be fully realised yet, in which case it isn't
                  * holding any controllers open anyway. */
-                if (!m->cgroup_realized)
+                if (!rt->cgroup_realized)
                         continue;
 
                 /* We must disable those below us first in order to release the controller. */
@@ -2564,8 +3296,8 @@ static int unit_realize_cgroup_now_disable(Unit *u, ManagerState state) {
                 if (unit_has_mask_disables_realized(m, target_mask, enable_mask))
                         continue;
 
-                new_target_mask = m->cgroup_realized_mask & target_mask;
-                new_enable_mask = m->cgroup_enabled_mask & enable_mask;
+                new_target_mask = rt->cgroup_realized_mask & target_mask;
+                new_enable_mask = rt->cgroup_enabled_mask & enable_mask;
 
                 r = unit_update_cgroup(m, new_target_mask, new_enable_mask, state);
                 if (r < 0)
@@ -2652,8 +3384,10 @@ static int unit_realize_cgroup_now(Unit *u, ManagerState state) {
         if (r < 0)
                 return r;
 
+        CGroupRuntime *crt = ASSERT_PTR(unit_get_cgroup_runtime(u));
+
         /* Now, reset the invalidation mask */
-        u->cgroup_invalidated_mask = 0;
+        crt->cgroup_invalidated_mask = 0;
         return 0;
 }
 
@@ -2704,11 +3438,13 @@ void unit_add_family_to_cgroup_realize_queue(Unit *u) {
          * masks. */
 
         do {
-                Unit *m;
+                CGroupRuntime *crt = unit_get_cgroup_runtime(u);
 
                 /* Children of u likely changed when we're called */
-                u->cgroup_members_mask_valid = false;
+                if (crt)
+                        crt->cgroup_members_mask_valid = false;
 
+                Unit *m;
                 UNIT_FOREACH_DEPENDENCY(m, u, UNIT_ATOM_SLICE_OF) {
 
                         /* No point in doing cgroup application for units without active processes. */
@@ -2717,7 +3453,8 @@ void unit_add_family_to_cgroup_realize_queue(Unit *u) {
 
                         /* We only enqueue siblings if they were realized once at least, in the main
                          * hierarchy. */
-                        if (!m->cgroup_realized)
+                        crt = unit_get_cgroup_runtime(m);
+                        if (!crt || !crt->cgroup_realized)
                                 continue;
 
                         /* If the unit doesn't need any new controllers and has current ones
@@ -2762,51 +3499,76 @@ int unit_realize_cgroup(Unit *u) {
         return unit_realize_cgroup_now(u, manager_state(u->manager));
 }
 
-void unit_release_cgroup(Unit *u) {
+void unit_release_cgroup(Unit *u, bool drop_cgroup_runtime) {
         assert(u);
 
         /* Forgets all cgroup details for this cgroup — but does *not* destroy the cgroup. This is hence OK to call
          * when we close down everything for reexecution, where we really want to leave the cgroup in place. */
 
-        if (u->cgroup_path) {
-                (void) hashmap_remove(u->manager->cgroup_unit, u->cgroup_path);
-                u->cgroup_path = mfree(u->cgroup_path);
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return;
+
+        if (crt->cgroup_path) {
+                (void) hashmap_remove(u->manager->cgroup_unit, crt->cgroup_path);
+                crt->cgroup_path = mfree(crt->cgroup_path);
         }
 
-        if (u->cgroup_control_inotify_wd >= 0) {
-                if (inotify_rm_watch(u->manager->cgroup_inotify_fd, u->cgroup_control_inotify_wd) < 0)
-                        log_unit_debug_errno(u, errno, "Failed to remove cgroup control inotify watch %i for %s, ignoring: %m", u->cgroup_control_inotify_wd, u->id);
+        if (crt->cgroup_control_inotify_wd >= 0) {
+                if (inotify_rm_watch(u->manager->cgroup_inotify_fd, crt->cgroup_control_inotify_wd) < 0)
+                        log_unit_debug_errno(u, errno, "Failed to remove cgroup control inotify watch %i for %s, ignoring: %m", crt->cgroup_control_inotify_wd, u->id);
 
-                (void) hashmap_remove(u->manager->cgroup_control_inotify_wd_unit, INT_TO_PTR(u->cgroup_control_inotify_wd));
-                u->cgroup_control_inotify_wd = -1;
+                (void) hashmap_remove(u->manager->cgroup_control_inotify_wd_unit, INT_TO_PTR(crt->cgroup_control_inotify_wd));
+                crt->cgroup_control_inotify_wd = -1;
         }
 
-        if (u->cgroup_memory_inotify_wd >= 0) {
-                if (inotify_rm_watch(u->manager->cgroup_inotify_fd, u->cgroup_memory_inotify_wd) < 0)
-                        log_unit_debug_errno(u, errno, "Failed to remove cgroup memory inotify watch %i for %s, ignoring: %m", u->cgroup_memory_inotify_wd, u->id);
+        if (crt->cgroup_memory_inotify_wd >= 0) {
+                if (inotify_rm_watch(u->manager->cgroup_inotify_fd, crt->cgroup_memory_inotify_wd) < 0)
+                        log_unit_debug_errno(u, errno, "Failed to remove cgroup memory inotify watch %i for %s, ignoring: %m", crt->cgroup_memory_inotify_wd, u->id);
 
-                (void) hashmap_remove(u->manager->cgroup_memory_inotify_wd_unit, INT_TO_PTR(u->cgroup_memory_inotify_wd));
-                u->cgroup_memory_inotify_wd = -1;
+                (void) hashmap_remove(u->manager->cgroup_memory_inotify_wd_unit, INT_TO_PTR(crt->cgroup_memory_inotify_wd));
+                crt->cgroup_memory_inotify_wd = -1;
         }
+
+        if (drop_cgroup_runtime)
+                *(CGroupRuntime**) ((uint8_t*) u + UNIT_VTABLE(u)->cgroup_runtime_offset) = cgroup_runtime_free(crt);
 }
 
-bool unit_maybe_release_cgroup(Unit *u) {
+int unit_cgroup_is_empty(Unit *u) {
         int r;
 
         assert(u);
 
-        if (!u->cgroup_path)
-                return true;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return -ENXIO;
+        if (!crt->cgroup_path)
+                return -EOWNERDEAD;
 
-        /* Don't release the cgroup if there are still processes under it. If we get notified later when all the
-         * processes exit (e.g. the processes were in D-state and exited after the unit was marked as failed)
-         * we need the cgroup paths to continue to be tracked by the manager so they can be looked up and cleaned
-         * up later. */
-        r = cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path);
+        r = cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path);
         if (r < 0)
-                log_unit_debug_errno(u, r, "Error checking if the cgroup is recursively empty, ignoring: %m");
-        else if (r == 1) {
-                unit_release_cgroup(u);
+                log_unit_debug_errno(u, r, "Failed to determine whether cgroup %s is empty: %m", empty_to_root(crt->cgroup_path));
+        return r;
+}
+
+static bool unit_maybe_release_cgroup(Unit *u) {
+        int r;
+
+        /* Releases the cgroup only if it is recursively empty.
+         * Returns true if the cgroup was released, false otherwise. */
+
+        assert(u);
+
+        /* Don't release the cgroup if there are still processes under it. If we get notified later when all
+         * the processes exit (e.g. the processes were in D-state and exited after the unit was marked as
+         * failed) we need the cgroup paths to continue to be tracked by the manager so they can be looked up
+         * and cleaned up later. */
+        r = unit_cgroup_is_empty(u);
+        if (r > 0) {
+                /* Do not free CGroupRuntime when called from unit_prune_cgroup. Various accounting data
+                 * we should keep, especially CPU usage and *_peak ones which would be shown even after
+                 * the unit stops. */
+                unit_release_cgroup(u, /* drop_cgroup_runtime = */ false);
                 return true;
         }
 
@@ -2814,32 +3576,43 @@ bool unit_maybe_release_cgroup(Unit *u) {
 }
 
 void unit_prune_cgroup(Unit *u) {
-        int r;
         bool is_root_slice;
+        int r;
 
         assert(u);
 
         /* Removes the cgroup, if empty and possible, and stops watching it. */
-
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return;
 
-        (void) unit_get_cpu_usage(u, NULL); /* Cache the last CPU usage value before we destroy the cgroup */
+        /* Cache the last resource usage values before we destroy the cgroup */
+        (void) unit_get_cpu_usage(u, /* ret = */ NULL);
+
+        for (CGroupMemoryAccountingMetric metric = 0; metric <= _CGROUP_MEMORY_ACCOUNTING_METRIC_CACHED_LAST; metric++)
+                (void) unit_get_memory_accounting(u, metric, /* ret = */ NULL);
+
+        /* All IO metrics are read at once from the underlying cgroup, so issue just a single call */
+        (void) unit_get_io_accounting(u, _CGROUP_IO_ACCOUNTING_METRIC_INVALID, /* ret = */ NULL);
+
+        /* We do not cache IP metrics here because the firewall objects are not freed with cgroups */
 
 #if BPF_FRAMEWORK
-        (void) lsm_bpf_cleanup(u); /* Remove cgroup from the global LSM BPF map */
+        (void) bpf_restrict_fs_cleanup(u); /* Remove cgroup from the global LSM BPF map */
 #endif
+
+        unit_modify_nft_set(u, /* add = */ false);
 
         is_root_slice = unit_has_name(u, SPECIAL_ROOT_SLICE);
 
-        r = cg_trim_everywhere(u->manager->cgroup_supported, u->cgroup_path, !is_root_slice);
+        r = cg_trim_everywhere(u->manager->cgroup_supported, crt->cgroup_path, !is_root_slice);
         if (r < 0)
                 /* One reason we could have failed here is, that the cgroup still contains a process.
                  * However, if the cgroup becomes removable at a later time, it might be removed when
                  * the containing slice is stopped. So even if we failed now, this unit shouldn't assume
                  * that the cgroup is still realized the next time it is started. Do not return early
                  * on error, continue cleanup. */
-                log_unit_full_errno(u, r == -EBUSY ? LOG_DEBUG : LOG_WARNING, r, "Failed to destroy cgroup %s, ignoring: %m", empty_to_root(u->cgroup_path));
+                log_unit_full_errno(u, r == -EBUSY ? LOG_DEBUG : LOG_WARNING, r, "Failed to destroy cgroup %s, ignoring: %m", empty_to_root(crt->cgroup_path));
 
         if (is_root_slice)
                 return;
@@ -2847,47 +3620,61 @@ void unit_prune_cgroup(Unit *u) {
         if (!unit_maybe_release_cgroup(u)) /* Returns true if the cgroup was released */
                 return;
 
-        u->cgroup_realized = false;
-        u->cgroup_realized_mask = 0;
-        u->cgroup_enabled_mask = 0;
+        assert(crt == unit_get_cgroup_runtime(u));
+        assert(!crt->cgroup_path);
 
-        u->bpf_device_control_installed = bpf_program_free(u->bpf_device_control_installed);
+        crt->cgroup_realized = false;
+        crt->cgroup_realized_mask = 0;
+        crt->cgroup_enabled_mask = 0;
+
+        crt->bpf_device_control_installed = bpf_program_free(crt->bpf_device_control_installed);
 }
 
-int unit_search_main_pid(Unit *u, pid_t *ret) {
+int unit_search_main_pid(Unit *u, PidRef *ret) {
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        pid_t pid = 0, npid;
         int r;
 
         assert(u);
         assert(ret);
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return -ENXIO;
 
-        r = cg_enumerate_processes(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, &f);
+        r = cg_enumerate_processes(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, &f);
         if (r < 0)
                 return r;
 
-        while (cg_read_pid(f, &npid) > 0)  {
+        for (;;) {
+                _cleanup_(pidref_done) PidRef npidref = PIDREF_NULL;
 
-                if (npid == pid)
+                /* cg_read_pidref() will return an error on unmapped PIDs.
+                 * We can't reasonably deal with units that contain those. */
+                r = cg_read_pidref(f, &npidref, CGROUP_DONT_SKIP_UNMAPPED);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        break;
+
+                if (pidref_equal(&pidref, &npidref)) /* seen already, cgroupfs reports duplicates! */
                         continue;
 
-                if (pid_is_my_child(npid) == 0)
+                if (pidref_is_my_child(&npidref) <= 0) /* ignore processes further down the tree */
                         continue;
 
-                if (pid != 0)
-                        /* Dang, there's more than one daemonized PID
-                        in this group, so we don't know what process
-                        is the main process. */
-
+                if (pidref_is_set(&pidref) != 0)
+                        /* Dang, there's more than one daemonized PID in this group, so we don't know what
+                         * process is the main process. */
                         return -ENODATA;
 
-                pid = npid;
+                pidref = TAKE_PIDREF(npidref);
         }
 
-        *ret = pid;
+        if (!pidref_is_set(&pidref))
+                return -ENODATA;
+
+        *ret = TAKE_PIDREF(pidref);
         return 0;
 }
 
@@ -2901,43 +3688,44 @@ static int unit_watch_pids_in_path(Unit *u, const char *path) {
 
         r = cg_enumerate_processes(SYSTEMD_CGROUP_CONTROLLER, path, &f);
         if (r < 0)
-                ret = r;
+                RET_GATHER(ret, r);
         else {
-                pid_t pid;
+                for (;;) {
+                        _cleanup_(pidref_done) PidRef pid = PIDREF_NULL;
 
-                while ((r = cg_read_pid(f, &pid)) > 0) {
-                        r = unit_watch_pid(u, pid, false);
-                        if (r < 0 && ret >= 0)
-                                ret = r;
+                        r = cg_read_pidref(f, &pid, /* flags = */ 0);
+                        if (r == 0)
+                                break;
+                        if (r < 0) {
+                                RET_GATHER(ret, r);
+                                break;
+                        }
+
+                        RET_GATHER(ret, unit_watch_pidref(u, &pid, /* exclusive= */ false));
                 }
-
-                if (r < 0 && ret >= 0)
-                        ret = r;
         }
 
         r = cg_enumerate_subgroups(SYSTEMD_CGROUP_CONTROLLER, path, &d);
-        if (r < 0) {
-                if (ret >= 0)
-                        ret = r;
-        } else {
-                char *fn;
+        if (r < 0)
+                RET_GATHER(ret, r);
+        else {
+                for (;;) {
+                        _cleanup_free_ char *fn = NULL, *p = NULL;
 
-                while ((r = cg_read_subgroup(d, &fn)) > 0) {
-                        _cleanup_free_ char *p = NULL;
+                        r = cg_read_subgroup(d, &fn);
+                        if (r == 0)
+                                break;
+                        if (r < 0) {
+                                RET_GATHER(ret, r);
+                                break;
+                        }
 
                         p = path_join(empty_to_root(path), fn);
-                        free(fn);
-
                         if (!p)
                                 return -ENOMEM;
 
-                        r = unit_watch_pids_in_path(u, p);
-                        if (r < 0 && ret >= 0)
-                                ret = r;
+                        RET_GATHER(ret, unit_watch_pids_in_path(u, p));
                 }
-
-                if (r < 0 && ret >= 0)
-                        ret = r;
         }
 
         return ret;
@@ -2952,7 +3740,8 @@ int unit_synthesize_cgroup_empty_event(Unit *u) {
          * support for non-unified systems where notifications aren't reliable, and hence need to take whatever we can
          * get as notification source as soon as we stopped having any useful PIDs to watch for. */
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return -ENOENT;
 
         r = cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER);
@@ -2978,7 +3767,8 @@ int unit_watch_all_pids(Unit *u) {
          * get reliable cgroup empty notifications: we try to use
          * SIGCHLD as replacement. */
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return -ENOENT;
 
         r = cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER);
@@ -2987,7 +3777,7 @@ int unit_watch_all_pids(Unit *u) {
         if (r > 0) /* On unified we can use proper notifications */
                 return 0;
 
-        return unit_watch_pids_in_path(u, u->cgroup_path);
+        return unit_watch_pids_in_path(u, crt->cgroup_path);
 }
 
 static int on_cgroup_empty_event(sd_event_source *s, void *userdata) {
@@ -3018,7 +3808,9 @@ static int on_cgroup_empty_event(sd_event_source *s, void *userdata) {
 
         unit_add_to_gc_queue(u);
 
-        if (UNIT_VTABLE(u)->notify_cgroup_empty)
+        if (UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(u)))
+                unit_prune_cgroup(u);
+        else if (UNIT_VTABLE(u)->notify_cgroup_empty)
                 UNIT_VTABLE(u)->notify_cgroup_empty(u);
 
         return 0;
@@ -3050,15 +3842,8 @@ void unit_add_to_cgroup_empty_queue(Unit *u) {
                 return;
 
         /* Let's verify that the cgroup is really empty */
-        if (!u->cgroup_path)
-                return;
-
-        r = cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path);
-        if (r < 0) {
-                log_unit_debug_errno(u, r, "Failed to determine whether cgroup %s is empty: %m", empty_to_root(u->cgroup_path));
-                return;
-        }
-        if (r == 0)
+        r = unit_cgroup_is_empty(u);
+        if (r <= 0)
                 return;
 
         LIST_PREPEND(cgroup_empty_queue, u->manager->cgroup_empty_queue, u);
@@ -3086,7 +3871,10 @@ int unit_check_oomd_kill(Unit *u) {
         uint64_t n = 0;
         int r;
 
-        if (!u->cgroup_path)
+        assert(u);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return 0;
 
         r = cg_all_unified();
@@ -3095,7 +3883,7 @@ int unit_check_oomd_kill(Unit *u) {
         else if (r == 0)
                 return 0;
 
-        r = cg_get_xattr_malloc(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "user.oomd_ooms", &value);
+        r = cg_get_xattr_malloc(crt->cgroup_path, "user.oomd_ooms", &value);
         if (r < 0 && !ERRNO_IS_XATTR_ABSENT(r))
                 return r;
 
@@ -3105,15 +3893,15 @@ int unit_check_oomd_kill(Unit *u) {
                          return r;
         }
 
-        increased = n > u->managed_oom_kill_last;
-        u->managed_oom_kill_last = n;
+        increased = n > crt->managed_oom_kill_last;
+        crt->managed_oom_kill_last = n;
 
         if (!increased)
                 return 0;
 
         n = 0;
         value = mfree(value);
-        r = cg_get_xattr_malloc(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "user.oomd_kill", &value);
+        r = cg_get_xattr_malloc(crt->cgroup_path, "user.oomd_kill", &value);
         if (r >= 0 && !isempty(value))
                 (void) safe_atou64(value, &n);
 
@@ -3140,10 +3928,16 @@ int unit_check_oom(Unit *u) {
         uint64_t c;
         int r;
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return 0;
 
-        r = cg_get_keyed_attribute("memory", u->cgroup_path, "memory.events", STRV_MAKE("oom_kill"), &oom_kill);
+        r = cg_get_keyed_attribute(
+                        "memory",
+                        crt->cgroup_path,
+                        "memory.events",
+                        STRV_MAKE("oom_kill"),
+                        &oom_kill);
         if (IN_SET(r, -ENOENT, -ENXIO)) /* Handle gracefully if cgroup or oom_kill attribute don't exist */
                 c = 0;
         else if (r < 0)
@@ -3154,8 +3948,8 @@ int unit_check_oom(Unit *u) {
                         return log_unit_debug_errno(u, r, "Failed to parse oom_kill field: %m");
         }
 
-        increased = c > u->oom_kill_last;
-        u->oom_kill_last = c;
+        increased = c > crt->oom_kill_last;
+        crt->oom_kill_last = c;
 
         if (!increased)
                 return 0;
@@ -3193,6 +3987,8 @@ static int on_cgroup_oom_event(sd_event_source *s, void *userdata) {
         }
 
         (void) unit_check_oom(u);
+        unit_add_to_gc_queue(u);
+
         return 0;
 }
 
@@ -3203,7 +3999,9 @@ static void unit_add_to_cgroup_oom_queue(Unit *u) {
 
         if (u->in_cgroup_oom_queue)
                 return;
-        if (!u->cgroup_path)
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return;
 
         LIST_PREPEND(cgroup_oom_queue, u->manager->cgroup_oom_queue, u);
@@ -3219,7 +4017,7 @@ static void unit_add_to_cgroup_oom_queue(Unit *u) {
                         return;
                 }
 
-                r = sd_event_source_set_priority(s, SD_EVENT_PRIORITY_NORMAL-8);
+                r = sd_event_source_set_priority(s, EVENT_PRIORITY_CGROUP_OOM);
                 if (r < 0) {
                         log_error_errno(r, "Failed to set priority of cgroup oom event source: %m");
                         return;
@@ -3240,11 +4038,16 @@ static int unit_check_cgroup_events(Unit *u) {
 
         assert(u);
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return 0;
 
-        r = cg_get_keyed_attribute_graceful(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "cgroup.events",
-                                            STRV_MAKE("populated", "frozen"), values);
+        r = cg_get_keyed_attribute_graceful(
+                        SYSTEMD_CGROUP_CONTROLLER,
+                        crt->cgroup_path,
+                        "cgroup.events",
+                        STRV_MAKE("populated", "frozen"),
+                        values);
         if (r < 0)
                 return r;
 
@@ -3258,13 +4061,11 @@ static int unit_check_cgroup_events(Unit *u) {
                         unit_add_to_cgroup_empty_queue(u);
         }
 
-        /* Disregard freezer state changes due to operations not initiated by us */
-        if (values[1] && IN_SET(u->freezer_state, FREEZER_FREEZING, FREEZER_THAWING)) {
-                if (streq(values[1], "0"))
-                        unit_thawed(u);
-                else
-                        unit_frozen(u);
-        }
+        /* Disregard freezer state changes due to operations not initiated by us.
+         * See: https://github.com/systemd/systemd/pull/13512/files#r416469963 and
+         *      https://github.com/systemd/systemd/pull/13512#issuecomment-573007207 */
+        if (values[1] && IN_SET(u->freezer_state, FREEZER_FREEZING, FREEZER_FREEZING_BY_PARENT, FREEZER_THAWING))
+                unit_freezer_complete(u, streq(values[1], "0") ? FREEZER_RUNNING : FREEZER_FROZEN);
 
         free(values[0]);
         free(values[1]);
@@ -3348,7 +4149,7 @@ static int cg_bpf_mask_supported(CGroupMask *ret) {
                 mask |= CGROUP_MASK_BPF_SOCKET_BIND;
 
         /* BPF-based cgroup_skb/{egress|ingress} hooks */
-        r = restrict_network_interfaces_supported();
+        r = bpf_restrict_ifaces_supported();
         if (r < 0)
                 return r;
         if (r > 0)
@@ -3425,7 +4226,7 @@ int manager_setup_cgroup(Manager *m) {
         /* Schedule cgroup empty checks early, but after having processed service notification messages or
          * SIGCHLD signals, so that a cgroup running empty is always just the last safety net of
          * notification, and we collected the metadata the notification and SIGCHLD stuff offers first. */
-        r = sd_event_source_set_priority(m->cgroup_empty_event_source, SD_EVENT_PRIORITY_NORMAL-5);
+        r = sd_event_source_set_priority(m->cgroup_empty_event_source, EVENT_PRIORITY_CGROUP_EMPTY);
         if (r < 0)
                 return log_error_errno(r, "Failed to set priority of cgroup empty event source: %m");
 
@@ -3454,7 +4255,7 @@ int manager_setup_cgroup(Manager *m) {
                 /* Process cgroup empty notifications early. Note that when this event is dispatched it'll
                  * just add the unit to a cgroup empty queue, hence let's run earlier than that. Also see
                  * handling of cgroup agent notifications, for the classic cgroup hierarchy support. */
-                r = sd_event_source_set_priority(m->cgroup_inotify_event_source, SD_EVENT_PRIORITY_NORMAL-9);
+                r = sd_event_source_set_priority(m->cgroup_inotify_event_source, EVENT_PRIORITY_CGROUP_INOTIFY);
                 if (r < 0)
                         return log_error_errno(r, "Failed to set priority of inotify event source: %m");
 
@@ -3485,7 +4286,7 @@ int manager_setup_cgroup(Manager *m) {
 
                 /* 6. And pin it, so that it cannot be unmounted */
                 safe_close(m->pin_cgroupfs_fd);
-                m->pin_cgroupfs_fd = open(path, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOCTTY|O_NONBLOCK);
+                m->pin_cgroupfs_fd = open(path, O_PATH|O_CLOEXEC|O_DIRECTORY);
                 if (m->pin_cgroupfs_fd < 0)
                         return log_error_errno(errno, "Failed to open pin file: %m");
 
@@ -3563,48 +4364,72 @@ Unit* manager_get_unit_by_cgroup(Manager *m, const char *cgroup) {
         }
 }
 
-Unit *manager_get_unit_by_pid_cgroup(Manager *m, pid_t pid) {
+Unit *manager_get_unit_by_pidref_cgroup(Manager *m, const PidRef *pid) {
         _cleanup_free_ char *cgroup = NULL;
 
         assert(m);
 
-        if (!pid_is_valid(pid))
-                return NULL;
-
-        if (cg_pid_get_path(SYSTEMD_CGROUP_CONTROLLER, pid, &cgroup) < 0)
+        if (cg_pidref_get_path(SYSTEMD_CGROUP_CONTROLLER, pid, &cgroup) < 0)
                 return NULL;
 
         return manager_get_unit_by_cgroup(m, cgroup);
 }
 
-Unit *manager_get_unit_by_pid(Manager *m, pid_t pid) {
+Unit *manager_get_unit_by_pidref_watching(Manager *m, const PidRef *pid) {
         Unit *u, **array;
 
         assert(m);
 
-        /* Note that a process might be owned by multiple units, we return only one here, which is good enough for most
-         * cases, though not strictly correct. We prefer the one reported by cgroup membership, as that's the most
-         * relevant one as children of the process will be assigned to that one, too, before all else. */
-
-        if (!pid_is_valid(pid))
+        if (!pidref_is_set(pid))
                 return NULL;
 
-        if (pid == getpid_cached())
-                return hashmap_get(m->units, SPECIAL_INIT_SCOPE);
-
-        u = manager_get_unit_by_pid_cgroup(m, pid);
+        u = hashmap_get(m->watch_pids, pid);
         if (u)
                 return u;
 
-        u = hashmap_get(m->watch_pids, PID_TO_PTR(pid));
-        if (u)
-                return u;
-
-        array = hashmap_get(m->watch_pids, PID_TO_PTR(-pid));
+        array = hashmap_get(m->watch_pids_more, pid);
         if (array)
                 return array[0];
 
         return NULL;
+}
+
+Unit *manager_get_unit_by_pidref(Manager *m, const PidRef *pid) {
+        Unit *u;
+
+        assert(m);
+
+        /* Note that a process might be owned by multiple units, we return only one here, which is good
+         * enough for most cases, though not strictly correct. We prefer the one reported by cgroup
+         * membership, as that's the most relevant one as children of the process will be assigned to that
+         * one, too, before all else. */
+
+        if (!pidref_is_set(pid))
+                return NULL;
+
+        if (pidref_is_self(pid))
+                return hashmap_get(m->units, SPECIAL_INIT_SCOPE);
+        if (pid->pid == 1)
+                return NULL;
+
+        u = manager_get_unit_by_pidref_cgroup(m, pid);
+        if (u)
+                return u;
+
+        u = manager_get_unit_by_pidref_watching(m, pid);
+        if (u)
+                return u;
+
+        return NULL;
+}
+
+Unit *manager_get_unit_by_pid(Manager *m, pid_t pid) {
+        assert(m);
+
+        if (!pid_is_valid(pid))
+                return NULL;
+
+        return manager_get_unit_by_pidref(m, &PIDREF_MAKE_FROM_PID(pid));
 }
 
 int manager_notify_cgroup_empty(Manager *m, const char *cgroup) {
@@ -3627,10 +4452,7 @@ int manager_notify_cgroup_empty(Manager *m, const char *cgroup) {
 }
 
 int unit_get_memory_available(Unit *u, uint64_t *ret) {
-        uint64_t unit_current, available = UINT64_MAX;
-        CGroupContext *unit_context;
-        const char *memory_file;
-        int r;
+        uint64_t available = UINT64_MAX, current = 0;
 
         assert(u);
         assert(ret);
@@ -3639,58 +4461,34 @@ int unit_get_memory_available(Unit *u, uint64_t *ret) {
          * claim before hitting the configured cgroup limits (if any). Consider both MemoryHigh
          * and MemoryMax, and also any slice the unit might be nested below. */
 
-        if (!UNIT_CGROUP_BOOL(u, memory_accounting))
-                return -ENODATA;
-
-        if (!u->cgroup_path)
-                return -ENODATA;
-
-        /* The root cgroup doesn't expose this information */
-        if (unit_has_host_root_cgroup(u))
-                return -ENODATA;
-
-        if ((u->cgroup_realized_mask & CGROUP_MASK_MEMORY) == 0)
-                return -ENODATA;
-
-        r = cg_all_unified();
-        if (r < 0)
-                return r;
-        memory_file = r > 0 ? "memory.current" : "memory.usage_in_bytes";
-
-        r = cg_get_attribute_as_uint64("memory", u->cgroup_path, memory_file, &unit_current);
-        if (r < 0)
-                return r;
-
-        assert_se(unit_context = unit_get_cgroup_context(u));
-
-        if (unit_context->memory_max != UINT64_MAX || unit_context->memory_high != UINT64_MAX)
-                available = LESS_BY(MIN(unit_context->memory_max, unit_context->memory_high), unit_current);
-
-        for (Unit *slice = UNIT_GET_SLICE(u); slice; slice = UNIT_GET_SLICE(slice)) {
-                uint64_t slice_current, slice_available = UINT64_MAX;
-                CGroupContext *slice_context;
+        do {
+                uint64_t unit_available, unit_limit = UINT64_MAX;
+                CGroupContext *unit_context;
 
                 /* No point in continuing if we can't go any lower */
                 if (available == 0)
                         break;
 
-                if (!slice->cgroup_path)
+                unit_context = unit_get_cgroup_context(u);
+                if (!unit_context)
+                        return -ENODATA;
+
+                CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+                if (!crt || !crt->cgroup_path)
                         continue;
 
-                slice_context = unit_get_cgroup_context(slice);
-                if (!slice_context)
-                        continue;
+                (void) unit_get_memory_current(u, &current);
+                /* in case of error, previous current propagates as lower bound */
 
-                if (slice_context->memory_max == UINT64_MAX && slice_context->memory_high == UINT64_MAX)
+                if (unit_has_name(u, SPECIAL_ROOT_SLICE))
+                        unit_limit = physical_memory();
+                else if (unit_context->memory_max == UINT64_MAX && unit_context->memory_high == UINT64_MAX)
                         continue;
+                unit_limit = MIN3(unit_limit, unit_context->memory_max, unit_context->memory_high);
 
-                r = cg_get_attribute_as_uint64("memory", slice->cgroup_path, memory_file, &slice_current);
-                if (r < 0)
-                        continue;
-
-                slice_available = LESS_BY(MIN(slice_context->memory_max, slice_context->memory_high), slice_current);
-                available = MIN(slice_available, available);
-        }
+                unit_available = LESS_BY(unit_limit, current);
+                available = MIN(unit_available, available);
+        } while ((u = UNIT_GET_SLICE(u)));
 
         *ret = available;
 
@@ -3700,27 +4498,95 @@ int unit_get_memory_available(Unit *u, uint64_t *ret) {
 int unit_get_memory_current(Unit *u, uint64_t *ret) {
         int r;
 
+        // FIXME: Merge this into unit_get_memory_accounting after support for cgroup v1 is dropped
+
         assert(u);
         assert(ret);
 
         if (!UNIT_CGROUP_BOOL(u, memory_accounting))
                 return -ENODATA;
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return -ENODATA;
 
         /* The root cgroup doesn't expose this information, let's get it from /proc instead */
         if (unit_has_host_root_cgroup(u))
                 return procfs_memory_get_used(ret);
 
-        if ((u->cgroup_realized_mask & CGROUP_MASK_MEMORY) == 0)
+        if ((crt->cgroup_realized_mask & CGROUP_MASK_MEMORY) == 0)
                 return -ENODATA;
 
         r = cg_all_unified();
         if (r < 0)
                 return r;
 
-        return cg_get_attribute_as_uint64("memory", u->cgroup_path, r > 0 ? "memory.current" : "memory.usage_in_bytes", ret);
+        return cg_get_attribute_as_uint64("memory", crt->cgroup_path, r > 0 ? "memory.current" : "memory.usage_in_bytes", ret);
+}
+
+int unit_get_memory_accounting(Unit *u, CGroupMemoryAccountingMetric metric, uint64_t *ret) {
+
+        static const char* const attributes_table[_CGROUP_MEMORY_ACCOUNTING_METRIC_MAX] = {
+                [CGROUP_MEMORY_PEAK]          = "memory.peak",
+                [CGROUP_MEMORY_SWAP_CURRENT]  = "memory.swap.current",
+                [CGROUP_MEMORY_SWAP_PEAK]     = "memory.swap.peak",
+                [CGROUP_MEMORY_ZSWAP_CURRENT] = "memory.zswap.current",
+        };
+
+        uint64_t bytes;
+        bool updated = false;
+        int r;
+
+        assert(u);
+        assert(metric >= 0);
+        assert(metric < _CGROUP_MEMORY_ACCOUNTING_METRIC_MAX);
+
+        if (!UNIT_CGROUP_BOOL(u, memory_accounting))
+                return -ENODATA;
+
+        /* The root cgroup doesn't expose this information. */
+        if (unit_has_host_root_cgroup(u))
+                return -ENODATA;
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return -ENODATA;
+        if (!crt->cgroup_path)
+                /* If the cgroup is already gone, we try to find the last cached value. */
+                goto finish;
+
+        if (!FLAGS_SET(crt->cgroup_realized_mask, CGROUP_MASK_MEMORY))
+                return -ENODATA;
+
+        r = cg_all_unified();
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -ENODATA;
+
+        r = cg_get_attribute_as_uint64("memory", crt->cgroup_path, attributes_table[metric], &bytes);
+        if (r < 0 && r != -ENODATA)
+                return r;
+        updated = r >= 0;
+
+finish:
+        if (metric <= _CGROUP_MEMORY_ACCOUNTING_METRIC_CACHED_LAST) {
+                uint64_t *last = &crt->memory_accounting_last[metric];
+
+                if (updated)
+                        *last = bytes;
+                else if (*last != UINT64_MAX)
+                        bytes = *last;
+                else
+                        return -ENODATA;
+
+        } else if (!updated)
+                return -ENODATA;
+
+        if (ret)
+                *ret = bytes;
+
+        return 0;
 }
 
 int unit_get_tasks_current(Unit *u, uint64_t *ret) {
@@ -3730,27 +4596,28 @@ int unit_get_tasks_current(Unit *u, uint64_t *ret) {
         if (!UNIT_CGROUP_BOOL(u, tasks_accounting))
                 return -ENODATA;
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return -ENODATA;
 
         /* The root cgroup doesn't expose this information, let's get it from /proc instead */
         if (unit_has_host_root_cgroup(u))
                 return procfs_tasks_get_current(ret);
 
-        if ((u->cgroup_realized_mask & CGROUP_MASK_PIDS) == 0)
+        if ((crt->cgroup_realized_mask & CGROUP_MASK_PIDS) == 0)
                 return -ENODATA;
 
-        return cg_get_attribute_as_uint64("pids", u->cgroup_path, "pids.current", ret);
+        return cg_get_attribute_as_uint64("pids", crt->cgroup_path, "pids.current", ret);
 }
 
-static int unit_get_cpu_usage_raw(Unit *u, nsec_t *ret) {
-        uint64_t ns;
+static int unit_get_cpu_usage_raw(const Unit *u, const CGroupRuntime *crt, nsec_t *ret) {
         int r;
 
         assert(u);
+        assert(crt);
         assert(ret);
 
-        if (!u->cgroup_path)
+        if (!crt->cgroup_path)
                 return -ENODATA;
 
         /* The root cgroup doesn't expose this information, let's get it from /proc instead */
@@ -3758,31 +4625,30 @@ static int unit_get_cpu_usage_raw(Unit *u, nsec_t *ret) {
                 return procfs_cpu_get_usage(ret);
 
         /* Requisite controllers for CPU accounting are not enabled */
-        if ((get_cpu_accounting_mask() & ~u->cgroup_realized_mask) != 0)
+        if ((get_cpu_accounting_mask() & ~crt->cgroup_realized_mask) != 0)
                 return -ENODATA;
 
         r = cg_all_unified();
         if (r < 0)
                 return r;
-        if (r > 0) {
-                _cleanup_free_ char *val = NULL;
-                uint64_t us;
+        if (r == 0)
+                return cg_get_attribute_as_uint64("cpuacct", crt->cgroup_path, "cpuacct.usage", ret);
 
-                r = cg_get_keyed_attribute("cpu", u->cgroup_path, "cpu.stat", STRV_MAKE("usage_usec"), &val);
-                if (IN_SET(r, -ENOENT, -ENXIO))
-                        return -ENODATA;
-                if (r < 0)
-                        return r;
+        _cleanup_free_ char *val = NULL;
+        uint64_t us;
 
-                r = safe_atou64(val, &us);
-                if (r < 0)
-                        return r;
+        r = cg_get_keyed_attribute("cpu", crt->cgroup_path, "cpu.stat", STRV_MAKE("usage_usec"), &val);
+        if (IN_SET(r, -ENOENT, -ENXIO))
+                return -ENODATA;
+        if (r < 0)
+                return r;
 
-                ns = us * NSEC_PER_USEC;
-        } else
-                return cg_get_attribute_as_uint64("cpuacct", u->cgroup_path, "cpuacct.usage", ret);
+        r = safe_atou64(val, &us);
+        if (r < 0)
+                return r;
 
-        *ret = ns;
+        *ret = us * NSEC_PER_USEC;
+
         return 0;
 }
 
@@ -3799,24 +4665,28 @@ int unit_get_cpu_usage(Unit *u, nsec_t *ret) {
         if (!UNIT_CGROUP_BOOL(u, cpu_accounting))
                 return -ENODATA;
 
-        r = unit_get_cpu_usage_raw(u, &ns);
-        if (r == -ENODATA && u->cpu_usage_last != NSEC_INFINITY) {
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return -ENODATA;
+
+        r = unit_get_cpu_usage_raw(u, crt, &ns);
+        if (r == -ENODATA && crt->cpu_usage_last != NSEC_INFINITY) {
                 /* If we can't get the CPU usage anymore (because the cgroup was already removed, for example), use our
                  * cached value. */
 
                 if (ret)
-                        *ret = u->cpu_usage_last;
+                        *ret = crt->cpu_usage_last;
                 return 0;
         }
         if (r < 0)
                 return r;
 
-        if (ns > u->cpu_usage_base)
-                ns -= u->cpu_usage_base;
+        if (ns > crt->cpu_usage_base)
+                ns -= crt->cpu_usage_base;
         else
                 ns = 0;
 
-        u->cpu_usage_last = ns;
+        crt->cpu_usage_last = ns;
         if (ret)
                 *ret = ns;
 
@@ -3839,9 +4709,13 @@ int unit_get_ip_accounting(
         if (!UNIT_CGROUP_BOOL(u, ip_accounting))
                 return -ENODATA;
 
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return -ENODATA;
+
         fd = IN_SET(metric, CGROUP_IP_INGRESS_BYTES, CGROUP_IP_INGRESS_PACKETS) ?
-                u->ip_accounting_ingress_map_fd :
-                u->ip_accounting_egress_map_fd;
+                crt->ip_accounting_ingress_map_fd :
+                crt->ip_accounting_egress_map_fd;
         if (fd < 0)
                 return -ENODATA;
 
@@ -3856,26 +4730,83 @@ int unit_get_ip_accounting(
          * all BPF programs and maps anew, but serialize the old counters. When deserializing we store them in the
          * ip_accounting_extra[] field, and add them in here transparently. */
 
-        *ret = value + u->ip_accounting_extra[metric];
+        *ret = value + crt->ip_accounting_extra[metric];
 
         return r;
 }
 
-static int unit_get_io_accounting_raw(Unit *u, uint64_t ret[static _CGROUP_IO_ACCOUNTING_METRIC_MAX]) {
-        static const char *const field_names[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {
+static uint64_t unit_get_effective_limit_one(Unit *u, CGroupLimitType type) {
+        CGroupContext *cc;
+
+        assert(u);
+        assert(UNIT_HAS_CGROUP_CONTEXT(u));
+
+        if (unit_has_name(u, SPECIAL_ROOT_SLICE))
+                switch (type) {
+                        case CGROUP_LIMIT_MEMORY_MAX:
+                        case CGROUP_LIMIT_MEMORY_HIGH:
+                                return physical_memory();
+                        case CGROUP_LIMIT_TASKS_MAX:
+                                return system_tasks_max();
+                        default:
+                                assert_not_reached();
+                }
+
+        cc = ASSERT_PTR(unit_get_cgroup_context(u));
+        switch (type) {
+                /* Note: on legacy/hybrid hierarchies memory_max stays CGROUP_LIMIT_MAX unless configured
+                 * explicitly. Effective value of MemoryLimit= (cgroup v1) is not implemented. */
+                case CGROUP_LIMIT_MEMORY_MAX:
+                        return cc->memory_max;
+                case CGROUP_LIMIT_MEMORY_HIGH:
+                        return cc->memory_high;
+                case CGROUP_LIMIT_TASKS_MAX:
+                        return cgroup_tasks_max_resolve(&cc->tasks_max);
+                default:
+                        assert_not_reached();
+        }
+}
+
+int unit_get_effective_limit(Unit *u, CGroupLimitType type, uint64_t *ret) {
+        uint64_t infimum;
+
+        assert(u);
+        assert(ret);
+        assert(type >= 0);
+        assert(type < _CGROUP_LIMIT_TYPE_MAX);
+
+        if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return -EINVAL;
+
+        infimum = unit_get_effective_limit_one(u, type);
+        for (Unit *slice = UNIT_GET_SLICE(u); slice; slice = UNIT_GET_SLICE(slice))
+                infimum = MIN(infimum, unit_get_effective_limit_one(slice, type));
+
+        *ret = infimum;
+        return 0;
+}
+
+static int unit_get_io_accounting_raw(
+                const Unit *u,
+                const CGroupRuntime *crt,
+                uint64_t ret[static _CGROUP_IO_ACCOUNTING_METRIC_MAX]) {
+
+        static const char* const field_names[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {
                 [CGROUP_IO_READ_BYTES]       = "rbytes=",
                 [CGROUP_IO_WRITE_BYTES]      = "wbytes=",
                 [CGROUP_IO_READ_OPERATIONS]  = "rios=",
                 [CGROUP_IO_WRITE_OPERATIONS] = "wios=",
         };
+
         uint64_t acc[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {};
         _cleanup_free_ char *path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
         assert(u);
+        assert(crt);
 
-        if (!u->cgroup_path)
+        if (!crt->cgroup_path)
                 return -ENODATA;
 
         if (unit_has_host_root_cgroup(u))
@@ -3884,13 +4815,13 @@ static int unit_get_io_accounting_raw(Unit *u, uint64_t ret[static _CGROUP_IO_AC
         r = cg_all_unified();
         if (r < 0)
                 return r;
-        if (r == 0) /* TODO: support cgroupv1 */
+        if (r == 0)
                 return -ENODATA;
 
-        if (!FLAGS_SET(u->cgroup_realized_mask, CGROUP_MASK_IO))
+        if (!FLAGS_SET(crt->cgroup_realized_mask, CGROUP_MASK_IO))
                 return -ENODATA;
 
-        r = cg_get_path("io", u->cgroup_path, "io.stat", &path);
+        r = cg_get_path("io", crt->cgroup_path, "io.stat", &path);
         if (r < 0)
                 return r;
 
@@ -3947,106 +4878,131 @@ static int unit_get_io_accounting_raw(Unit *u, uint64_t ret[static _CGROUP_IO_AC
 int unit_get_io_accounting(
                 Unit *u,
                 CGroupIOAccountingMetric metric,
-                bool allow_cache,
                 uint64_t *ret) {
 
         uint64_t raw[_CGROUP_IO_ACCOUNTING_METRIC_MAX];
         int r;
 
-        /* Retrieve an IO account parameter. This will subtract the counter when the unit was started. */
+        /*
+         * Retrieve an IO counter, subtracting the value of the counter value at the time the unit was started.
+         * If ret == NULL and metric == _<...>_INVALID, no return value is expected (refresh the caches only).
+         */
+
+        assert(u);
+        assert(metric >= 0 || (!ret && metric == _CGROUP_IO_ACCOUNTING_METRIC_INVALID));
+        assert(metric < _CGROUP_IO_ACCOUNTING_METRIC_MAX);
 
         if (!UNIT_CGROUP_BOOL(u, io_accounting))
                 return -ENODATA;
 
-        if (allow_cache && u->io_accounting_last[metric] != UINT64_MAX)
-                goto done;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return -ENODATA;
 
-        r = unit_get_io_accounting_raw(u, raw);
-        if (r == -ENODATA && u->io_accounting_last[metric] != UINT64_MAX)
+        r = unit_get_io_accounting_raw(u, crt, raw);
+        if (r == -ENODATA && metric >= 0 && crt->io_accounting_last[metric] != UINT64_MAX)
                 goto done;
         if (r < 0)
                 return r;
 
         for (CGroupIOAccountingMetric i = 0; i < _CGROUP_IO_ACCOUNTING_METRIC_MAX; i++) {
                 /* Saturated subtraction */
-                if (raw[i] > u->io_accounting_base[i])
-                        u->io_accounting_last[i] = raw[i] - u->io_accounting_base[i];
+                if (raw[i] > crt->io_accounting_base[i])
+                        crt->io_accounting_last[i] = raw[i] - crt->io_accounting_base[i];
                 else
-                        u->io_accounting_last[i] = 0;
+                        crt->io_accounting_last[i] = 0;
         }
 
 done:
         if (ret)
-                *ret = u->io_accounting_last[metric];
+                *ret = crt->io_accounting_last[metric];
 
         return 0;
 }
 
-int unit_reset_cpu_accounting(Unit *u) {
+static int unit_reset_cpu_accounting(Unit *unit, CGroupRuntime *crt) {
         int r;
 
-        assert(u);
+        assert(crt);
 
-        u->cpu_usage_last = NSEC_INFINITY;
+        crt->cpu_usage_base = 0;
+        crt->cpu_usage_last = NSEC_INFINITY;
 
-        r = unit_get_cpu_usage_raw(u, &u->cpu_usage_base);
-        if (r < 0) {
-                u->cpu_usage_base = 0;
-                return r;
+        if (unit) {
+                r = unit_get_cpu_usage_raw(unit, crt, &crt->cpu_usage_base);
+                if (r < 0 && r != -ENODATA)
+                        return r;
         }
 
         return 0;
 }
 
-int unit_reset_ip_accounting(Unit *u) {
-        int r = 0, q = 0;
-
-        assert(u);
-
-        if (u->ip_accounting_ingress_map_fd >= 0)
-                r = bpf_firewall_reset_accounting(u->ip_accounting_ingress_map_fd);
-
-        if (u->ip_accounting_egress_map_fd >= 0)
-                q = bpf_firewall_reset_accounting(u->ip_accounting_egress_map_fd);
-
-        zero(u->ip_accounting_extra);
-
-        return r < 0 ? r : q;
-}
-
-int unit_reset_io_accounting(Unit *u) {
+static int unit_reset_io_accounting(Unit *unit, CGroupRuntime *crt) {
         int r;
 
-        assert(u);
+        assert(crt);
 
-        for (CGroupIOAccountingMetric i = 0; i < _CGROUP_IO_ACCOUNTING_METRIC_MAX; i++)
-                u->io_accounting_last[i] = UINT64_MAX;
+        zero(crt->io_accounting_base);
+        FOREACH_ELEMENT(i, crt->io_accounting_last)
+                *i = UINT64_MAX;
 
-        r = unit_get_io_accounting_raw(u, u->io_accounting_base);
-        if (r < 0) {
-                zero(u->io_accounting_base);
-                return r;
+        if (unit) {
+                r = unit_get_io_accounting_raw(unit, crt, crt->io_accounting_base);
+                if (r < 0 && r != -ENODATA)
+                        return r;
         }
 
         return 0;
+}
+
+static void cgroup_runtime_reset_memory_accounting_last(CGroupRuntime *crt) {
+        assert(crt);
+
+        FOREACH_ELEMENT(i, crt->memory_accounting_last)
+                *i = UINT64_MAX;
+}
+
+static int cgroup_runtime_reset_ip_accounting(CGroupRuntime *crt) {
+        int r = 0;
+
+        assert(crt);
+
+        if (crt->ip_accounting_ingress_map_fd >= 0)
+                RET_GATHER(r, bpf_firewall_reset_accounting(crt->ip_accounting_ingress_map_fd));
+
+        if (crt->ip_accounting_egress_map_fd >= 0)
+                RET_GATHER(r, bpf_firewall_reset_accounting(crt->ip_accounting_egress_map_fd));
+
+        zero(crt->ip_accounting_extra);
+
+        return r;
 }
 
 int unit_reset_accounting(Unit *u) {
-        int r, q, v;
+        int r = 0;
 
         assert(u);
 
-        r = unit_reset_cpu_accounting(u);
-        q = unit_reset_io_accounting(u);
-        v = unit_reset_ip_accounting(u);
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return 0;
 
-        return r < 0 ? r : q < 0 ? q : v;
+        cgroup_runtime_reset_memory_accounting_last(crt);
+        RET_GATHER(r, unit_reset_cpu_accounting(u, crt));
+        RET_GATHER(r, unit_reset_io_accounting(u, crt));
+        RET_GATHER(r, cgroup_runtime_reset_ip_accounting(crt));
+
+        return r;
 }
 
 void unit_invalidate_cgroup(Unit *u, CGroupMask m) {
         assert(u);
 
         if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return;
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
                 return;
 
         if (m == 0)
@@ -4059,10 +5015,10 @@ void unit_invalidate_cgroup(Unit *u, CGroupMask m) {
         if (m & (CGROUP_MASK_CPU | CGROUP_MASK_CPUACCT))
                 m |= CGROUP_MASK_CPU | CGROUP_MASK_CPUACCT;
 
-        if (FLAGS_SET(u->cgroup_invalidated_mask, m)) /* NOP? */
+        if (FLAGS_SET(crt->cgroup_invalidated_mask, m)) /* NOP? */
                 return;
 
-        u->cgroup_invalidated_mask |= m;
+        crt->cgroup_invalidated_mask |= m;
         unit_add_to_cgroup_realize_queue(u);
 }
 
@@ -4072,10 +5028,14 @@ void unit_invalidate_cgroup_bpf(Unit *u) {
         if (!UNIT_HAS_CGROUP_CONTEXT(u))
                 return;
 
-        if (u->cgroup_invalidated_mask & CGROUP_MASK_BPF_FIREWALL) /* NOP? */
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
                 return;
 
-        u->cgroup_invalidated_mask |= CGROUP_MASK_BPF_FIREWALL;
+        if (crt->cgroup_invalidated_mask & CGROUP_MASK_BPF_FIREWALL) /* NOP? */
+                return;
+
+        crt->cgroup_invalidated_mask |= CGROUP_MASK_BPF_FIREWALL;
         unit_add_to_cgroup_realize_queue(u);
 
         /* If we are a slice unit, we also need to put compile a new BPF program for all our children, as the IP access
@@ -4127,105 +5087,104 @@ void manager_invalidate_startup_units(Manager *m) {
                 unit_invalidate_cgroup(u, CGROUP_MASK_CPU|CGROUP_MASK_IO|CGROUP_MASK_BLKIO|CGROUP_MASK_CPUSET);
 }
 
-static int unit_get_nice(Unit *u) {
-        ExecContext *ec;
+static int unit_cgroup_freezer_kernel_state(Unit *u, FreezerState *ret) {
+        _cleanup_free_ char *val = NULL;
+        FreezerState s;
+        int r;
 
-        ec = unit_get_exec_context(u);
-        return ec ? ec->nice : 0;
-}
+        assert(u);
+        assert(ret);
 
-static uint64_t unit_get_cpu_weight(Unit *u) {
-        ManagerState state = manager_state(u->manager);
-        CGroupContext *cc;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                return -EOWNERDEAD;
 
-        cc = unit_get_cgroup_context(u);
-        return cc ? cgroup_context_cpu_weight(cc, state) : CGROUP_WEIGHT_DEFAULT;
-}
+        r = cg_get_keyed_attribute(
+                        SYSTEMD_CGROUP_CONTROLLER,
+                        crt->cgroup_path,
+                        "cgroup.events",
+                        STRV_MAKE("frozen"),
+                        &val);
+        if (IN_SET(r, -ENOENT, -ENXIO))
+                return -ENODATA;
+        if (r < 0)
+                return r;
 
-int compare_job_priority(const void *a, const void *b) {
-        const Job *x = a, *y = b;
-        int nice_x, nice_y;
-        uint64_t weight_x, weight_y;
-        int ret;
+        if (streq(val, "0"))
+                s = FREEZER_RUNNING;
+        else if (streq(val, "1"))
+                s = FREEZER_FROZEN;
+        else {
+                log_unit_debug(u, "Unexpected cgroup frozen state: %s", val);
+                s = _FREEZER_STATE_INVALID;
+        }
 
-        if ((ret = CMP(x->unit->type, y->unit->type)) != 0)
-                return -ret;
-
-        weight_x = unit_get_cpu_weight(x->unit);
-        weight_y = unit_get_cpu_weight(y->unit);
-
-        if ((ret = CMP(weight_x, weight_y)) != 0)
-                return -ret;
-
-        nice_x = unit_get_nice(x->unit);
-        nice_y = unit_get_nice(y->unit);
-
-        if ((ret = CMP(nice_x, nice_y)) != 0)
-                return ret;
-
-        return strcmp(x->unit->id, y->unit->id);
+        *ret = s;
+        return 0;
 }
 
 int unit_cgroup_freezer_action(Unit *u, FreezerAction action) {
         _cleanup_free_ char *path = NULL;
-        FreezerState target, kernel = _FREEZER_STATE_INVALID;
-        int r, ret;
+        FreezerState current, next, objective;
+        int r;
 
         assert(u);
-        assert(IN_SET(action, FREEZER_FREEZE, FREEZER_THAW));
+        assert(action >= 0);
+        assert(action < _FREEZER_ACTION_MAX);
 
         if (!cg_freezer_supported())
                 return 0;
 
-        /* Ignore all requests to thaw init.scope or -.slice and reject all requests to freeze them */
-        if (unit_has_name(u, SPECIAL_ROOT_SLICE) || unit_has_name(u, SPECIAL_INIT_SCOPE))
-                return action == FREEZER_FREEZE ? -EPERM : 0;
+        unit_next_freezer_state(u, action, &next, &objective);
 
-        if (!u->cgroup_realized)
-                return -EBUSY;
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
+                /* No realized cgroup = nothing to freeze */
+                goto skip;
 
-        if (action == FREEZER_THAW) {
-                Unit *slice = UNIT_GET_SLICE(u);
-
-                if (slice) {
-                        r = unit_cgroup_freezer_action(slice, FREEZER_THAW);
-                        if (r < 0)
-                                return log_unit_error_errno(u, r, "Failed to thaw slice %s of unit: %m", slice->id);
-                }
-        }
-
-        target = action == FREEZER_FREEZE ? FREEZER_FROZEN : FREEZER_RUNNING;
-
-        r = unit_freezer_state_kernel(u, &kernel);
-        if (r < 0)
-                log_unit_debug_errno(u, r, "Failed to obtain cgroup freezer state: %m");
-
-        if (target == kernel) {
-                u->freezer_state = target;
-                if (action == FREEZER_FREEZE)
-                        return 0;
-                ret = 0;
-        } else
-                ret = 1;
-
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "cgroup.freeze", &path);
+        r = unit_cgroup_freezer_kernel_state(u, &current);
         if (r < 0)
                 return r;
 
-        log_unit_debug(u, "%s unit.", action == FREEZER_FREEZE ? "Freezing" : "Thawing");
+        if (current == objective)
+                goto skip;
 
-        if (target != kernel) {
-                if (action == FREEZER_FREEZE)
-                        u->freezer_state = FREEZER_FREEZING;
+        if (next == freezer_state_finish(next)) {
+                /* We're directly transitioning into a finished state, which in theory means that
+                 * the cgroup's current state already matches the objective and thus we'd return 0.
+                 * But, reality shows otherwise (such case would have been handled by current == objective
+                 * branch above). This indicates that our freezer_state tracking has diverged
+                 * from the real state of the cgroup, which can happen if someone meddles with the
+                 * cgroup from underneath us. This really shouldn't happen during normal operation,
+                 * though. So, let's warn about it and fix up the state to be valid */
+
+                log_unit_warning(u, "Unit wants to transition to %s freezer state but cgroup is unexpectedly %s, fixing up.",
+                                 freezer_state_to_string(next), freezer_state_to_string(current) ?: "(invalid)");
+
+                if (next == FREEZER_FROZEN)
+                        next = FREEZER_FREEZING;
+                else if (next == FREEZER_FROZEN_BY_PARENT)
+                        next = FREEZER_FREEZING_BY_PARENT;
+                else if (next == FREEZER_RUNNING)
+                        next = FREEZER_THAWING;
                 else
-                        u->freezer_state = FREEZER_THAWING;
+                        assert_not_reached();
         }
 
-        r = write_string_file(path, one_zero(action == FREEZER_FREEZE), WRITE_STRING_FILE_DISABLE_BUFFER);
+        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, crt->cgroup_path, "cgroup.freeze", &path);
         if (r < 0)
                 return r;
 
-        return ret;
+        r = write_string_file(path, one_zero(objective == FREEZER_FROZEN), WRITE_STRING_FILE_DISABLE_BUFFER);
+        if (r < 0)
+                return r;
+
+        unit_set_freezer_state(u, next);
+        return 1; /* Wait for cgroup event before replying */
+
+skip:
+        unit_set_freezer_state(u, freezer_state_finish(next));
+        return 0;
 }
 
 int unit_get_cpuset(Unit *u, CPUSet *cpus, const char *name) {
@@ -4235,10 +5194,11 @@ int unit_get_cpuset(Unit *u, CPUSet *cpus, const char *name) {
         assert(u);
         assert(cpus);
 
-        if (!u->cgroup_path)
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt || !crt->cgroup_path)
                 return -ENODATA;
 
-        if ((u->cgroup_realized_mask & CGROUP_MASK_CPUSET) == 0)
+        if ((crt->cgroup_realized_mask & CGROUP_MASK_CPUSET) == 0)
                 return -ENODATA;
 
         r = cg_all_unified();
@@ -4247,13 +5207,410 @@ int unit_get_cpuset(Unit *u, CPUSet *cpus, const char *name) {
         if (r == 0)
                 return -ENODATA;
 
-        r = cg_get_attribute("cpuset", u->cgroup_path, name, &v);
+        r = cg_get_attribute("cpuset", crt->cgroup_path, name, &v);
         if (r == -ENOENT)
                 return -ENODATA;
         if (r < 0)
                 return r;
 
         return parse_cpu_set_full(v, cpus, false, NULL, NULL, 0, NULL);
+}
+
+CGroupRuntime* cgroup_runtime_new(void) {
+        _cleanup_(cgroup_runtime_freep) CGroupRuntime *crt = NULL;
+
+        crt = new(CGroupRuntime, 1);
+        if (!crt)
+                return NULL;
+
+        *crt = (CGroupRuntime) {
+                .cgroup_control_inotify_wd = -1,
+                .cgroup_memory_inotify_wd = -1,
+
+                .ip_accounting_ingress_map_fd = -EBADF,
+                .ip_accounting_egress_map_fd = -EBADF,
+
+                .ipv4_allow_map_fd = -EBADF,
+                .ipv6_allow_map_fd = -EBADF,
+                .ipv4_deny_map_fd = -EBADF,
+                .ipv6_deny_map_fd = -EBADF,
+
+                .cgroup_invalidated_mask = _CGROUP_MASK_ALL,
+        };
+
+        unit_reset_cpu_accounting(/* unit = */ NULL, crt);
+        unit_reset_io_accounting(/* unit = */ NULL, crt);
+        cgroup_runtime_reset_memory_accounting_last(crt);
+        assert_se(cgroup_runtime_reset_ip_accounting(crt) >= 0);
+
+        return TAKE_PTR(crt);
+}
+
+CGroupRuntime* cgroup_runtime_free(CGroupRuntime *crt) {
+        if (!crt)
+                return NULL;
+
+        fdset_free(crt->initial_socket_bind_link_fds);
+#if BPF_FRAMEWORK
+        bpf_link_free(crt->ipv4_socket_bind_link);
+        bpf_link_free(crt->ipv6_socket_bind_link);
+#endif
+        hashmap_free(crt->bpf_foreign_by_key);
+
+        bpf_program_free(crt->bpf_device_control_installed);
+
+#if BPF_FRAMEWORK
+        bpf_link_free(crt->restrict_ifaces_ingress_bpf_link);
+        bpf_link_free(crt->restrict_ifaces_egress_bpf_link);
+#endif
+        fdset_free(crt->initial_restrict_ifaces_link_fds);
+
+        bpf_firewall_close(crt);
+
+        free(crt->cgroup_path);
+
+        return mfree(crt);
+}
+
+static const char* const ip_accounting_metric_field_table[_CGROUP_IP_ACCOUNTING_METRIC_MAX] = {
+        [CGROUP_IP_INGRESS_BYTES]   = "ip-accounting-ingress-bytes",
+        [CGROUP_IP_INGRESS_PACKETS] = "ip-accounting-ingress-packets",
+        [CGROUP_IP_EGRESS_BYTES]    = "ip-accounting-egress-bytes",
+        [CGROUP_IP_EGRESS_PACKETS]  = "ip-accounting-egress-packets",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(ip_accounting_metric_field, CGroupIPAccountingMetric);
+
+static const char* const io_accounting_metric_field_base_table[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {
+        [CGROUP_IO_READ_BYTES]       = "io-accounting-read-bytes-base",
+        [CGROUP_IO_WRITE_BYTES]      = "io-accounting-write-bytes-base",
+        [CGROUP_IO_READ_OPERATIONS]  = "io-accounting-read-operations-base",
+        [CGROUP_IO_WRITE_OPERATIONS] = "io-accounting-write-operations-base",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(io_accounting_metric_field_base, CGroupIOAccountingMetric);
+
+static const char* const io_accounting_metric_field_last_table[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {
+        [CGROUP_IO_READ_BYTES]       = "io-accounting-read-bytes-last",
+        [CGROUP_IO_WRITE_BYTES]      = "io-accounting-write-bytes-last",
+        [CGROUP_IO_READ_OPERATIONS]  = "io-accounting-read-operations-last",
+        [CGROUP_IO_WRITE_OPERATIONS] = "io-accounting-write-operations-last",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(io_accounting_metric_field_last, CGroupIOAccountingMetric);
+
+static const char* const memory_accounting_metric_field_last_table[_CGROUP_MEMORY_ACCOUNTING_METRIC_CACHED_LAST + 1] = {
+        [CGROUP_MEMORY_PEAK]      = "memory-accounting-peak",
+        [CGROUP_MEMORY_SWAP_PEAK] = "memory-accounting-swap-peak",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(memory_accounting_metric_field_last, CGroupMemoryAccountingMetric);
+
+static int serialize_cgroup_mask(FILE *f, const char *key, CGroupMask mask) {
+        _cleanup_free_ char *s = NULL;
+        int r;
+
+        assert(f);
+        assert(key);
+
+        if (mask == 0)
+                return 0;
+
+        r = cg_mask_to_string(mask, &s);
+        if (r < 0)
+                return log_error_errno(r, "Failed to format cgroup mask: %m");
+
+        return serialize_item(f, key, s);
+}
+
+int cgroup_runtime_serialize(Unit *u, FILE *f, FDSet *fds) {
+        int r;
+
+        assert(u);
+        assert(f);
+        assert(fds);
+
+        CGroupRuntime *crt = unit_get_cgroup_runtime(u);
+        if (!crt)
+                return 0;
+
+        (void) serialize_item_format(f, "cpu-usage-base", "%" PRIu64, crt->cpu_usage_base);
+        if (crt->cpu_usage_last != NSEC_INFINITY)
+                (void) serialize_item_format(f, "cpu-usage-last", "%" PRIu64, crt->cpu_usage_last);
+
+        if (crt->managed_oom_kill_last > 0)
+                (void) serialize_item_format(f, "managed-oom-kill-last", "%" PRIu64, crt->managed_oom_kill_last);
+
+        if (crt->oom_kill_last > 0)
+                (void) serialize_item_format(f, "oom-kill-last", "%" PRIu64, crt->oom_kill_last);
+
+        for (CGroupMemoryAccountingMetric metric = 0; metric <= _CGROUP_MEMORY_ACCOUNTING_METRIC_CACHED_LAST; metric++) {
+                uint64_t v;
+
+                r = unit_get_memory_accounting(u, metric, &v);
+                if (r >= 0)
+                        (void) serialize_item_format(f, memory_accounting_metric_field_last_to_string(metric), "%" PRIu64, v);
+        }
+
+        for (CGroupIPAccountingMetric m = 0; m < _CGROUP_IP_ACCOUNTING_METRIC_MAX; m++) {
+                uint64_t v;
+
+                r = unit_get_ip_accounting(u, m, &v);
+                if (r >= 0)
+                        (void) serialize_item_format(f, ip_accounting_metric_field_to_string(m), "%" PRIu64, v);
+        }
+
+        for (CGroupIOAccountingMetric im = 0; im < _CGROUP_IO_ACCOUNTING_METRIC_MAX; im++) {
+                (void) serialize_item_format(f, io_accounting_metric_field_base_to_string(im), "%" PRIu64, crt->io_accounting_base[im]);
+
+                if (crt->io_accounting_last[im] != UINT64_MAX)
+                        (void) serialize_item_format(f, io_accounting_metric_field_last_to_string(im), "%" PRIu64, crt->io_accounting_last[im]);
+        }
+
+        if (crt->cgroup_path)
+                (void) serialize_item(f, "cgroup", crt->cgroup_path);
+        if (crt->cgroup_id != 0)
+                (void) serialize_item_format(f, "cgroup-id", "%" PRIu64, crt->cgroup_id);
+
+        (void) serialize_bool(f, "cgroup-realized", crt->cgroup_realized);
+        (void) serialize_cgroup_mask(f, "cgroup-realized-mask", crt->cgroup_realized_mask);
+        (void) serialize_cgroup_mask(f, "cgroup-enabled-mask", crt->cgroup_enabled_mask);
+        (void) serialize_cgroup_mask(f, "cgroup-invalidated-mask", crt->cgroup_invalidated_mask);
+
+        (void) bpf_socket_bind_serialize(u, f, fds);
+
+        (void) bpf_program_serialize_attachment(f, fds, "ip-bpf-ingress-installed", crt->ip_bpf_ingress_installed);
+        (void) bpf_program_serialize_attachment(f, fds, "ip-bpf-egress-installed", crt->ip_bpf_egress_installed);
+        (void) bpf_program_serialize_attachment(f, fds, "bpf-device-control-installed", crt->bpf_device_control_installed);
+        (void) bpf_program_serialize_attachment_set(f, fds, "ip-bpf-custom-ingress-installed", crt->ip_bpf_custom_ingress_installed);
+        (void) bpf_program_serialize_attachment_set(f, fds, "ip-bpf-custom-egress-installed", crt->ip_bpf_custom_egress_installed);
+
+        (void) bpf_restrict_ifaces_serialize(u, f, fds);
+
+        return 0;
+}
+
+#define MATCH_DESERIALIZE(u, key, l, v, parse_func, target)             \
+        ({                                                              \
+                bool _deserialize_matched = streq(l, key);              \
+                if (_deserialize_matched) {                             \
+                        CGroupRuntime *crt = unit_setup_cgroup_runtime(u); \
+                        if (!crt)                                       \
+                                log_oom_debug();                        \
+                        else {                                          \
+                                int _deserialize_r = parse_func(v);     \
+                                if (_deserialize_r < 0)                 \
+                                        log_unit_debug_errno(u, _deserialize_r, \
+                                                             "Failed to parse \"%s=%s\", ignoring.", l, v); \
+                                else                                    \
+                                        crt->target = _deserialize_r; \
+                        }                                               \
+                }                                                       \
+                _deserialize_matched;                                   \
+        })
+
+#define MATCH_DESERIALIZE_IMMEDIATE(u, key, l, v, parse_func, target)   \
+        ({                                                              \
+                 bool _deserialize_matched = streq(l, key);             \
+                 if (_deserialize_matched) {                            \
+                         CGroupRuntime *crt = unit_setup_cgroup_runtime(u); \
+                         if (!crt)                                      \
+                                 log_oom_debug();                       \
+                         else {                                         \
+                                 int _deserialize_r = parse_func(v, &crt->target); \
+                                 if (_deserialize_r < 0)                \
+                                         log_unit_debug_errno(u, _deserialize_r, \
+                                                              "Failed to parse \"%s=%s\", ignoring", l, v); \
+                         }                                              \
+                 }                                                      \
+                _deserialize_matched;                                   \
+        })
+
+#define MATCH_DESERIALIZE_METRIC(u, key, l, v, parse_func, target)             \
+        ({                                                              \
+                bool _deserialize_matched = streq(l, key);              \
+                if (_deserialize_matched) {                             \
+                        CGroupRuntime *crt = unit_setup_cgroup_runtime(u); \
+                        if (!crt)                                       \
+                                log_oom_debug();                        \
+                        else {                                          \
+                                int _deserialize_r = parse_func(v);     \
+                                if (_deserialize_r < 0)                 \
+                                        log_unit_debug_errno(u, _deserialize_r, \
+                                                             "Failed to parse \"%s=%s\", ignoring.", l, v); \
+                                else                                    \
+                                        crt->target = _deserialize_r; \
+                        }                                               \
+                }                                                       \
+                _deserialize_matched;                                   \
+        })
+
+int cgroup_runtime_deserialize_one(Unit *u, const char *key, const char *value, FDSet *fds) {
+        int r;
+
+        assert(u);
+        assert(value);
+
+        if (!UNIT_HAS_CGROUP_CONTEXT(u))
+                return 0;
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "cpu-usage-base", key, value, safe_atou64, cpu_usage_base) ||
+            MATCH_DESERIALIZE_IMMEDIATE(u, "cpuacct-usage-base", key, value, safe_atou64, cpu_usage_base))
+                return 1;
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "cpu-usage-last", key, value, safe_atou64, cpu_usage_last))
+                return 1;
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "managed-oom-kill-last", key, value, safe_atou64, managed_oom_kill_last))
+                return 1;
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "oom-kill-last", key, value, safe_atou64, oom_kill_last))
+                return 1;
+
+        if (streq(key, "cgroup")) {
+                r = unit_set_cgroup_path(u, value);
+                if (r < 0)
+                        log_unit_debug_errno(u, r, "Failed to set cgroup path %s, ignoring: %m", value);
+
+                (void) unit_watch_cgroup(u);
+                (void) unit_watch_cgroup_memory(u);
+                return 1;
+        }
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "cgroup-id", key, value, safe_atou64, cgroup_id))
+                return 1;
+
+        if (MATCH_DESERIALIZE(u, "cgroup-realized", key, value, parse_boolean, cgroup_realized))
+                return 1;
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "cgroup-realized-mask", key, value, cg_mask_from_string, cgroup_realized_mask))
+                return 1;
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "cgroup-enabled-mask", key, value, cg_mask_from_string, cgroup_enabled_mask))
+                return 1;
+
+        if (MATCH_DESERIALIZE_IMMEDIATE(u, "cgroup-invalidated-mask", key, value, cg_mask_from_string, cgroup_invalidated_mask))
+                return 1;
+
+        if (STR_IN_SET(key, "ipv4-socket-bind-bpf-link-fd", "ipv6-socket-bind-bpf-link-fd")) {
+                int fd;
+
+                fd = deserialize_fd(fds, value);
+                if (fd >= 0)
+                        (void) bpf_socket_bind_add_initial_link_fd(u, fd);
+
+                return 1;
+        }
+
+        if (STR_IN_SET(key,
+                       "ip-bpf-ingress-installed", "ip-bpf-egress-installed",
+                       "bpf-device-control-installed",
+                       "ip-bpf-custom-ingress-installed", "ip-bpf-custom-egress-installed")) {
+
+                CGroupRuntime *crt = unit_setup_cgroup_runtime(u);
+                if (!crt)
+                        log_oom_debug();
+                else {
+                        if (streq(key, "ip-bpf-ingress-installed"))
+                                (void) bpf_program_deserialize_attachment(value, fds, &crt->ip_bpf_ingress_installed);
+
+                        if (streq(key, "ip-bpf-egress-installed"))
+                                (void) bpf_program_deserialize_attachment(value, fds, &crt->ip_bpf_egress_installed);
+
+                        if (streq(key, "bpf-device-control-installed"))
+                                (void) bpf_program_deserialize_attachment(value, fds, &crt->bpf_device_control_installed);
+
+                        if (streq(key, "ip-bpf-custom-ingress-installed"))
+                                (void) bpf_program_deserialize_attachment_set(value, fds, &crt->ip_bpf_custom_ingress_installed);
+
+                        if (streq(key, "ip-bpf-custom-egress-installed"))
+                                (void) bpf_program_deserialize_attachment_set(value, fds, &crt->ip_bpf_custom_egress_installed);
+                }
+
+                return 1;
+        }
+
+        if (streq(key, "restrict-ifaces-bpf-fd")) {
+                int fd;
+
+                fd = deserialize_fd(fds, value);
+                if (fd >= 0)
+                        (void) bpf_restrict_ifaces_add_initial_link_fd(u, fd);
+                return 1;
+        }
+
+        CGroupMemoryAccountingMetric mm = memory_accounting_metric_field_last_from_string(key);
+        if (mm >= 0) {
+                uint64_t c;
+
+                r = safe_atou64(value, &c);
+                if (r < 0)
+                        log_unit_debug(u, "Failed to parse memory accounting last value %s, ignoring.", value);
+                else {
+                        CGroupRuntime *crt = unit_setup_cgroup_runtime(u);
+                        if (!crt)
+                                log_oom_debug();
+                        else
+                                crt->memory_accounting_last[mm] = c;
+                }
+
+                return 1;
+        }
+
+        CGroupIPAccountingMetric ipm = ip_accounting_metric_field_from_string(key);
+        if (ipm >= 0) {
+                uint64_t c;
+
+                r = safe_atou64(value, &c);
+                if (r < 0)
+                        log_unit_debug(u, "Failed to parse IP accounting value %s, ignoring.", value);
+                else {
+                        CGroupRuntime *crt = unit_setup_cgroup_runtime(u);
+                        if (!crt)
+                                log_oom_debug();
+                        else
+                                crt->ip_accounting_extra[ipm] = c;
+                }
+
+                return 1;
+        }
+
+        CGroupIOAccountingMetric iom = io_accounting_metric_field_base_from_string(key);
+        if (iom >= 0) {
+                uint64_t c;
+
+                r = safe_atou64(value, &c);
+                if (r < 0)
+                        log_unit_debug(u, "Failed to parse IO accounting base value %s, ignoring.", value);
+                else {
+                        CGroupRuntime *crt = unit_setup_cgroup_runtime(u);
+                        if (!crt)
+                                log_oom_debug();
+                        else
+                                crt->io_accounting_base[iom] = c;
+                }
+
+                return 1;
+        }
+
+        iom = io_accounting_metric_field_last_from_string(key);
+        if (iom >= 0) {
+                uint64_t c;
+
+                r = safe_atou64(value, &c);
+                if (r < 0)
+                        log_unit_debug(u, "Failed to parse IO accounting last value %s, ignoring.", value);
+                else {
+                        CGroupRuntime *crt = unit_setup_cgroup_runtime(u);
+                        if (!crt)
+                                log_oom_debug();
+                        else
+                                crt->io_accounting_last[iom] = c;
+                }
+                return 1;
+        }
+
+        return 0;
 }
 
 static const char* const cgroup_device_policy_table[_CGROUP_DEVICE_POLICY_MAX] = {
@@ -4264,9 +5621,46 @@ static const char* const cgroup_device_policy_table[_CGROUP_DEVICE_POLICY_MAX] =
 
 DEFINE_STRING_TABLE_LOOKUP(cgroup_device_policy, CGroupDevicePolicy);
 
-static const char* const freezer_action_table[_FREEZER_ACTION_MAX] = {
-        [FREEZER_FREEZE] = "freeze",
-        [FREEZER_THAW] = "thaw",
+static const char* const cgroup_pressure_watch_table[_CGROUP_PRESSURE_WATCH_MAX] = {
+        [CGROUP_PRESSURE_WATCH_NO]   = "no",
+        [CGROUP_PRESSURE_WATCH_YES]  = "yes",
+        [CGROUP_PRESSURE_WATCH_AUTO] = "auto",
+        [CGROUP_PRESSURE_WATCH_SKIP] = "skip",
 };
 
-DEFINE_STRING_TABLE_LOOKUP(freezer_action, FreezerAction);
+DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(cgroup_pressure_watch, CGroupPressureWatch, CGROUP_PRESSURE_WATCH_YES);
+
+static const char* const cgroup_ip_accounting_metric_table[_CGROUP_IP_ACCOUNTING_METRIC_MAX] = {
+        [CGROUP_IP_INGRESS_BYTES]   = "IPIngressBytes",
+        [CGROUP_IP_EGRESS_BYTES]    = "IPEgressBytes",
+        [CGROUP_IP_INGRESS_PACKETS] = "IPIngressPackets",
+        [CGROUP_IP_EGRESS_PACKETS]  = "IPEgressPackets",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(cgroup_ip_accounting_metric, CGroupIPAccountingMetric);
+
+static const char* const cgroup_io_accounting_metric_table[_CGROUP_IO_ACCOUNTING_METRIC_MAX] = {
+        [CGROUP_IO_READ_BYTES]       = "IOReadBytes",
+        [CGROUP_IO_WRITE_BYTES]      = "IOWriteBytes",
+        [CGROUP_IO_READ_OPERATIONS]  = "IOReadOperations",
+        [CGROUP_IO_WRITE_OPERATIONS] = "IOWriteOperations",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(cgroup_io_accounting_metric, CGroupIOAccountingMetric);
+
+static const char* const cgroup_memory_accounting_metric_table[_CGROUP_MEMORY_ACCOUNTING_METRIC_MAX] = {
+        [CGROUP_MEMORY_PEAK]          = "MemoryPeak",
+        [CGROUP_MEMORY_SWAP_CURRENT]  = "MemorySwapCurrent",
+        [CGROUP_MEMORY_SWAP_PEAK]     = "MemorySwapPeak",
+        [CGROUP_MEMORY_ZSWAP_CURRENT] = "MemoryZSwapCurrent",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(cgroup_memory_accounting_metric, CGroupMemoryAccountingMetric);
+
+static const char *const cgroup_effective_limit_type_table[_CGROUP_LIMIT_TYPE_MAX] = {
+        [CGROUP_LIMIT_MEMORY_MAX]  = "EffectiveMemoryMax",
+        [CGROUP_LIMIT_MEMORY_HIGH] = "EffectiveMemoryHigh",
+        [CGROUP_LIMIT_TASKS_MAX]   = "EffectiveTasksMax",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(cgroup_effective_limit_type, CGroupLimitType);

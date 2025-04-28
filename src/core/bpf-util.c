@@ -3,6 +3,7 @@
 #include "bpf-dlopen.h"
 #include "bpf-util.h"
 #include "cgroup-util.h"
+#include "initrd-util.h"
 #include "log.h"
 
 bool cgroup_bpf_supported(void) {
@@ -19,8 +20,7 @@ bool cgroup_bpf_supported(void) {
         }
 
         if (r == 0) {
-                log_info_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                               "Not running with unified cgroup hierarchy, disabling cgroup BPF features.");
+                log_info("Not running with unified cgroup hierarchy, disabling cgroup BPF features.");
                 return (supported = false);
         }
 

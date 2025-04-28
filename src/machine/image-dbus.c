@@ -31,7 +31,7 @@ int bus_image_method_remove(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_pair_ int errno_pipe_fd[2] = { -1, -1 };
+        _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
         Image *image = ASSERT_PTR(userdata);
         Manager *m = image->userdata;
         pid_t child;
@@ -50,11 +50,8 @@ int bus_image_method_remove(
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -70,25 +67,19 @@ int bus_image_method_remove(
                 return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
         if (r == 0) {
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
-
                 r = image_remove(image);
-                if (r < 0) {
-                        (void) write(errno_pipe_fd[1], &r, sizeof(r));
-                        _exit(EXIT_FAILURE);
-                }
-
-                _exit(EXIT_SUCCESS);
+                report_errno_and_exit(errno_pipe_fd[1], r);
         }
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = operation_new(m, NULL, child, message, errno_pipe_fd[0], NULL);
+        r = operation_new_with_bus_reply(m, /* machine= */ NULL, child, message, errno_pipe_fd[0], /* ret= */ NULL);
         if (r < 0) {
                 (void) sigkill_wait(child);
                 return r;
         }
 
-        errno_pipe_fd[0] = -1;
+        errno_pipe_fd[0] = -EBADF;
 
         return 1;
 }
@@ -121,11 +112,8 @@ int bus_image_method_rename(
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -133,17 +121,9 @@ int bus_image_method_rename(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        /* The image is cached with its name, hence it is necessary to remove from the cache before renaming. */
-        assert_se(hashmap_remove_value(m->image_cache, image->name, image));
-
-        r = image_rename(image, new_name);
-        if (r < 0) {
-                image_unref(image);
-                return r;
-        }
-
-        /* Then save the object again in the cache. */
-        assert_se(hashmap_put(m->image_cache, image->name, image) > 0);
+        r = rename_image_and_update_cache(m, image, new_name);
+        if (r < 0)
+                return sd_bus_error_set_errnof(error, r, "Failed to rename image: %m");
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -153,7 +133,7 @@ int bus_image_method_clone(
                 void *userdata,
                 sd_bus_error *error) {
 
-        _cleanup_close_pair_ int errno_pipe_fd[2] = { -1, -1 };
+        _cleanup_close_pair_ int errno_pipe_fd[2] = EBADF_PAIR;
         Image *image = ASSERT_PTR(userdata);
         Manager *m = ASSERT_PTR(image->userdata);
         const char *new_name;
@@ -181,11 +161,8 @@ int bus_image_method_clone(
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -201,25 +178,19 @@ int bus_image_method_clone(
                 return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
         if (r == 0) {
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
-
                 r = image_clone(image, new_name, read_only);
-                if (r < 0) {
-                        (void) write(errno_pipe_fd[1], &r, sizeof(r));
-                        _exit(EXIT_FAILURE);
-                }
-
-                _exit(EXIT_SUCCESS);
+                report_errno_and_exit(errno_pipe_fd[1], r);
         }
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = operation_new(m, NULL, child, message, errno_pipe_fd[0], NULL);
+        r = operation_new_with_bus_reply(m, /* machine= */ NULL, child, message, errno_pipe_fd[0], /* ret= */ NULL);
         if (r < 0) {
                 (void) sigkill_wait(child);
                 return r;
         }
 
-        errno_pipe_fd[0] = -1;
+        errno_pipe_fd[0] = -EBADF;
 
         return 1;
 }
@@ -248,11 +219,8 @@ int bus_image_method_mark_read_only(
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -293,11 +261,8 @@ int bus_image_method_set_limit(
 
         r = bus_verify_polkit_async(
                         message,
-                        CAP_SYS_ADMIN,
                         "org.freedesktop.machine1.manage-images",
                         details,
-                        false,
-                        UID_INVALID,
                         &m->polkit_registry,
                         error);
         if (r < 0)
@@ -321,7 +286,7 @@ int bus_image_method_get_hostname(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -339,7 +304,7 @@ int bus_image_method_get_machine_id(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -367,7 +332,7 @@ int bus_image_method_get_machine_info(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
@@ -384,66 +349,12 @@ int bus_image_method_get_os_release(
         int r;
 
         if (!image->metadata_valid) {
-                r = image_read_metadata(image);
+                r = image_read_metadata(image, &image_policy_container);
                 if (r < 0)
                         return sd_bus_error_set_errnof(error, r, "Failed to read image metadata: %m");
         }
 
         return bus_reply_pair_array(message, image->os_release);
-}
-
-static int image_flush_cache(sd_event_source *s, void *userdata) {
-        Manager *m = ASSERT_PTR(userdata);
-
-        assert(s);
-
-        hashmap_clear(m->image_cache);
-        return 0;
-}
-
-int manager_acquire_image(Manager *m, const char *name, Image **ret) {
-        int r;
-
-        assert(m);
-        assert(name);
-
-        Image *existing = hashmap_get(m->image_cache, name);
-        if (existing) {
-                if (ret)
-                        *ret = existing;
-                return 0;
-        }
-
-        if (!m->image_cache_defer_event) {
-                r = sd_event_add_defer(m->event, &m->image_cache_defer_event, image_flush_cache, m);
-                if (r < 0)
-                        return r;
-
-                r = sd_event_source_set_priority(m->image_cache_defer_event, SD_EVENT_PRIORITY_IDLE);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_event_source_set_enabled(m->image_cache_defer_event, SD_EVENT_ONESHOT);
-        if (r < 0)
-                return r;
-
-        _cleanup_(image_unrefp) Image *image = NULL;
-        r = image_find(IMAGE_MACHINE, name, NULL, &image);
-        if (r < 0)
-                return r;
-
-        image->userdata = m;
-
-        r = hashmap_ensure_put(&m->image_cache, &image_hash_ops, image->name, image);
-        if (r < 0)
-                return r;
-
-        if (ret)
-                *ret = image;
-
-        TAKE_PTR(image);
-        return 0;
 }
 
 static int image_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
@@ -476,7 +387,7 @@ static int image_object_find(sd_bus *bus, const char *path, const char *interfac
         return 1;
 }
 
-char *image_bus_path(const char *name) {
+char* image_bus_path(const char *name) {
         _cleanup_free_ char *e = NULL;
 
         assert(name);

@@ -3,18 +3,19 @@
 #include "macro.h"
 #include "network-generator.h"
 #include "string-util.h"
+#include "tests.h"
 
 static void test_network_one(const char *ifname, const char *key, const char *value, const char *expected) {
         _cleanup_(context_clear) Context context = {};
         _cleanup_free_ char *output = NULL;
         Network *network;
 
-        printf("# %s=%s\n", key, value);
-        assert_se(parse_cmdline_item(key, value, &context) >= 0);
-        assert_se(network = network_get(&context, ifname));
-        assert_se(network_format(network, &output) >= 0);
-        puts(output);
-        assert_se(streq(output, expected));
+        log_debug("/* %s(%s=%s) */", __func__, key, value);
+
+        ASSERT_OK(parse_cmdline_item(key, value, &context));
+        ASSERT_NOT_NULL(network = network_get(&context, ifname));
+        ASSERT_OK(network_format(network, &output));
+        ASSERT_STREQ(output, expected);
 }
 
 static void test_network_two(const char *ifname,
@@ -25,15 +26,14 @@ static void test_network_two(const char *ifname,
         _cleanup_free_ char *output = NULL;
         Network *network;
 
-        printf("# %s=%s\n", key1, value1);
-        printf("# %s=%s\n", key2, value2);
-        assert_se(parse_cmdline_item(key1, value1, &context) >= 0);
-        assert_se(parse_cmdline_item(key2, value2, &context) >= 0);
-        assert_se(context_merge_networks(&context) >= 0);
-        assert_se(network = network_get(&context, ifname));
-        assert_se(network_format(network, &output) >= 0);
-        puts(output);
-        assert_se(streq(output, expected));
+        log_debug("/* %s(%s=%s, %s=%s) */", __func__, key1, value1, key2, value2);
+
+        ASSERT_OK(parse_cmdline_item(key1, value1, &context));
+        ASSERT_OK(parse_cmdline_item(key2, value2, &context));
+        ASSERT_OK(context_merge_networks(&context));
+        ASSERT_NOT_NULL(network = network_get(&context, ifname));
+        ASSERT_OK(network_format(network, &output));
+        ASSERT_STREQ(output, expected);
 }
 
 static void test_netdev_one(const char *ifname, const char *key, const char *value, const char *expected) {
@@ -41,12 +41,12 @@ static void test_netdev_one(const char *ifname, const char *key, const char *val
         _cleanup_free_ char *output = NULL;
         NetDev *netdev;
 
-        printf("# %s=%s\n", key, value);
-        assert_se(parse_cmdline_item(key, value, &context) >= 0);
-        assert_se(netdev = netdev_get(&context, ifname));
-        assert_se(netdev_format(netdev, &output) >= 0);
-        puts(output);
-        assert_se(streq(output, expected));
+        log_debug("/* %s(%s=%s) */", __func__, key, value);
+
+        ASSERT_OK(parse_cmdline_item(key, value, &context));
+        ASSERT_NOT_NULL(netdev = netdev_get(&context, ifname));
+        ASSERT_OK(netdev_format(netdev, &output));
+        ASSERT_STREQ(output, expected);
 }
 
 static void test_link_one(const char *filename, const char *key, const char *value, const char *expected) {
@@ -54,15 +54,17 @@ static void test_link_one(const char *filename, const char *key, const char *val
         _cleanup_free_ char *output = NULL;
         Link *link;
 
-        printf("# %s=%s\n", key, value);
-        assert_se(parse_cmdline_item(key, value, &context) >= 0);
-        assert_se(link = link_get(&context, filename));
-        assert_se(link_format(link, &output) >= 0);
-        puts(output);
-        assert_se(streq(output, expected));
+        log_debug("/* %s(%s=%s) */", __func__, key, value);
+
+        ASSERT_OK(parse_cmdline_item(key, value, &context));
+        ASSERT_NOT_NULL(link = link_get(&context, filename));
+        ASSERT_OK(link_format(link, &output));
+        ASSERT_STREQ(output, expected);
 }
 
 int main(int argc, char *argv[]) {
+        test_setup_logging(LOG_DEBUG);
+
         test_network_one("", "ip", "dhcp6",
                          "[Match]\n"
                          "Kind=!*\n"
@@ -101,6 +103,21 @@ int main(int argc, char *argv[]) {
                          "\n[Network]\n"
                          "DHCP=ipv4\n"
                          "\n[DHCP]\n"
+                         );
+
+        test_network_one("eth0", "ip", "10.99.37.44::10.99.10.1:255.255.0.0::eth0:off",
+                         "[Match]\n"
+                         "Name=eth0\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=no\n"
+                         "LinkLocalAddressing=no\n"
+                         "IPv6AcceptRA=no\n"
+                         "\n[DHCP]\n"
+                         "\n[Address]\n"
+                         "Address=10.99.37.44/16\n"
+                         "\n[Route]\n"
+                         "Gateway=10.99.10.1\n"
                          );
 
         test_network_one("eth0", "ip", "192.168.0.10::192.168.0.1:255.255.255.0:hogehoge:eth0:on",
@@ -325,6 +342,31 @@ int main(int argc, char *argv[]) {
                          "Bond=bond99\n"
                          "\n[DHCP]\n"
                          );
+
+        test_netdev_one("bridge99", "bridge", "bridge99:",
+                        "[NetDev]\n"
+                        "Kind=bridge\n"
+                        "Name=bridge99\n"
+                        );
+
+        test_netdev_one("bridge99", "bridge", "bridge99:,,,",
+                        "[NetDev]\n"
+                        "Kind=bridge\n"
+                        "Name=bridge99\n"
+                        );
+
+        test_netdev_one("bond99", "bond", "bond99:",
+                        "[NetDev]\n"
+                        "Kind=bond\n"
+                        "Name=bond99\n"
+                        );
+
+        test_netdev_one("bond99", "bond", "bond99::hogehoge:1530",
+                        "[NetDev]\n"
+                        "Kind=bond\n"
+                        "Name=bond99\n"
+                        "MTUBytes=1530\n"
+                        );
 
         test_netdev_one("bond99", "bond", "bond99:eth0,eth1::1530",
                         "[NetDev]\n"

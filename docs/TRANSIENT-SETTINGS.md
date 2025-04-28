@@ -148,6 +148,7 @@ All execution-related settings are available for transient units.
 ✓ SyslogLevelPrefix=
 ✓ LogLevelMax=
 ✓ LogExtraFields=
+✓ LogFilterPatterns=
 ✓ LogRateLimitIntervalSec=
 ✓ LogRateLimitBurst=
 ✓ SecureBits=
@@ -280,7 +281,9 @@ All cgroup/resource control settings are available for transient units
 ✓ ManagedOOMSwap=
 ✓ ManagedOOMMemoryPressure=
 ✓ ManagedOOMMemoryPressureLimit=
+✓ ManagedOOMMemoryPressureDurationSec=
 ✓ ManagedOOMPreference=
+✓ CoredumpReceive=
 ```
 
 ## Process Killing Settings
@@ -385,6 +388,7 @@ Most timer unit settings are available to transient units.
 ✓ AccuracySec=
 ✓ RandomizedDelaySec=
 ✓ FixedRandomDelay=
+✓ DeferReactivation=
   Unit=
 ```
 

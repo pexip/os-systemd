@@ -5,6 +5,7 @@
 
 #include "sd-bus.h"
 
+#include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
@@ -16,10 +17,10 @@
 #include "main-func.h"
 #include "memory-util.h"
 #include "pager.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "set.h"
-#include "spawn-polkit-agent.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "verbs.h"
@@ -33,6 +34,7 @@ static bool arg_ask_password = true;
 static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 static const char *arg_host = NULL;
 static bool arg_convert = true;
+static bool arg_full = false;
 
 typedef struct StatusInfo {
         char **locale;
@@ -60,7 +62,7 @@ static int print_status_info(StatusInfo *i) {
         assert(i);
 
         if (arg_transport == BUS_TRANSPORT_LOCAL) {
-                _cleanup_(locale_context_clear) LocaleContext c = { .mtime = USEC_INFINITY };
+                _cleanup_(locale_context_clear) LocaleContext c = {};
 
                 r = locale_context_load(&c, LOCALE_LOAD_PROC_CMDLINE);
                 if (r < 0)
@@ -71,22 +73,22 @@ static int print_status_info(StatusInfo *i) {
                         return log_error_errno(r, "Failed to build locale settings from kernel command line: %m");
         }
 
-        table = table_new("key", "value");
+        table = table_new_vertical();
         if (!table)
                 return log_oom();
 
+        if (arg_full)
+                table_set_width(table, 0);
+
         assert_se(cell = table_get_cell(table, 0, 0));
         (void) table_set_ellipsize_percent(table, cell, 100);
-        (void) table_set_align_percent(table, cell, 100);
-
-        table_set_header(table, false);
 
         table_set_ersatz_string(table, TABLE_ERSATZ_UNSET);
 
         if (!strv_isempty(kernel_locale)) {
                 log_warning("Warning: Settings on kernel command line override system locale settings in /etc/locale.conf.");
                 r = table_add_many(table,
-                                   TABLE_STRING, "Command Line:",
+                                   TABLE_FIELD, "Command Line",
                                    TABLE_SET_COLOR, ansi_highlight_yellow(),
                                    TABLE_STRV, kernel_locale,
                                    TABLE_SET_COLOR, ansi_highlight_yellow());
@@ -95,30 +97,30 @@ static int print_status_info(StatusInfo *i) {
         }
 
         r = table_add_many(table,
-                           TABLE_STRING, "System Locale:",
+                           TABLE_FIELD, "System Locale",
                            TABLE_STRV, i->locale,
-                           TABLE_STRING, "VC Keymap:",
+                           TABLE_FIELD, "VC Keymap",
                            TABLE_STRING, i->vconsole_keymap);
         if (r < 0)
                 return table_log_add_error(r);
 
         if (!isempty(i->vconsole_keymap_toggle)) {
                 r = table_add_many(table,
-                                   TABLE_STRING, "VC Toggle Keymap:",
+                                   TABLE_FIELD, "VC Toggle Keymap",
                                    TABLE_STRING, i->vconsole_keymap_toggle);
                 if (r < 0)
                         return table_log_add_error(r);
         }
 
         r = table_add_many(table,
-                           TABLE_STRING, "X11 Layout:",
+                           TABLE_FIELD, "X11 Layout",
                            TABLE_STRING, i->x11_layout);
         if (r < 0)
                 return table_log_add_error(r);
 
         if (!isempty(i->x11_model)) {
                 r = table_add_many(table,
-                                   TABLE_STRING, "X11 Model:",
+                                   TABLE_FIELD, "X11 Model",
                                    TABLE_STRING, i->x11_model);
                 if (r < 0)
                         return table_log_add_error(r);
@@ -126,7 +128,7 @@ static int print_status_info(StatusInfo *i) {
 
         if (!isempty(i->x11_variant)) {
                 r = table_add_many(table,
-                                   TABLE_STRING, "X11 Variant:",
+                                   TABLE_FIELD, "X11 Variant",
                                    TABLE_STRING, i->x11_variant);
                 if (r < 0)
                         return table_log_add_error(r);
@@ -134,7 +136,7 @@ static int print_status_info(StatusInfo *i) {
 
         if (!isempty(i->x11_options)) {
                 r = table_add_many(table,
-                                   TABLE_STRING, "X11 Options:",
+                                   TABLE_FIELD, "X11 Options",
                                    TABLE_STRING, i->x11_options);
                 if (r < 0)
                         return table_log_add_error(r);
@@ -185,7 +187,7 @@ static int set_locale(int argc, char **argv, void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_message_new_method_call(bus, &m, bus_locale, "SetLocale");
         if (r < 0)
@@ -227,7 +229,7 @@ static int set_vconsole_keymap(int argc, char **argv, void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         map = argv[1];
         toggle_map = argc > 2 ? argv[2] : "";
@@ -266,7 +268,7 @@ static int set_x11_keymap(int argc, char **argv, void *userdata) {
         sd_bus *bus = userdata;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         layout = argv[1];
         model = argc > 2 ? argv[2] : "";
@@ -316,27 +318,25 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
 
         for (;;) {
                 _cleanup_free_ char *line = NULL;
-                char *l, *w;
+                char *w;
 
-                r = read_line(f, LONG_LINE_MAX, &line);
+                r = read_stripped_line(f, LONG_LINE_MAX, &line);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read keyboard mapping list: %m");
                 if (r == 0)
                         break;
 
-                l = strstrip(line);
-
-                if (isempty(l))
+                if (isempty(line))
                         continue;
 
-                if (l[0] == '!') {
-                        if (startswith(l, "! model"))
+                if (line[0] == '!') {
+                        if (startswith(line, "! model"))
                                 state = MODELS;
-                        else if (startswith(l, "! layout"))
+                        else if (startswith(line, "! layout"))
                                 state = LAYOUTS;
-                        else if (startswith(l, "! variant"))
+                        else if (startswith(line, "! variant"))
                                 state = VARIANTS;
-                        else if (startswith(l, "! option"))
+                        else if (startswith(line, "! option"))
                                 state = OPTIONS;
                         else
                                 state = NONE;
@@ -347,7 +347,7 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
                 if (state != look_for)
                         continue;
 
-                w = l + strcspn(l, WHITESPACE);
+                w = line + strcspn(line, WHITESPACE);
 
                 if (argc > 1) {
                         char *e;
@@ -370,8 +370,7 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
                 } else
                         *w = 0;
 
-                r = strv_extend(&list, l);
-                if (r < 0)
+                if (strv_consume(&list, TAKE_PTR(line)) < 0)
                         return log_oom();
         }
 
@@ -379,8 +378,7 @@ static int list_x11_keymaps(int argc, char **argv, void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
                                        "Couldn't find any entries.");
 
-        strv_sort(list);
-        strv_uniq(list);
+        strv_sort_uniq(list);
 
         pager_open(arg_pager_flags);
 
@@ -414,6 +412,7 @@ static int help(void) {
                "\nOptions:\n"
                "  -h --help                Show this help\n"
                "     --version             Show package version\n"
+               "  -l --full                Do not ellipsize output\n"
                "     --no-pager            Do not pipe output into a pager\n"
                "     --no-ask-password     Do not prompt for password\n"
                "  -H --host=[USER@]HOST    Operate on remote host\n"
@@ -444,6 +443,7 @@ static int parse_argv(int argc, char *argv[]) {
         static const struct option options[] = {
                 { "help",            no_argument,       NULL, 'h'                 },
                 { "version",         no_argument,       NULL, ARG_VERSION         },
+                { "full",            no_argument,       NULL, 'l'                 },
                 { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
                 { "host",            required_argument, NULL, 'H'                 },
                 { "machine",         required_argument, NULL, 'M'                 },
@@ -457,7 +457,7 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hH:M:", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "hlH:M:", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -466,6 +466,10 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_VERSION:
                         return version();
+
+                case 'l':
+                        arg_full = true;
+                        break;
 
                 case ARG_NO_CONVERT:
                         arg_convert = false;
@@ -530,9 +534,9 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = bus_connect_transport(arg_transport, arg_host, false, &bus);
+        r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
         return localectl_main(bus, argc, argv);
 }

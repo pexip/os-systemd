@@ -102,7 +102,7 @@ static void test_compress_decompress(const char* label, const char* type,
 
                 r = compress(text, size, buf, size, &j);
                 /* assume compression must be successful except for small or random inputs */
-                assert_se(r > 0 || (size < 2048 && r == -ENOBUFS) || streq(type, "random"));
+                assert_se(r >= 0 || (size < 2048 && r == -ENOBUFS) || streq(type, "random"));
 
                 /* check for overwrites */
                 assert_se(buf[size] == 0);
@@ -158,7 +158,6 @@ int main(int argc, char *argv[]) {
         else
                 arg_start = getpid_cached();
 
-        const char *i;
         NULSTR_FOREACH(i, "zeros\0simple\0random\0") {
 #if HAVE_XZ
                 test_compress_decompress("XZ", i, compress_blob_xz, decompress_blob_xz);

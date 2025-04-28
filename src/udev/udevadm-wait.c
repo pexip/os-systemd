@@ -6,7 +6,7 @@
 #include "sd-event.h"
 
 #include "alloc-util.h"
-#include "chase-symlinks.h"
+#include "chase.h"
 #include "device-monitor-private.h"
 #include "device-util.h"
 #include "errno-util.h"
@@ -52,7 +52,7 @@ static int check_device(const char *path) {
         assert(path);
 
         if (arg_wait_until == WAIT_UNTIL_REMOVED) {
-                r = laccess(path, F_OK);
+                r = access_nofollow(path, F_OK);
                 if (r == -ENOENT)
                         return true;
                 if (r < 0)
@@ -67,7 +67,7 @@ static int check_device(const char *path) {
                 return r;
 
         if (arg_wait_until == WAIT_UNTIL_INITIALIZED)
-                return sd_device_get_is_initialized(dev);
+                return device_is_processed(dev);
 
         return true;
 }
@@ -166,8 +166,8 @@ static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device,
         if (path_strv_contains(arg_devices, name))
                 return check_and_exit(sd_device_monitor_get_event(monitor));
 
-        FOREACH_DEVICE_DEVLINK(device, name)
-                if (path_strv_contains(arg_devices, name))
+        FOREACH_DEVICE_DEVLINK(device, link)
+                if (path_strv_contains(arg_devices, link))
                         return check_and_exit(sd_device_monitor_get_event(monitor));
 
         return 0;

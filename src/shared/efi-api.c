@@ -5,8 +5,10 @@
 #include "alloc-util.h"
 #include "dirent-util.h"
 #include "efi-api.h"
+#include "efi-fundamental.h"
 #include "efivars.h"
 #include "fd-util.h"
+#include "fileio.h"
 #include "sort-util.h"
 #include "stat-util.h"
 #include "stdio-util.h"
@@ -77,7 +79,7 @@ int efi_reboot_to_firmware_supported(void) {
         if (!is_efi_boot())
                 goto not_supported;
 
-        r = efi_get_variable(EFI_GLOBAL_VARIABLE(OsIndicationsSupported), NULL, &v, &s);
+        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("OsIndicationsSupported"), NULL, &v, &s);
         if (r == -ENOENT)
                 goto not_supported; /* variable doesn't exist? it's not supported then */
         if (r < 0)
@@ -113,7 +115,7 @@ static int get_os_indications(uint64_t *ret) {
                 return r;
 
         /* stat() the EFI variable, to see if the mtime changed. If it did we need to cache again. */
-        if (stat(EFIVAR_PATH(EFI_GLOBAL_VARIABLE(OsIndications)), &new_stat) < 0) {
+        if (stat(EFIVAR_PATH(EFI_GLOBAL_VARIABLE_STR("OsIndications")), &new_stat) < 0) {
                 if (errno != ENOENT)
                         return -errno;
 
@@ -127,7 +129,7 @@ static int get_os_indications(uint64_t *ret) {
                 return 0;
         }
 
-        r = efi_get_variable(EFI_GLOBAL_VARIABLE(OsIndications), NULL, &v, &s);
+        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("OsIndications"), NULL, &v, &s);
         if (r == -ENOENT) {
                 /* Some firmware implementations that do support OsIndications and report that with
                  * OsIndicationsSupported will remove the OsIndications variable when it is unset. Let's
@@ -170,7 +172,7 @@ int efi_set_reboot_to_firmware(bool value) {
 
         /* Avoid writing to efi vars store if we can due to firmware bugs. */
         if (b != b_new)
-                return efi_set_variable(EFI_GLOBAL_VARIABLE(OsIndications), &b_new, sizeof(uint64_t));
+                return efi_set_variable(EFI_GLOBAL_VARIABLE_STR("OsIndications"), &b_new, sizeof(uint64_t));
 
         return 0;
 }
@@ -187,32 +189,6 @@ static ssize_t utf16_size(const uint16_t *s, size_t buf_len_bytes) {
         }
 
         return -EINVAL; /* The terminator was not found */
-}
-
-struct guid {
-        uint32_t u1;
-        uint16_t u2;
-        uint16_t u3;
-        uint8_t u4[8];
-} _packed_;
-
-static void efi_guid_to_id128(const void *guid, sd_id128_t *id128) {
-        uint32_t u1;
-        uint16_t u2, u3;
-        const struct guid *uuid = guid;
-
-        memcpy(&u1, &uuid->u1, sizeof(uint32_t));
-        id128->bytes[0] = (u1 >> 24) & 0xff;
-        id128->bytes[1] = (u1 >> 16) & 0xff;
-        id128->bytes[2] = (u1 >> 8) & 0xff;
-        id128->bytes[3] = u1 & 0xff;
-        memcpy(&u2, &uuid->u2, sizeof(uint16_t));
-        id128->bytes[4] = (u2 >> 8) & 0xff;
-        id128->bytes[5] = u2 & 0xff;
-        memcpy(&u3, &uuid->u3, sizeof(uint16_t));
-        id128->bytes[6] = (u3 >> 8) & 0xff;
-        id128->bytes[7] = u3 & 0xff;
-        memcpy(&id128->bytes[8], uuid->u4, sizeof(uuid->u4));
 }
 
 int efi_get_boot_option(
@@ -290,7 +266,7 @@ int efi_get_boot_option(
                                         continue;
 
                                 if (ret_part_uuid)
-                                        efi_guid_to_id128(dpath->drive.signature, &p_uuid);
+                                        p_uuid = efi_guid_to_id128(dpath->drive.signature);
                                 continue;
                         }
 
@@ -324,16 +300,6 @@ static void to_utf16(uint16_t *dest, const char *src) {
         for (i = 0; src[i] != '\0'; i++)
                 dest[i] = src[i];
         dest[i] = '\0';
-}
-
-static void id128_to_efi_guid(sd_id128_t id, void *guid) {
-        struct guid uuid = {
-                .u1 = id.bytes[0] << 24 | id.bytes[1] << 16 | id.bytes[2] << 8 | id.bytes[3],
-                .u2 = id.bytes[4] << 8 | id.bytes[5],
-                .u3 = id.bytes[6] << 8 | id.bytes[7],
-        };
-        memcpy(uuid.u4, id.bytes+8, sizeof(uuid.u4));
-        memcpy(guid, &uuid, sizeof(uuid));
 }
 
 static uint16_t *tilt_slashes(uint16_t *s) {
@@ -388,7 +354,7 @@ int efi_add_boot_option(
         memcpy(&devicep->drive.part_nr, &part, sizeof(uint32_t));
         memcpy(&devicep->drive.part_start, &pstart, sizeof(uint64_t));
         memcpy(&devicep->drive.part_size, &psize, sizeof(uint64_t));
-        id128_to_efi_guid(part_uuid, devicep->drive.signature);
+        efi_id128_to_guid(part_uuid, devicep->drive.signature);
         devicep->drive.mbr_type = MBR_TYPE_EFI_PARTITION_TABLE_HEADER;
         devicep->drive.signature_type = SIGNATURE_TYPE_GUID;
         size += devicep->length;
@@ -433,7 +399,7 @@ int efi_get_boot_order(uint16_t **ret_order) {
         if (!is_efi_boot())
                 return -EOPNOTSUPP;
 
-        r = efi_get_variable(EFI_GLOBAL_VARIABLE(BootOrder), NULL, &buf, &l);
+        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("BootOrder"), NULL, &buf, &l);
         if (r < 0)
                 return r;
 
@@ -453,7 +419,7 @@ int efi_set_boot_order(const uint16_t *order, size_t n) {
         if (!is_efi_boot())
                 return -EOPNOTSUPP;
 
-        return efi_set_variable(EFI_GLOBAL_VARIABLE(BootOrder), order, n * sizeof(uint16_t));
+        return efi_set_variable(EFI_GLOBAL_VARIABLE_STR("BootOrder"), order, n * sizeof(uint16_t));
 }
 
 static int boot_id_hex(const char s[static 4]) {
@@ -470,10 +436,6 @@ static int boot_id_hex(const char s[static 4]) {
                         return -EINVAL;
 
         return id;
-}
-
-static int cmp_uint16(const uint16_t *a, const uint16_t *b) {
-        return CMP(*a, *b);
 }
 
 int efi_get_boot_options(uint16_t **ret_options) {
@@ -493,13 +455,13 @@ int efi_get_boot_options(uint16_t **ret_options) {
         FOREACH_DIRENT(de, dir, return -errno) {
                 int id;
 
-                if (strncmp(de->d_name, "Boot", 4) != 0)
+                if (!startswith(de->d_name, "Boot"))
                         continue;
 
                 if (strlen(de->d_name) != 45)
                         continue;
 
-                if (strcmp(de->d_name + 8, EFI_GLOBAL_VARIABLE_STR("")) != 0)  /* generate variable suffix using macro */
+                if (!streq(de->d_name + 8, EFI_GLOBAL_VARIABLE_STR(""))) /* generate variable suffix using macro */
                         continue;
 
                 id = boot_id_hex(de->d_name + 4);
@@ -521,25 +483,75 @@ int efi_get_boot_options(uint16_t **ret_options) {
 
 bool efi_has_tpm2(void) {
         static int cache = -1;
+        int r;
 
         /* Returns whether the system has a TPM2 chip which is known to the EFI firmware. */
 
-        if (cache < 0) {
+        if (cache >= 0)
+                return cache;
 
-                /* First, check if we are on an EFI boot at all. */
-                if (!is_efi_boot())
-                        cache = false;
-                else {
-                        /* Then, check if the ACPI table "TPM2" exists, which is the TPM2 event log table, see:
-                         * https://trustedcomputinggroup.org/wp-content/uploads/TCG_ACPIGeneralSpecification_v1.20_r8.pdf
-                         * This table exists whenever the firmware is hooked up to TPM2. */
-                        cache = access("/sys/firmware/acpi/tables/TPM2", F_OK) >= 0;
-                        if (!cache && errno != ENOENT)
-                                log_debug_errno(errno, "Unable to test whether /sys/firmware/acpi/tables/TPM2 exists, assuming it doesn't: %m");
-                }
-        }
+        /* First, check if we are on an EFI boot at all. */
+        if (!is_efi_boot())
+                return (cache = false);
 
-        return cache;
+        /* Then, check if the ACPI table "TPM2" exists, which is the TPM2 event log table, see:
+         * https://trustedcomputinggroup.org/wp-content/uploads/TCG_ACPIGeneralSpecification_v1.20_r8.pdf
+         * This table exists whenever the firmware knows ACPI and is hooked up to TPM2. */
+        if (access("/sys/firmware/acpi/tables/TPM2", F_OK) >= 0)
+                return (cache = true);
+        if (errno != ENOENT)
+                log_debug_errno(errno, "Unable to test whether /sys/firmware/acpi/tables/TPM2 exists, assuming it doesn't: %m");
+
+        /* As the last try, check if the EFI firmware provides the EFI_TCG2_FINAL_EVENTS_TABLE
+         * stored in EFI configuration table, see:
+         *
+         * https://trustedcomputinggroup.org/wp-content/uploads/EFI-Protocol-Specification-rev13-160330final.pdf */
+        if (access("/sys/kernel/security/tpm0/binary_bios_measurements", F_OK) >= 0) {
+                _cleanup_free_ char *major = NULL;
+
+                /* The EFI table might exist for TPM 1.2 as well, hence let's check explicitly which TPM version we are looking at here. */
+                r = read_virtual_file("/sys/class/tpm/tpm0/tpm_version_major", SIZE_MAX, &major, /* ret_size= */ NULL);
+                if (r >= 0)
+                        return (cache = streq(strstrip(major), "2"));
+
+                log_debug_errno(r, "Unable to read /sys/class/tpm/tpm0/tpm_version_major, assuming TPM does not qualify as TPM2: %m");
+
+        } else if (errno != ENOENT)
+                  log_debug_errno(errno, "Unable to test whether /sys/kernel/security/tpm0/binary_bios_measurements exists, assuming it doesn't: %m");
+
+        return (cache = false);
 }
 
 #endif
+
+sd_id128_t efi_guid_to_id128(const void *guid) {
+        const EFI_GUID *uuid = ASSERT_PTR(guid); /* cast is safe, because struct efi_guid is packed */
+        sd_id128_t id128;
+
+        id128.bytes[0] = (uuid->Data1 >> 24) & 0xff;
+        id128.bytes[1] = (uuid->Data1 >> 16) & 0xff;
+        id128.bytes[2] = (uuid->Data1 >> 8) & 0xff;
+        id128.bytes[3] = uuid->Data1 & 0xff;
+
+        id128.bytes[4] = (uuid->Data2 >> 8) & 0xff;
+        id128.bytes[5] = uuid->Data2 & 0xff;
+
+        id128.bytes[6] = (uuid->Data3 >> 8) & 0xff;
+        id128.bytes[7] = uuid->Data3 & 0xff;
+
+        memcpy(&id128.bytes[8], uuid->Data4, sizeof(uuid->Data4));
+
+        return id128;
+}
+
+void efi_id128_to_guid(sd_id128_t id, void *ret_guid) {
+        assert(ret_guid);
+
+        EFI_GUID uuid = {
+                .Data1 = id.bytes[0] << 24 | id.bytes[1] << 16 | id.bytes[2] << 8 | id.bytes[3],
+                .Data2 = id.bytes[4] << 8 | id.bytes[5],
+                .Data3 = id.bytes[6] << 8 | id.bytes[7],
+        };
+        memcpy(uuid.Data4, id.bytes+8, sizeof(uuid.Data4));
+        memcpy(ret_guid, &uuid, sizeof(uuid));
+}

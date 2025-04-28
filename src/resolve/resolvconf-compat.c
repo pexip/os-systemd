@@ -4,7 +4,8 @@
 #include <net/if.h>
 
 #include "alloc-util.h"
-#include "def.h"
+#include "build.h"
+#include "constants.h"
 #include "dns-domain.h"
 #include "extract-word.h"
 #include "fileio.h"
@@ -33,13 +34,14 @@ static int resolvconf_help(void) {
                "     --version  Show package version\n"
                "  -a            Register per-interface DNS server and domain data\n"
                "  -d            Unregister per-interface DNS server and domain data\n"
+               "  -p            Do not use this interface as default route\n"
                "  -f            Ignore if specified interface does not exist\n"
                "  -x            Send DNS traffic preferably over this interface\n"
                "\n"
                "This is a compatibility alias for the resolvectl(1) tool, providing native\n"
                "command line compatibility with the resolvconf(8) tool of various Linux\n"
                "distributions and BSD systems. Some options supported by other implementations\n"
-               "are not supported and are ignored: -m, -p, -u. Various options supported by other\n"
+               "are not supported and are ignored: -m, -u. Various options supported by other\n"
                "implementations are not supported and will cause the invocation to fail:\n"
                "-I, -i, -l, -R, -r, -v, -V, --enable-updates, --disable-updates,\n"
                "--updates-are-enabled.\n"
@@ -118,7 +120,7 @@ int resolvconf_parse_argv(int argc, char *argv[]) {
 
         enum {
                 TYPE_REGULAR,
-                TYPE_PRIVATE,   /* -p: Not supported, treated identically to TYPE_REGULAR */
+                TYPE_PRIVATE,
                 TYPE_EXCLUSIVE, /* -x */
         } type = TYPE_REGULAR;
 
@@ -131,7 +133,7 @@ int resolvconf_parse_argv(int argc, char *argv[]) {
         if (getenv("IF_EXCLUSIVE"))
                 type = TYPE_EXCLUSIVE;
         if (getenv("IF_PRIVATE"))
-                type = TYPE_PRIVATE; /* not actually supported */
+                type = TYPE_PRIVATE;
 
         arg_mode = _MODE_INVALID;
 
@@ -159,7 +161,7 @@ int resolvconf_parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'p':
-                        type = TYPE_PRIVATE; /* not actually supported */
+                        type = TYPE_PRIVATE;
                         break;
 
                 case 'f':
@@ -225,9 +227,9 @@ int resolvconf_parse_argv(int argc, char *argv[]) {
 
                 for (;;) {
                         _cleanup_free_ char *line = NULL;
-                        const char *a, *l;
+                        const char *a;
 
-                        r = read_line(stdin, LONG_LINE_MAX, &line);
+                        r = read_stripped_line(stdin, LONG_LINE_MAX, &line);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read from stdin: %m");
                         if (r == 0)
@@ -235,42 +237,57 @@ int resolvconf_parse_argv(int argc, char *argv[]) {
 
                         n++;
 
-                        l = strstrip(line);
-                        if (IN_SET(*l, '#', ';', 0))
+                        if (IN_SET(*line, '#', ';', 0))
                                 continue;
 
-                        a = first_word(l, "nameserver");
+                        a = first_word(line, "nameserver");
                         if (a) {
                                 (void) parse_nameserver(a);
                                 continue;
                         }
 
-                        a = first_word(l, "domain");
+                        a = first_word(line, "domain");
                         if (!a)
-                                a = first_word(l, "search");
+                                a = first_word(line, "search");
                         if (a) {
                                 (void) parse_search_domain(a);
                                 continue;
                         }
 
-                        log_syntax(NULL, LOG_DEBUG, "stdin", n, 0, "Ignoring resolv.conf line: %s", l);
+                        log_syntax(NULL, LOG_DEBUG, "stdin", n, 0, "Ignoring resolv.conf line: %s", line);
                 }
 
-                if (type == TYPE_EXCLUSIVE) {
+                switch (type) {
+                case TYPE_REGULAR:
+                        break;
 
+                case TYPE_PRIVATE:
+                        arg_disable_default_route = true;
+                        break;
+
+                case TYPE_EXCLUSIVE:
                         /* If -x mode is selected, let's preferably route non-suffixed lookups to this interface. This
                          * somewhat matches the original -x behaviour */
 
                         r = strv_extend(&arg_set_domain, "~.");
                         if (r < 0)
                                 return log_oom();
+                        break;
 
-                } else if (type == TYPE_PRIVATE)
-                        log_debug("Private DNS server data not supported, ignoring.");
+                default:
+                        assert_not_reached();
+                }
 
-                if (!arg_set_dns)
+                if (strv_isempty(arg_set_dns))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "No DNS servers specified, refusing operation.");
+
+                if (strv_isempty(arg_set_domain)) {
+                        /* When no domain/search is set, clear the current domains. */
+                        r = strv_extend(&arg_set_domain, "");
+                        if (r < 0)
+                                return log_oom();
+                }
         }
 
         return 1; /* work to do */

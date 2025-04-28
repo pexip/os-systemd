@@ -7,11 +7,11 @@
 #include "export-tar.h"
 #include "fd-util.h"
 #include "import-common.h"
+#include "pretty-print.h"
 #include "process-util.h"
 #include "ratelimit.h"
 #include "string-util.h"
 #include "tmpfile-util.h"
-#include "util.h"
 
 #define COPY_BUFFER_SIZE (16*1024)
 
@@ -91,8 +91,8 @@ int tar_export_new(
                 return -ENOMEM;
 
         *e = (TarExport) {
-                .output_fd = -1,
-                .tar_fd = -1,
+                .output_fd = -EBADF,
+                .tar_fd = -EBADF,
                 .on_finished = on_finished,
                 .userdata = userdata,
                 .quota_referenced = UINT64_MAX,
@@ -132,8 +132,17 @@ static void tar_export_report_progress(TarExport *e) {
         if (!ratelimit_below(&e->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u", percent);
-        log_info("Exported %u%%.", percent);
+        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+
+        if (isatty_safe(STDERR_FILENO))
+                (void) draw_progress_barf(
+                                percent,
+                                "%s %s/%s",
+                                special_glyph(SPECIAL_GLYPH_ARROW_RIGHT),
+                                FORMAT_BYTES(e->written_uncompressed),
+                                FORMAT_BYTES(e->quota_referenced));
+        else
+                log_info("Exported %u%%.", percent);
 
         e->last_percent = percent;
 }
@@ -230,6 +239,9 @@ static int tar_export_process(TarExport *e) {
         return 0;
 
 finish:
+        if (r >= 0 && isatty_safe(STDERR_FILENO))
+                clear_progress_bar(/* prefix= */ NULL);
+
         if (e->on_finished)
                 e->on_finished(e, r, e->userdata);
         else
@@ -251,7 +263,7 @@ static int tar_export_on_defer(sd_event_source *s, void *userdata) {
 }
 
 int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType compress) {
-        _cleanup_close_ int sfd = -1;
+        _cleanup_close_ int sfd = -EBADF;
         int r;
 
         assert(e);
@@ -294,7 +306,7 @@ int tar_export_start(TarExport *e, const char *path, int fd, ImportCompressType 
                         return r;
 
                 /* Let's try to make a snapshot, if we can, so that the export is atomic */
-                r = btrfs_subvol_snapshot_fd(sfd, e->temp_path, BTRFS_SNAPSHOT_READ_ONLY|BTRFS_SNAPSHOT_RECURSIVE);
+                r = btrfs_subvol_snapshot_at(sfd, NULL, AT_FDCWD, e->temp_path, BTRFS_SNAPSHOT_READ_ONLY|BTRFS_SNAPSHOT_RECURSIVE);
                 if (r < 0) {
                         log_debug_errno(r, "Couldn't create snapshot %s of %s, not exporting atomically: %m", e->temp_path, path);
                         e->temp_path = mfree(e->temp_path);
