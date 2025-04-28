@@ -1,7 +1,5 @@
-Index: os-systemd/src/core/path.c
-===================================================================
---- os-systemd.orig/src/core/path.c
-+++ os-systemd/src/core/path.c
+--- systemd.orig/src/core/path.c
++++ systemd/src/core/path.c
 @@ -26,6 +26,13 @@
  #include "unit-name.h"
  #include "unit.h"
@@ -38,15 +36,15 @@ Index: os-systemd/src/core/path.c
                  s->previous_exists = b;
                  break;
  
-@@ -480,7 +491,7 @@ static void path_set_state(Path *p, Path
-         unit_notify(UNIT(p), state_translation_table[old_state], state_translation_table[state], 0);
+@@ -481,7 +492,7 @@ static void path_set_state(Path *p, Path
+         unit_notify(UNIT(p), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
  }
  
 -static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify);
 +static void path_enter_waiting(Path *p, PathWaitingSource source);
  
  static int path_coldplug(Unit *u) {
-         Path *p = PATH(u);
+         Path *p = ASSERT_PTR(PATH(u));
 @@ -491,7 +502,7 @@ static int path_coldplug(Unit *u) {
          if (p->deserialized_state != p->state) {
  
@@ -56,7 +54,7 @@ Index: os-systemd/src/core/path.c
                  else
                          path_set_state(p, p->deserialized_state);
          }
-@@ -561,18 +572,18 @@ fail:
+@@ -563,18 +574,18 @@ fail:
          path_enter_dead(p, PATH_FAILURE_RESOURCES);
  }
  
@@ -78,7 +76,7 @@ Index: os-systemd/src/core/path.c
          _cleanup_free_ char *trigger_path = NULL;
          Unit *trigger;
          int r;
-@@ -588,7 +599,7 @@ static void path_enter_waiting(Path *p,
+@@ -590,7 +601,7 @@ static void path_enter_waiting(Path *p,
                  return;
          }
  
@@ -87,9 +85,9 @@ Index: os-systemd/src/core/path.c
                  log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                  path_enter_running(p, trigger_path);
                  return;
-@@ -598,11 +609,15 @@ static void path_enter_waiting(Path *p,
-         if (r < 0)
-                 goto fail;
+@@ -603,11 +614,15 @@ static void path_enter_waiting(Path *p,
+                 return;
+         }
  
 -        /* Hmm, so now we have created inotify watches, but the file
 -         * might have appeared/been removed by now, so we must
@@ -107,7 +105,7 @@ Index: os-systemd/src/core/path.c
                  log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                  path_enter_running(p, trigger_path);
                  return;
-@@ -644,7 +659,7 @@ static int path_start(Unit *u) {
+@@ -643,7 +658,7 @@ static int path_start(Unit *u) {
          path_mkdir(p);
  
          p->result = PATH_SUCCESS;
@@ -116,7 +114,7 @@ Index: os-systemd/src/core/path.c
  
          return 1;
  }
-@@ -741,6 +756,7 @@ static int path_deserialize_item(Unit *u
+@@ -739,6 +754,7 @@ static int path_deserialize_item(Unit *u
                                      path_equal(s->path, unescaped)) {
  
                                          s->previous_exists = previous_exists;
@@ -124,7 +122,7 @@ Index: os-systemd/src/core/path.c
                                          break;
                                  }
                  }
-@@ -795,7 +811,7 @@ static int path_dispatch_io(sd_event_sou
+@@ -792,7 +808,7 @@ static int path_dispatch_io(sd_event_sou
          if (changed)
                  path_enter_running(p, found->path);
          else
@@ -133,7 +131,7 @@ Index: os-systemd/src/core/path.c
  
          return 0;
  
-@@ -861,7 +877,7 @@ static void path_trigger_notify_impl(Uni
+@@ -857,7 +873,7 @@ static void path_trigger_notify_impl(Uni
                  return;
  
          if (on_defer) {
@@ -142,10 +140,8 @@ Index: os-systemd/src/core/path.c
                  return;
          }
  
-Index: os-systemd/src/core/path.h
-===================================================================
---- os-systemd.orig/src/core/path.h
-+++ os-systemd/src/core/path.h
+--- systemd.orig/src/core/path.h
++++ systemd/src/core/path.h
 @@ -31,6 +31,7 @@ typedef struct PathSpec {
          int primary_wd;
  

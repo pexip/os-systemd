@@ -1,13 +1,11 @@
-diff --git a/rules.d/99-systemd.rules.in b/rules.d/99-systemd.rules.in
-index 7b50409..d1d1dd8 100644
---- a/rules.d/99-systemd.rules.in
-+++ b/rules.d/99-systemd.rules.in
-@@ -66,8 +66,9 @@ SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:0701??:
+--- systemd.orig/rules.d/99-systemd.rules.in
++++ systemd/rules.d/99-systemd.rules.in
+@@ -69,8 +69,9 @@ SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_dev
  
- SUBSYSTEM=="udc", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-gadget.target"
+ SUBSYSTEM=="udc", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-gadget.target"
  
 -# Apply sysctl variables to network devices (and only to those) as they appear.
--ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="{{ROOTLIBEXECDIR}}/systemd-sysctl --prefix=/net/ipv4/conf/$name --prefix=/net/ipv4/neigh/$name --prefix=/net/ipv6/conf/$name --prefix=/net/ipv6/neigh/$name"
+-ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="{{LIBEXECDIR}}/systemd-sysctl --prefix=/net/ipv4/conf/$name --prefix=/net/ipv4/neigh/$name --prefix=/net/ipv6/conf/$name --prefix=/net/ipv6/neigh/$name"
 +# Apply sysctl config to network devices as they appear, using sysctl rather than systemd-sysctl. Let's not break if we don't have enough entropy!
 +# This will (re)set all the sysctl settings each time it's called, meh.
 +ACTION=="add", SUBSYSTEM=="net", KERNEL!="lo", RUN+="/usr/sbin/sysctl -q --system"

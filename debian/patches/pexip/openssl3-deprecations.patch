@@ -1,61 +1,6 @@
-Index: os-systemd/src/shared/openssl-util.c
-===================================================================
---- os-systemd.orig/src/shared/openssl-util.c
-+++ os-systemd/src/shared/openssl-util.c
-@@ -3,6 +3,7 @@
- #include "openssl-util.h"
- #include "alloc-util.h"
- #include "hexdecoct.h"
-+#include "openssl/rsa.h"
- 
- #if HAVE_OPENSSL
- int openssl_hash(const EVP_MD *alg,
-diff --git a/src/resolve/resolved-dnstls-openssl.c b/src/resolve/resolved-dnstls-openssl.c
-index 4a0132a..357808d 100644
---- a/src/resolve/resolved-dnstls-openssl.c
-+++ b/src/resolve/resolved-dnstls-openssl.c
-@@ -392,8 +392,10 @@ int dnstls_manager_init(Manager *manager) {
- 
-         assert(manager);
- 
--        ERR_load_crypto_strings();
--        SSL_load_error_strings();
-+# if OPENSSL_VERSION_NUMBER < 0x30000000L
-+        OpenSSL_add_all_algorithms();
-+        ERR_load_CRYPTO_strings();
-+# endif
- 
-         manager->dnstls_data.ctx = SSL_CTX_new(TLS_client_method());
-         if (!manager->dnstls_data.ctx)
-diff --git a/src/resolve/resolved-dns-dnssec.c b/src/resolve/resolved-dns-dnssec.c
-index f63cd9b..acd3523 100644
---- a/src/resolve/resolved-dns-dnssec.c
-+++ b/src/resolve/resolved-dns-dnssec.c
-@@ -14,11 +14,18 @@
- #include "string-table.h"
- 
- #if PREFER_OPENSSL
--#  pragma GCC diagnostic push
--#    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
--DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(RSA*, RSA_free, NULL);
--DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(EC_KEY*, EC_KEY_free, NULL);
--#  pragma GCC diagnostic pop
-+#  include "openssl/rsa.h"
-+#  include "openssl/param_build.h"
-+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(OSSL_PARAM*, OSSL_PARAM_free, NULL);
-+DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(OSSL_PARAM_BLD*, OSSL_PARAM_BLD_free, NULL);
-+/* The macro gets very confused, so spell this one out longhand */
-+typedef unsigned char OSSL_BUF;
-+static inline void OSSL_BUF_freep(OSSL_BUF* *p) {
-+        if (*p != NULL) {
-+                OPENSSL_free(*p);
-+                *p = NULL;
-+        }
-+}
- #endif
- 
- #define VERIFY_RRS_MAX 256
-@@ -101,9 +108,11 @@ static int dnssec_rsa_verify_raw(
+--- systemd.orig/src/resolve/resolved-dns-dnssec.c
++++ systemd/src/resolve/resolved-dns-dnssec.c
+@@ -103,9 +103,11 @@ static int dnssec_rsa_verify_raw(
  #if PREFER_OPENSSL
  #  pragma GCC diagnostic push
  #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -68,7 +13,7 @@ index f63cd9b..acd3523 100644
          _cleanup_(BN_freep) BIGNUM *e = NULL, *m = NULL;
  
          assert(hash_algorithm);
-@@ -116,42 +125,44 @@ static int dnssec_rsa_verify_raw(
+@@ -118,42 +120,44 @@ static int dnssec_rsa_verify_raw(
          if (!m)
                  return -EIO;
  
@@ -128,7 +73,7 @@ index f63cd9b..acd3523 100644
  #else
          gcry_sexp_t public_key_sexp = NULL, data_sexp = NULL, signature_sexp = NULL;
          gcry_mpi_t n = NULL, e = NULL, s = NULL;
-@@ -301,44 +312,44 @@ static int dnssec_ecdsa_verify_raw(
+@@ -303,44 +307,44 @@ static int dnssec_ecdsa_verify_raw(
          int k;
  
  #if PREFER_OPENSSL
@@ -196,7 +141,7 @@ index f63cd9b..acd3523 100644
  
          r = BN_bin2bn(signature_r, signature_r_size, NULL);
          if (!r)
-@@ -356,14 +367,23 @@ static int dnssec_ecdsa_verify_raw(
+@@ -358,14 +362,23 @@ static int dnssec_ecdsa_verify_raw(
  
          if (ECDSA_SIG_set0(sig, r, s) <= 0)
                  return -EIO;

@@ -1,7 +1,5 @@
-Index: os-systemd/src/core/path.c
-===================================================================
---- os-systemd.orig/src/core/path.c
-+++ os-systemd/src/core/path.c
+--- systemd.orig/src/core/path.c
++++ systemd/src/core/path.c
 @@ -232,12 +232,16 @@ static bool path_spec_check_good(PathSpe
  
          case PATH_CHANGED:
@@ -34,7 +32,7 @@ Index: os-systemd/src/core/path.c
          }
  
          return 0;
-@@ -562,6 +568,9 @@ static void path_enter_running(Path *p,
+@@ -565,6 +571,9 @@ static void path_enter_running(Path *p,
  
          job_set_activation_details(job, details);
  
@@ -44,7 +42,7 @@ Index: os-systemd/src/core/path.c
          path_set_state(p, PATH_RUNNING);
          path_unwatch(p);
  
-@@ -576,9 +585,13 @@ static bool path_check_good(Path *p, Pat
+@@ -578,9 +587,13 @@ static bool path_check_good(Path *p, Pat
          assert(p);
          assert(ret_trigger_path);
  
@@ -60,10 +58,10 @@ Index: os-systemd/src/core/path.c
  
          return false;
  }
-@@ -594,11 +607,13 @@ static void path_enter_waiting(Path *p,
+@@ -596,11 +609,13 @@ static void path_enter_waiting(Path *p,
          /* If the triggered unit is already running, so are we */
          trigger = UNIT_TRIGGER(UNIT(p));
-         if (trigger && !UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(trigger))) {
+         if (trigger && !UNIT_IS_INACTIVE_OR_DEACTIVATING(unit_active_state(trigger))) {
 +                log_unit_debug(UNIT(p), "%d: already triggered!",  __LINE__);
                  path_set_state(p, PATH_RUNNING);
                  path_unwatch(p);
@@ -74,7 +72,7 @@ Index: os-systemd/src/core/path.c
          if (path_check_good(p, source, &trigger_path)) {
                  log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                  path_enter_running(p, trigger_path);
-@@ -617,6 +632,7 @@ static void path_enter_waiting(Path *p,
+@@ -622,6 +637,7 @@ static void path_enter_waiting(Path *p,
          if (source != PATH_WAITING_SOURCE_TRIGGER_NOTIFY)
                  source = PATH_WAITING_SOURCE_DISPATCH_IO;
  
@@ -82,7 +80,7 @@ Index: os-systemd/src/core/path.c
          if (path_check_good(p, source, &trigger_path)) {
                  log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                  path_enter_running(p, trigger_path);
-@@ -659,6 +675,7 @@ static int path_start(Unit *u) {
+@@ -658,6 +674,7 @@ static int path_start(Unit *u) {
          path_mkdir(p);
  
          p->result = PATH_SUCCESS;
@@ -90,15 +88,15 @@ Index: os-systemd/src/core/path.c
          path_enter_waiting(p, PATH_WAITING_SOURCE_START);
  
          return 1;
-@@ -670,6 +687,7 @@ static int path_stop(Unit *u) {
-         assert(p);
+@@ -668,6 +685,7 @@ static int path_stop(Unit *u) {
+ 
          assert(IN_SET(p->state, PATH_WAITING, PATH_RUNNING));
  
 +        log_unit_debug(u, "%d: calling path_enter_dead()",  __LINE__);
          path_enter_dead(p, PATH_SUCCESS);
          return 1;
  }
-@@ -697,6 +715,8 @@ static int path_serialize(Unit *u, FILE
+@@ -694,6 +712,8 @@ static int path_serialize(Unit *u, FILE
                                               type,
                                               s->previous_exists,
                                               escaped);
@@ -106,8 +104,8 @@ Index: os-systemd/src/core/path.c
 +                                __LINE__, s->previous_exists);
          }
  
-         return 0;
-@@ -739,6 +759,9 @@ static int path_deserialize_item(Unit *u
+         (void) serialize_ratelimit(f, "trigger-ratelimit", &p->trigger_limit);
+@@ -737,6 +757,9 @@ static int path_deserialize_item(Unit *u
                          ssize_t l;
                          PathType type;
  
