@@ -1,6 +1,25 @@
+Index: systemd/src/resolve/resolved-dns-dnssec.c
+===================================================================
 --- systemd.orig/src/resolve/resolved-dns-dnssec.c
 +++ systemd/src/resolve/resolved-dns-dnssec.c
-@@ -103,9 +103,11 @@ static int dnssec_rsa_verify_raw(
+@@ -17,8 +17,14 @@
+ #if PREFER_OPENSSL && OPENSSL_VERSION_MAJOR >= 3
+ #  pragma GCC diagnostic push
+ #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+-DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(RSA*, RSA_free, NULL);
+-DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(EC_KEY*, EC_KEY_free, NULL);
++/* The macro gets very confused, so spell this one out longhand */
++typedef unsigned char OSSL_BUF;
++static inline void OSSL_BUF_freep(OSSL_BUF* *p) {
++        if (*p != NULL) {
++                OPENSSL_free(*p);
++                *p = NULL;
++        }
++}
+ #  pragma GCC diagnostic pop
+ #endif
+ 
+@@ -103,9 +109,11 @@ static int dnssec_rsa_verify_raw(
  #if PREFER_OPENSSL
  #  pragma GCC diagnostic push
  #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -13,7 +32,7 @@
          _cleanup_(BN_freep) BIGNUM *e = NULL, *m = NULL;
  
          assert(hash_algorithm);
-@@ -118,42 +120,44 @@ static int dnssec_rsa_verify_raw(
+@@ -118,42 +126,44 @@ static int dnssec_rsa_verify_raw(
          if (!m)
                  return -EIO;
  
@@ -73,7 +92,7 @@
  #else
          gcry_sexp_t public_key_sexp = NULL, data_sexp = NULL, signature_sexp = NULL;
          gcry_mpi_t n = NULL, e = NULL, s = NULL;
-@@ -303,44 +307,44 @@ static int dnssec_ecdsa_verify_raw(
+@@ -303,44 +313,44 @@ static int dnssec_ecdsa_verify_raw(
          int k;
  
  #if PREFER_OPENSSL
@@ -97,14 +116,14 @@
  
 -        ec_group = EC_GROUP_new_by_curve_name(curve);
 -        if (!ec_group)
--                return -ENOMEM;
--
--        p = EC_POINT_new(ec_group);
--        if (!p)
 +        bld = OSSL_PARAM_BLD_new();
 +        if (!bld)
                  return -ENOMEM;
  
+-        p = EC_POINT_new(ec_group);
+-        if (!p)
+-                return -ENOMEM;
+-
 -        bctx = BN_CTX_new();
 -        if (!bctx)
 -                return -ENOMEM;
@@ -141,7 +160,7 @@
  
          r = BN_bin2bn(signature_r, signature_r_size, NULL);
          if (!r)
-@@ -358,14 +362,23 @@ static int dnssec_ecdsa_verify_raw(
+@@ -358,14 +368,23 @@ static int dnssec_ecdsa_verify_raw(
  
          if (ECDSA_SIG_set0(sig, r, s) <= 0)
                  return -EIO;
