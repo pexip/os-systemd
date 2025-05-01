@@ -337,7 +337,6 @@ usr/lib/systemd/system/systemd-hybrid-sleep.service
 usr/lib/systemd/system/systemd-initctl.service
 usr/lib/systemd/system/systemd-initctl.socket
 usr/lib/systemd/system/systemd-journal-catalog-update.service
-usr/lib/systemd/system/systemd-journald-audit.socket
 usr/lib/systemd/system/systemd-journald-dev-log.socket
 usr/lib/systemd/system/systemd-journald.service
 usr/lib/systemd/system/systemd-journald@.service
