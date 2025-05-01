@@ -187,3 +187,17 @@ Index: systemd/src/resolve/resolved-dns-dnssec.c
  #else
          gcry_sexp_t public_key_sexp = NULL, data_sexp = NULL, signature_sexp = NULL;
          gcry_mpi_t q = NULL, r = NULL, s = NULL;
+Index: systemd/src/shared/openssl-util.c
+===================================================================
+--- systemd.orig/src/shared/openssl-util.c
++++ systemd/src/shared/openssl-util.c
+@@ -17,6 +17,9 @@
+ #  include <openssl/rsa.h>
+ #  include <openssl/ec.h>
+ 
++#define OPENSSL_NO_ENGINE
++#define OPENSSL_NO_DEPRECATED_3_0
++
+ #  if !defined(OPENSSL_NO_ENGINE) && !defined(OPENSSL_NO_DEPRECATED_3_0)
+ #    include <openssl/engine.h>
+ DISABLE_WARNING_DEPRECATED_DECLARATIONS;
