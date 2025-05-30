@@ -1,3 +1,16 @@
+systemd (252.38-1~deb12u1+pexip24u1) pexip; urgency=medium
+
+  * New upstream release with security update
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Fri, 30 May 2025 11:51:31 +0100
+
+systemd (252.38-1~deb12u1) bookworm-security; urgency=medium
+
+  * New upstream version 252.38 (fixes CVE-2025-4598)
+  * Refresh patch to remove fuzz from 252.38
+
+ -- Luca Boccassi <bluca@debian.org>  Thu, 29 May 2025 18:04:02 +0100
+
 systemd (252.36-1~deb12u1+pexip24u1) pexip; urgency=medium
 
   * New upstream release
