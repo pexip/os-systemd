@@ -458,6 +458,7 @@ usr/lib/tmpfiles.d/20-systemd-shell-extra.conf
 usr/lib/tmpfiles.d/20-systemd-ssh-generator.conf
 usr/lib/tmpfiles.d/20-systemd-stub.conf
 usr/lib/tmpfiles.d/credstore.conf
+<pkg.systemd.upstream> usr/lib/tmpfiles.d/etc.conf
 usr/lib/tmpfiles.d/home.conf
 usr/lib/tmpfiles.d/journal-nocow.conf
 usr/lib/tmpfiles.d/legacy.conf
@@ -512,6 +513,7 @@ usr/share/dbus-1/system-services/org.freedesktop.network1.service
 usr/share/dbus-1/system-services/org.freedesktop.systemd1.service
 usr/share/dbus-1/system-services/org.freedesktop.timedate1.service
 usr/share/doc/systemd/
+<pkg.systemd.upstream> usr/share/factory/
 usr/share/locale/
 usr/share/mime/packages/io.systemd.xml
 usr/share/polkit-1/actions/io.systemd.credentials.policy
@@ -522,6 +524,7 @@ usr/share/polkit-1/actions/org.freedesktop.network1.policy
 usr/share/polkit-1/actions/org.freedesktop.systemd1.policy
 usr/share/polkit-1/actions/org.freedesktop.timedate1.policy
 usr/share/polkit-1/actions/org.freedesktop.timesync1.policy
+<pkg.systemd.upstream> usr/share/polkit-1/rules.d/10-systemd-logind-root-ignore-inhibitors.rules.example
 usr/share/polkit-1/rules.d/systemd-networkd.rules
 usr/share/systemd/kbd-model-map
 usr/share/systemd/language-fallback-map
