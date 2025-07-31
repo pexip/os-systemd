@@ -2,8 +2,11 @@ Index: systemd/src/resolve/resolved-dns-dnssec.c
 ===================================================================
 --- systemd.orig/src/resolve/resolved-dns-dnssec.c
 +++ systemd/src/resolve/resolved-dns-dnssec.c
-@@ -17,8 +17,14 @@
+@@ -15,10 +15,17 @@
+ #include "string-table.h"
+ 
  #if PREFER_OPENSSL && OPENSSL_VERSION_MAJOR >= 3
++#include <openssl/evp.h>
  #  pragma GCC diagnostic push
  #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 -DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(RSA*, RSA_free, NULL);
@@ -19,7 +22,7 @@ Index: systemd/src/resolve/resolved-dns-dnssec.c
  #  pragma GCC diagnostic pop
  #endif
  
-@@ -103,9 +109,11 @@ static int dnssec_rsa_verify_raw(
+@@ -103,9 +110,11 @@ static int dnssec_rsa_verify_raw(
  #if PREFER_OPENSSL
  #  pragma GCC diagnostic push
  #    pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -32,7 +35,7 @@ Index: systemd/src/resolve/resolved-dns-dnssec.c
          _cleanup_(BN_freep) BIGNUM *e = NULL, *m = NULL;
  
          assert(hash_algorithm);
-@@ -118,42 +126,44 @@ static int dnssec_rsa_verify_raw(
+@@ -118,42 +127,44 @@ static int dnssec_rsa_verify_raw(
          if (!m)
                  return -EIO;
  
@@ -92,7 +95,7 @@ Index: systemd/src/resolve/resolved-dns-dnssec.c
  #else
          gcry_sexp_t public_key_sexp = NULL, data_sexp = NULL, signature_sexp = NULL;
          gcry_mpi_t n = NULL, e = NULL, s = NULL;
-@@ -303,44 +313,44 @@ static int dnssec_ecdsa_verify_raw(
+@@ -303,44 +314,44 @@ static int dnssec_ecdsa_verify_raw(
          int k;
  
  #if PREFER_OPENSSL
@@ -160,7 +163,7 @@ Index: systemd/src/resolve/resolved-dns-dnssec.c
  
          r = BN_bin2bn(signature_r, signature_r_size, NULL);
          if (!r)
-@@ -358,14 +368,23 @@ static int dnssec_ecdsa_verify_raw(
+@@ -358,14 +369,23 @@ static int dnssec_ecdsa_verify_raw(
  
          if (ECDSA_SIG_set0(sig, r, s) <= 0)
                  return -EIO;
