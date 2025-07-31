@@ -22,7 +22,7 @@ if ((LLVM)) && [[ -n "$SANITIZERS" ]]; then
     MKOSI_LDFLAGS="$MKOSI_LDFLAGS -Wl,-rpath=$(realpath "$(clang --print-runtime-dir)")"
 fi
 
-MKOSI_MESON_OPTIONS="-D mode=developer -D vcs-tag=${VCS_TAG:-true} -D b_sanitize=${SANITIZERS:-none}"
+MKOSI_MESON_OPTIONS="-D mode=developer -D vcs-tag=${VCS_TAG:-true} -D b_sanitize=${SANITIZERS:-none} -Dtime-epoch=1744207869"
 if ((WIPE)) && [[ -d "$BUILDDIR/meson-private" ]]; then
     MKOSI_MESON_OPTIONS="$MKOSI_MESON_OPTIONS --wipe"
 fi
@@ -59,7 +59,7 @@ EOF
 TS="${SOURCE_DATE_EPOCH:-$(date +%s)}"
 
 sed "pkg/$PKG_SUBDIR/PKGBUILD" \
-    --expression "s/^_tag=.*/_tag=$(cat meson.version)/" \
+    --expression "s/^pkgver=.*/pkgver=$(cat meson.version)/" \
     --expression "s/^pkgrel=.*/pkgrel=$(date "+%Y%m%d%H%M%S" --date "@$TS")/" >/tmp/PKGBUILD
 mount --bind /tmp/PKGBUILD "pkg/$PKG_SUBDIR/PKGBUILD"
 

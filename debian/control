@@ -9,7 +9,7 @@ XSBC-Pexip-Original-Uploaders: Marco d'Itri <md@linux.it>,
            Felipe Sateler <fsateler@debian.org>,
            Luca Boccassi <bluca@debian.org>,
            Nick Rosbrook <enr0n@ubuntu.com>,
-Standards-Version: 4.7.0
+Standards-Version: 4.7.2
 Rules-Requires-Root: no
 Vcs-Git: https://salsa.debian.org/systemd-team/systemd.git
 Vcs-Browser: https://salsa.debian.org/systemd-team/systemd
@@ -512,6 +512,7 @@ Depends: ${shlibs:Depends},
          systemd-userdbd (= ${binary:Version}),
          systemd (= ${binary:Version}),
          libpam-runtime,
+         polkitd,
 Recommends: ${dlopen:Recommends},
 Suggests: ${dlopen:Suggests},
 Description: home area manager
