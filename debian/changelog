@@ -1,9 +1,10 @@
-systemd (257.8-1~deb13u2) trixie; urgency=medium
+systemd (257.9-1~deb13u1) trixie; urgency=medium
 
-  * Non-maintainer upload.
-  * systemd-networkd: Fix segfault on VLAN-aware bridges. (Closes: #1112535)
+  * Update upstream source from tag 'upstream/257.9' Update to upstream
+    version '257.9' with Debian dir
+    9b05cb6904e089147c1521b0ced983a575d8abe4
 
- -- Philipp Kern <pkern@debian.org>  Tue, 09 Sep 2025 10:38:33 +0200
+ -- Luca Boccassi <bluca@debian.org>  Wed, 03 Sep 2025 19:38:20 +0100
 
 systemd (257.8-1~deb13u1) trixie; urgency=medium
 
