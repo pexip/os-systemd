@@ -1,0 +1,29 @@
+From 24c1f6f5ac06b29d39d587ecccb269fd42349307 Mon Sep 17 00:00:00 2001
+From: Yu Watanabe <watanabe.yu+github@gmail.com>
+Date: Fri, 8 Aug 2025 19:39:28 +0900
+Subject: [PATCH] network/bridge-vlan: fix segfault
+
+Fixes a bug introduced by 78738adf88ad288a6af37a1998adc749ac6b5f2d.
+Fixes #38515.
+
+(cherry picked from commit 570210eb281f33e4c013cfdabc142838691aaa9f)
+---
+ src/network/networkd-bridge-vlan.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/network/networkd-bridge-vlan.c b/src/network/networkd-bridge-vlan.c
+index 9cc3293951..a80792e175 100644
+--- a/src/network/networkd-bridge-vlan.c
++++ b/src/network/networkd-bridge-vlan.c
+@@ -246,7 +246,7 @@ int bridge_vlan_set_message(Link *link, sd_netlink_message *m, bool is_set) {
+         if (r < 0)
+                 return r;
+ 
+-        if (link->master_ifindex <= 0 || streq(link->kind, "bridge")) {
++        if (link->master_ifindex <= 0 || streq_ptr(link->kind, "bridge")) {
+                 /* If the setting is requested in a .network file for a bridge master (or a physical master)
+                  * interface, then BRIDGE_FLAGS_SELF flag needs to be set. */
+                 r = sd_netlink_message_append_u16(m, IFLA_BRIDGE_FLAGS, BRIDGE_FLAGS_SELF);
+-- 
+2.47.3
+

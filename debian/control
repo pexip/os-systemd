@@ -543,13 +543,15 @@ Description: simple UEFI boot manager - integration and services
 
 Package: systemd-boot-tools
 Build-Profiles: <!stage1>
-Architecture: amd64 i386 arm64 armhf loong64 riscv64
+Architecture: linux-any
 Depends: ${shlibs:Depends},
          ${misc:Depends},
 Recommends: ${dlopen:Recommends},
 Suggests: ${dlopen:Suggests},
 Breaks: systemd-boot (<< 257.4-2~),
+        systemd (<< 257.7-2~),
 Replaces: systemd-boot (<< 257.4-2~),
+          systemd (<< 257.7-2~),
 Description: simple UEFI boot manager - tools
  systemd-boot (short: sd-boot) is a simple UEFI boot manager. It provides a
  textual menu to select the entry to boot and an editor for the kernel command
@@ -601,6 +603,7 @@ Recommends: systemd,
             systemd-repart,
             python3-cryptography,
             python3-lz4,
+            sbsigntool | pesign,
 Conflicts: systemd (<< 255.1-1~)
 Replaces: systemd (<< 255.1-1~)
 Description: tool to build Unified Kernel Images
