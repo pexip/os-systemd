@@ -1,3 +1,15 @@
+systemd (252.39-1~deb12u1+pexip24u1) pexip; urgency=medium
+
+  * New upstream release
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Wed, 10 Sep 2025 14:41:17 +0100
+
+systemd (252.39-1~deb12u1) bookworm; urgency=medium
+
+  * New upstream version 252.39
+
+ -- Luca Boccassi <bluca@debian.org>  Thu, 26 Jun 2025 15:58:40 +0100
+
 systemd (252.38-1~deb12u1+pexip24u1) pexip; urgency=medium
 
   * New upstream release with security update
