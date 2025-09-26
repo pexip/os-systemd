@@ -70,7 +70,8 @@ handle_tmp() {
   # the tmpfs from tmp.mount in case a unit is later activated that implicitly
   # depends on it (for example with PrivateTmp=yes) by runtime masking it
   # Do not use systemctl here, as libsystemd-shared might not be unpacked yet
-  if [ -z "$DPKG_ROOT" ] && [ -d /run/systemd/system ] && ! df --output=fstype /tmp | grep -q tmpfs; then
+  # Avoid overriding local unit or fstab configuration
+  if [ -z "$DPKG_ROOT" ] && [ -d /run/systemd/system ] && [ ! -f /etc/systemd/system/tmp.mount ] && [ ! -f /run/systemd/generator/tmp.mount ] && ! df --output=fstype /tmp | grep -q tmpfs; then
     touch /run/systemd/system/tmp.mount
   fi
 }
