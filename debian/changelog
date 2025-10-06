@@ -1,3 +1,10 @@
+systemd (252.39-1~deb12u1+pexip24u2) pexip; urgency=medium
+
+  * Boost systemd service watchdog default watchdog timeout 
+    from 3min to 6min.
+
+ -- Steve McIntyre <steve.mcintyre@pexip.com>  Mon, 06 Oct 2025 11:57:28 +0100
+
 systemd (252.39-1~deb12u1+pexip24u1) pexip; urgency=medium
 
   * New upstream release

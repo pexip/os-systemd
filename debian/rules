@@ -37,6 +37,7 @@ else
 endif
 
 CONFFLAGS = \
+        -Dservice-watchdog=6min \
 	-Db_lto=true \
 	-Db_pie=true \
 	-Dmode=release \
