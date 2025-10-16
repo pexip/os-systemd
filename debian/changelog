@@ -1,3 +1,30 @@
+systemd (257.8-1~deb13u2) trixie; urgency=medium
+
+  * Non-maintainer upload.
+  * systemd-networkd: Fix segfault on VLAN-aware bridges. (Closes: #1112535)
+
+ -- Philipp Kern <pkern@debian.org>  Tue, 09 Sep 2025 10:38:33 +0200
+
+systemd (257.8-1~deb13u1) trixie; urgency=medium
+
+  * ukify: recommend sbsigntool | pesign for signing (Closes: #1108803)
+  * Move bootctl zsh completion file too to new package
+  * systemd-boot-tools: change architecture to linux-any. The tool can be
+    used for cross-building, and it's available on all architectures, not
+    just EFI ones
+  * systemd-boot: fix initramfs post-update hook for uncompressed kernels
+    (Closes: #1109098)
+  * systemd-boot: register interest in systemd-boot-signed trigger
+    (Closes: #1109984)
+  * NEWS: fix typo (Closes: #1109979)
+  * systemd-boot: fix registering/removing uncompressed kernels
+  * d/t/control: prefer systemd-boot-tools if available
+  * Update upstream source from tag 'upstream/257.8' Update to upstream
+    version '257.8' with Debian dir
+    7153da4dd3bde82b88c5f48d704826e431373076
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 10 Aug 2025 15:04:51 +0100
+
 systemd (257.7-1+pexip25u1) pexip-trixie; urgency=medium
 
   * New upstream release
