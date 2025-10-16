@@ -1,3 +1,9 @@
+systemd (257.8-1~deb13u2+pexip25u1) pexip-trixie; urgency=medium
+
+  * New upstream release.
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Thu, 16 Oct 2025 12:01:02 +0100
+
 systemd (257.8-1~deb13u2) trixie; urgency=medium
 
   * Non-maintainer upload.
