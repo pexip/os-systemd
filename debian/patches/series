@@ -1,4 +1,3 @@
-0001-network-bridge-vlan-fix-segfault.patch
 pexip/disable-journald-audit.patch
 pexip/install-avoid-utf8.patch
 pexip/path-coldplug-event-race.patch
