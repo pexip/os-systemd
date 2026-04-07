@@ -1,3 +1,5 @@
+Log if inotify event queue overflows
+
 Index: os-systemd/src/core/path.c
 ===================================================================
 --- os-systemd.orig/src/core/path.c

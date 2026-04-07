@@ -1,3 +1,5 @@
+Drop /var/log/README
+
 --- systemd.orig/tmpfiles.d/legacy.conf.in
 +++ systemd/tmpfiles.d/legacy.conf.in
 @@ -13,9 +13,6 @@

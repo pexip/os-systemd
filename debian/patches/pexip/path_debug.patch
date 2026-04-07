@@ -1,3 +1,6 @@
+Add extra debug logging to the path handling code to make debugging the path
+handling code easier.
+
 --- systemd.orig/src/core/path.c
 +++ systemd/src/core/path.c
 @@ -232,12 +232,16 @@ static bool path_spec_check_good(PathSpe

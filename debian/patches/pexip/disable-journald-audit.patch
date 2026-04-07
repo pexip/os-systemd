@@ -1,3 +1,5 @@
+Disable journald-auditd as we use syslog
+
 --- systemd.orig/units/systemd-journald.service.in
 +++ systemd/units/systemd-journald.service.in
 @@ -12,7 +12,7 @@ Description=Journal Service

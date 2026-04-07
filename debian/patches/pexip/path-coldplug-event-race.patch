@@ -1,3 +1,6 @@
+Fix up a quite serious issue in systemd where events can be dropped
+during the coldplug path.
+
 --- systemd.orig/src/core/path.c
 +++ systemd/src/core/path.c
 @@ -26,6 +26,13 @@
