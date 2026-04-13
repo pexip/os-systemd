@@ -377,7 +377,7 @@ static int raw_pull_make_local_copy(RawPull *i) {
                 assert(i->raw_job->disk_fd >= 0);
                 assert(i->offset == UINT64_MAX);
 
-                if (lseek(i->raw_job->disk_fd, SEEK_SET, 0) < 0)
+                if (lseek(i->raw_job->disk_fd, 0, SEEK_SET) < 0)
                         return log_error_errno(errno, "Failed to seek to beginning of vendor image: %m");
         }
 
@@ -527,7 +527,7 @@ static void raw_pull_job_on_finished(PullJob *j) {
                  * checksum file. */
 
                 if (j == i->raw_job) {
-                        if (j->error == ENOMEDIUM) /* HTTP 404 */
+                        if (j->error == -ENOMEDIUM) /* HTTP 404 */
                                 r = log_error_errno(j->error, "Failed to retrieve image file. (Wrong URL?)");
                         else
                                 r = log_error_errno(j->error, "Failed to retrieve image file.");

@@ -31,6 +31,7 @@
 #include "hexdecoct.h"
 #include "initrd-util.h"
 #include "json-util.h"
+#include "label-util.h"
 #include "main-func.h"
 #include "mkdir-label.h"
 #include "openssl-util.h"
@@ -1677,7 +1678,7 @@ static int event_log_add_component_file(EventLog *el, EventLogComponent *compone
         }
 
         if (!sd_json_variant_is_object(j)) {
-                log_warning_errno(r, "Component file %s does not contain JSON object, ignoring.", path);
+                log_warning("Component file %s does not contain JSON object, ignoring.", path);
                 return 0;
         }
 
@@ -3943,8 +3944,7 @@ static int pcr_prediction_add_result(
                 Tpm2PCRPrediction *context,
                 Tpm2PCRPredictionResult *result,
                 uint32_t pcr,
-                const char *path,
-                size_t offset) {
+                const char *path) {
 
         _cleanup_free_ Tpm2PCRPredictionResult *copy = NULL;
         int r;
@@ -3979,18 +3979,11 @@ static const EVP_MD* evp_from_tpm2_alg(uint16_t alg) {
 }
 
 static int event_log_component_variant_calculate(
-                Tpm2PCRPrediction *context,
                 Tpm2PCRPredictionResult *result,
-                EventLogComponent *component,
                 EventLogComponentVariant *variant,
-                uint32_t pcr,
-                const char *path) {
+                uint32_t pcr) {
 
-        int r;
-
-        assert(context);
         assert(result);
-        assert(component);
         assert(variant);
 
         FOREACH_ARRAY(rr, variant->records, variant->n_records) {
@@ -4043,13 +4036,6 @@ static int event_log_component_variant_calculate(
 
                         assert(l == (unsigned) sz);
                 }
-
-                /* This is a valid result once we hit the start location */
-                if (arg_location_start && strcmp(component->id, arg_location_start) >= 0) {
-                        r = pcr_prediction_add_result(context, result, pcr, path, rr - variant->records);
-                        if (r < 0)
-                                return r;
-                }
         }
 
         return 0;
@@ -4073,7 +4059,7 @@ static int event_log_predict_pcrs(
         /* Check if we reached the end of the components, generate a result, and backtrack */
         if (component_index >= el->n_components ||
             (arg_location_end && strcmp(el->components[component_index]->id, arg_location_end) > 0)) {
-                r = pcr_prediction_add_result(context, parent_result, pcr, path, /* offset= */ 0);
+                r = pcr_prediction_add_result(context, parent_result, pcr, path);
                 if (r < 0)
                         return r;
 
@@ -4081,6 +4067,13 @@ static int event_log_predict_pcrs(
         }
 
         component = ASSERT_PTR(el->components[component_index]);
+
+        /* Check if we are just about to process a component after start, if so record a result and continue. */
+        if (arg_location_start && strcmp(component->id, arg_location_start) > 0) {
+                r = pcr_prediction_add_result(context, parent_result, pcr, path);
+                if (r < 0)
+                        return r;
+        }
 
         FOREACH_ARRAY(ii, component->variants, component->n_variants) {
                 _cleanup_free_ Tpm2PCRPredictionResult *result = NULL;
@@ -4105,12 +4098,9 @@ static int event_log_predict_pcrs(
                         return log_oom();
 
                 r = event_log_component_variant_calculate(
-                                context,
                                 result,
-                                component,
                                 variant,
-                                pcr,
-                                subpath);
+                                pcr);
                 if (r < 0)
                         return r;
 
@@ -4407,7 +4397,7 @@ static int write_boot_policy_file(const char *json_text) {
                         AT_FDCWD,
                         boot_policy_file,
                         &encoded,
-                        WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_MKDIR_0755);
+                        WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_MKDIR_0755|WRITE_STRING_FILE_LABEL);
         if (r < 0)
                 return log_error_errno(r, "Failed to write boot policy file to '%s': %m", boot_policy_file);
 
@@ -4820,7 +4810,7 @@ static int make_policy(bool force, RecoveryPinMode recovery_pin_mode) {
                 return log_error_errno(r, "Failed to format new configuration to JSON: %m");
 
         const char *path = arg_policy_path ?: (in_initrd() ? "/run/systemd/pcrlock.json" : "/var/lib/systemd/pcrlock.json");
-        r = write_string_file(path, text, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_MKDIR_0755);
+        r = write_string_file(path, text, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_MKDIR_0755|WRITE_STRING_FILE_LABEL);
         if (r < 0)
                 return log_error_errno(r, "Failed to write new configuration to '%s': %m", path);
 
@@ -5346,6 +5336,10 @@ static int run(int argc, char *argv[]) {
         int r;
 
         log_setup();
+
+        r = mac_init();
+        if (r < 0)
+                return r;
 
         r = parse_argv(argc, argv);
         if (r <= 0)

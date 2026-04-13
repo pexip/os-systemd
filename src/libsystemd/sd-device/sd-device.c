@@ -95,7 +95,7 @@ int device_add_property_aux(sd_device *device, const char *key, const char *valu
         else
                 properties = &device->properties;
 
-        if (value) {
+        if (!isempty(value)) {
                 _unused_ _cleanup_free_ char *old_value = NULL;
                 _cleanup_free_ char *new_key = NULL, *new_value = NULL, *old_key = NULL;
                 int r;
@@ -153,8 +153,8 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
                 r = chase(_syspath, NULL, 0, &syspath, &fd);
                 if (r == -ENOENT)
                          /* the device does not exist (any more?) */
-                        return log_debug_errno(SYNTHETIC_ERRNO(ENODEV),
-                                               "sd-device: Failed to chase symlinks in \"%s\".", _syspath);
+                        return log_trace_errno(SYNTHETIC_ERRNO(ENODEV),
+                                               "sd-device: Device \"%s\" not found.", _syspath);
                 if (r < 0)
                         return log_debug_errno(r, "sd-device: Failed to get target of '%s': %m", _syspath);
 

@@ -1064,9 +1064,19 @@ static int append_release_log_fields(
 
         /* Find an ID first, in order of preference from more specific to less specific: IMAGE_ID -> ID */
         id = strv_find_first_field((char *const *)field_ids[type], fields);
+        if (id && string_has_cc(id, /* ok= */ NULL)) {
+                log_debug("os-release file '%s' contains control characters in the ID field, skipping.",
+                          release->name);
+                id = NULL;
+        }
 
         /* Then the version, same logic, prefer the more specific one */
         version = strv_find_first_field((char *const *)field_versions[type], fields);
+        if (version && string_has_cc(version, /* ok= */ NULL)) {
+                log_debug("os-release file '%s' contains control characters in the version field, skipping.",
+                          release->name);
+                version = NULL;
+        }
 
         /* If there's no valid version to be found, simply omit it. */
         if (!id && !version)
@@ -1171,7 +1181,7 @@ static int install_chroot_dropin(
                                                ext->path,
                                                /* With --force tell PID1 to avoid enforcing that the image <name> and
                                                 * extension-release.<name> have to match. */
-                                               !IN_SET(type, IMAGE_DIRECTORY, IMAGE_SUBVOLUME) &&
+                                               !IN_SET(ext->type, IMAGE_DIRECTORY, IMAGE_SUBVOLUME) &&
                                                    FLAGS_SET(flags, PORTABLE_FORCE_EXTENSION) ?
                                                        ":x-systemd.relax-extension-release-check\n" :
                                                        "\n",

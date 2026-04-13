@@ -611,6 +611,13 @@ EOF
 }
 
 testcase_simultaneous_events() {
+    . /etc/os-release
+    if [[ "$ID" == "debian" ]]; then
+        # See https://github.com/systemd/systemd/issues/39552
+        echo "Simultaneous events test cases are not working on Debian, skipping the test" | tee --append /skipped
+        exit 77
+    fi
+
     testcase_simultaneous_events_1
     testcase_simultaneous_events_2
     testcase_simultaneous_events_3
@@ -1000,7 +1007,7 @@ testcase_iscsi_lvm() {
     udevadm wait --settle --timeout=30 "${devices[0]}"
     mount "${devices[0]}" "$mpoint"
     for i in {1..4}; do
-        dd if=/dev/zero of="$mpoint/lun$i.img" bs=1M count=32
+        truncate -s 32M "$mpoint/lun$i.img"
     done
     # Initialize a new iSCSI target <$target_name> consisting of 4 LUNs, each
     # backed by a file
@@ -1295,7 +1302,7 @@ testcase_mdadm_lvm() {
     printf 'y\ny\n' | mdadm --create "$raid_dev" --name "$raid_name" --uuid "$uuid" /dev/disk/by-id/scsi-0systemd_foobar_deadbeefmdadmlvm{0..3} -v -f --level=10 --raid-devices=4
     udevadm wait --settle --timeout=30 "$raid_dev"
     # Create an LVM on the MD
-    lvm pvcreate -y "$raid_dev"
+    lvm pvcreate -y -ff "$raid_dev"
     lvm pvs
     lvm vgcreate "$vgroup" -y "$raid_dev"
     lvm vgs
