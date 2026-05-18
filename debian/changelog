@@ -1,3 +1,9 @@
+systemd (257.13-1~deb13u1+pexip25u2) pexip-trixie; urgency=medium
+
+  * Rebuild against our openssl
+
+ -- Huw Jones <huw@pexip.com>  Mon, 18 May 2026 15:58:47 +0100
+
 systemd (257.13-1~deb13u1+pexip25u1) pexip-trixie; urgency=medium
 
   * New upstream release
