@@ -261,7 +261,7 @@ int start_upload(Uploader *u,
                 }
 
                 if (STRPTR_IN_SET(arg_trust, "-", "all"))
-                        easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0,
+                        easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L,
                                     LOG_ERR, return -EUCLEAN);
                 else if (arg_trust || startswith(u->url, "https://"))
                         easy_setopt(curl, CURLOPT_CAINFO, arg_trust ?: TRUST_FILE,
@@ -588,8 +588,6 @@ static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
 
-        opterr = 0;
-
         while ((c = getopt_long(argc, argv, "hu:mM:D:", options, NULL)) >= 0)
                 switch (c) {
                 case 'h':
@@ -710,14 +708,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case '?':
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Unknown option %s.",
-                                               argv[optind - 1]);
-
-                case ':':
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "Missing argument to %s.",
-                                               argv[optind - 1]);
+                        return -EINVAL;
 
                 default:
                         assert_not_reached();

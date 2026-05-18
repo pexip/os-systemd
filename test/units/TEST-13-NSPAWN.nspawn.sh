@@ -86,7 +86,7 @@ testcase_sanity() {
     create_dummy_container "$template"
     # Create a simple image from the just created container template
     image="$(mktemp /var/lib/machines/TEST-13-NSPAWN.image-XXX.img)"
-    dd if=/dev/zero of="$image" bs=1M count=256
+    truncate -s 384M "$image"
     mkfs.ext4 "$image"
     mkdir -p /mnt
     mount -o loop "$image" /mnt
@@ -368,6 +368,46 @@ EOF
     (! systemd-nspawn --rlimit==)
 }
 
+testcase_check_default_inaccessible_paths() {
+    local root container inaccessible_paths path exp
+
+    # Taken from src/nspawn/nspawn-mount.c:mount_all()
+    inaccessible_paths=(
+        "/proc/kallsyms"
+        "/proc/kcore"
+        "/proc/keys"
+        "/proc/sysrq-trigger"
+        "/proc/timer_list"
+    )
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.default_inaccessible_paths.XXX)"
+    container="$(basename "$root")"
+    create_dummy_container "$root"
+
+    # Each inaccessible path should have zeroed permissions, which stat's %a reports as a single 0
+    for path in "${inaccessible_paths[@]}"; do
+        systemd-nspawn --directory="$root" \
+                       bash -xec "ls -l $path; [[ \$(stat --format=%a $path) -eq 0 ]]"
+    done
+
+    # SYSTEMD_NSPAWN_API_VFS_WRITABLE=yes mounts certain API directories under /sys/ and /proc/sys/
+    # as writable, and it also skips the path masking (by dropping the MOUNT_APPLY_APIVFS_RO flag)
+    for path in "${inaccessible_paths[@]}"; do
+        exp="$(stat --format=%a "$path")"
+        SYSTEMD_NSPAWN_API_VFS_WRITABLE=yes systemd-nspawn --directory="$root" \
+                       bash -xec "ls -l $path; [[ \$(stat --format=%a $path) -eq $exp ]]"
+    done
+
+    # SYSTEMD_NSPAWN_API_VFS_WRITABLE=network mounts only /proc/sys/net/ as writable but doesn't
+    # drop the MOUNT_APPLY_APIVFS_RO flag, so the masking should still apply
+    for path in "${inaccessible_paths[@]}"; do
+        SYSTEMD_NSPAWN_API_VFS_WRITABLE=network systemd-nspawn --directory="$root" \
+                       bash -xec "ls -l $path; [[ \$(stat --format=%a $path) -eq 0 ]]"
+    done
+
+    rm -fr "$root"
+}
+
 nspawn_settings_cleanup() {
     for dev in sd-host-only sd-shared{1,2,3} sd-macvlan{1,2} sd-ipvlan{1,2}; do
         ip link del "$dev" || :
@@ -637,7 +677,7 @@ testcase_rootidmap() {
     root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.rootidmap-path.XXX)"
     # Create ext4 image, as ext4 supports idmapped-mounts.
     mkdir -p /tmp/rootidmap/bind
-    dd if=/dev/zero of=/tmp/rootidmap/ext4.img bs=4k count=2048
+    truncate -s $((4096*2048)) /tmp/rootidmap/ext4.img
     mkfs.ext4 /tmp/rootidmap/ext4.img
     mount /tmp/rootidmap/ext4.img /tmp/rootidmap/bind
     trap "rootidmap_cleanup /tmp/rootidmap/" RETURN
@@ -681,7 +721,7 @@ testcase_owneridmap() {
     root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.owneridmap-path.XXX)"
     # Create ext4 image, as ext4 supports idmapped-mounts.
     mkdir -p /tmp/owneridmap/bind
-    dd if=/dev/zero of=/tmp/owneridmap/ext4.img bs=4k count=2048
+    truncate -s $((4096*2048)) /tmp/owneridmap/ext4.img
     mkfs.ext4 /tmp/owneridmap/ext4.img
     mount /tmp/owneridmap/ext4.img /tmp/owneridmap/bind
     trap "owneridmap_cleanup /tmp/owneridmap/" RETURN
@@ -1289,6 +1329,62 @@ testcase_link_journa_hostl() {
         [[ "$(stat "$hoge" --format=%u)" == 0 ]]
         rm "$hoge"
     done
+
+    rm -fr "$root"
+}
+
+testcase_volatile_link_journal_no_userns() {
+    local root machine_id journal_dir acl_output
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.volatile-journal.XXX)"
+    create_dummy_container "$root"
+
+    machine_id="$(systemd-id128 new)"
+    echo "$machine_id" >"$root/etc/machine-id"
+
+    journal_dir="/var/log/journal/$machine_id"
+    mkdir -p "$journal_dir"
+    chown root:root "$journal_dir"
+
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --boot \
+                   --volatile=yes \
+                   --link-journal=host \
+                   systemd.unit=systemd-tmpfiles-setup.service
+
+    local gid
+    gid="$(stat -c '%g' "$journal_dir")"
+
+    # Ensure GID is not 4294967295 (GID_INVALID)
+    [[ "$gid" != "4294967295" ]]
+
+    # Ensure the directory is owned by a valid user (root or systemd-journal
+    # group). The GID should be either 0 (root) or the systemd-journal GID, not
+    # some bombastically large number
+    [[ "$gid" -lt 65535 ]]
+
+    # Ensure the invalid GID doesn't appear in ACLs
+    acl_output="$(getfacl "$journal_dir" || true)"
+    grep -q "4294967295" <<< "$acl_output" && exit 1
+
+    rm -fr "$root" "$journal_dir"
+}
+
+testcase_cap_net_bind_service() {
+    local root
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.cap-net-bind-service.XXX)"
+    create_dummy_container "$root"
+
+    # Check that CAP_NET_BIND_SERVICE is available without --private-users
+    systemd-nspawn --register=no --directory="$root" capsh --has-p=cap_net_bind_service
+
+    # Check that CAP_NET_BIND_SERVICE is not available with --private-users=identity
+    (! systemd-nspawn --register=no --directory="$root" --private-users=identity capsh --has-p=cap_net_bind_service)
+
+    # Check that CAP_NET_BIND_SERVICE is not available with --private-users=pick
+    (! systemd-nspawn --register=no --directory="$root" --private-users=pick capsh --has-p=cap_net_bind_service)
 
     rm -fr "$root"
 }

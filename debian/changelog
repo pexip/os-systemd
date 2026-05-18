@@ -1,3 +1,26 @@
+systemd (257.13-1~deb13u1) trixie; urgency=medium
+
+  [ Luca Boccassi ]
+  * preinst: ensure /tmp workaround does not override local unit/fstab
+    (Closes: #1116344)
+  * preinst: ensure /tmp/ workaround is only attempted on first trixie upgrade
+  * Explicitly disable bpf-framework for stage1 builds
+
+  [ Tobias Deiminger ]
+  * CVE-2026-40226 (In nspawn in systemd 233 through 259 before 260, an
+    escape-to-host act ...)
+  * CVE-2026-40225 (In udev in systemd before 260, local root execution can
+    occur via mali ...)
+  * CVE-2026-29111 (systemd, a system and service manager, (as PID 1) hits an
+    assert and f ...)
+  * CVE-2026-4105 (A flaw was found in systemd. The systemd-machined service
+    contains an  ...)
+  * Update upstream source from tag 'upstream/257.13'
+    Update to upstream version '257.13'
+    with Debian dir 608373bc40f1a965a842a0c61f9d1fb40c3dfc82
+
+ -- Tobias Deiminger <tobias.deiminger@linutronix.de>  Mon, 13 Apr 2026 21:38:05 +0200
+
 systemd (257.9-1~deb13u1+pexip25u4) pexip-trixie; urgency=medium
 
   * postinst: don't retain old tmp.conf compatibility with pre-trixie

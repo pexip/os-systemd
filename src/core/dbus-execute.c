@@ -2509,6 +2509,9 @@ int bus_exec_context_set_transient_property(
                                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Journal field is not valid UTF-8");
 
                         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                                if (c->n_log_extra_fields >= LOG_EXTRA_FIELDS_MAX)
+                                        return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Too many extra log fields.");
+
                                 if (!GREEDY_REALLOC(c->log_extra_fields, c->n_log_extra_fields + 1))
                                         return -ENOMEM;
 
@@ -3592,7 +3595,7 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
-                if (empty) {
+                if (!UNIT_WRITE_FLAGS_NOOP(flags) && empty) {
                         bind_mount_free_many(c->bind_mounts, c->n_bind_mounts);
                         c->bind_mounts = NULL;
                         c->n_bind_mounts = 0;
@@ -3637,7 +3640,7 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
-                if (empty) {
+                if (!UNIT_WRITE_FLAGS_NOOP(flags) && empty) {
                         temporary_filesystem_free_many(c->temporary_filesystems, c->n_temporary_filesystems);
                         c->temporary_filesystems = NULL;
                         c->n_temporary_filesystems = 0;

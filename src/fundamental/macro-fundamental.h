@@ -151,15 +151,15 @@
 #define UNIQ_T(x, uniq) CONCATENATE(__unique_prefix_, CONCATENATE(x, uniq))
 #define UNIQ __COUNTER__
 
-/* Note that this works differently from pthread_once(): this macro does
- * not synchronize code execution, i.e. code that is run conditionalized
- * on this macro will run concurrently to all other code conditionalized
- * the same way, there's no ordering or completion enforced. */
+/* The macro is true when the code block is called first time, and is false for the second and later times.
+ * Note that this works differently from pthread_once(): this macro does not synchronize code execution, i.e.
+ * code that is run conditionalized on this macro will run concurrently to all other code conditionalized the
+ * same way, there's no ordering or completion enforced. */
 #define ONCE __ONCE(UNIQ_T(_once_, UNIQ))
-#define __ONCE(o)                                                  \
-        ({                                                         \
-                static bool (o) = false;                           \
-                __atomic_exchange_n(&(o), true, __ATOMIC_SEQ_CST); \
+#define __ONCE(o)                                                       \
+        ({                                                              \
+                static bool (o) = false;                                \
+                !__atomic_exchange_n(&(o), true, __ATOMIC_SEQ_CST);     \
         })
 
 #define U64_KB UINT64_C(1024)
@@ -568,3 +568,10 @@ static inline uint64_t ALIGN_OFFSET_U64(uint64_t l, uint64_t ali) {
 
 #define PTR_TO_SIZE(p) ((size_t) ((uintptr_t) (p)))
 #define SIZE_TO_PTR(u) ((void *) ((uintptr_t) (u)))
+
+/* This macro is used to have a const-returning and non-const returning version of a function based on
+ * whether its first argument is const or not (e.g. strstr()). */
+#define const_generic(ptr, call)                              \
+        _Generic(0 ? (ptr) : (void*) 1,                       \
+                 const void*: (const typeof(*call)*) (call),  \
+                 void*: (call))

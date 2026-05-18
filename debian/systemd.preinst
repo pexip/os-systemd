@@ -81,7 +81,8 @@ case "$1" in
     install|upgrade)
     fail_if_unmerged
     # begin-remove-after: released:trixie
-    if [ -n "$2" ] && [ -n "$3" ]; then
+    # Ensure this only runs on the first install/upgrade to Trixie
+    if [ -n "$2" ] && [ -n "$3" ] && dpkg --compare-versions "$2" lt 257; then
       handle_tmp
     fi
     rm -f /etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service
