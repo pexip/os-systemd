@@ -53,6 +53,9 @@ wrap=(
     findmnt
     getent
     getfacl
+    groupadd
+    groupmod
+    groups
     id
     integritysetup
     iscsid
@@ -75,6 +78,7 @@ wrap=(
     setpriv
     sshd
     stat
+    stress-ng
     su
     tar
     tgtd

@@ -1759,7 +1759,7 @@ int config_parse_exec_root_hash_sig(
                 void *userdata) {
 
         _cleanup_free_ void *roothash_sig_decoded = NULL;
-        char *value;
+        const char *value;
         ExecContext *c = ASSERT_PTR(data);
         size_t roothash_sig_decoded_size = 0;
         int r;
@@ -2964,6 +2964,11 @@ int config_parse_log_extra_fields(
                 if (!journal_field_valid(k, eq-k, false)) {
                         log_syntax(unit, LOG_WARNING, filename, line, 0, "Log field name is invalid, ignoring: %s", k);
                         continue;
+                }
+
+                if (c->n_log_extra_fields >= LOG_EXTRA_FIELDS_MAX) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Too many extra log fields, ignoring some.");
+                        return 0;
                 }
 
                 if (!GREEDY_REALLOC(c->log_extra_fields, c->n_log_extra_fields + 1))
