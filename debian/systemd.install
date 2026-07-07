@@ -167,7 +167,6 @@ usr/lib/systemd/system-generators/systemd-gpt-auto-generator
 usr/lib/systemd/system-generators/systemd-hibernate-resume-generator
 usr/lib/systemd/system-generators/systemd-rc-local-generator
 usr/lib/systemd/system-generators/systemd-run-generator
-usr/lib/systemd/system-generators/systemd-ssh-generator
 usr/lib/systemd/system-generators/systemd-system-update-generator
 usr/lib/systemd/system-generators/systemd-sysv-generator
 usr/lib/systemd/system-generators/systemd-tpm2-generator
@@ -459,7 +458,6 @@ usr/lib/sysusers.d/systemd-journal.conf
 usr/lib/sysusers.d/systemd-network.conf
 <pkg.systemd.upstream> usr/lib/tmpfiles.d/20-systemd-osc-context.conf
 usr/lib/tmpfiles.d/20-systemd-shell-extra.conf
-usr/lib/tmpfiles.d/20-systemd-ssh-generator.conf
 usr/lib/tmpfiles.d/20-systemd-stub.conf
 usr/lib/tmpfiles.d/credstore.conf
 <pkg.systemd.upstream> usr/lib/tmpfiles.d/etc.conf
